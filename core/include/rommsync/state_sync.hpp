@@ -60,6 +60,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
+#include "rommsync/placement.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
@@ -68,6 +69,46 @@
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sync {
+
+/// The largest `GET /api/states` body this client will work from.
+///
+/// `/api/states` takes no `limit` and returns every state the user has, so
+/// unlike `GET /api/roms` there is no paging lever to pull -- the bound is all
+/// there is. At the ~600 bytes a `StateSchema` row costs, this is around 220
+/// states across the whole library, against `scan::kMaxStates` local ones.
+///
+/// **Over the bound the whole run stops rather than working from what fits.**
+/// A partial listing is worse than none: a local state whose server row fell off
+/// the end reads as "the server has no row with this name", and the answer to
+/// that is an upload -- which, `POST /api/states` being an upsert, would replace
+/// the row that was there. So the listing is all of it or none of it.
+///
+/// **It bounds the rows, and the text only once it is here.** `Send` reads a
+/// body whole, so a listing past this is already resident when it is refused --
+/// up to the transport's ceiling, `http::kMaxResponseBytes`, past which it is
+/// refused unread (#248). Under it, the listing is read a row at a time and
+/// costs its text and one row's document (`json::ParseEach`, M9-20, #246), which
+/// `sysmodule/source/main.cpp` counts.
+inline constexpr std::size_t kMaxStateListBytes = 128 * 1024;
+static_assert(kMaxStateListBytes <= http::kMaxResponseBytes,
+              "a listing this client works from has to be one the transport hands over");
+
+/// The most server states one run places, keeps both of or fails to place --
+/// every row of the listing no local state claimed (M9-21, #247).
+///
+/// Each is an operation the tick holds to its end, ~1 KiB on aarch64 with the
+/// server's row copied into it, and a listing at `kMaxStateListBytes` is ~220
+/// rows: unbounded, the placements alone were most of the tick's heap row. At
+/// `scan::kMaxStates` they cost what the scan's own states do, and a console
+/// tracks no more states than that anyway. **The rest are not dropped**: a
+/// placed state is this console's from then on, claimed by the next run's scan
+/// rather than placed again, so the next run places the next ones.
+///
+/// **Placements come first.** A row that places nothing -- its path is taken,
+/// or nothing says where it goes -- is unclaimed again every run, so it is
+/// recorded only in what the placements left, and past that counted in one
+/// line; otherwise a listing that led with such rows would starve the rest.
+inline constexpr std::size_t kMaxStatePlacements = scan::kMaxStates;
 
 /// One row of `GET /api/states`, reduced to what arbitration uses.
 ///
@@ -261,6 +302,11 @@ struct StateSyncReport {
   /// survive. Neither completed nor failed -- it is the policy working.
   int kept_both = 0;
 
+  /// Server rows passed over because they are not this console's to load: the
+  /// placement said `foreign` -- another core's state, or a slot the frontend
+  /// has no file for (#239). Counted and nothing else: no operation, no warning.
+  int filtered = 0;
+
   /// The `CancelToken` fired: this operation, and every one after it, was not
   /// attempted.
   bool canceled = false;
@@ -299,14 +345,21 @@ struct StateSyncOptions {
   /// two states backed up in the same second do not collide.
   std::function<Timestamp()> now;
 
+  /// `retroarch.cfg` as this tick read it, for where RetroArch keeps its states
+  /// (`scan::ScanStates`). Defaulted, unlike the scan's own argument, because
+  /// the default is exactly what a console with no `retroarch.cfg` reads.
+  retroarch::Settings retroarch;
+
   /// Where a server state the client has no local file for should be written,
-  /// SD-root absolute. Returning an empty string -- or leaving this null --
-  /// fails that one with `kNoPlacement` rather than guessing.
+  /// SD-root absolute. A placement with no path -- or leaving this null -- fails
+  /// that one with `kNoPlacement` and the placement's reason rather than
+  /// guessing. A missing folder is made; a file already at the path is
+  /// keep-both, untouched.
   ///
   /// Injected for `ExecuteOptions::place`'s reasons: the directory depends on
   /// the rom's platform and on which emulator the state belongs to, and neither
-  /// is something this file can work out from the row alone.
-  std::function<std::string(const ServerState&)> place;
+  /// is something this file can work out from the row alone (`place::Placer`).
+  std::function<place::Placement(const ServerState&)> place;
 
   /// Optional, not owned; must outlive the call. Checked between states and
   /// passed to every request, so a shutdown ends the run at a boundary rather
@@ -329,5 +382,14 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
                            const auth::StoredToken& token, const config::Config& config,
                            const roms::RomIndex& index, state::Baseline* baseline,
                            const StateSyncOptions& options = {});
+
+/// What one states run says about the credentials, for `auth::Gate`: the last
+/// operation that spoke, as `AnswerOf(StateError)` reads it -- a listing the
+/// server refused is an operation too -- or `kAccepted` for a run whose listing
+/// answered and left nothing to do. `kSilent` when it did not run.
+///
+/// The caller's to feed, as `TickResult::answer` is: a states run is requests
+/// on the same token as the saves half, and a 401 it met is the same verdict.
+auth::Answer AnswerOf(const StateSyncReport& report);
 
 }  // namespace rommsync::sync

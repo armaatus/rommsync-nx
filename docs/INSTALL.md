@@ -43,7 +43,9 @@ you have installed homebrew on a Switch before and have never seen RomM.
   That is the overlay that starts, stops and boot-toggles sysmodules, and it is
   the only supported way to turn `sys-rommsync` on. rommsync-nx does not ship
   its own boot switch.
-- **A RomM 5.2.0 server the console can reach over the network**, and an account
+- **A RomM 5.4.0 or later server the console can reach over the network** — an
+  older one is refused before any save is offered to it
+  ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#romm-is-too-old)) — and an account
   on it you can sign into from a phone or a computer. Make a dedicated RomM user
   for the Switch if you can — it is the thing you revoke later without touching
   your main account ([SECURITY.md](SECURITY.md#tokens--scopes)).
@@ -59,13 +61,14 @@ Unzip the release onto the **root** of your SD card, keeping the folder
 structure. There is no wrapper directory: the archive merges into the
 `atmosphere/` and `switch/` folders your card already has.
 
-Six files land, and nothing else changes:
+Six files and one empty folder land, and nothing else changes:
 
 ```
 README.txt
 LICENSE
 atmosphere/contents/4200000000524D53/exefs.nsp
 atmosphere/contents/4200000000524D53/toolbox.json
+atmosphere/contents/4200000000524D53/flags/
 config/rommsync/config.ini.example
 switch/.overlays/ovl-rommsync.ovl
 ```
@@ -89,14 +92,16 @@ switch/.overlays/ovl-rommsync.ovl
 - `README.txt` and `LICENSE` land at the **root** of the card under those names,
   so an unrelated `README.txt` or `LICENSE` already sitting there is replaced.
 
-There is **no `flags/` directory** in the archive at all — not an empty one, not
-one holding a disabled flag. `atmosphere/contents/4200000000524D53/` arrives
-holding those two files and nothing else. ovl-sysmodules creates `flags/` itself
-the first time you turn the boot toggle on, so there is nothing for the zip to
-carry.
+The `flags/` folder arrives **empty**. Nothing in it means the sysmodule does
+not start at boot; ovl-sysmodules puts `boot2.flag` there the first time you
+turn the boot toggle on. Current ovl-sysmodules would create the folder itself,
+but older builds — still in the wild — write the flag without creating it, and
+the toggle then silently does nothing. Shipping the folder costs nothing and
+removes that.
 
-That is deliberate. `flags/boot2.flag` is what makes Atmosphère launch the
-sysmodule at boot, so shipping it would mean the next boot after you unpacked
+There is no `boot2.flag` in the archive, and that is deliberate.
+`flags/boot2.flag` is what makes Atmosphère launch the sysmodule at boot, so
+shipping it would mean the next boot after you unpacked
 the zip started a sysmodule that has no server, no token, and a folder map you
 have not checked yet — reading and writing save folders before you had any
 chance to look at which ones. Installed first, started when you say so.
@@ -123,8 +128,8 @@ is the single most common way this goes wrong.
 They are not two spellings of the same thing. `boot2.flag` is ovl-sysmodules'
 to write: do not create it by hand, and rommsync-nx never writes it itself —
 two overlays writing the same flag is how they end up disagreeing about what is
-on. It creates the `flags/` directory too, which is why the archive does not
-ship one.
+on. The archive ships the empty `flags/` directory it goes in, and nothing
+inside it.
 
 ovl-sysmodules also lists `sys-rommsync` in its **Dynamic** section, which means
 its `A` button starts and stops the process there and then, without a reboot —
@@ -173,9 +178,9 @@ the file only needs to hold your **overrides**.
 Use `https://` if your RomM has it. Plain `http://` works and sends your token
 in the clear on every request — see [Security](#security) below.
 
-Once the overlay's Settings screen lands
-([#26](https://github.com/armaatus/rommsync-nx/issues/26)) you will be able to
-set the server URL from the console instead. Today, the file is the way.
+The overlay's Settings screen
+([#26](https://github.com/armaatus/rommsync-nx/issues/26)) shows the server URL
+but cannot change it; the file is the way.
 
 The full key list — the sync interval, the download options, and the folder map
 that decides where roms land and which folders saves are read from — is in
@@ -190,17 +195,12 @@ once in a browser, and the console gets a token. No account secret is ever
 entered on the console, and there is nothing to type with a joystick but a
 button press.
 
-> **Not reachable yet.** The pairing screen is built, but the only thing that
-> opens it is **Re-pair** on the Settings screen, which arrives with
-> [#26](https://github.com/armaatus/rommsync-nx/issues/26). Until that lands
-> there is no button in the overlay that starts this. The six steps below are
-> the release that ships once it does.
-
 Six steps:
 
 1. Reboot (or launch the sysmodule from ovl-sysmodules) so `sys-rommsync` is
    actually running.
-2. Open your overlay menu and choose **ovl-rommsync**.
+2. Open your overlay menu and choose **ovl-rommsync**. It opens on the status
+   screen; press **Y** for Settings and choose **Pairing** from its menu.
 3. Press **Pair**. The screen says **"Contacting the server"** while it asks RomM
    for a code.
 4. The screen then shows an **address** and an **eight-character code**. Open
@@ -257,14 +257,21 @@ Which folders those are is the folder map in
 [CONFIG.md](CONFIG.md#defaults--the-folder-map), and there is one warning worth
 repeating here:
 
-> **Check the Tico paths on your own card.** The built-in RetroArch defaults are
-> correct. The Tico defaults are best-guesses, and a wrong `saves` folder is a
-> platform whose saves are silently never found. Correct them in `config.ini`
-> before you rely on the sync.
+> **Check the Tico paths on your own card.** The built-in Tico folders are the
+> names Tico uses (`master-system`, `dc`, ...), and Tico 0.8's per-account
+> layout is found on its own -- but with several accounts on the console, no
+> Tico save syncs until `[tico] account` names one, and the settings screen
+> lists them ([CONFIG.md](CONFIG.md#tico-per-account-saves)). A wrong `saves`
+> folder is a platform whose saves are silently never found, so look before you
+> rely on the sync.
 
 One rule to read there before you edit the map: a `[platform.…]` section
 replaces that platform's defaults rather than adding to them
 ([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-defaults)).
+
+To share those saves with RetroArch on another device, RomM's web player, Argosy
+or Grout, [INTEROP.md](INTEROP.md) is what to set on each of them and which
+systems sync with which.
 
 ---
 
@@ -288,6 +295,45 @@ is in the archive:
 
 The only file the upgrade overwrites that you might have edited is
 `config/rommsync/config.ini.example`, which nothing reads.
+
+**Update both halves together.** The sysmodule and the overlay are separate
+files, and replacing only one of them leaves two releases on the card. The
+overlay notices: when the two cannot talk at all it says *sysmodule
+unreachable* and names the half to update, and when they can but are from
+different releases its status screen shows both builds and says to install both
+from the same release. Unzipping the whole release again is the fix either way.
+
+**Upgrading from v1.0.0-rc1 moves your saves to the shared slot.** rc1 kept each
+save in a slot of its own on the server (`tico-srm`, `retroarch-srm`), which no
+other client reads. This release syncs them in `autosave`, the slot RetroArch's
+Cloud Sync and RomM's web player use ([CONFIG.md](CONFIG.md#slot-the-shared-slot)).
+The first sync after the upgrade offers each save to that slot rather than
+uploading it again: where RomM already holds a newer save there (from RetroArch,
+say) it comes down to the card, your copy backed up first; where your copy is
+the newer one, it shows up under **Conflicts** so you can choose. rc1's copies
+stay on the server as they were, visible as named slots in RomM's web UI —
+delete them there once you no longer want them
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#upgrading-from-rc1-the-old-slots-236)).
+
+**Going back to an older release** is safe for your settings and your pairing,
+but not seamless. An older build — any from the one after v1.0.0-rc1 on —
+refuses a `config.ini` or a `token.dat` that a
+newer one wrote rather than misreading it — it runs idle on its defaults, says
+so under Settings, and leaves both files exactly as they were for when you
+upgrade again. The records it can rebuild (the sync baseline, the download
+queue) it rebuilds. The full list is in
+[ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases).
+
+v1.0.0-rc1 predates all of that: it reads a newer file as best it can. The settings
+that read differently there are a `[platform.<slug>]` section holding
+only `emulator =` — rc1 ignores that key, so the section maps no folders and
+the platform is skipped; a section holding only `enabled =` is skipped the same
+way. Remove such a section before going back to rc1. rc1
+also reports the `version = 1` line as a warning ("nothing it configures"),
+which is harmless, and a `[sources]` or `[tico]` section as one it does not
+know, which is too: rc1 never reads `retroarch.cfg`, so it scans only the folder
+map, and does so even while RetroArch's own Cloud Sync is on -- and it reads
+Tico's folders in the layout before 0.8.0 only, under rc1's own folder names.
 
 ---
 
@@ -313,9 +359,10 @@ client-tokens UI. That is the only thing that actually makes it stop working,
 and it is why a dedicated RomM user is worth the two minutes.
 
 The overlay's **Re-pair** does the client half for you: it discards the stored
-token and restarts the flow from step 4. It arrives with the Settings screen
-([#26](https://github.com/armaatus/rommsync-nx/issues/26)), like everything else
-that opens the pairing screen — see the note in step 4. It leaves `device.dat`
+token and restarts the flow from step 4. It is on the Settings screen
+([#26](https://github.com/armaatus/rommsync-nx/issues/26)), beside the
+**Pairing** row step 4 uses, and it starts the new pairing before it discards the
+old token, so a refused attempt loses nothing. It leaves `device.dat`
 alone, so RomM recognises the same console rather than collecting a new one each
 time. See [AUTH.md](AUTH.md#re-pairing--revocation).
 

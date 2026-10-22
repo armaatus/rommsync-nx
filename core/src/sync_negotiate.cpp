@@ -4,6 +4,7 @@
 // request and refuses what it cannot read.
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -68,6 +69,7 @@ constexpr ReasonSpelling kReasons[] = {
     {Reason::kNoChanges, "no_changes", "No changes since last sync"},
     {Reason::kAppearIdentical, "appear_identical", "Saves appear identical"},
     {Reason::kUntracked, "untracked", "Save is untracked on this device"},
+    {Reason::kDeletedOnServer, "deleted_on_server", "Save was deleted on the server"},
 };
 
 const ReasonSpelling* SpellingOf(Reason reason) {
@@ -173,6 +175,16 @@ std::optional<Negotiation> Refused(const http::Result& result) {
                       (result.message.empty() ? std::string("the caller cancelled")
                                               : result.message));
   }
+  if (http::AnsweredTooLarge(result)) {
+    // A plan whose text is past the transport's ceiling (`http::kMaxResponseBytes`)
+    // is one past `kMaxPlanOperations` several times over, refused before it was
+    // read rather than held whole and refused while parsed (#248, §4) -- and the
+    // same answer, which a scoped tick splits (`TickOptions::rom_scope`).
+    return Refuse(NegotiateError::kPlanTooLarge,
+                  "the plan is larger than the " +
+                      std::to_string(http::kMaxResponseBytes / 1024) +
+                      " KiB this console reads in one answer");
+  }
   if (!result.ok()) {
     Negotiation refused =
         Refuse(NegotiateError::kUnreachable,
@@ -237,6 +249,8 @@ const char* ToString(Action action) {
       return "conflict";
     case Action::kNoOp:
       return "no_op";
+    case Action::kDelete:
+      return "delete";
   }
   return "no_op";
 }
@@ -256,6 +270,9 @@ Action ClassifyAction(std::string_view action, bool* recognized) {
   }
   if (action == "no_op") {
     return Action::kNoOp;
+  }
+  if (action == "delete") {
+    return Action::kDelete;
   }
   if (recognized != nullptr) {
     *recognized = false;
@@ -309,6 +326,8 @@ const char* ToString(NegotiateError error) {
       return "server_error";
     case NegotiateError::kMalformed:
       return "malformed";
+    case NegotiateError::kPlanTooLarge:
+      return "plan_too_large";
   }
   return "none";
 }
@@ -333,6 +352,8 @@ auth::Answer AnswerOf(NegotiateError error) {
     case NegotiateError::kNone:
     case NegotiateError::kNoSuchDevice:
     case NegotiateError::kSyncDisabled:
+    // A plan, if a larger one than this console holds: RomM read the token.
+    case NegotiateError::kPlanTooLarge:
       return auth::Answer::kAccepted;
     // The rest say nothing, `kRejected` -- a bare 4xx -- included.
     case NegotiateError::kRejected:
@@ -347,9 +368,57 @@ auth::Answer AnswerOf(NegotiateError error) {
   return auth::Answer::kSilent;
 }
 
-auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
+auth::Parsed<SyncPlan> ParseNegotiateResponse(
+    std::string_view body, bool* too_large,
+    const std::function<bool(const SyncOperation&)>& keep) {
   auth::Parsed<SyncPlan> parsed;
-  const json::ParseResult document = json::Parse(body);
+  if (too_large != nullptr) {
+    *too_large = false;
+  }
+  // An operation at a time (`json::ParseEach`): the plan held as one document is
+  // ~10x its text, 1.3 MiB at 512 operations on aarch64 (M9-20, #246).
+  SyncPlan plan;
+  // A dropped operation's warnings go with it (`keep`).
+  std::vector<std::string> dropped_warnings;
+  const json::ParseResult document = json::ParseEach(
+      body, "operations",
+      [&plan, too_large, &keep, &dropped_warnings](const json::Value& element,
+                                                   std::size_t index) {
+        if (!keep && index >= kMaxPlanOperations) {
+          if (too_large != nullptr) {
+            *too_large = true;
+          }
+          return Fail("operations", "holds more than the " + std::to_string(kMaxPlanOperations) +
+                                        " operations one plan may carry");
+        }
+        SyncOperation operation;
+        std::vector<std::string>* warnings = keep ? &dropped_warnings : &plan.warnings;
+        const json::Error error = ReadOperation(element, index, &operation, warnings);
+        if (!error.ok() || !keep) {
+          if (error.ok()) {
+            plan.operations.push_back(std::move(operation));
+          }
+          return error;
+        }
+        if (!keep(operation)) {
+          dropped_warnings.clear();
+          return json::Error{};
+        }
+        if (plan.operations.size() >= kMaxPlanOperations) {
+          if (too_large != nullptr) {
+            *too_large = true;
+          }
+          return Fail("operations", "holds more than the " + std::to_string(kMaxPlanOperations) +
+                                        " operations one plan may carry");
+        }
+        for (std::string& warning : dropped_warnings) {
+          plan.warnings.push_back(std::move(warning));
+        }
+        dropped_warnings.clear();
+        plan.operations.push_back(std::move(operation));
+        return json::Error{};
+      },
+      "negotiate response");
   if (!document.ok()) {
     // A truncated body lands here, and it must: half a plan that parsed would be
     // a plan with saves missing from it, which looks exactly like a device that
@@ -358,7 +427,6 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
     return parsed;
   }
 
-  SyncPlan plan;
   json::Reader reader(document.value, "negotiate response");
   reader.Required("session_id", &plan.session_id);
   reader.Required("total_upload", &plan.total_upload);
@@ -373,39 +441,36 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
     parsed.error = Fail("session_id", "is not a positive session id");
     return parsed;
   }
+  // 5.4.0's (#233), and the one total read as optional: a body shaped like
+  // 5.2.0's has no deletions to count. Present, it is held to the type the
+  // others are -- a count that is not a number is a body that moved.
+  if (const json::Value* deletes = document.value.Find("total_delete"); deletes != nullptr) {
+    if (!deletes->is_integer()) {
+      parsed.error = Fail("total_delete", "is not an integer");
+      return parsed;
+    }
+    plan.total_delete = deletes->integer();
+  }
 
   const json::Value* operations = document.value.Find("operations");
   if (operations == nullptr) {
     parsed.error = Fail("operations", "is missing");
     return parsed;
   }
-  if (!operations->is_array()) {
-    // An empty array is a fully-synced device and is fine; anything that is not
-    // an array is a shape that moved.
-    parsed.error =
-        Fail("operations", std::string("expected an array, got ") + json::ToString(operations->type()));
-    return parsed;
-  }
-
-  plan.operations.reserve(operations->size());
-  for (std::size_t index = 0; index < operations->elements().size(); ++index) {
-    SyncOperation operation;
-    const json::Error error =
-        ReadOperation(operations->elements()[index], index, &operation, &plan.warnings);
-    if (!error.ok()) {
-      parsed.error = error;
-      return parsed;
-    }
-    plan.operations.push_back(std::move(operation));
-  }
+  // An empty array is a fully-synced device and is fine; anything that is not an
+  // array is a shape that moved, and `ParseEach` refused it by name above.
 
   parsed.value = std::move(plan);
   return parsed;
 }
 
-Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
-                      const std::vector<ClientSaveState>& saves,
-                      const NegotiateOptions& options) {
+namespace {
+
+/// Both public spellings: `rom_ids` null is the unscoped negotiation.
+Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& token,
+                          const std::vector<ClientSaveState>& saves,
+                          const std::vector<std::int64_t>* rom_ids,
+                          const NegotiateOptions& options) {
   if (token.server_url.empty() || token.access_token.empty()) {
     return Refuse(NegotiateError::kNotRegistered, "this console is not paired");
   }
@@ -440,10 +505,10 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
                       invalid.Describe());
   }
 
-  SyncNegotiatePayload payload;
-  payload.device_id = token.device_id;
-  payload.saves = saves;
-  const Encoded encoded = EncodeNegotiateRequest(payload);
+  // The saves and roms read where the caller holds them, not copied into a
+  // payload first: that was every save twice in the tick's plan phase (#248).
+  Encoded encoded = EncodeNegotiateRequest(token.device_id, saves, rom_ids, options.emulators,
+                                           options.restore_unlisted);
   if (!encoded.ok()) {
     // The payload's own fields -- a blank `device_id` -- which the loop above
     // does not cover. Nothing is sent either way.
@@ -457,7 +522,8 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
   request.headers.push_back({"Accept", "application/json"});
   request.headers.push_back({"Content-Type", "application/json"});
   request.headers.push_back({"Authorization", "Bearer " + token.access_token});
-  request.body = encoded.body;
+  // Moved, not copied: one body, held while the plan arrives and no longer.
+  request.body = std::move(encoded.body);
   request.timeout = options.timeout;
   request.cancel = options.cancel;
 
@@ -483,9 +549,19 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
     if (const std::optional<Negotiation> refused = Refused(result)) {
       outcome = *refused;
     } else {
-      auth::Parsed<SyncPlan> parsed = ParseNegotiateResponse(result.response.body);
+      // Let go of before the plan is read: an answer that parses, or does not,
+      // is never sent again (`ShouldRetry`), and the plan is the tick's largest
+      // thing beside it (#248, `kHeapTickSaves`'s plan phase).
+      std::string().swap(request.body);
+      bool too_large = false;
+      auth::Parsed<SyncPlan> parsed =
+          ParseNegotiateResponse(result.response.body, &too_large, options.keep);
       if (parsed.ok()) {
         outcome.plan = std::move(parsed.value);
+      } else if (too_large) {
+        outcome = Refuse(NegotiateError::kPlanTooLarge,
+                         "the plan holds more than the " + std::to_string(kMaxPlanOperations) +
+                             " operations this console can carry at once");
       } else {
         outcome = Refuse(NegotiateError::kMalformed,
                          "the plan could not be read: " + parsed.error.Describe());
@@ -517,6 +593,21 @@ Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
     waited += backoff;
     backoff = backoff * 2 > options.max_backoff ? options.max_backoff : backoff * 2;
   }
+}
+
+}  // namespace
+
+Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
+                      const std::vector<ClientSaveState>& saves,
+                      const NegotiateOptions& options) {
+  return NegotiateWith(client, token, saves, nullptr, options);
+}
+
+Negotiation NegotiateRoms(http::HttpClient& client, const auth::StoredToken& token,
+                          const std::vector<ClientSaveState>& saves,
+                          const std::vector<std::int64_t>& rom_ids,
+                          const NegotiateOptions& options) {
+  return NegotiateWith(client, token, saves, &rom_ids, options);
 }
 
 }  // namespace rommsync::sync

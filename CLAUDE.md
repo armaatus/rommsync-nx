@@ -37,7 +37,7 @@ ctest --test-dir build -R sync --output-on-failure   # one group
 
 # the three Switch targets, built by devkitPro rather than CMake. Nothing built
 # here runs anywhere before the M8-1 gate; see switch.mk.
-docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
+docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
   bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
 
 ./scripts/orca/env.sh                            # regenerate .env
@@ -55,8 +55,10 @@ rather than working around it.
 
 ## How tests work here
 
-There is no mock RomM. Tests run against a **real RomM 5.2.0** in Docker, so a
-passing test means the behaviour is genuinely real. Failure modes a healthy RomM
+There is no mock RomM. Tests run against a **real RomM** in Docker — the
+version `ROMM_VERSION` in `.env` names, 5.4.0 by default and the floor since #235
+([TESTING.md](docs/TESTING.md#choosing-the-romm-version)) — so a passing test
+means the behaviour is genuinely real. Failure modes a healthy RomM
 will not produce on demand (401 mid-sync, truncated body, dropped connection,
 stall) are forced with the fault proxy in front of it:
 

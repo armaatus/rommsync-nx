@@ -68,7 +68,9 @@ class ScreenFrame {
   /// What a failed typed call means.
   ///
   /// `MalformedResponse()` is a payload this build cannot read -- the sysmodule
-  /// is there and the two halves disagree. Anything else is the transport, and
+  /// is there and the two halves disagree. `NotResponding()` is a call that ran
+  /// out of budget, which is `kNotResponding` and leaves the session alone
+  /// (#209). Anything else is the transport, and
   /// which of the two unreachable sentences applies is established by dropping
   /// the session and trying the port again, here rather than on the next frame:
   /// whether the port is still there is exactly what decides which sentence the

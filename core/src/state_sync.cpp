@@ -12,11 +12,15 @@
 //   | id X         | id != X                   | -          | keep both |
 //   | id X         | id X, unmoved             | unchanged  | no-op     |
 //   | id X         | id X, unmoved             | changed    | upload    |
-//   | id X         | id X, moved               | unchanged  | download  |
+//   | id X         | id X, moved               | unchanged  | download* |
 //   | id X         | id X, moved               | changed    | keep both |
 //
+// * only when the row's `emulator` is a core that loads this state
+//   (`place::LoadsState`, #239); another core's is kept apart.
+//
 // ...and one server row no local file claimed is placed, which overwrites
-// nothing. **Every branch that is not an unambiguous match keeps both copies**,
+// nothing -- or, when the placement calls it `foreign`, filtered without a word
+// (#239). **Every branch that is not an unambiguous match keeps both copies**,
 // and no branch deletes anything.
 //
 // The overwrite order is `sync_execute.cpp`'s, unchanged and not re-spelled:
@@ -40,6 +44,7 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/hash_file.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync_execute.hpp"
@@ -48,28 +53,6 @@ namespace rommsync::sync {
 namespace {
 
 constexpr const char* kStatesPath = "/api/states";
-
-/// The largest `GET /api/states` body this client will work from.
-///
-/// `/api/states` takes no `limit` and returns every state the user has, so
-/// unlike `GET /api/roms` there is no paging lever to pull -- the bound is all
-/// there is. At the ~600 bytes a `StateSchema` row costs, this is around 220
-/// states across the whole library, against `scan::kMaxStates` local ones.
-///
-/// **Over the bound the whole run stops rather than working from what fits.**
-/// A partial listing is worse than none: a local state whose server row fell off
-/// the end reads as "the server has no row with this name", and the answer to
-/// that is an upload -- which, `POST /api/states` being an upsert, would replace
-/// the row that was there. So the listing is all of it or none of it.
-///
-/// **It bounds the parse, not the allocation.** `http::HttpClient::Send` reads a
-/// successful body whole, so a four-megabyte listing is already resident by the
-/// time this is checked; what the bound stops is turning it into that many more
-/// `ServerState`s, each of them several heap strings. Bounding the *transfer*
-/// needs a ceiling on `http::Request`, which every list call in this engine
-/// would want and none has -- `GET /api/roms` pages instead, and `/api/states`
-/// offers no `limit` to page with.
-constexpr std::size_t kMaxStateListBytes = 128 * 1024;
 
 /// How one state is named in a log line: the rom and the file. Never a token,
 /// and never the file's contents.
@@ -218,6 +201,22 @@ auth::Answer AnswerOf(StateError error) {
   return auth::Answer::kSilent;
 }
 
+auth::Answer AnswerOf(const StateSyncReport& report) {
+  if (!report.ran) {
+    return auth::Answer::kSilent;
+  }
+  // Nothing past the listing, so the listing answered: a 2xx with this token.
+  auth::Answer answer =
+      report.operations.empty() ? auth::Answer::kAccepted : auth::Answer::kSilent;
+  for (const StateOperationResult& operation : report.operations) {
+    const auth::Answer said = AnswerOf(operation.error);
+    if (said != auth::Answer::kSilent) {
+      answer = said;
+    }
+  }
+  return answer;
+}
+
 namespace {
 
 /// One `StateSchema` object, read strictly. Shared by the list and the single
@@ -282,23 +281,23 @@ auth::Parsed<ServerState> ParseState(std::string_view body) {
 
 auth::Parsed<std::vector<ServerState>> ParseStateList(std::string_view body) {
   auth::Parsed<std::vector<ServerState>> parsed;
-  const json::ParseResult document = json::Parse(body);
+  // A row at a time (`json::ParseEach`): held as one document the listing was
+  // ~8x its text, 980 KiB at `kMaxStateListBytes` on aarch64 (M9-20, #246).
+  std::vector<ServerState> states;
+  const json::ParseResult document = json::ParseEach(
+      body, "",
+      [&states](const json::Value& element, std::size_t) {
+        ServerState state;
+        json::Error error;
+        if (ReadStateRow(element, &state, &error)) {
+          states.push_back(std::move(state));
+        }
+        return error;
+      },
+      "state list");
   if (!document.ok()) {
     parsed.error = document.error;
     return parsed;
-  }
-  if (!document.value.is_array()) {
-    parsed.error = json::Error{0, "state list", "expected an array of StateSchema"};
-    return parsed;
-  }
-  std::vector<ServerState> states;
-  states.reserve(document.value.elements().size());
-  for (const json::Value& element : document.value.elements()) {
-    ServerState state;
-    if (!ReadStateRow(element, &state, &parsed.error)) {
-      return parsed;
-    }
-    states.push_back(std::move(state));
   }
   parsed.value = std::move(states);
   return parsed;
@@ -318,6 +317,15 @@ bool ListServerStates(http::HttpClient& client, const auth::StoredToken& token,
   const http::Result result =
       client.Send(Authed(http::Method::kGet, http::JoinUrl(token.server_url, kStatesPath), token,
                          options));
+  if (http::AnsweredTooLarge(result)) {
+    // Past the transport's ceiling, which is past `kMaxStateListBytes` too: the
+    // same refusal, made before the body was read (#248).
+    *error = StateError::kRefused;
+    *message = "the state listing is larger than the " +
+               std::to_string(kMaxStateListBytes) +
+               " bytes this client can work from; no state was touched this tick";
+    return false;
+  }
   if (const auto refused = Refused(result, "the state listing")) {
     *error = refused->first;
     *message = refused->second;
@@ -330,14 +338,21 @@ bool ListServerStates(http::HttpClient& client, const auth::StoredToken& token,
                " this client can work from; no state was touched this tick";
     return false;
   }
-  const auth::Parsed<std::vector<ServerState>> parsed = ParseStateList(result.response.body);
+  auth::Parsed<std::vector<ServerState>> parsed = ParseStateList(result.response.body);
   if (!parsed.ok()) {
     *error = StateError::kRefused;
     *message = "the state listing did not parse (" + parsed.error.Describe() + ")";
     return false;
   }
-  *out = parsed.value;
+  // Moved: a copy held both lists at once, beside the body (M9-20, #246).
+  *out = std::move(parsed.value);
   return true;
+}
+
+/// Whether `sd_path` already holds a file, which a placement may not write over.
+bool Taken(fs::FileSystem& files, const std::string& sd_path) {
+  const std::string resolved = files.Resolve(sd_path);
+  return !resolved.empty() && io::Exists(resolved);
 }
 
 /// The server's row for `(rom_id, file_name)`, or nullptr.
@@ -366,6 +381,26 @@ bool ServerUnmoved(const state::StateRecord& row, const ServerState& state) {
 bool LocalUnmoved(const state::StateRecord& row, const scan::StateFile& file) {
   return UnixSeconds(row.mtime) == file.modified_unix && row.file_size_bytes == file.size_bytes &&
          !file.content_hash.empty() && row.content_hash == file.content_hash;
+}
+
+/// Another scanned state of the same rom that `row` still describes exactly, or
+/// nullptr.
+///
+/// The row under a name was taken of one file, and the file now under that name
+/// can be a different one: `[sync] map_state_slots` renames every Tico slot one
+/// along, so the card's `Game.state0` is keyed `Game.state1` -- the name the
+/// card's own `Game.state1` was synced under until now (#239). Read as "this
+/// console played on", that is an upload of slot 1 over slot 2's row. When the
+/// file the row was taken of is still on the card, unchanged, it is not that.
+const scan::StateFile* RowDescribesAnother(const state::StateRecord& row,
+                                           const scan::StateFile& file,
+                                           const std::vector<scan::StateFile>& scanned) {
+  for (const scan::StateFile& other : scanned) {
+    if (other.rom_id == file.rom_id && other.sd_path != file.sd_path && LocalUnmoved(row, other)) {
+      return &other;
+    }
+  }
+  return nullptr;
 }
 
 /// The decision table from the file header, as one function.
@@ -401,6 +436,18 @@ StateAction Decide(const state::StateRecord* row, const ServerState* server,
     return StateAction::kUpload;
   }
   if (!local_moved) {
+    // POST moves a row's `emulator` to whoever sent it, so a row this console
+    // paired with may since hold another core's memory under the same name.
+    // Downloaded, it is a state this console's core cannot load, written over
+    // one it can (#239).
+    if (!place::LoadsState(server->emulator, file.emulator)) {
+      *why = "the server's state under this name was last written by " +
+             (server->emulator.empty() ? std::string("an unnamed emulator") : server->emulator) +
+             ", whose states " +
+             (file.emulator.empty() ? std::string("this console's emulator") : file.emulator) +
+             " does not load; both copies are kept and neither was touched";
+      return StateAction::kKeepBoth;
+    }
     return StateAction::kDownload;
   }
   *why = "both this console's copy and the server's have changed since the last sync, and RomM "
@@ -442,6 +489,20 @@ StateOperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   part.file_name = file.file_name;
   part.content_type = "application/octet-stream";
   request.form.push_back(std::move(part));
+
+  // Tico and RetroArch both keep a screenshot beside a state, `<state>.png`
+  // [Tico's name: verify on #44]. Sent as the row's, under the server's name
+  // for the state plus `.png`: RomM binds a screenshot to the state whose name
+  // is its stem (#239). Without one the state goes up alone.
+  const std::string screenshot = files.Resolve(file.sd_path + ".png");
+  if (!screenshot.empty() && io::Exists(screenshot)) {
+    http::FormPart picture;
+    picture.name = "screenshotFile";
+    picture.file_path = screenshot;
+    picture.file_name = file.file_name + ".png";
+    picture.content_type = "image/png";
+    request.form.push_back(std::move(picture));
+  }
 
   const http::Result result = client.Send(request);
   if (const auto refused = Refused(result, "the state upload")) {
@@ -499,7 +560,7 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // anything has checked it. A stale one from an interrupted run goes first --
   // the bytes in it are a download that never completed and belong to nothing.
   io::StagedFile staged(io::TempPathFor(destination));
-  std::remove(staged.path().c_str());
+  io::Remove(staged.path());
 
   http::Request request =
       Authed(http::Method::kGet,
@@ -528,7 +589,7 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   if (const auto refused = Refused(fetched, "the state download")) {
     // The backend leaves its partial behind for a resume that is never coming,
     // so it is litter beside a state rather than progress towards one.
-    std::remove(http::PartialPathFor(staged.path()).c_str());
+    io::Remove(http::PartialPathFor(staged.path()));
     // **A body that ended early is `kUnverified`, not `kTransferFailed`.** The
     // length check is enforced by the transport (`DownloadTarget::expected_size`)
     // and comes back as `http::Error::kTruncated`, so leaving it in the
@@ -721,7 +782,7 @@ void AdvanceWritten(fs::FileSystem& files, const scan::StateFile* local,
 /// a file.
 ///
 /// **A card whose saves alone fill the baseline cannot record a state at all.**
-/// `scan::kMaxSaves` is the whole of `state::kMaxRecords`, so 512 saves leave no
+/// `scan::kMaxSaves` is the whole of `state::kMaxRecords`, so that many leave no
 /// room, both passes run, and every state row goes -- including the ones this
 /// run just wrote. The next tick then finds no row for any state and answers
 /// keep-both, which is safe and settles rather than churning, but it does mean
@@ -784,7 +845,7 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
   }
   report.ran = true;
 
-  report.scan = scan::ScanStates(config, index, files, *baseline);
+  report.scan = scan::ScanStates(config, options.retroarch, index, files, *baseline);
   // Lifted, not left on `report.scan`. "An ambiguous state is skipped and
   // logged" is the acceptance, and a caller that logs `warnings` and nothing
   // else -- which is what every other step of a tick hands up -- would otherwise
@@ -873,7 +934,20 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     const state::StateRecord* row = baseline->FindState(file.rom_id, file.file_name);
 
     std::string why;
-    const StateAction action = Decide(row, server, file, &why);
+    StateAction action = Decide(row, server, file, &why);
+    if (action == StateAction::kUpload && row != nullptr && server != nullptr) {
+      // An upload over a row this console synced -- unless the row was taken of
+      // another file, which is a rename rather than play, and the row holds that
+      // file's state for whoever reads it.
+      if (const scan::StateFile* other =
+              RowDescribesAnother(*row, file, report.scan.states)) {
+        action = StateAction::kKeepBoth;
+        why = "the server's state under this name was synced from " + other->sd_path +
+              ", not " + file.sd_path +
+              " -- the names were renamed, as turning [sync] map_state_slots on or off does; "
+              "both copies are kept and neither was touched";
+      }
+    }
     switch (action) {
       case StateAction::kNoOp: {
         StateOperationResult result;
@@ -922,12 +996,23 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
 
   // Whatever the server holds that no local file claimed. Placing one overwrites
   // nothing, so it is the one branch that needs no arbitration at all.
+  //
+  // **At most `kMaxStatePlacements` operations a run** (#247), and placements
+  // first. A row that places nothing -- nothing says where it goes, or its path
+  // is already taken -- comes back unclaimed every run, and a run that spent its
+  // budget on those before the rows behind them would never place those rows.
+  // So they are set aside, by index, and recorded in what the placements left;
+  // past that they are one line, not an operation each.
+  std::size_t unclaimed_operations = 0;
+  std::vector<std::size_t> unplaceable;
+  bool more_to_place = false;
   for (std::size_t at = 0; at < server_states.size() && !stopped; ++at) {
     if (claimed[at]) {
       continue;
     }
     if (options.cancel != nullptr && options.cancel->canceled()) {
       report.canceled = true;
+      stopped = true;
       break;
     }
     const ServerState& server = server_states[at];
@@ -936,13 +1021,85 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       // shape of a shared library, not something the user can act on.
       continue;
     }
-    const std::string sd_path = options.place != nullptr ? options.place(server) : std::string();
+    const place::Placement placement =
+        options.place != nullptr ? options.place(server) : place::Placement{};
+    const std::string& sd_path = placement.sd_path;
+    if (sd_path.empty() && placement.foreign) {
+      // Another core's state, or a slot this frontend has no file for: states
+      // have no negotiate to filter by emulator, so this is the filter (#239).
+      // Silent for the reason a rom this console lacks is.
+      ++report.filtered;
+      continue;
+    }
+    if (sd_path.empty() || Taken(files, sd_path)) {
+      unplaceable.push_back(at);
+      continue;
+    }
+    if (unclaimed_operations == kMaxStatePlacements) {
+      more_to_place = true;
+      break;
+    }
+    ++unclaimed_operations;
+    // The emulator's folder for the system may not exist yet: a state the
+    // console has never held is often for a system it has never run.
+    if (const std::size_t parent = sd_path.rfind('/'); parent != std::string::npos && parent > 0) {
+      const fs::MakeDirResult made = files.CreateDirectory(sd_path.substr(0, parent));
+      if (!made.ok()) {
+        if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
+                         StateError::kUnreadableCard,
+                         "the folder for " + sd_path + " could not be made: " + made.message))) {
+          stopped = true;
+        }
+        continue;
+      }
+    }
+    StateOperationResult result =
+        Fetch(client, files, token, server, sd_path, StateAction::kPlace, options,
+              &report.warnings);
+    if (result.outcome == StateOutcome::kDownloaded) {
+      AdvanceWritten(files, nullptr, server, sd_path, baseline, &report.warnings);
+    }
+    if (!record(std::move(result))) {
+      stopped = true;
+    }
+  }
+  if (more_to_place && !stopped) {
+    // True as written: what was placed is on the card now, so the next run's
+    // scan claims it rather than placing it again.
+    report.warnings.push_back(
+        "the server holds more states for this console's roms than one sync places (" +
+        std::to_string(kMaxStatePlacements) + "); the rest wait for the next sync");
+  }
+
+  std::size_t not_listed = 0;
+  for (const std::size_t at : unplaceable) {
+    if (stopped) {
+      break;
+    }
+    if (options.cancel != nullptr && options.cancel->canceled()) {
+      report.canceled = true;
+      break;
+    }
+    if (unclaimed_operations == kMaxStatePlacements) {
+      ++not_listed;
+      continue;
+    }
+    ++unclaimed_operations;
+    const ServerState& server = server_states[at];
+    // Asked again rather than kept from the pass above: a placement is a path
+    // and a sentence, and one per row set aside would be the listing's worth.
+    const place::Placement placement =
+        options.place != nullptr ? options.place(server) : place::Placement{};
+    const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
       if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
                        StateError::kNoPlacement,
-                       "the server holds a state this console does not, and nothing said where a "
-                       "new one should go"))) {
-        break;
+                       placement.reason.empty()
+                           ? "the server holds a state this console does not, and nothing said "
+                             "where a new one should go"
+                           : "the server holds a state this console does not, and none was "
+                             "placed: " + placement.reason))) {
+        stopped = true;
       }
       continue;
     }
@@ -953,26 +1110,19 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     // an overwrite on the strength of a row this console has no history for,
     // which is exactly the case the policy keeps both copies for. The backup
     // inside `Fetch` would keep it recoverable; that is not the promise.
-    const std::string resolved = files.Resolve(sd_path);
-    if (!resolved.empty() && io::Exists(resolved)) {
-      if (!record(KeepBoth(server.rom_id, server.file_name, sd_path,
-                           "the server holds a state this console has no history for, and " +
-                               sd_path +
-                               " is already taken; both copies are kept and neither was touched",
-                           &server))) {
-        break;
-      }
-      continue;
+    if (!record(KeepBoth(server.rom_id, server.file_name, sd_path,
+                         "the server holds a state this console has no history for, and " +
+                             sd_path +
+                             " is already taken; both copies are kept and neither was touched",
+                         &server))) {
+      stopped = true;
     }
-    StateOperationResult result =
-        Fetch(client, files, token, server, sd_path, StateAction::kPlace, options,
-              &report.warnings);
-    if (result.outcome == StateOutcome::kDownloaded) {
-      AdvanceWritten(files, nullptr, server, sd_path, baseline, &report.warnings);
-    }
-    if (!record(std::move(result))) {
-      break;
-    }
+  }
+  if (not_listed > 0) {
+    report.warnings.push_back(
+        std::to_string(not_listed) +
+        " more of the server's states for this console's roms could not be placed either -- "
+        "nothing said where they go, or their path is taken -- and are not listed one by one");
   }
 
   report.rows_dropped = TrimStates(report.operations, baseline, &report.warnings);

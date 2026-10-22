@@ -7,7 +7,7 @@
 // is one game's save uploaded over another game's, and that rule going quiet is
 // the worst way for this file to rot.
 //
-// The last two need the real RomM 5.2.0, because the two things a fake index
+// The last two need the real RomM, because the two things a fake index
 // cannot answer are the two the issue asks about: that `GET /api/roms` answers
 // an **envelope** which has to be paged -- a rom on the last page is exactly the
 // one a save needs -- and that the fields this client matches on
@@ -21,7 +21,16 @@
 //   truncated    -- a directory past the bound keeps a set that does not move
 //   hashing      -- the digest is real, reused when the file is unchanged, and
 //                   null only when the bytes could not be read
+//   sources      -- fixture trees for RetroArch (flat and sort-by-core), Tico
+//                   and an override each scan to the emulator id that wrote them
+//   retroarch    -- the folders retroarch.cfg names, read the way RetroArch lays
+//                   them out: flat, sorted by core, beside the content, and left
+//                   alone while RetroArch's Cloud Sync is on (#230)
+//   tico         -- Tico 0.7.9, and 0.8.0 with one account and with two (#231);
+//                   backups/, .tmp, screenshots and .restart are never synced
 //   library      -- a Sandbox scanned against the docker library, end to end
+//   grown        -- the index is reserved from the first page's total, and a
+//                   library that grows mid-fetch stops it there, and says so
 //   paging       -- limit=1 over a six-rom library still finds the last page
 #include <algorithm>
 #include <cstdint>
@@ -30,6 +39,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -37,20 +47,24 @@
 #include "harness.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/host/native_file_system.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/tico.hpp"
 
 namespace {
 
 namespace config = rommsync::config;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
+namespace retroarch = rommsync::retroarch;
 namespace roms = rommsync::roms;
 namespace scan = rommsync::scan;
 namespace state = rommsync::state;
 namespace sync = rommsync::sync;
+namespace tico = rommsync::tico;
 
 using harness::Fixture;
 using harness::Sandbox;
@@ -175,6 +189,15 @@ class FakeFileSystem final : public fs::FileSystem {
     return (root_ / relative).string();
   }
 
+  /// The listing `fs::kMaxDirectoryEntries` cuts: what was added is what was
+  /// kept, and the backend says more was there.
+  void MarkTruncated(const std::string& directory) {
+    fs::Listing& listing = listings_[directory];
+    listing.error = fs::ListError::kTooManyEntries;
+    listing.message = directory + ": more than " + std::to_string(fs::kMaxDirectoryEntries) +
+                      " entries; the first by name are kept";
+  }
+
   int CallsFor(const std::string& directory) const {
     const auto found = calls_.find(directory);
     return found == calls_.end() ? 0 : found->second;
@@ -189,6 +212,10 @@ class FakeFileSystem final : public fs::FileSystem {
 /// A baseline with nothing in it -- a first boot, where every save is read and
 /// hashed. Scenarios that care about the *reuse* build their own.
 const state::Baseline kFirstTick;
+
+/// RetroArch as a console with no `retroarch.cfg` has it: the Switch build's
+/// defaults, whose folders the scenarios that predate #230 never populate.
+const retroarch::Settings kRetroArchDefaults;
 
 roms::Rom MakeRom(std::int64_t id, std::string name, std::string platform) {
   roms::Rom rom;
@@ -236,27 +263,40 @@ void Names(::checks::Checks& checks) {
   checks.ExpectEq(scan::BaseName("Game.state.auto"), std::string("Game.state"),
                   "only the last extension is stripped");
 
-  checks.ExpectEq(scan::EmulatorFor("/retroarch/saves"), std::string("retroarch"),
-                  "the default RetroArch folder names its emulator");
-  checks.ExpectEq(scan::EmulatorFor("/tico/saves/gba"), std::string("tico"),
-                  "so does Tico's");
-  checks.ExpectEq(scan::EmulatorFor("/emulators/RetroArch/saves"), std::string("retroarch"),
-                  "any segment, and FAT32 is case-insensitive");
-  checks.ExpectEq(scan::EmulatorFor("/saves"), std::string(),
-                  "a folder that names no emulator implies none");
-
-  checks.ExpectEq(scan::SlotFor("retroarch", "Game (USA).srm"), std::string("retroarch-srm"),
-                  "the slot is the emulator and the extension");
-  // The reason the emulator is in there at all: RomM pairs on `(rom_id, slot)`
-  // alone, so a RetroArch `.srm` and a Tico `.srm` for one rom that both mapped
-  // to `srm` would overwrite each other through the server, forever.
-  checks.Expect(scan::SlotFor("tico", "Game (USA).srm") != scan::SlotFor("retroarch",
-                                                                         "Game (USA).srm"),
-                "two emulators' .srm for one rom are different slots");
-  checks.ExpectEq(scan::SlotFor("retroarch", "Game"), std::string("retroarch-save"),
-                  "a save with no extension still gets a stable, non-empty slot");
-  checks.ExpectEq(scan::SlotFor("retroarch", "Game.SRM"), std::string("retroarch-srm"),
+  // #236: the shared slot RetroArch's Cloud Sync, the web player, Argosy and
+  // Grout all file a game's save RAM under.
+  checks.ExpectEq(std::string(config::kDefaultSlot), std::string("autosave"),
+                  "the default slot is RomM's AUTOSAVE_SLOT");
+  checks.ExpectEq(config::Defaults().sync.slot, std::string("autosave"),
+                  "and it is the slot a console with no [sync] slot line uses");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game (USA).srm"), std::string("autosave"),
+                  "a .srm is the configured slot itself");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game.SRM"), std::string("autosave"),
                   "the slot does not change with the case the card happened to use");
+  checks.ExpectEq(scan::SlotFor("Switch", "Game.srm"), std::string("Switch"),
+                  "a configured slot is used as written");
+  // RomM pairs on `(rom_id, slot)` alone and keeps the newest row per pair, so a
+  // `.rtc` in the same slot as its `.srm` would be negotiated as the head the
+  // `.srm` is paired with. RomM's own RetroArch path keeps companions out of the
+  // slot for that reason ("a slot holds one save").
+  checks.ExpectEq(scan::SlotFor("autosave", "Game.rtc"), std::string("autosave-rtc"),
+                  "a companion file is a slot of its own beside the save's");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game.mcd"), std::string("autosave-mcd"),
+                  "and so is every extension RomM does not slot as save RAM");
+  checks.ExpectEq(scan::SlotFor("autosave", "Game"), std::string("autosave-save"),
+                  "a save with no extension still gets a stable, non-empty slot");
+
+  // What a v2 state.db row's `<source>-<ext>` slot becomes (#236's migration).
+  checks.ExpectEq(scan::MigratedSlot("autosave", "retroarch-srm"), std::string("autosave"),
+                  "retroarch-srm moves to the shared slot");
+  checks.ExpectEq(scan::MigratedSlot("autosave", "tico-srm"), std::string("autosave"),
+                  "and so does tico-srm");
+  checks.ExpectEq(scan::MigratedSlot("autosave", "tico-rtc"), std::string("autosave-rtc"),
+                  "a companion's old slot moves to the companion's new one");
+  checks.ExpectEq(scan::MigratedSlot("Switch", "srm"), std::string("Switch"),
+                  "a slot from a folder neither emulator explained was the bare extension");
+  checks.ExpectEq(scan::MigratedSlot("autosave", "tico-save"), std::string("autosave-save"),
+                  "and an extensionless save keeps its 'save'");
 
   // The scan must not emit more saves than a baseline can hold: `SaveBaseline`
   // *refuses* a file with more rows than `state::kMaxRecords`, so a card past
@@ -292,7 +332,7 @@ void Ambiguous(::checks::Checks& checks) {
   // difference, which is the point.
   files.AddFile("/tico/saves/snes", "Rampart.srm", 32768, kMtime);
 
-  const scan::ScanResult result = scan::ScanSaves(config, index, files, kFirstTick);
+  const scan::ScanResult result = scan::ScanSaves(config, kRetroArchDefaults, index, files, kFirstTick);
 
   checks.ExpectEq(result.files_seen, static_cast<std::size_t>(3), "three files were looked at");
   checks.Expect(SkippedFor(result, "/retroarch/saves/Rampart.srm", scan::SkipReason::kAmbiguous),
@@ -327,7 +367,7 @@ void Ambiguous(::checks::Checks& checks) {
   partial.set_truncated(true);
   FakeFileSystem more("more");
   more.AddFile("/retroarch/saves", "Rampart.srm", 64, kMtime);
-  const scan::ScanResult short_index = scan::ScanSaves(config, partial, more, kFirstTick);
+  const scan::ScanResult short_index = scan::ScanSaves(config, kRetroArchDefaults, partial, more, kFirstTick);
   checks.Expect(short_index.index_truncated, "the scan carries the index's truncation");
   checks.Expect(!short_index.skipped.empty() &&
                     short_index.skipped.front().message.find("index is incomplete") !=
@@ -360,7 +400,7 @@ void WalkedOnce(::checks::Checks& checks) {
   files.AddFile("/retroarch/saves", "gb240p.srm", 512, kMtime);
   files.AddDirectory("/retroarch/saves", "RetroArch-Core-Options");
 
-  const scan::ScanResult result = scan::ScanSaves(config, index, files, kFirstTick);
+  const scan::ScanResult result = scan::ScanSaves(config, kRetroArchDefaults, index, files, kFirstTick);
 
   checks.ExpectEq(files.CallsFor("/retroarch/saves"), 1,
                   "a folder listed under a dozen platforms is read once");
@@ -386,7 +426,7 @@ void Unusable(::checks::Checks& checks) {
   files.AddFile("/retroarch/saves", "gb240p.srm", 512, 0);
   files.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
 
-  const scan::ScanResult result = scan::ScanSaves(config, index, files, kFirstTick);
+  const scan::ScanResult result = scan::ScanSaves(config, kRetroArchDefaults, index, files, kFirstTick);
 
   checks.Expect(SkippedFor(result, "/retroarch/saves/gb240p.srm", scan::SkipReason::kUnusable),
                 "a save with an unset mtime is skipped with a reason");
@@ -415,7 +455,7 @@ void Unusable(::checks::Checks& checks) {
   for (const std::int64_t mtime : kExtremes) {
     FakeFileSystem extreme("extreme");
     extreme.AddFile("/retroarch/saves", "nova.srm", 512, mtime);
-    const scan::ScanResult scanned = scan::ScanSaves(config, index, extreme, kFirstTick);
+    const scan::ScanResult scanned = scan::ScanSaves(config, kRetroArchDefaults, index, extreme, kFirstTick);
     if (scanned.saves.empty()) {
       checks.Expect(SkippedFor(scanned, "/retroarch/saves/nova.srm", scan::SkipReason::kUnusable),
                     "an mtime of " + std::to_string(mtime) + " is skipped as unusable");
@@ -463,30 +503,99 @@ void Unusable(::checks::Checks& checks) {
   checks.Expect(!bare.ToClientSaveState(std::string()).content_hash.has_value(),
                 "an empty digest is null, not a blank value the server would store");
 
-  // Two files for one rom in one folder land on the same `(rom_id, slot)`, which
-  // the server pairs on -- so they would overwrite each other through RomM on
-  // alternating ticks. The first in scan order keeps it.
+  // Two files for one rom land on the same `(rom_id, slot)`, which the server
+  // pairs on -- so they would overwrite each other through RomM on alternating
+  // ticks. The first in scan order keeps it. Since #236 that includes one rom's
+  // `.srm` under two emulators: the shared slot holds one save per rom.
   FakeFileSystem duplicates("duplicates");
   duplicates.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.sav", 512, kMtime);
-  const scan::ScanResult mixed = scan::ScanSaves(config, index, duplicates, kFirstTick);
-  checks.ExpectEq(mixed.saves.size(), static_cast<std::size_t>(3),
-                  "the same rom under two emulators, and two extensions, are three slots");
+  const scan::ScanResult mixed = scan::ScanSaves(config, kRetroArchDefaults, index, duplicates, kFirstTick);
+  checks.ExpectEq(mixed.saves.size(), static_cast<std::size_t>(2),
+                  "two extensions are two slots, and the same rom's .srm twice is one");
+  checks.Expect(SkippedFor(mixed, "/tico/saves/nes/nova.srm", scan::SkipReason::kDuplicateSlot),
+                "the copy found second -- Tico's, after RetroArch's -- is reported, not synced");
+  const scan::SaveFile* sav = FindSave(mixed, "nova.sav");
+  checks.Expect(sav != nullptr && sav->slot == "autosave-sav",
+                "a .sav is a slot of its own beside the .srm's");
 
   // Two spellings of one extension in one folder are one slot, because the slot
   // is lowercased. The entries are sorted by name, so `nova.SRM` is seen first
   // (`S` sorts before `s`) and keeps the slot; which one wins matters less than
   // that the same one wins on every tick.
   duplicates.AddFile("/retroarch/saves", "nova.SRM", 512, kMtime);
-  const scan::ScanResult clashing = scan::ScanSaves(config, index, duplicates, kFirstTick);
+  const scan::ScanResult clashing = scan::ScanSaves(config, kRetroArchDefaults, index, duplicates, kFirstTick);
   checks.Expect(SkippedFor(clashing, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
                 "a second file claiming a taken (rom_id, slot) is reported, not synced");
   checks.ExpectEq(clashing.saves.size(), mixed.saves.size(),
                   "and the clash costs exactly the one file");
-  const scan::ScanResult replayed = scan::ScanSaves(config, index, duplicates, kFirstTick);
+  const scan::ScanResult replayed = scan::ScanSaves(config, kRetroArchDefaults, index, duplicates, kFirstTick);
   checks.Expect(SkippedFor(replayed, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
                 "the same file loses the slot on the next tick, not the other one");
+
+  // #236: the server is told the rom's own stem, which is the name RomM serves
+  // RetroArch the save under -- not whatever the card's copy happened to be
+  // called when it matched by the tagless name.
+  roms::RomIndex tagged;
+  roms::Rom game = MakeRom(9, "Game (USA)", "snes");
+  game.fs_name_no_tags = "Game";
+  tagged.Add(game);
+  FakeFileSystem renamed("server-name");
+  renamed.AddFile("/tico/saves/snes", "Game.srm", 512, kMtime);
+  renamed.AddFile("/tico/saves/snes", "Game.rtc", 16, kMtime);
+  const scan::ScanResult named = scan::ScanSaves(config, kRetroArchDefaults, tagged, renamed, kFirstTick);
+  const scan::SaveFile* srm = FindSave(named, "Game.srm");
+  checks.Expect(srm != nullptr && srm->slot == "autosave" && srm->server_name == "Game (USA).srm",
+                "the save is in autosave, under the rom's stem");
+  checks.Expect(srm != nullptr && srm->ToClientSaveState().file_name == "Game (USA).srm",
+                "and negotiate is told that name");
+  const scan::SaveFile* rtc = FindSave(named, "Game.rtc");
+  checks.Expect(rtc != nullptr && rtc->slot == "autosave-rtc" && rtc->server_name == "Game (USA).rtc",
+                "the clock beside it is its own slot, under the same stem (#231's collision)");
+  // #236: the emulators negotiate is filtered to.
+  const std::optional<std::vector<std::string>> filter = scan::EmulatorFilter(config, named.saves);
+  const auto lists = [&filter](const char* id) {
+    return filter.has_value() && std::find(filter->begin(), filter->end(), id) != filter->end();
+  };
+  checks.Expect(lists("snes9x") && lists("Snes9x"),
+                "the filter holds the scanned save's core, and RetroArch's folder name for it -- "
+                "what a Grout-like client sends as the emulator");
+  checks.Expect(lists("mgba") && lists("fceumm") && lists("tico-duckstation"),
+                "and the core every mapped platform's folders resolve to, with no save yet");
+  checks.Expect(!lists("mednafen_psx_hw"),
+                "but not a core no folder of this console writes");
+  // #238: a platform played in Tico is restored with Tico's module, so the
+  // RetroArch folder mapped beside it names no core to be offered -- RomM's web
+  // player writes `mupen64plus_next` and `ppsspp`, and a first-time restore of
+  // one would be refused on every tick.
+  checks.Expect(!lists("mupen64plus_next") && !lists("ppsspp") && !lists("pcsx_rearmed"),
+                "nor RetroArch's own core for a platform played in Tico, with no save of it here");
+  checks.Expect(lists("tico-mupen64plus") && lists("tico-ppsspp"),
+                "which is offered Tico's module's saves instead");
+  scan::SaveFile retroarch_n64 = named.saves.front();
+  retroarch_n64.emulator = "mupen64plus_next";
+  const std::optional<std::vector<std::string>> with_n64 =
+      scan::EmulatorFilter(config, {retroarch_n64});
+  checks.Expect(with_n64.has_value() &&
+                    std::find(with_n64->begin(), with_n64->end(), "mupen64plus_next") !=
+                        with_n64->end(),
+                "a RetroArch N64 save on the card still names its core: it pairs with its own");
+  checks.Expect(filter.has_value() && std::is_sorted(filter->begin(), filter->end()) &&
+                    std::adjacent_find(filter->begin(), filter->end()) == filter->end(),
+                "sorted and without repeats, so the body is the same every tick");
+  scan::SaveFile anonymous = named.saves.front();
+  anonymous.emulator.clear();
+  checks.Expect(!scan::EmulatorFilter(config, {anonymous}).has_value(),
+                "a save with no emulator turns the filter off: RomM cannot list null, and its "
+                "own upload would vanish from the pairing and be uploaded again every tick");
+
+  config::Config mine = config;
+  mine.sync.slot = "switch";
+  const scan::ScanResult moved = scan::ScanSaves(mine, kRetroArchDefaults, tagged, renamed, kFirstTick);
+  const scan::SaveFile* configured = FindSave(moved, "Game.rtc");
+  checks.Expect(configured != nullptr && configured->slot == "switch-rtc",
+                "[sync] slot decides both: " + (configured ? configured->slot : std::string("none")));
 }
 
 // --- hashing ------------------------------------------------------------------
@@ -501,7 +610,7 @@ void Hashing(::checks::Checks& checks) {
   files.AddFile("/retroarch/saves", "gb240p.srm", 512, kMtime);
   files.AddFile("/retroarch/saves", "nova.srm", 1024, kMtime);
 
-  const scan::ScanResult first = scan::ScanSaves(config, index, files, kFirstTick);
+  const scan::ScanResult first = scan::ScanSaves(config, kRetroArchDefaults, index, files, kFirstTick);
   checks.ExpectEq(first.saves.size(), static_cast<std::size_t>(2), "both saves are reported");
   checks.ExpectEq(first.unhashed_total, static_cast<std::size_t>(0), "and both are hashed");
   for (const scan::SaveFile& save : first.saves) {
@@ -527,7 +636,7 @@ void Hashing(::checks::Checks& checks) {
     row.file_size_bytes = save.size_bytes;
     baseline.Set(std::move(row));
   }
-  const scan::ScanResult reused = scan::ScanSaves(config, index, files, baseline);
+  const scan::ScanResult reused = scan::ScanSaves(config, kRetroArchDefaults, index, files, baseline);
   for (const scan::SaveFile& save : reused.saves) {
     checks.ExpectEq(save.content_hash, stored,
                     "an unchanged save reuses the baseline's digest rather than re-reading");
@@ -537,7 +646,7 @@ void Hashing(::checks::Checks& checks) {
   // (mtime, size) alone misses a real edit.
   FakeFileSystem edited("hashing-edited");
   edited.AddFile("/retroarch/saves", "gb240p.srm", 513, kMtime);
-  const scan::ScanResult rehashed = scan::ScanSaves(config, index, edited, baseline);
+  const scan::ScanResult rehashed = scan::ScanSaves(config, kRetroArchDefaults, index, edited, baseline);
   checks.ExpectEq(rehashed.saves.size(), static_cast<std::size_t>(1), "the edited save is reported");
   if (!rehashed.saves.empty()) {
     checks.Expect(rehashed.saves.front().content_hash != stored,
@@ -549,7 +658,7 @@ void Hashing(::checks::Checks& checks) {
   // where the server plans an upload for bytes it may already have.
   FakeFileSystem gone("hashing-gone");
   gone.AddUnreadableFile("/retroarch/saves", "nova.srm", kMtime);
-  const scan::ScanResult unreadable = scan::ScanSaves(config, index, gone, kFirstTick);
+  const scan::ScanResult unreadable = scan::ScanSaves(config, kRetroArchDefaults, index, gone, kFirstTick);
   checks.ExpectEq(unreadable.saves.size(), static_cast<std::size_t>(1),
                   "an unhashable save is still a save");
   checks.ExpectEq(unreadable.skipped_total, static_cast<std::size_t>(0), "and not a skip");
@@ -606,6 +715,8 @@ void Truncated(::checks::Checks& checks) {
                 "a directory past the bound says so rather than pretending it is complete");
   checks.ExpectEq(listing.entries.size(), fs::kMaxDirectoryEntries,
                   "and holds exactly the bound");
+  checks.Expect(listing.entries.capacity() <= fs::kMaxDirectoryEntries,
+                "and never allocated room for more than the bound (M9-19, #217)");
 
   std::vector<std::string> names;
   for (const fs::Entry& entry : listing.entries) {
@@ -641,6 +752,930 @@ void Truncated(::checks::Checks& checks) {
   checks.Expect(repeat == names, "and reading it again gives the same entries");
 
   std::filesystem::remove_all(root, error);
+
+  // The scan's own bound, `kMaxSaves`: a card holding more matched saves than it
+  // stops at one walk past it, and says so in a flag the engine reads -- the
+  // skip that says the same is the last recorded, and may not be spelled out
+  // (M9-20, #246).
+  const auto scan_of = [](std::size_t saves) {
+    roms::RomIndex index;
+    FakeFileSystem card("bound");
+    for (std::size_t at = 0; at < saves; ++at) {
+      std::string name = std::to_string(at);
+      name.insert(name.begin(), 4 - name.size(), '0');
+      index.Add(MakeRom(static_cast<std::int64_t>(at) + 1, "Game " + name, "gba"));
+      card.AddFile("/tico/saves/gba", "Game " + name + ".srm", 16, kMtime);
+    }
+    return scan::ScanSaves(config::Defaults(), kRetroArchDefaults, index, card, kFirstTick);
+  };
+  const scan::ScanResult at_bound = scan_of(scan::kMaxSaves);
+  checks.ExpectEq(at_bound.saves.size(), scan::kMaxSaves, "a card at the bound reports all of it");
+  checks.Expect(!at_bound.stopped_at_bound, "and is not a card the scan stopped short of");
+  const scan::ScanResult past = scan_of(scan::kMaxSaves + 3);
+  checks.ExpectEq(past.saves.size(), scan::kMaxSaves, "one past it reports the bound");
+  checks.Expect(past.stopped_at_bound, "and says the walk stopped there");
+
+  // The bound is on saves, not on files: a card holding exactly the bound's
+  // saves and then a file that is no save -- one with no rom, one whose mtime
+  // is unusable -- synced every save it has, and a later folder is still read.
+  {
+    roms::RomIndex index;
+    FakeFileSystem card("bound-not-saves");
+    for (std::size_t at = 0; at < scan::kMaxSaves; ++at) {
+      std::string name = std::to_string(at);
+      name.insert(name.begin(), 4 - name.size(), '0');
+      index.Add(MakeRom(static_cast<std::int64_t>(at) + 1, "Game " + name, "gba"));
+      card.AddFile("/tico/saves/gba", "Game " + name + ".srm", 16, kMtime);
+    }
+    card.AddFile("/tico/saves/gba", "Zzz No Rom.srm", 16, kMtime);
+    index.Add(MakeRom(static_cast<std::int64_t>(scan::kMaxSaves) + 1, "Zzz Unset Clock", "gba"));
+    card.AddFile("/tico/saves/gba", "Zzz Unset Clock.srm", 16, 0);
+    card.AddFile("/tico/saves/snes", "Also No Rom.srm", 16, kMtime);
+    const scan::ScanResult full =
+        scan::ScanSaves(config::Defaults(), kRetroArchDefaults, index, card, kFirstTick);
+    checks.ExpectEq(full.saves.size(), scan::kMaxSaves, "bound, then non-saves: every save");
+    checks.Expect(!full.stopped_at_bound,
+                  "bound, then non-saves: not a walk that stopped short: " +
+                      full.DescribeSkipped());
+    checks.Expect(SkippedFor(full, "/tico/saves/gba/Zzz No Rom.srm", scan::SkipReason::kUnmatched),
+                  "bound, then non-saves: the file with no rom is said as that");
+    checks.Expect(SkippedFor(full, "/tico/saves/gba/Zzz Unset Clock.srm",
+                             scan::SkipReason::kUnusable),
+                  "bound, then non-saves: and so is the one with an unusable mtime");
+    checks.Expect(std::find(full.folders.begin(), full.folders.end(), "/tico/saves/snes") !=
+                      full.folders.end(),
+                  "bound, then non-saves: a later folder is still read");
+
+    // And a save past those non-saves is still the one the bound refuses.
+    index.Add(MakeRom(static_cast<std::int64_t>(scan::kMaxSaves) + 2, "Snes Late", "snes"));
+    card.AddFile("/tico/saves/snes", "Snes Late.srm", 16, kMtime);
+    const scan::ScanResult over =
+        scan::ScanSaves(config::Defaults(), kRetroArchDefaults, index, card, kFirstTick);
+    checks.Expect(over.stopped_at_bound &&
+                      SkippedFor(over, "/tico/saves/snes/Snes Late.srm",
+                                 scan::SkipReason::kTooManySaves),
+                  "bound, non-saves, then a save: that save is where the walk stopped");
+  }
+
+  // States share the walk, against their own bound.
+  {
+    config::Config states = config::Defaults();
+    states.sync.states = true;
+    roms::RomIndex index;
+    FakeFileSystem card("bound-states");
+    for (std::size_t at = 0; at < scan::kMaxStates; ++at) {
+      std::string name = std::to_string(at);
+      name.insert(name.begin(), 4 - name.size(), '0');
+      index.Add(MakeRom(static_cast<std::int64_t>(at) + 1, "Game " + name, "gba"));
+      card.AddFile("/tico/states/gba", "Game " + name + ".state", 16, kMtime);
+    }
+    card.AddFile("/tico/states/gba", "Zzz No Rom.state", 16, kMtime);
+    const scan::ScanResult full =
+        scan::ScanStates(states, kRetroArchDefaults, index, card, kFirstTick);
+    checks.ExpectEq(full.states.size(), scan::kMaxStates, "states at the bound: every state");
+    checks.Expect(!full.stopped_at_bound,
+                  "states at the bound, then a non-state: read whole: " + full.DescribeSkipped());
+
+    index.Add(MakeRom(static_cast<std::int64_t>(scan::kMaxStates) + 1, "Zzz Late", "gba"));
+    card.AddFile("/tico/states/gba", "Zzz Late.state", 16, kMtime);
+    const scan::ScanResult over =
+        scan::ScanStates(states, kRetroArchDefaults, index, card, kFirstTick);
+    checks.ExpectEq(over.states.size(), scan::kMaxStates, "states past the bound: the bound");
+    checks.Expect(over.stopped_at_bound &&
+                      SkippedFor(over, "/tico/states/gba/Zzz Late.state",
+                                 scan::SkipReason::kTooManyStates),
+                  "states past the bound: stopped at the state it had no room for");
+  }
+}
+
+// --- sources ------------------------------------------------------------------
+
+/// The `config.ini` the `sources` fixtures are scanned under: the built-in map,
+/// plus RetroArch's sort-by-core folders (and one RomM does not know), the Tico
+/// systems the defaults did not map before #231 (spelled out, as a user would), a folder neither emulator owns,
+/// and two overrides.
+constexpr const char* kSourcesConfig = R"ini([server]
+url = https://romm.example.com
+
+[platform.gb]
+emulator = mgba
+roms   = /tico/roms/gb
+saves  = /tico/saves/gb, /retroarch/saves/Gambatte
+states = /tico/states/gb
+
+[platform.gba]
+roms   = /tico/roms/gba
+saves  = /retroarch/saves, /tico/saves/gba, /retroarch/saves/mGBA
+states = /retroarch/states, /tico/states/gba
+
+[platform.psx]
+roms   = /tico/roms/psx
+saves  = /tico/saves/psx, /retroarch/saves/Beetle PSX HW, /retroarch/saves/Beetle PSX
+states = /tico/states/psx
+
+[platform.gbc]
+saves = /tico/saves/gbc, /retroarch/saves/Gearboy
+
+[platform.sms]
+saves = /tico/saves/master-system
+
+[platform.gamegear]
+saves = /tico/saves/game-gear
+
+[platform.segacd]
+saves = /tico/saves/sega-cd
+
+[platform.arcade]
+saves = /tico/saves/fbneo
+
+[platform.saturn]
+saves = /tico/saves/saturn
+
+[platform.ngp]
+saves = /emulators/ngp
+
+[platform.wonderswan]
+emulator = mednafen_wswan
+saves = /emulators/wonderswan
+
+[platform.vectrex]
+saves = /tico/saves/vectrex
+)ini";
+
+void Sources(::checks::Checks& checks) {
+  const config::LoadResult parsed = config::ParseConfig(kSourcesConfig);
+  checks.Expect(parsed.ok(), "the fixture config parses: " + parsed.DescribeDiagnostics());
+  const config::Config& config = parsed.value;
+
+  struct Row {
+    const char* directory;
+    const char* file_name;
+    const char* platform;
+    const char* emulator;  ///< "" is sent as null
+    const char* slot;
+  };
+  // One row per fixture file, grouped by the layout that wrote it.
+  const Row kRows[] = {
+      // RetroArch, flat: one folder for every system, so the platform's default core.
+      {"/retroarch/saves", "Snes Game.srm", "snes", "snes9x", "autosave"},
+      {"/retroarch/saves", "Nes Game.srm", "nes", "fceumm", "autosave"},
+      {"/retroarch/saves", "N64 Game.srm", "n64", "mupen64plus_next", "autosave"},
+      {"/retroarch/saves", "Psp Game.srm", "psp", "ppsspp", "autosave"},
+      // RetroArch, sort-by-core: the folder names the core, and outranks an override.
+      {"/retroarch/saves/mGBA", "Gba Core.srm", "gba", "mgba", "autosave"},
+      {"/retroarch/saves/Gambatte", "Gb Core.srm", "gb", "gambatte", "autosave"},
+      {"/retroarch/saves/Beetle PSX HW", "Psx Hw.srm", "psx", "mednafen_psx_hw", "autosave"},
+      {"/retroarch/saves/Beetle PSX", "Psx Sw.srm", "psx", "mednafen_psx", "autosave"},
+      // RetroArch, a subfolder RomM's table does not know: no guessed core.
+      {"/retroarch/saves/Gearboy", "Gbc Gearboy.srm", "gbc", "", "autosave"},
+      // Tico: one folder per system, and the module Tico runs for it.
+      {"/tico/saves/nes", "Nes Tico.srm", "nes", "fceumm", "autosave"},
+      {"/tico/saves/snes", "Snes Tico.srm", "snes", "snes9x", "autosave"},
+      {"/tico/saves/gbc", "Gbc Tico.srm", "gbc", "gambatte", "autosave"},
+      {"/tico/saves/gba", "Gba Tico.srm", "gba", "mgba", "autosave"},
+      {"/tico/saves/genesis", "Md Tico.srm", "genesis", "genesis_plus_gx", "autosave"},
+      {"/tico/saves/master-system", "Sms Tico.srm", "sms", "genesis_plus_gx", "autosave"},
+      {"/tico/saves/game-gear", "Gg Tico.srm", "gamegear", "genesis_plus_gx", "autosave"},
+      {"/tico/saves/sega-cd", "Scd Tico.brm", "segacd", "genesis_plus_gx", "autosave-brm"},
+      {"/tico/saves/fbneo", "Arcade Tico.srm", "arcade", "fbneo", "autosave"},
+      // Tico, formats no libretro core shares: isolated under tico-* (#226 D3).
+      {"/tico/saves/n64", "N64 Tico.eep", "n64", "tico-mupen64plus", "autosave-eep"},
+      {"/tico/saves/psx", "Psx Tico.mcd", "psx", "tico-duckstation", "autosave-mcd"},
+      {"/tico/saves/dc", "Dc Tico.bin", "dreamcast", "tico-flycast", "autosave-bin"},
+      {"/tico/saves/dc", "Dc Romm.bin", "dc", "tico-flycast", "autosave-bin"},  // RomM's own spelling
+      {"/tico/saves/nds", "Nds Tico.dsv", "nds", "tico-drastic", "autosave-dsv"},
+      {"/tico/saves/saturn", "Saturn Tico.bkr", "saturn", "tico-yabasanshiro", "autosave-bkr"},
+      // Tico's psp folder holds no file the scan reads: PPSSPP saves are folders,
+      // and a loose file is the named skip (#238, scan.isolated).
+      // The override: mGBA for GB, set in config.ini.
+      {"/tico/saves/gb", "Gb Tico.srm", "gb", "mgba", "autosave"},
+      // A folder neither emulator owns: the override when there is one, else null.
+      {"/emulators/wonderswan", "Ws Game.sav", "wonderswan", "mednafen_wswan", "autosave-sav"},
+      {"/emulators/ngp", "Ngp Game.sav", "ngp", "", "autosave-sav"},
+      // A system Tico has no table entry for: null rather than a guess.
+      {"/tico/saves/vectrex", "Vec Game.srm", "vectrex", "", "autosave"},
+  };
+
+  roms::RomIndex index;
+  FakeFileSystem files("sources");
+  std::int64_t next_id = 1;
+  for (const Row& row : kRows) {
+    const std::string name(row.file_name);
+    index.Add(MakeRom(next_id++, scan::BaseName(name), row.platform));
+    files.AddFile(row.directory, name, 64, kMtime);
+  }
+
+  const scan::ScanResult result = scan::ScanSaves(config, kRetroArchDefaults, index, files, kFirstTick);
+  checks.ExpectEq(result.skipped_total, std::size_t{0},
+                  "every fixture file is a save: " + result.DescribeSkipped());
+  for (const Row& row : kRows) {
+    const scan::SaveFile* save = FindSave(result, row.file_name);
+    if (save == nullptr) {
+      checks.Expect(false, std::string(row.directory) + "/" + row.file_name + " was not scanned");
+      continue;
+    }
+    const std::string where = std::string(row.directory) + "/" + row.file_name;
+    checks.ExpectEq(save->emulator, std::string(row.emulator), where + "'s emulator id");
+    checks.ExpectEq(save->slot, std::string(row.slot), where + "'s slot");
+    const sync::ClientSaveState negotiated = save->ToClientSaveState();
+    checks.Expect(negotiated.emulator.has_value() == (*row.emulator != '\0'),
+                  where + ": an unknown emulator is sent as null, never as \"\"");
+    checks.Expect(sync::Validate(negotiated).ok(), where + " is a negotiate entry RomM accepts");
+  }
+
+  // A state is told apart by the same rules, through the state folders.
+  roms::RomIndex state_index;
+  state_index.Add(MakeRom(1, "Snes Game", "snes"));
+  state_index.Add(MakeRom(2, "Gba Game", "gba"));
+  state_index.Add(MakeRom(3, "Gb Game", "gb"));
+  FakeFileSystem state_files("source-states");
+  state_files.AddFile("/retroarch/states", "Snes Game.state", 64, kMtime);
+  state_files.AddFile("/tico/states/gba", "Gba Game.state0", 64, kMtime);
+  state_files.AddFile("/tico/states/gb", "Gb Game.state5", 64, kMtime);
+  const scan::ScanResult states = scan::ScanStates(config, kRetroArchDefaults, state_index, state_files, kFirstTick);
+  const std::pair<const char*, const char*> kStates[] = {
+      {"Snes Game.state", "snes9x"}, {"Gba Game.state0", "mgba"}, {"Gb Game.state5", "mgba"}};
+  checks.ExpectEq(states.states.size(), std::size_t{3}, "three states were scanned");
+  for (const auto& [file_name, emulator] : kStates) {
+    bool seen = false;
+    for (const scan::StateFile& state : states.states) {
+      if (state.file_name == file_name) {
+        seen = true;
+        checks.ExpectEq(state.emulator, std::string(emulator),
+                        std::string(file_name) + "'s emulator id");
+      }
+    }
+    checks.Expect(seen, std::string(file_name) + " was scanned");
+  }
+}
+
+// --- retroarch ----------------------------------------------------------------
+
+/// A card laid out the way RetroArch lays one out: a file in a folder, and the
+/// folder in its parent's listing, which `AddFile` alone does not make.
+class RetroArchCard {
+ public:
+  explicit RetroArchCard(std::string_view label) : files(label) {}
+
+  void Save(const std::string& directory, const std::string& name) {
+    const std::size_t slash = directory.rfind('/');
+    if (slash != std::string::npos && slash > 0) {
+      const std::string parent = directory.substr(0, slash);
+      if (made_.insert(directory).second) {
+        files.AddDirectory(parent, directory.substr(slash + 1));
+      }
+    }
+    files.AddFile(directory, name, 64, kMtime);
+  }
+
+  FakeFileSystem files;
+
+ private:
+  std::set<std::string> made_;
+};
+
+const scan::SaveFile* SaveAt(const scan::ScanResult& result, std::string_view sd_path) {
+  for (const scan::SaveFile& save : result.saves) {
+    if (save.sd_path == sd_path) {
+      return &save;
+    }
+  }
+  return nullptr;
+}
+
+bool Read(const scan::ScanResult& result, std::string_view directory) {
+  return std::find(result.folders.begin(), result.folders.end(), directory) !=
+         result.folders.end();
+}
+
+void RetroArch(::checks::Checks& checks) {
+  roms::RomIndex index;
+  index.Add(MakeRom(1, "Gba Game", "gba"));
+  index.Add(MakeRom(2, "Snes Game", "snes"));
+  index.Add(MakeRom(3, "Gb Game", "gb"));
+  index.Add(MakeRom(4, "Psx Game", "psx"));
+
+  const config::Config defaults = config::Defaults();
+  const std::string kSaves = "/retroarch/cores/savefiles";
+
+  // Flat: sort-by-core off. One folder for every system, the platform's core,
+  // and a subfolder is not descended into.
+  {
+    retroarch::Settings flat;
+    flat.sort_savefiles = false;
+    RetroArchCard card("ra-flat");
+    card.Save(kSaves, "Gba Game.srm");
+    card.Save(kSaves, "Snes Game.srm");
+    card.Save(kSaves + "/mGBA", "Gb Game.srm");
+    const scan::ScanResult result = scan::ScanSaves(defaults, flat, index, card.files, kFirstTick);
+    const scan::SaveFile* gba = SaveAt(result, kSaves + "/Gba Game.srm");
+    const scan::SaveFile* snes = SaveAt(result, kSaves + "/Snes Game.srm");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave",
+                  "flat: the folder retroarch.cfg names is RetroArch's, with the platform's core");
+    checks.Expect(snes != nullptr && snes->emulator == "snes9x", "flat: per platform");
+    checks.ExpectEq(result.saves.size(), std::size_t{2},
+                    "flat: a core folder is not read while sorting is off");
+    checks.Expect(Read(result, kSaves), "flat: the folder is reported as read");
+  }
+
+  // Sorted -- the Switch build's default: `<savefile_directory>/<CoreFolder>/`,
+  // one level, each folder through RomM's table.
+  {
+    RetroArchCard card("ra-sorted");
+    card.Save(kSaves + "/mGBA", "Gba Game.srm");
+    card.Save(kSaves + "/Snes9x", "Snes Game.srm");
+    card.Save(kSaves + "/Gearboy", "Gb Game.srm");
+    card.Save(kSaves + "/.netplay", "Psx Game.srm");
+    card.Save(kSaves, "Psx Game.srm");
+    // A copy the built-in map's flat guess still finds, older than the live one.
+    card.Save("/retroarch/saves", "Gba Game.srm");
+    const scan::ScanResult result =
+        scan::ScanSaves(defaults, kRetroArchDefaults, index, card.files, kFirstTick);
+    const scan::SaveFile* gba = FindSave(result, "Gba Game.srm");
+    checks.Expect(gba != nullptr && gba->sd_path == kSaves + "/mGBA/Gba Game.srm",
+                  "sorted: the copy RetroArch reads wins its slot over a stale flat one");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave",
+                  "sorted: the core folder names the emulator; and the slot is the shared one");
+    checks.Expect(SkippedFor(result, "/retroarch/saves/Gba Game.srm",
+                             scan::SkipReason::kDuplicateSlot),
+                  "sorted: and the stale copy is reported, not synced");
+    const scan::SaveFile* snes = FindSave(result, "Snes Game.srm");
+    checks.Expect(snes != nullptr && snes->emulator == "snes9x", "sorted: Snes9x is snes9x");
+    const scan::SaveFile* gb = FindSave(result, "Gb Game.srm");
+    checks.Expect(gb != nullptr && gb->emulator.empty() && gb->slot == "autosave",
+                  "sorted: a core RomM does not know is RetroArch's, with no guessed id");
+    checks.Expect(FindSave(result, "Psx Game.srm") == nullptr,
+                  "sorted: neither a loose file nor a netplay folder is a save RetroArch reads");
+    checks.Expect(SkippedFor(result, kSaves + "/Psx Game.srm", scan::SkipReason::kOutsideLayout),
+                  "sorted: the loose file is reported as outside RetroArch's layout");
+    checks.Expect(Read(result, kSaves + "/mGBA") && !Read(result, kSaves + "/.netplay"),
+                  "sorted: the core folders are what was read");
+  }
+
+  // A folder retroarch.cfg names is RetroArch's whatever it is called -- and one
+  // that is not there is ignored, as RetroArch ignores it, for the default.
+  {
+    retroarch::Settings elsewhere;
+    elsewhere.savefile_directory = "/Emulation/Saves";
+    RetroArchCard card("ra-elsewhere");
+    card.Save("/Emulation/Saves/mGBA", "Gba Game.srm");
+    const scan::ScanResult named =
+        scan::ScanSaves(defaults, elsewhere, index, card.files, kFirstTick);
+    const scan::SaveFile* gba = FindSave(named, "Gba Game.srm");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave",
+                  "a configured folder with no 'retroarch' in its path is still RetroArch's");
+
+    retroarch::Settings gone;
+    gone.savefile_directory = "/nowhere";
+    RetroArchCard fallback("ra-fallback");
+    fallback.Save(kSaves + "/mGBA", "Gba Game.srm");
+    const scan::ScanResult defaulted =
+        scan::ScanSaves(defaults, gone, index, fallback.files, kFirstTick);
+    checks.Expect(FindSave(defaulted, "Gba Game.srm") != nullptr,
+                  "a configured folder that does not exist falls back to the build's default");
+  }
+
+  // Beside the content: rom folders, read only on opt-in, and only for
+  // RetroArch's own save extension -- everything else there is a rom.
+  {
+    retroarch::Settings beside;
+    beside.savefiles_in_content_dir = true;
+    beside.sort_savefiles = false;
+    RetroArchCard card("ra-content");
+    card.Save("/tico/roms/gba", "Gba Game.gba");
+    card.Save("/tico/roms/gba", "Gba Game.srm");
+    card.Save("/tico/roms/snes", "Snes Game.sfc");
+    card.Save(kSaves, "Snes Game.srm");  // not where RetroArch writes now
+
+    const scan::ScanResult closed = scan::ScanSaves(defaults, beside, index, card.files, kFirstTick);
+    checks.ExpectEq(closed.saves.size(), std::size_t{0},
+                    "content dir, not opted in: neither the rom folders nor the stale folder");
+
+    config::Config opted = defaults;
+    opted.sources.retroarch_content_dir = true;
+    const scan::ScanResult open = scan::ScanSaves(opted, beside, index, card.files, kFirstTick);
+    const scan::SaveFile* gba = SaveAt(open, "/tico/roms/gba/Gba Game.srm");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && gba->slot == "autosave" &&
+                      gba->rom_id == 1,
+                  "content dir, opted in: the save beside the rom is RetroArch's");
+    checks.ExpectEq(open.saves.size(), std::size_t{1}, "content dir: and a rom is never a save");
+    checks.Expect(!Read(open, "/tico/roms/gba"),
+                  "content dir: a rom folder is not offered to the .tmp sweep, where a rom "
+                  "download stages");
+    checks.ExpectEq(open.skipped_total, std::size_t{0},
+                    "content dir: the roms are not even unmatched files: " +
+                        open.DescribeSkipped());
+
+    retroarch::Settings sorted_beside = beside;
+    sorted_beside.sort_savefiles = true;
+    RetroArchCard sorted("ra-content-sorted");
+    sorted.Save("/tico/roms/snes", "Snes Game.sfc");
+    sorted.Save("/tico/roms/snes/Snes9x", "Snes Game.srm");
+    const scan::ScanResult both =
+        scan::ScanSaves(opted, sorted_beside, index, sorted.files, kFirstTick);
+    const scan::SaveFile* snes = FindSave(both, "Snes Game.srm");
+    checks.Expect(snes != nullptr && snes->emulator == "snes9x",
+                  "content dir and sorted: the core folder beside the rom");
+  }
+
+  // A `savefile_directory` that is a mapped rom folder is one whatever
+  // retroarch.cfg calls it: its roms are not saves, they do not count against
+  // the scan's bound, and the .tmp a rom download stages there is not swept.
+  // Case-insensitively, as FAT32 is.
+  {
+    retroarch::Settings into_roms;
+    into_roms.savefile_directory = "/tico/ROMS/snes";
+    into_roms.sort_savefiles = false;
+    RetroArchCard card("ra-into-roms");
+    card.Save("/tico/ROMS/snes", "Snes Game.sfc");
+    card.Save("/tico/ROMS/snes", "Snes Game.srm");
+    const scan::ScanResult flat = scan::ScanSaves(defaults, into_roms, index, card.files, kFirstTick);
+    checks.Expect(FindSave(flat, "Snes Game.sfc") == nullptr,
+                  "savefile_directory a rom folder: the rom is not a save");
+    checks.Expect(FindSave(flat, "Snes Game.srm") != nullptr,
+                  "savefile_directory a rom folder: RetroArch's save beside it still is");
+    checks.Expect(!Read(flat, "/tico/ROMS/snes"),
+                  "savefile_directory a rom folder: not offered to the .tmp sweep");
+    checks.ExpectEq(flat.files_seen, std::size_t{1},
+                    "savefile_directory a rom folder: the rom is not a file the scan saw");
+
+    // Sorted, with the folder that holds every rom folder: each platform's rom
+    // folder is then a "core" folder under it.
+    retroarch::Settings above_roms;
+    above_roms.savefile_directory = "/tico/roms";
+    RetroArchCard above("ra-above-roms");
+    above.Save("/tico/roms/snes", "Snes Game.sfc");
+    above.Save("/tico/roms/gba", "Gba Game.gba");
+    above.Save("/tico/roms/mGBA", "Gba Game.srm");
+    const scan::ScanResult sorted =
+        scan::ScanSaves(defaults, above_roms, index, above.files, kFirstTick);
+    checks.Expect(FindSave(sorted, "Snes Game.sfc") == nullptr &&
+                      FindSave(sorted, "Gba Game.gba") == nullptr,
+                  "savefile_directory above the rom folders: no rom is a save");
+    checks.Expect(!Read(sorted, "/tico/roms/snes") && !Read(sorted, "/tico/roms/gba"),
+                  "savefile_directory above the rom folders: none is offered to the .tmp sweep");
+    const scan::SaveFile* gba = FindSave(sorted, "Gba Game.srm");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba" && Read(sorted, "/tico/roms/mGBA"),
+                  "savefile_directory above the rom folders: a real core folder is read as one");
+
+    // The map's own save folder, when it names the platform's rom folder.
+    config::Config beside_map = defaults;
+    beside_map.platforms["gba"].saves = {"/tico/roms/gba"};
+    RetroArchCard mapped("map-into-roms");
+    mapped.Save("/tico/roms/gba", "Gba Game.gba");
+    mapped.Save("/tico/roms/gba", "Gba Game.srm");
+    const scan::ScanResult map =
+        scan::ScanSaves(beside_map, kRetroArchDefaults, index, mapped.files, kFirstTick);
+    checks.Expect(FindSave(map, "Gba Game.gba") == nullptr &&
+                      FindSave(map, "Gba Game.srm") != nullptr,
+                  "a map save folder that is a rom folder: the save, not the rom");
+    checks.Expect(!Read(map, "/tico/roms/gba"),
+                  "a map save folder that is a rom folder: not offered to the .tmp sweep");
+  }
+
+  // Cloud Sync on: RetroArch syncs itself and every RetroArch folder is left
+  // alone, the map's included. Tico's are not RetroArch's.
+  {
+    retroarch::Settings syncing;
+    syncing.cloud_sync = true;
+    RetroArchCard card("ra-cloud");
+    card.Save(kSaves + "/mGBA", "Gba Game.srm");
+    card.Save("/retroarch/saves", "Snes Game.srm");
+    card.Save("/tico/saves/gb", "Gb Game.srm");
+    const scan::ScanResult left = scan::ScanSaves(defaults, syncing, index, card.files, kFirstTick);
+    checks.ExpectEq(left.saves.size(), std::size_t{1}, "cloud sync: only Tico's save is read");
+    checks.Expect(FindSave(left, "Gb Game.srm") != nullptr, "cloud sync: and it is Tico's");
+    checks.Expect(!Read(left, "/retroarch/saves") && !Read(left, kSaves + "/mGBA"),
+                  "cloud sync: no RetroArch folder is even listed");
+
+    config::Config forced = defaults;
+    forced.sources.retroarch = config::SourceMode::kOn;
+    const scan::ScanResult both = scan::ScanSaves(forced, syncing, index, card.files, kFirstTick);
+    checks.ExpectEq(both.saves.size(), std::size_t{3},
+                    "[sources] retroarch = on reads RetroArch's folders anyway");
+  }
+
+  // #217's listing bound: a cut listing keeps the first names, and a capital
+  // sorts before `mGBA`. RetroArch's own folder still finds every core RomM's
+  // table names; the plan of core folders is bounded; and beside the roms only
+  // a core the table names is a core.
+  {
+    RetroArchCard card("ra-bound");
+    card.Save(kSaves, "Aaa Stale.srm");
+    card.Save(kSaves, "Bbb Stale.srm");
+    card.files.AddFile(kSaves + "/mGBA", "Gba Game.srm", 64, kMtime);  // past the cut
+    card.files.MarkTruncated(kSaves);
+    const scan::ScanResult cut =
+        scan::ScanSaves(defaults, kRetroArchDefaults, index, card.files, kFirstTick);
+    const scan::SaveFile* gba = FindSave(cut, "Gba Game.srm");
+    checks.Expect(gba != nullptr && gba->emulator == "mgba",
+                  "bound: a core folder the cut listing dropped is still read, by RomM's table");
+    checks.Expect(SkippedFor(cut, kSaves, scan::SkipReason::kDirectoryFailed),
+                  "bound: and the cut itself is said");
+
+    RetroArchCard many("ra-many");
+    for (int i = 0; i < 70; ++i) {
+      std::string name = "Core" + std::to_string(100 + i);
+      many.Save(kSaves + "/" + name, "Gba Game.srm");
+    }
+    const scan::ScanResult capped =
+        scan::ScanSaves(defaults, kRetroArchDefaults, index, many.files, kFirstTick);
+    std::size_t cores = 0;
+    for (const std::string& folder : capped.folders) {
+      cores += folder.rfind(kSaves + "/Core", 0) == 0 ? 1 : 0;
+    }
+    checks.ExpectEq(cores, scan::kMaxRetroArchFolders,
+                    "bound: no more core folders are read than the plan's bound");
+    checks.Expect(SkippedFor(capped, kSaves + "/Core169", scan::SkipReason::kDirectoryFailed),
+                  "bound: and the ones past it are said, by name");
+
+    retroarch::Settings beside;
+    beside.savefiles_in_content_dir = true;
+    config::Config opted = defaults;
+    opted.sources.retroarch_content_dir = true;
+    RetroArchCard roms("ra-bound-roms");
+    roms.Save("/tico/roms/psx", "Psx Game.cue");
+    roms.Save("/tico/roms/psx/Psx Game", "Psx Game.srm");  // a multi-disc game's folder
+    roms.Save("/tico/roms/psx/PCSX-ReARMed", "Psx Game.srm");
+    const scan::ScanResult disc = scan::ScanSaves(opted, beside, index, roms.files, kFirstTick);
+    const scan::SaveFile* psx = FindSave(disc, "Psx Game.srm");
+    checks.Expect(disc.saves.size() == 1 && psx != nullptr && psx->emulator == "pcsx_rearmed",
+                  "bound: beside the roms, a game's folder is not a core; the core's is");
+  }
+
+  // States follow their own four settings through the same rules.
+  {
+    config::Config states = defaults;
+    states.sync.states = true;
+    RetroArchCard card("ra-states");
+    card.Save("/retroarch/cores/savestates/mGBA", "Gba Game.state1");
+    card.Save("/retroarch/cores/savestates", "Snes Game.state");
+    const scan::ScanResult sorted =
+        scan::ScanStates(states, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.ExpectEq(sorted.states.size(), std::size_t{1}, "states: sorted by core by default");
+    checks.Expect(!sorted.states.empty() && sorted.states.front().emulator == "mgba",
+                  "states: the core folder names the emulator");
+
+    retroarch::Settings flat;
+    flat.sort_savestates = false;
+    const scan::ScanResult unsorted = scan::ScanStates(states, flat, index, card.files, kFirstTick);
+    checks.Expect(unsorted.states.size() == 1 && unsorted.states.front().emulator == "snes9x",
+                  "states: sort_savestates_enable is its own switch");
+  }
+}
+
+// --- tico ---------------------------------------------------------------------
+
+/// Two Switch accounts, as Tico 0.8 names their folders under `users/`.
+const std::string kAccountA = "0123456789abcdef0123456789abcdef";
+const std::string kAccountB = "fedcba9876543210fedcba9876543210";
+
+/// What a Tico module leaves beside a save that is not one (#226 R5): its
+/// rotating `backups/` and a `.tmp` an interrupted write did not rename.
+void AddTicoLitter(RetroArchCard* card, const std::string& directory, const std::string& save) {
+  card->Save(directory + "/backups", save + ".1");
+  card->Save(directory + "/backups", save + ".2");
+  card->files.AddFile(directory, save + ".tmp", 64, kMtime);
+}
+
+config::Config TicoConfig(const std::string& account_line) {
+  const config::LoadResult parsed = config::ParseConfig(
+      "[server]\nurl = https://romm.example.com\n\n[sync]\nstates = true\n" +
+      (account_line.empty() ? std::string() : "\n[tico]\n" + account_line + "\n"));
+  return parsed.value;
+}
+
+roms::RomIndex TicoLibrary() {
+  roms::RomIndex index;
+  index.Add(MakeRom(1, "Snes Game", "snes"));
+  index.Add(MakeRom(2, "Sms Game", "sms"));
+  index.Add(MakeRom(3, "Gba Game", "gba"));
+  index.Add(MakeRom(4, "Old Game", "snes"));
+  index.Add(MakeRom(5, "Other Game", "snes"));
+  index.Add(MakeRom(6, "Psx Game", "psx"));
+  return index;
+}
+
+bool Mentions(const std::vector<config::Diagnostic>& notes, std::string_view text) {
+  for (const config::Diagnostic& note : notes) {
+    if (note.Describe().find(text) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void Tico(::checks::Checks& checks) {
+  const roms::RomIndex index = TicoLibrary();
+
+  // Tico 0.7.9: one folder per system, in Tico's spelling of it, straight under
+  // saves/ -- read through the built-in map, which spells `sms` `master-system`.
+  {
+    RetroArchCard card("tico-079");
+    card.Save("/tico/saves/snes", "Snes Game.srm");
+    card.Save("/tico/saves/master-system", "Sms Game.srm");
+    // Snes9x's clock beside its SRAM: a sidecar, synced as a save of its own in
+    // its own slot, so neither file ever stands in for the other.
+    card.Save("/tico/saves/snes", "Snes Game.rtc");
+    AddTicoLitter(&card, "/tico/saves/snes", "Snes Game.srm");
+    const config::Config config = TicoConfig("");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.ExpectEq(result.saves.size(), std::size_t{3},
+                    "0.7.9: the saves and the clock are found: " + result.DescribeSkipped());
+    const scan::SaveFile* srm = SaveAt(result, "/tico/saves/snes/Snes Game.srm");
+    const scan::SaveFile* rtc = SaveAt(result, "/tico/saves/snes/Snes Game.rtc");
+    checks.Expect(srm != nullptr && rtc != nullptr && srm->rom_id == rtc->rom_id &&
+                      srm->slot == "autosave" && rtc->slot == "autosave-rtc" &&
+                      rtc->emulator == "snes9x",
+                  "the .rtc is the same rom's, in a slot of its own, under the same emulator");
+    const scan::SaveFile* sms = SaveAt(result, "/tico/saves/master-system/Sms Game.srm");
+    checks.Expect(sms != nullptr && sms->emulator == "genesis_plus_gx" && sms->slot == "autosave",
+                  "an sms save is read from Tico's master-system folder");
+    checks.ExpectEq(result.skipped_total, std::size_t{0},
+                    "0.7.9: a .tmp and backups/ are not saves, and not skips either: " +
+                        result.DescribeSkipped());
+    checks.Expect(tico::Notes(config, card.files).empty(), "0.7.9: nothing to say");
+  }
+
+  // Tico 0.8.0, one account: saves/users/<uid>/<slug>/, found without being
+  // told the account; what is left in the old folders is outside the layout.
+  {
+    RetroArchCard card("tico-080");
+    const std::string saves = "/tico/saves/users/" + kAccountA;
+    card.files.AddDirectory("/tico/saves", "users");
+    card.files.AddDirectory("/tico/saves/users", kAccountA);
+    card.Save(saves + "/snes", "Snes Game.srm");
+    card.Save(saves + "/master-system", "Sms Game.srm");
+    AddTicoLitter(&card, saves + "/snes", "Snes Game.srm");
+    card.Save("/tico/saves/snes", "Old Game.srm");
+    card.files.AddFile("/tico/saves/snes", "Old Game.srm.tmp", 64, kMtime);
+    const config::Config config = TicoConfig("");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.ExpectEq(result.saves.size(), std::size_t{2},
+                    "0.8.0: both saves in the account's folders: " + result.DescribeSkipped());
+    const scan::SaveFile* snes = SaveAt(result, saves + "/snes/Snes Game.srm");
+    checks.Expect(snes != nullptr && snes->emulator == "snes9x" && snes->slot == "autosave",
+                  "the account's snes save keeps Tico's emulator id and its slot");
+    checks.Expect(SaveAt(result, "/tico/saves/snes/Old Game.srm") == nullptr,
+                  "a save left in the layout before 0.8.0 is not synced");
+    checks.Expect(SkippedFor(result, "/tico/saves/snes/Old Game.srm",
+                             scan::SkipReason::kOutsideLayout),
+                  "...and is said to be outside the layout: " + result.DescribeSkipped());
+    checks.ExpectEq(result.skipped_total, std::size_t{1},
+                    "and nothing else was skipped -- litter is not a skip: " +
+                        result.DescribeSkipped());
+    checks.Expect(Read(result, saves + "/snes"), "the account folder is what was read");
+    checks.Expect(!Read(result, "/tico/saves/snes"), "and the old one is not");
+
+    // The acceptance's own words: neither ever reaches RomM.
+    sync::SyncNegotiatePayload payload;
+    for (const scan::SaveFile& save : result.saves) {
+      payload.saves.push_back(save.ToClientSaveState());
+    }
+    const sync::Encoded encoded = sync::EncodeNegotiateRequest(payload);
+    checks.Expect(encoded.ok(), "the payload encodes");
+    checks.Expect(encoded.body.find("backups") == std::string::npos &&
+                      encoded.body.find(".tmp") == std::string::npos &&
+                      encoded.body.find(".1") == std::string::npos,
+                  "no backups/ file and no .tmp is in the negotiate payload: " + encoded.body);
+
+    const std::vector<config::Diagnostic> notes = tico::Notes(config, card.files);
+    checks.Expect(Mentions(notes, kAccountA), "the overlay is told whose saves are read");
+    for (const config::Diagnostic& note : notes) {
+      checks.Expect(note.severity == config::Severity::kNotice,
+                    "and that is a notice: " + note.Describe());
+    }
+
+    // States: slot 5 is Tico's Auto; its screenshot and DuckStation's
+    // `.restart` are beside it and are not states.
+    const std::string states = "/tico/states/users/" + kAccountA;
+    card.files.AddDirectory("/tico/states", "users");
+    card.files.AddDirectory("/tico/states/users", kAccountA);
+    card.Save(states + "/gba", "Gba Game.state5");
+    card.Save(states + "/gba", "Gba Game.state5.png");
+    card.Save(states + "/psx", "Psx Game.state5");
+    card.Save(states + "/psx", "Psx Game.state5.restart");
+    AddTicoLitter(&card, states + "/gba", "Gba Game.state5");
+    const scan::ScanResult scanned =
+        scan::ScanStates(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.ExpectEq(scanned.states.size(), std::size_t{2},
+                    "0.8.0: the two states, and nothing beside them: " +
+                        scanned.DescribeSkipped());
+    checks.ExpectEq(scanned.skipped_total, std::size_t{0},
+                    "a screenshot, a .restart, a .tmp and backups/ are not skips: " +
+                        scanned.DescribeSkipped());
+  }
+
+  // A `users/` past `fs::kMaxDirectoryEntries` lists only its first names, so
+  // one account in the listing is not one account on the card: `auto` does not
+  // pick it.
+  {
+    RetroArchCard cut("tico-cut");
+    cut.files.AddDirectory("/tico/saves", "users");
+    cut.files.AddDirectory("/tico/saves/users", kAccountA);
+    cut.files.MarkTruncated("/tico/saves/users");
+    cut.Save("/tico/saves/users/" + kAccountA + "/snes", "Snes Game.srm");
+    const scan::ScanResult result =
+        scan::ScanSaves(TicoConfig(""), kRetroArchDefaults, index, cut.files, kFirstTick);
+    checks.Expect(result.saves.empty() &&
+                      SkippedFor(result, "/tico/saves/users", scan::SkipReason::kTicoAccount),
+                  "a cut users/ listing is no answer to whose saves these are: " +
+                      result.DescribeSkipped());
+  }
+
+  // Tico 0.8.0, two accounts. `auto` will not pick: nothing of either is synced,
+  // and the note names both so the overlay can show which to choose.
+  RetroArchCard card("tico-two");
+  card.files.AddDirectory("/tico/saves", "users");
+  card.files.AddDirectory("/tico/saves/users", kAccountA);
+  card.files.AddDirectory("/tico/saves/users", kAccountB);
+  card.files.AddDirectory("/tico/saves/users", "not-an-account");
+  card.Save("/tico/saves/users/" + kAccountA + "/snes", "Snes Game.srm");
+  card.Save("/tico/saves/users/" + kAccountB + "/snes", "Other Game.srm");
+  card.Save("/tico/saves/snes", "Old Game.srm");
+  {
+    const config::Config config = TicoConfig("");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.Expect(result.saves.empty(),
+                  "two accounts and no choice: no Tico save is synced: " +
+                      result.DescribeSkipped());
+    checks.Expect(SkippedFor(result, "/tico/saves/users", scan::SkipReason::kTicoAccount),
+                  "and the scan says why, once, for the folder: " + result.DescribeSkipped());
+    checks.ExpectEq(result.skipped_total, std::size_t{1},
+                    "once rather than per platform: " + result.DescribeSkipped());
+    const std::vector<config::Diagnostic> notes = tico::Notes(config, card.files);
+    checks.Expect(notes.size() == 1 && notes[0].severity == config::Severity::kWarning &&
+                      notes[0].section == "tico" && notes[0].key == "account",
+                  "one warning on [tico] account");
+    checks.Expect(Mentions(notes, kAccountA) && Mentions(notes, kAccountB) &&
+                      !Mentions(notes, "not-an-account"),
+                  "naming both accounts, and only accounts");
+  }
+  {
+    const config::Config config = TicoConfig("account = " + kAccountB);
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.Expect(result.saves.size() == 1 &&
+                      result.saves[0].sd_path ==
+                          "/tico/saves/users/" + kAccountB + "/snes/Other Game.srm",
+                  "a named account is the one synced: " + result.DescribeSkipped());
+    checks.Expect(tico::Notes(config, card.files).empty() ||
+                      tico::Notes(config, card.files)[0].severity == config::Severity::kNotice,
+                  "and that is nothing to warn about");
+  }
+  {
+    const config::Config config = TicoConfig("account = 00000000000000000000000000000000");
+    const std::vector<config::Diagnostic> notes = tico::Notes(config, card.files);
+    checks.Expect(notes.size() == 1 && notes[0].severity == config::Severity::kWarning &&
+                      Mentions(notes, kAccountA),
+                  "an account with no folder is a warning that lists the ones there are");
+  }
+  {
+    const config::Config config = TicoConfig("account = legacy");
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, card.files, kFirstTick);
+    checks.Expect(result.saves.size() == 1 &&
+                      result.saves[0].sd_path == "/tico/saves/snes/Old Game.srm",
+                  "legacy reads the layout before 0.8.0 even beside users/: " +
+                      result.DescribeSkipped());
+  }
+}
+
+// --- isolated -----------------------------------------------------------------
+//
+// #238: the systems whose Tico format no libretro core reads. Each syncs under its
+// own `tico-*` id; PPSSPP's per-game folders are a named skip rather than
+// silence; and DuckStation names its cards the way #226 R5 found -- one card for
+// every disc, without the disc tag, and card 2 as `<name>_2.mcd`.
+
+void Isolated(::checks::Checks& checks) {
+  roms::RomIndex index;
+  index.Add(MakeRom(1, "Psx Game", "psx"));
+  index.Add(MakeRom(2, "Two Disc (USA) (Disc 1)", "psx"));
+  index.Add(MakeRom(3, "Two Disc (USA) (Disc 2)", "psx"));
+  index.Add(MakeRom(4, "N64 Game", "n64"));
+  index.Add(MakeRom(5, "Dc Game", "dreamcast"));
+  index.Add(MakeRom(6, "Nds Game", "nds"));
+  index.Add(MakeRom(7, "Saturn Game", "saturn"));
+  index.Add(MakeRom(8, "Psp Game", "psp"));
+  index.Add(MakeRom(9, "Card_2", "psx"));
+  index.Add(MakeRom(10, "Twin (Disc 1)", "psx"));
+  index.Add(MakeRom(11, "Twin (Disc 1)", "psx"));
+  // As RomM strips them: both discs reduce to `Untagged`, which is the card's
+  // name -- an ambiguity by the tag-stripped name, and disc 1's card by
+  // DuckStation's.
+  for (const auto& [id, disc] : {std::pair<std::int64_t, const char*>{12, "Untagged (Disc 1)"},
+                                 std::pair<std::int64_t, const char*>{13, "Untagged (Disc 2)"}}) {
+    roms::Rom rom = MakeRom(id, disc, "psx");
+    rom.fs_name_no_tags = "Untagged";
+    index.Add(rom);
+  }
+
+  const std::string saves = "/tico/saves/users/" + kAccountA;
+  RetroArchCard card("isolated");
+  card.files.AddDirectory("/tico/saves", "users");
+  card.files.AddDirectory("/tico/saves/users", kAccountA);
+  card.Save(saves + "/psx", "Psx Game.mcd");
+  card.Save(saves + "/psx", "Psx Game_2.mcd");
+  card.Save(saves + "/psx", "Two Disc (USA).mcd");
+  card.Save(saves + "/psx", "Two Disc (USA)_2.mcd");
+  card.Save(saves + "/psx", "Card_2.mcd");
+  card.Save(saves + "/psx", "Twin.mcd");
+  card.Save(saves + "/psx", "Nobody_2.mcd");
+  card.Save(saves + "/psx", "Untagged.mcd");
+  card.Save(saves + "/n64", "N64 Game.eep");
+  card.Save(saves + "/n64", "N64 Game.sra");
+  card.Save(saves + "/n64", "N64 Game.fla");
+  card.Save(saves + "/n64", "N64 Game.mpk");
+  card.Save(saves + "/dc", "Dc Game.bin");
+  card.Save(saves + "/nds", "Nds Game.dsv");
+  card.Save(saves + "/saturn", "Saturn Game.bkr");
+  // PPSSPP: one folder per game at the SAVEDATA level, its files inside, and
+  // the module's rotating backups/ beside them.
+  card.Save(saves + "/psp/ULUS10041", "PARAM.SFO");
+  card.Save(saves + "/psp/ULUS10041", "DATA.BIN");
+  card.Save(saves + "/psp/backups", "Psp Game.1");
+  // And a loose file named for the rom, which PPSSPP does not write: still no
+  // PSP save, so nothing goes up under `tico-ppsspp`.
+  card.Save(saves + "/psp", "Psp Game.sav");
+  // The layout before 0.8.0 holds a PSP folder too, and is outside it now.
+  card.Save("/tico/saves/psp/NPJH50505", "DATA.BIN");
+
+  const scan::ScanResult result =
+      scan::ScanSaves(TicoConfig(""), kRetroArchDefaults, index, card.files, kFirstTick);
+
+  struct Row {
+    const char* file;
+    std::int64_t rom_id;
+    const char* emulator;
+    const char* slot;
+  };
+  const Row kRows[] = {
+      {"psx/Psx Game.mcd", 1, "tico-duckstation", "autosave-mcd"},
+      {"psx/Psx Game_2.mcd", 1, "tico-duckstation", "autosave-mcd-card2"},
+      {"psx/Two Disc (USA).mcd", 2, "tico-duckstation", "autosave-mcd"},
+      {"psx/Two Disc (USA)_2.mcd", 2, "tico-duckstation", "autosave-mcd-card2"},
+      {"psx/Card_2.mcd", 9, "tico-duckstation", "autosave-mcd"},
+      {"psx/Untagged.mcd", 12, "tico-duckstation", "autosave-mcd"},
+      {"n64/N64 Game.eep", 4, "tico-mupen64plus", "autosave-eep"},
+      {"n64/N64 Game.sra", 4, "tico-mupen64plus", "autosave-sra"},
+      {"n64/N64 Game.fla", 4, "tico-mupen64plus", "autosave-fla"},
+      {"n64/N64 Game.mpk", 4, "tico-mupen64plus", "autosave-mpk"},
+      {"dc/Dc Game.bin", 5, "tico-flycast", "autosave-bin"},
+      {"nds/Nds Game.dsv", 6, "tico-drastic", "autosave-dsv"},
+      {"saturn/Saturn Game.bkr", 7, "tico-yabasanshiro", "autosave-bkr"},
+  };
+  for (const Row& row : kRows) {
+    const std::string path = saves + "/" + row.file;
+    const scan::SaveFile* save = SaveAt(result, path);
+    if (save == nullptr) {
+      checks.Expect(false, path + " was scanned: " + result.DescribeSkipped());
+      continue;
+    }
+    checks.ExpectEq(save->rom_id, row.rom_id, path + " is its rom's");
+    checks.ExpectEq(save->emulator, std::string(row.emulator), path + "'s emulator id");
+    checks.ExpectEq(save->slot, std::string(row.slot), path + "'s slot");
+  }
+  // Card 2 goes up under the name DuckStation gives it, not the rom's.
+  if (const scan::SaveFile* two = SaveAt(result, saves + "/psx/Two Disc (USA)_2.mcd")) {
+    checks.ExpectEq(two->server_name, std::string("Two Disc (USA)_2.mcd"),
+                    "card 2's upload name is DuckStation's");
+  }
+  checks.ExpectEq(result.saves.size(), std::size_t{13},
+                  "every isolated save, and no PSP file: " + result.DescribeSkipped());
+
+  checks.Expect(SkippedFor(result, saves + "/psp/ULUS10041", scan::SkipReason::kSaveFolder),
+                "a PPSSPP save folder is a named skip: " + result.DescribeSkipped());
+  checks.Expect(SkippedFor(result, "/tico/saves/psp/NPJH50505", scan::SkipReason::kSaveFolder),
+                "and so is one left in the layout before 0.8.0, which is not read either");
+  checks.Expect(SkippedFor(result, saves + "/psp/Psp Game.sav", scan::SkipReason::kSaveFolder),
+                "a loose file in the psp folder is no PSP save either, whatever it is named");
+  checks.Expect(SkippedFor(result, saves + "/psx/Twin.mcd", scan::SkipReason::kAmbiguous),
+                "a card two disc-1 roms could own is not guessed");
+  checks.Expect(SkippedFor(result, saves + "/psx/Nobody_2.mcd", scan::SkipReason::kUnmatched),
+                "a card 2 of no rom is unmatched");
+  checks.ExpectEq(result.skipped_total, std::size_t{5},
+                  "and nothing else -- backups/ is litter, not a save folder: " +
+                      result.DescribeSkipped());
+  for (const scan::Skip& skip : result.skipped) {
+    if (skip.reason == scan::SkipReason::kSaveFolder) {
+      checks.Expect(skip.message.find("PPSSPP") != std::string::npos,
+                    "the skip says whose folder it is: " + skip.message);
+    }
+  }
+  checks.ExpectEq(std::string(scan::ToString(scan::SkipReason::kSaveFolder)),
+                  std::string("save folder"), "and is named for the log");
+
+  // Where #237 places a card for a rom: Tico's name for it.
+  checks.ExpectEq(scan::MemoryCardName("Psx Game", 1), std::string("Psx Game.mcd"),
+                  "card 1 is the rom's name");
+  checks.ExpectEq(scan::MemoryCardName("Two Disc (USA) (Disc 2)", 1),
+                  std::string("Two Disc (USA).mcd"), "without the disc tag: one card per game");
+  checks.ExpectEq(scan::MemoryCardName("Two Disc (USA) (Disc 1)", 2),
+                  std::string("Two Disc (USA)_2.mcd"), "and card 2 is _2");
 }
 
 // --- library ------------------------------------------------------------------
@@ -671,7 +1706,7 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
   const std::unique_ptr<fs::FileSystem> files =
       rommsync::host::MakeNativeFileSystem(sandbox.root().string());
   const config::Config config = config::Defaults();
-  const scan::ScanResult result = scan::ScanSaves(config, fetched.index, *files, kFirstTick);
+  const scan::ScanResult result = scan::ScanSaves(config, kRetroArchDefaults, fetched.index, *files, kFirstTick);
 
   checks.ExpectEq(result.files_seen, static_cast<std::size_t>(5), "every file was looked at");
   checks.ExpectEq(result.saves.size(), static_cast<std::size_t>(4),
@@ -690,10 +1725,10 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
     const char* slot;
   };
   const Expected kExpected[] = {
-      {"240pee.srm", "240pee", "nes", "retroarch", "retroarch-srm"},
-      {"gb240p.srm", "gb240p", "gb", "retroarch", "retroarch-srm"},
-      {"nova.sav", "nova", "nes", "retroarch", "retroarch-sav"},
-      {"240pee_mb.srm", "240pee_mb", "gba", "tico", "tico-srm"},
+      {"240pee.srm", "240pee", "nes", "fceumm", "autosave"},
+      {"gb240p.srm", "gb240p", "gb", "gambatte", "autosave"},
+      {"nova.sav", "nova", "nes", "fceumm", "autosave-sav"},
+      {"240pee_mb.srm", "240pee_mb", "gba", "mgba", "autosave"},
   };
   for (const Expected& expected : kExpected) {
     const scan::SaveFile* save = FindSave(result, expected.file_name);
@@ -712,8 +1747,9 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
     checks.ExpectEq(save->platform_fs_slug, std::string(expected.platform),
                     "the record carries the rom's platform");
     checks.ExpectEq(save->emulator, std::string(expected.emulator),
-                    "and the emulator the folder it came from belongs to");
-    checks.ExpectEq(save->slot, std::string(expected.slot), "and a slot derived from both");
+                    "and the core that writes that platform's saves in that folder");
+    checks.ExpectEq(save->slot, std::string(expected.slot),
+                    "and the shared slot (#236)");
     checks.Expect(save->modified_unix > 0, "and the mtime the card gave up");
     checks.Expect(save->size_bytes > 0, "and its size");
     checks.Expect(save->file_name.find('/') == std::string::npos,
@@ -745,13 +1781,44 @@ void Library(::checks::Checks& checks, http::HttpClient& client, const std::stri
 
   // A second scan of an unchanged card must produce the same slots, or the
   // server sees a new save every tick.
-  const scan::ScanResult again = scan::ScanSaves(config, fetched.index, *files, kFirstTick);
+  const scan::ScanResult again = scan::ScanSaves(config, kRetroArchDefaults, fetched.index, *files, kFirstTick);
   checks.ExpectEq(again.saves.size(), result.saves.size(), "a rescan sees the same saves");
   for (const scan::SaveFile& save : again.saves) {
     const scan::SaveFile* first = FindSave(result, save.file_name);
     checks.Expect(first != nullptr && first->slot == save.slot && first->rom_id == save.rom_id,
                   "and pairs each one with the same (rom_id, slot)");
   }
+
+  // #230, end to end on a real card layout: RetroArch's own file read off the
+  // card, its sorted core folders walked, and the live library's roms matched.
+  Sandbox sorted(checks, "save-scan-retroarch");
+  sorted.MakeDirs("/retroarch/cores/savefiles/Gambatte");
+  sorted.MakeDirs("/retroarch/cores/savefiles/mGBA");
+  sorted.Write("/retroarch/retroarch.cfg",
+               "savefile_directory = \"sdmc:/retroarch/cores/savefiles\"\n"
+               "sort_savefiles_enable = \"true\"\n"
+               "cloud_sync_enable = \"false\"\n");
+  sorted.Write("/retroarch/cores/savefiles/Gambatte/gb240p.srm", "gb sram");
+  sorted.Write("/retroarch/cores/savefiles/mGBA/240pee_mb.srm", "gba sram");
+  sorted.Write("/retroarch/cores/savefiles/240pee.srm", "left from before sorting");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(sorted.root().string());
+  const retroarch::LoadResult cfg = retroarch::Load(card->Resolve(retroarch::kConfigSdPath));
+  checks.Expect(cfg.found && cfg.diagnostics.empty(), "retroarch.cfg is read off the card");
+  const scan::ScanResult cores =
+      scan::ScanSaves(config, cfg.value, fetched.index, *card, kFirstTick);
+  const std::pair<const char*, const char*> kCores[] = {{"gb240p.srm", "gambatte"},
+                                                        {"240pee_mb.srm", "mgba"}};
+  checks.ExpectEq(cores.saves.size(), std::size_t{2}, "the two core folders' saves are found");
+  for (const auto& [file_name, emulator] : kCores) {
+    const scan::SaveFile* save = FindSave(cores, file_name);
+    checks.Expect(save != nullptr && save->emulator == emulator && save->slot == "autosave" &&
+                      fetched.index.ById(save->rom_id) != nullptr,
+                  std::string(file_name) + " is the live rom's, under " + emulator);
+  }
+  checks.Expect(SkippedFor(cores, "/retroarch/cores/savefiles/240pee.srm",
+                           scan::SkipReason::kOutsideLayout),
+                "the loose file is not RetroArch's while it sorts by core");
 }
 
 // --- paging -------------------------------------------------------------------
@@ -767,6 +1834,10 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
     checks.Expect(false, "the fixture library is empty; scan it with provision.py");
     return;
   }
+  // Held for the length of a tick, and a heap term at its bound (M9-19, #217):
+  // sized once from `total`, not doubled past the library as it grows.
+  checks.ExpectEq(all.index.roms().capacity(), all.index.size(),
+                  "the index is reserved to the library it holds, not grown past it");
 
   // The rom the last page holds. A client that reads `items` and stops has the
   // first page only, and this is the save that then never matches.
@@ -778,6 +1849,8 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
   checks.Expect(one_at_a_time.ok(), "a limit of one still fetched: " + one_at_a_time.message);
   checks.ExpectEq(one_at_a_time.index.size(), all.index.size(),
                   "paging by one finds the whole library");
+  checks.ExpectEq(one_at_a_time.index.roms().capacity(), all.index.size(),
+                  "and reserves it from the first page's total rather than page by page");
   checks.Expect(!one_at_a_time.index.truncated(), "and does not stop early");
 
   const roms::Match found =
@@ -853,6 +1926,77 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
   checks.Expect(odd.Find("(USA)", "").matched(), "and the rom is still findable by the other");
 }
 
+// --- grown --------------------------------------------------------------------
+
+/// `GET /api/roms`, answered from a script: each request takes the next body.
+class ScriptedLibrary final : public http::HttpClient {
+ public:
+  explicit ScriptedLibrary(std::vector<std::string> pages) : pages_(std::move(pages)) {}
+
+  http::Result Send(const http::Request&) override {
+    http::Result result;
+    result.response.status = 200;
+    result.response.body = next_ < pages_.size()
+                               ? pages_[next_++]
+                               : std::string(R"({"items":[],"total":0,"limit":1,"offset":0})");
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+ private:
+  std::vector<std::string> pages_;
+  std::size_t next_ = 0;
+};
+
+std::string OneRomPage(std::int64_t id, std::int64_t total, std::int64_t offset) {
+  const std::string name = "game" + std::to_string(id);
+  return R"({"items":[{"id":)" + std::to_string(id) + R"(,"fs_name_no_ext":")" + name +
+         R"(","fs_name_no_tags":")" + name +
+         R"(","platform_fs_slug":"nes","has_multiple_files":false}],"total":)" +
+         std::to_string(total) + R"(,"limit":1,"offset":)" + std::to_string(offset) + "}";
+}
+
+/// The index is reserved once, from the first page's `total`, because it is a
+/// heap term at its bound (M9-19, #217) -- and a library that grows while it is
+/// being read must not grow the index past that reservation. It stops there and
+/// says why, as a library that shrank mid-fetch already does; the next tick
+/// reads the roms that arrived.
+void Grown(::checks::Checks& checks) {
+  roms::FetchOptions options;
+  options.base_url = "http://library.invalid";
+  options.page_size = 1;
+
+  ScriptedLibrary steady({OneRomPage(1, 2, 0), OneRomPage(2, 2, 1)});
+  const roms::FetchResult whole = roms::FetchRomIndex(steady, options);
+  checks.Expect(whole.ok() && !whole.index.truncated(), "a library read whole: " + whole.message);
+  checks.ExpectEq(whole.index.size(), std::size_t{2}, "holds both roms");
+  checks.ExpectEq(whole.index.roms().capacity(), std::size_t{2}, "in exactly the room it needed");
+
+  // Two roms when the fetch started and three by its second page.
+  ScriptedLibrary growing({OneRomPage(1, 2, 0), OneRomPage(2, 3, 1), OneRomPage(3, 3, 2)});
+  const roms::FetchResult grown = roms::FetchRomIndex(growing, options);
+  checks.Expect(grown.ok(), "a library that grew mid-fetch is still an index: " + grown.message);
+  checks.ExpectEq(grown.index.size(), std::size_t{2}, "of the roms there were when it started");
+  checks.ExpectEq(grown.index.roms().capacity(), std::size_t{2}, "and no room past them");
+  checks.Expect(grown.index.truncated(), "which it says is short");
+  checks.Expect(grown.message.find("grew") != std::string::npos,
+                "and why, so an unmatched save names this rather than the library: " +
+                    grown.message);
+
+  // The bound still wins over a larger library.
+  options.max_roms = 1;
+  ScriptedLibrary large({OneRomPage(1, 2, 0), OneRomPage(2, 2, 1)});
+  const roms::FetchResult capped = roms::FetchRomIndex(large, options);
+  checks.ExpectEq(capped.index.size(), std::size_t{1}, "an index stops at max_roms");
+  checks.ExpectEq(capped.index.roms().capacity(), std::size_t{1}, "and reserves no more than it");
+  checks.Expect(capped.index.truncated(), "and says so");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -867,7 +2011,9 @@ int main(int argc, char** argv) {
   rig::Checks checks;
 
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
-      scenario == "unusable" || scenario == "truncated" || scenario == "hashing") {
+      scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
+      scenario == "sources" || scenario == "grown" || scenario == "retroarch" ||
+      scenario == "tico" || scenario == "isolated") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
@@ -878,6 +2024,16 @@ int main(int argc, char** argv) {
       Truncated(checks);
     } else if (scenario == "hashing") {
       Hashing(checks);
+    } else if (scenario == "sources") {
+      Sources(checks);
+    } else if (scenario == "grown") {
+      Grown(checks);
+    } else if (scenario == "retroarch") {
+      RetroArch(checks);
+    } else if (scenario == "tico") {
+      Tico(checks);
+    } else if (scenario == "isolated") {
+      Isolated(checks);
     } else {
       Unusable(checks);
     }

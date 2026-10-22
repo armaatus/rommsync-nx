@@ -1,5 +1,6 @@
 #include "rommsync/ipc.hpp"
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -206,6 +207,7 @@ constexpr SyncResult kAllSyncResults[] = {
     SyncResult::kOk,
     SyncResult::kPartial,
     SyncResult::kFailed,
+    SyncResult::kServerDisabled,
 };
 
 constexpr DownloadState kAllDownloadStates[] = {
@@ -215,7 +217,7 @@ constexpr DownloadState kAllDownloadStates[] = {
 
 constexpr SyncOutcome kAllSyncOutcomes[] = {
     SyncOutcome::kAccepted,      SyncOutcome::kAlreadyRunning, SyncOutcome::kNotConfigured,
-    SyncOutcome::kUnauthenticated, SyncOutcome::kDisabled,
+    SyncOutcome::kUnauthenticated, SyncOutcome::kDisabled,       SyncOutcome::kDeferred,
 };
 
 constexpr WriteOutcome kAllWriteOutcomes[] = {
@@ -234,6 +236,12 @@ constexpr conflicts::RestoreOutcome kAllRestoreOutcomes[] = {
     conflicts::RestoreOutcome::kRestored,      conflicts::RestoreOutcome::kNoSuchEntry,
     conflicts::RestoreOutcome::kNothingToRestore, conflicts::RestoreOutcome::kBackupMissing,
     conflicts::RestoreOutcome::kBackupFailed,  conflicts::RestoreOutcome::kWriteFailed,
+};
+
+constexpr RestorePhase kAllRestorePhases[] = {
+    RestorePhase::kIdle,
+    RestorePhase::kRunning,
+    RestorePhase::kDone,
 };
 
 constexpr config::Severity kAllSeverities[] = {
@@ -506,6 +514,8 @@ const char* ToString(Command command) {
       return "RestoreBackup";
     case Command::kGetLog:
       return "GetLog";
+    case Command::kGetRestoreState:
+      return "GetRestoreState";
   }
   return "Unknown";
 }
@@ -594,6 +604,8 @@ const char* ToString(SyncResult result) {
       return "partial";
     case SyncResult::kFailed:
       return "failed";
+    case SyncResult::kServerDisabled:
+      return "server_disabled";
   }
   return "never";
 }
@@ -626,8 +638,22 @@ const char* ToString(SyncOutcome outcome) {
       return "unauthenticated";
     case SyncOutcome::kDisabled:
       return "disabled";
+    case SyncOutcome::kDeferred:
+      return "deferred";
   }
   return "accepted";
+}
+
+const char* ToString(RestorePhase phase) {
+  switch (phase) {
+    case RestorePhase::kIdle:
+      return "idle";
+    case RestorePhase::kRunning:
+      return "running";
+    case RestorePhase::kDone:
+      return "done";
+  }
+  return "idle";
 }
 
 const char* ToString(WriteOutcome outcome) {
@@ -740,6 +766,8 @@ std::string EncodeStatus(const Status& status) {
   AppendInteger(&out, "failed", status.failed);
   AppendInteger(&out, "queue_depth", status.queue_depth);
   AppendInteger(&out, "config_error_count", status.config_error_count);
+  AppendText(&out, "server_version", status.server_version);
+  AppendBool(&out, "server_supported", status.server_supported);
   AppendKey(&out, "download");
   out += '{';
   AppendText(&out, "state", ToString(status.download.state), /*first=*/true);
@@ -772,7 +800,9 @@ Decoded<Status> DecodeStatus(std::string_view text) {
         !ReadInteger(object, "failed", &out->failed, 0, kMaxCount, error) ||
         !ReadInteger(object, "queue_depth", &out->queue_depth, 0, kMaxQueueDepth, error) ||
         !ReadInteger(object, "config_error_count", &out->config_error_count, 0, kMaxCount,
-                     error)) {
+                     error) ||
+        !ReadText(object, "server_version", &out->server_version, error) ||
+        !ReadBool(object, "server_supported", &out->server_supported, error)) {
       return;
     }
     out->interface = static_cast<std::uint32_t>(interface_version);
@@ -1063,9 +1093,36 @@ Decoded<Cursor> DecodeCursor(std::string_view text) {
                               });
 }
 
-std::string EncodeListPage(const ListPage& page) {
-  std::string out("{");
-  AppendKey(&out, "items", /*first=*/true);
+namespace {
+
+/// What a page encodes to, counted rather than built (#248).
+struct EncodedLength {
+  std::size_t bytes = 0;
+  EncodedLength& operator+=(std::string_view text) {
+    bytes += text.size();
+    return *this;
+  }
+  EncodedLength& operator+=(char) {
+    ++bytes;
+    return *this;
+  }
+};
+
+/// `page` as its wire text, into anything that takes text: the string it is
+/// sent as, or the count that sizes that string and decides whether an item
+/// still fits. One writer for both, so the size a page is judged by is the size
+/// it is sent at.
+template <typename Out>
+void WriteListPage(Out& out, const ListPage& page) {
+  const auto key = [&out](std::string_view name, bool first) {
+    if (!first) {
+      out += ',';
+    }
+    out += json::Quote(name);
+    out += ':';
+  };
+  out += '{';
+  key("items", /*first=*/true);
   out += '[';
   bool first_item = true;
   for (const ListItem& item : page.items) {
@@ -1076,15 +1133,19 @@ std::string EncodeListPage(const ListPage& page) {
     out += '{';
     bool first_field = true;
     for (const ListField& field : item.fields) {
-      AppendKey(&out, field.key, first_field);
+      key(field.key, first_field);
       first_field = false;
       switch (field.value.type) {
         case ListValue::Type::kString:
           out += json::Quote(field.value.text);
           break;
-        case ListValue::Type::kInteger:
-          out += std::to_string(field.value.number);
+        case ListValue::Type::kInteger: {
+          char digits[24];
+          const std::to_chars_result written =
+              std::to_chars(digits, digits + sizeof(digits), field.value.number);
+          out += std::string_view(digits, static_cast<std::size_t>(written.ptr - digits));
           break;
+        }
         case ListValue::Type::kBool:
           out += field.value.flag ? "true" : "false";
           break;
@@ -1093,9 +1154,27 @@ std::string EncodeListPage(const ListPage& page) {
     out += '}';
   }
   out += ']';
-  AppendBool(&out, "has_more", page.has_more);
-  AppendBool(&out, "pending", page.pending);
+  key("has_more", false);
+  out += page.has_more ? "true" : "false";
+  key("pending", false);
+  out += page.pending ? "true" : "false";
   out += '}';
+}
+
+std::size_t EncodedSize(const ListPage& page) {
+  EncodedLength length;
+  WriteListPage(length, page);
+  return length.bytes;
+}
+
+}  // namespace
+
+std::string EncodeListPage(const ListPage& page) {
+  // Reserved to its length, so a page is its text once on its way out rather
+  // than its text doubling there (#248).
+  std::string out;
+  out.reserve(EncodedSize(page));
+  WriteListPage(out, page);
   return out;
 }
 
@@ -1155,7 +1234,10 @@ bool AppendIfItFits(ListPage* page, ListItem item) {
     return false;
   }
   page->items.push_back(std::move(item));
-  if (Fits(EncodeListPage(*page))) {
+  // Counted, not encoded: an encode per append held the page's text as it
+  // doubled past `kMaxPayloadBytes`, ~24 KiB beside the page on the IPC thread
+  // (#248). The count is the encoder's own (`WriteListPage`).
+  if (EncodedSize(*page) <= kMaxPayloadBytes) {
     return true;
   }
   page->items.pop_back();
@@ -1280,12 +1362,32 @@ Decoded<std::int64_t> DecodeEntryId(std::string_view text) {
       });
 }
 
+namespace {
+
+/// The report object, written once for both payloads that carry one.
+void AppendRestoreReport(std::string* out, const conflicts::RestoreReport& report) {
+  *out += '{';
+  AppendText(out, "outcome", conflicts::ToString(report.outcome), /*first=*/true);
+  AppendText(out, "message", report.message);
+  AppendText(out, "backup_sd_path", report.backup_sd_path);
+  *out += '}';
+}
+
+bool ReadRestoreReport(const json::Value& object, conflicts::RestoreReport* out,
+                       json::Error* error) {
+  // Both texts may be empty: a restore that replaced nothing wrote no backup,
+  // and a message is a sentence rather than a field a caller derives from.
+  return ReadEnum(object, "outcome", kAllRestoreOutcomes, conflicts::ToString,
+                  "a restore outcome", &out->outcome, error) &&
+         ReadText(object, "message", &out->message, error) &&
+         ReadText(object, "backup_sd_path", &out->backup_sd_path, error);
+}
+
+}  // namespace
+
 std::string EncodeRestoreReport(const conflicts::RestoreReport& report) {
-  std::string out("{");
-  AppendText(&out, "outcome", conflicts::ToString(report.outcome), /*first=*/true);
-  AppendText(&out, "message", report.message);
-  AppendText(&out, "backup_sd_path", report.backup_sd_path);
-  out += '}';
+  std::string out;
+  AppendRestoreReport(&out, report);
   return out;
 }
 
@@ -1293,16 +1395,36 @@ Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text) {
   return DecodeObject<conflicts::RestoreReport>(
       text, "restore report",
       [](const json::Value& object, conflicts::RestoreReport* out, json::Error* error) {
-        if (!ReadEnum(object, "outcome", kAllRestoreOutcomes, conflicts::ToString,
-                      "a restore outcome", &out->outcome, error)) {
+        ReadRestoreReport(object, out, error);
+      });
+}
+
+std::string EncodeRestoreState(const RestoreState& state) {
+  std::string out("{");
+  AppendText(&out, "phase", ToString(state.phase), /*first=*/true);
+  AppendInteger(&out, "entry_id", state.entry_id);
+  AppendKey(&out, "report");
+  AppendRestoreReport(&out, state.report);
+  out += '}';
+  return out;
+}
+
+Decoded<RestoreState> DecodeRestoreState(std::string_view text) {
+  return DecodeObject<RestoreState>(
+      text, "restore state", [](const json::Value& object, RestoreState* out, json::Error* error) {
+        // `0` is allowed, which is what an idle state is about: a decoder that
+        // refused it would be refusing the one answer that says the sysmodule
+        // restarted.
+        if (!ReadEnum(object, "phase", kAllRestorePhases, ToString, "a restore phase",
+                      &out->phase, error) ||
+            !ReadInteger(object, "entry_id", &out->entry_id, 0, kMaxId, error)) {
           return;
         }
-        // Both may be empty: a restore that replaced nothing wrote no backup,
-        // and a message is a sentence rather than a field a caller derives from.
-        if (!ReadText(object, "message", &out->message, error) ||
-            !ReadText(object, "backup_sd_path", &out->backup_sd_path, error)) {
+        const json::Value* report = ReadObject(object, "report", error);
+        if (report == nullptr) {
           return;
         }
+        ReadRestoreReport(*report, &out->report, error);
       });
 }
 

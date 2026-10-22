@@ -9,7 +9,9 @@
 // The interesting half is the failure scenarios. A downloader that works on the
 // happy path and quietly leaves a half-written rom behind when the connection
 // dies is worse than one that does not work at all, so `drop`, `truncate`,
-// `cancel` and `stall` all assert on what is NOT on disk afterwards.
+// `cancel` and `stall` all assert on what is NOT on disk afterwards. `disk` is
+// the one whose failure is the card's rather than the network's: RomM is real,
+// and the refusal comes from `faulty::Disk` over the backend's own writes.
 //
 // **This file is compiled twice**, and that is the point (M1-7, #126). The
 // scenarios below are the whole of what `core/include/rommsync/http.hpp`
@@ -20,9 +22,14 @@
 // unreachable off a console -- everything a downloader can get wrong is
 // checked, against the same RomM, by the same eighteen scenarios. A second copy
 // of them would have drifted from this one by the second issue.
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <csignal>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -31,6 +38,7 @@
 #include <thread>
 #include <vector>
 
+#include "faulty_disk.hpp"
 #include "loopback_server.hpp"
 #include "rig.hpp"
 
@@ -135,26 +143,89 @@ int Status(http::HttpClient& client, const std::string& base) {
   return checks.failures();
 }
 
-// A JSON POST against the endpoint the device-code flow (M1) actually starts on.
-int PostJson(http::HttpClient& client, const std::string& base) {
-  rig::Checks checks;
-
+/// `POST /api/auth/device/init`, as `post_json` sends it.
+http::Request DeviceInit(const std::string& base, const std::string& identifier) {
   http::Request request;
   request.method = http::Method::kPost;
   request.url = base + "/api/auth/device/init";
   request.headers.push_back({"Content-Type", "application/json"});
-  request.body =
-      R"({"client_device_identifier":"rommsync-nx-http-test","name":"http test",)"
-      R"("client":"rommsync-nx","platform":"switch","client_version":"0.0.0",)"
-      R"("requested_scopes":["me.read"]})";
+  request.body = R"({"client_device_identifier":")" + identifier + R"(","name":"http test",)"
+                 R"("client":"rommsync-nx","platform":"switch","client_version":"0.0.0",)"
+                 R"("requested_scopes":["me.read"]})";
+  return request;
+}
 
-  const http::Result result = client.Send(request);
+/// RomM's device-init window: ten a minute per client IP, counted in a fixed
+/// Redis window that opens on the first init and expires 60 s later
+/// (`AUTHORIZE_RATE_LIMIT` and `RATE_LIMIT_WINDOW_SECONDS` in RomM's
+/// `backend/utils/device_auth.py`, 5.2.0 and 5.4.0 alike). Both are constants,
+/// not settings, and the 429 carries no Retry-After.
+constexpr std::chrono::seconds kInitWindow{60};
+
+/// How long a 429 asks to be left alone: its Retry-After in seconds if it has
+/// one, else the whole of RomM's window -- which, being fixed rather than
+/// sliding, is certain to have rolled over by then. One second over, for the
+/// clocks.
+std::chrono::seconds RetryAfter(const http::Response& refused) {
+  const std::string* header = http::FindHeader(refused.headers, "Retry-After");
+  if (header != nullptr && !header->empty() && header->size() < 6 &&
+      std::all_of(header->begin(), header->end(), [](char c) { return c >= '0' && c <= '9'; })) {
+    return std::chrono::seconds(std::stoi(*header) + 1);
+  }
+  return kInitWindow + std::chrono::seconds(1);
+}
+
+// A JSON POST against the endpoint the device-code flow (M1) actually starts on.
+//
+// The suite reaches that endpoint from one IP, the fault proxy's, and `pair.*`,
+// `device.*` and `engine.*` open codes on it too -- so whether RomM's ten a
+// minute is already spent when this runs is test order and timing (#235's
+// flake, held by `http.post_json_spent`). A 429 is therefore waited out ONCE,
+// for as long as the window it names, and the second answer is held to exactly
+// what the first would have been. Not a retry loop: a second 429 is red.
+int PostJson(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+
+  const http::Request init = DeviceInit(base, "rommsync-nx-http-test");
+  http::Result result = client.Send(init);
+  if (result.ok() && result.response.status == 429) {
+    const std::chrono::seconds wait = RetryAfter(result.response);
+    std::cerr << "  device init is rate limited (429); waiting " << wait.count()
+              << "s for RomM's window, then sending it once more\n";
+    std::this_thread::sleep_for(wait);
+    result = client.Send(init);
+  }
   checks.ExpectOk(result, "POST /api/auth/device/init");
   checks.ExpectEq(result.response.status, 201, "status");
   checks.Expect(!rig::JsonString(result.response.body, "device_code").empty(),
                 "RomM returned a device_code");
   // Nothing approves the code, so it expires on its own and no state leaks.
   return checks.failures();
+}
+
+// RomM allows ten device inits a minute per client IP, and every rig test is
+// one IP: the fault proxy's. `pair.*`, `device.*` and `engine.*` open a code
+// each, so by the time `post_json` runs in a full suite the minute may already
+// be spent -- which is how it failed, intermittently, from #235 on. This is that
+// suite made deterministic: spend the window first, then run `post_json`.
+int PostJsonSpentWindow(http::HttpClient& client, const std::string& base) {
+  rig::Checks checks;
+  constexpr int kInitsPerWindow = 10;  // RomM's AUTHORIZE_RATE_LIMIT
+  bool refused = false;
+  for (int sent = 0; sent <= kInitsPerWindow && !refused; ++sent) {
+    const http::Result spent = client.Send(DeviceInit(base, "rommsync-nx-http-spend"));
+    checks.ExpectOk(spent, "spending the init window");
+    refused = spent.response.status == 429;
+    if (!refused && spent.response.status != 201) {
+      checks.ExpectEq(spent.response.status, 201, "an init inside the window");
+      return checks.failures();
+    }
+  }
+  checks.Expect(refused, "RomM refuses the eleventh init in a minute (docs/AUTH.md)");
+  if (!refused) {
+    return checks.failures();
+  }
+  return checks.failures() + PostJson(client, base);
 }
 
 // A form-urlencoded POST: RomM's token endpoint, which is also how every
@@ -218,7 +289,7 @@ int Download(http::HttpClient& client, const std::string& base, const std::strin
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("download.bin");
@@ -315,7 +386,7 @@ int Range(http::HttpClient& client, const std::string& base, const std::string& 
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful() && reference.response.body.size() > kOffset,
                 "the reference copy is bigger than the offset");
   if (checks.failures() != 0) {
@@ -373,6 +444,65 @@ int Drop(http::HttpClient& client, const std::string& base, const std::string& a
   return checks.failures();
 }
 
+// The card refusing the bytes, named for what it is (M9-13, #202).
+//
+// `faulty::Disk` refuses the `.part`'s writes part way in with the errno a card
+// produces. A full card and a file past FAT32's ceiling are two sentences a
+// user can act on, and everything else is "the card refused" -- so the three
+// arrive as three errors, and none of them leaves a file where the body goes.
+int DiskRefusals(http::HttpClient& client, const std::string& base, const std::string& asset) {
+  rig::Checks checks;
+  const auto refused = [&](int error, http::Error expected, const char* name) {
+    const std::string path = Scratch(std::string("disk-") + name + ".bin");
+    Clear(path);
+    http::Request request;
+    request.url = base + asset;
+    request.timeout = std::chrono::milliseconds{0};
+    http::Result result;
+    {
+      faulty::Disk card({".part", error, 100'000, /*gone=*/false});
+      result = client.Download(request, DownloadTo(path));
+      checks.Expect(card.refusals() > 0, std::string(name) + ": the card refused a write");
+    }
+    checks.ExpectError(result, expected, std::string(name) + ": named for what the card said");
+    checks.Expect(!Exists(path), std::string(name) + ": no file at the destination");
+    Clear(path);
+  };
+  refused(ENOSPC, http::Error::kDiskFull, "full");
+  refused(EFBIG, http::Error::kFileTooLarge, "too-large");
+  refused(EIO, http::Error::kWriteFailed, "eio");
+
+  // Every byte taken, and the commit refused -- `fsdevCommitDevice` on the
+  // console, where a full card's FAT is written. The `errno` is the one the
+  // sync left, and a sync that left none is still an I/O failure: never
+  // "Success", which is what a flush that had gone through used to report.
+  const auto uncommitted = [&](int error, http::Error expected, const char* name,
+                               const char* says) {
+    const std::string path = Scratch(std::string("disk-commit-") + name + ".bin");
+    Clear(path);
+    http::Request request;
+    request.url = base + asset;
+    request.timeout = std::chrono::milliseconds{0};
+    http::Result result;
+    {
+      faulty::SyncRefused card(".part", error);
+      result = client.Download(request, DownloadTo(path));
+      checks.Expect(card.refusals() > 0, std::string(name) + ": the card refused the commit");
+    }
+    checks.ExpectError(result, expected, std::string(name) + ": named for what the sync said");
+    checks.Expect(result.message.find("could not make durable") != std::string::npos,
+                  std::string(name) + ": and says the bytes were not made durable: " +
+                      result.message);
+    checks.Expect(result.message.find(says) != std::string::npos,
+                  std::string(name) + ": with the reason \"" + says + "\": " + result.message);
+    checks.Expect(!Exists(path), std::string(name) + ": no file at the destination");
+    Clear(path);
+  };
+  uncommitted(ENOSPC, http::Error::kDiskFull, "full", std::strerror(ENOSPC));
+  uncommitted(0, http::Error::kWriteFailed, "silent", std::strerror(EIO));
+  return checks.failures();
+}
+
 // The other half of the same story: pick the interrupted download back up.
 int Resume(http::HttpClient& client, const std::string& base, const std::string& asset) {
   rig::Checks checks;
@@ -380,7 +510,7 @@ int Resume(http::HttpClient& client, const std::string& base, const std::string&
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("resume.bin");
@@ -422,7 +552,7 @@ int ResumeWithoutRangeSupport(http::HttpClient& client, const std::string& base)
 
   http::Request reference_request;
   reference_request.url = base + "/api/heartbeat";
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("resume-no-range.bin");
@@ -504,7 +634,7 @@ int ResumeStaleRange(http::HttpClient& client, const std::string& base,
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("resume-stale.bin");
@@ -534,7 +664,7 @@ int RangeExpectedSize(http::HttpClient& client, const std::string& base,
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful() && reference.response.body.size() > kOffset,
                 "the reference copy is bigger than the offset");
   if (checks.failures() != 0) {
@@ -592,7 +722,7 @@ int Truncate(http::HttpClient& client, const std::string& base, const std::strin
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
   const std::uint64_t full_size = reference.response.body.size();
 
@@ -853,6 +983,281 @@ int MultipartGrows(http::HttpClient& client) {
   return checks.failures();
 }
 
+// A buffered body has a ceiling on every backend, declared or not (#248).
+//
+// The wire reserved a declared `Content-Length` up to 256 KiB and past that let
+// the body double its way in, uncapped -- and a page of roms RomM identified on
+// IGDB is ~12 KiB a row, ~750 KiB for 64 of them, which on the console was a
+// `std::terminate`. Past `http::kMaxResponseBytes` a body is `kTooLarge`, which
+// is what lets a pager ask for less (`roms::FetchRomIndex`).
+int TooLarge(http::HttpClient& client) {
+  rig::Checks checks;
+  // A refused body is one the client stops reading, so the server's write meets
+  // a closed socket.
+  std::signal(SIGPIPE, SIG_IGN);
+  constexpr std::size_t kCeiling = http::kMaxResponseBytes;
+  const auto declared = [](std::size_t size) {
+    return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(size) +
+           "\r\nConnection: close\r\n\r\n" + std::string(size, 'd');
+  };
+  const auto chunked = [](std::size_t size) {
+    std::string response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                           "Connection: close\r\n\r\n";
+    const std::string chunk(4096, 'c');
+    for (std::size_t sent = 0; sent < size; sent += chunk.size()) {
+      const std::size_t take = std::min(chunk.size(), size - sent);
+      char line[32];
+      std::snprintf(line, sizeof(line), "%zx\r\n", take);
+      response += line + chunk.substr(0, take) + "\r\n";
+    }
+    return response + "0\r\n\r\n";
+  };
+  struct Case {
+    const char* what;
+    std::string response;
+    bool fits;
+  };
+  const Case cases[] = {
+      {"a declared body at the ceiling", declared(kCeiling), true},
+      {"a declared body past the ceiling", declared(kCeiling + 1), false},
+      {"a declared body well past it", declared(4 * kCeiling), false},
+      {"an undeclared body past the ceiling", chunked(kCeiling + 4096), false},
+  };
+  for (const Case& served : cases) {
+    rig::LoopbackServer server;
+    if (!server.Start(1, [&](int fd, std::size_t, const std::string&) {
+          rig::WriteAll(fd, served.response);
+        })) {
+      std::cerr << "  could not start the loopback server\n";
+      return 1;
+    }
+    http::Request request;
+    request.url = server.origin() + "/api/roms";
+    const http::Result result = client.Send(request);
+    server.Stop();
+    if (served.fits) {
+      checks.ExpectOk(result, served.what);
+      checks.ExpectEq(result.response.body.size(), kCeiling,
+                      std::string(served.what) + " arrives whole");
+    } else {
+      checks.ExpectEq(static_cast<int>(result.error), static_cast<int>(http::Error::kTooLarge),
+                      std::string(served.what) + " is refused as too large: " + result.message);
+      checks.Expect(result.response.body.empty(),
+                    std::string(served.what) + " and hands back none of it");
+    }
+  }
+  return checks.failures();
+}
+
+#ifdef ROMMSYNC_TEST_WIRE_BACKEND
+// What the wire client asks of a connection per read, which on the console is
+// what it asks of the `ssl` service per IPC round trip (M9-10, #201).
+//
+// Wire-only, because libcurl has no `Connector` to observe and its chunk is not
+// ours. The connection underneath is the shipping `PlainConnector` against the
+// real rig; this only watches the sizes go past.
+class RecordingConnection final : public rommsync::sysmodule::Connection {
+ public:
+  RecordingConnection(std::unique_ptr<Connection> inner, std::size_t* asked,
+                      std::size_t* filled)
+      : inner_(std::move(inner)), asked_(asked), filled_(filled) {}
+
+  rommsync::sysmodule::IoResult Write(const void* data, std::size_t size,
+                                      std::chrono::milliseconds timeout) override {
+    return inner_->Write(data, size, timeout);
+  }
+
+  rommsync::sysmodule::IoResult Read(void* data, std::size_t size,
+                                     std::chrono::milliseconds timeout) override {
+    *asked_ = std::max(*asked_, size);
+    const rommsync::sysmodule::IoResult io = inner_->Read(data, size, timeout);
+    if (io.status == rommsync::sysmodule::IoStatus::kOk) {
+      *filled_ = std::max(*filled_, io.transferred);
+    }
+    return io;
+  }
+
+ private:
+  std::unique_ptr<Connection> inner_;
+  std::size_t* asked_;
+  std::size_t* filled_;
+};
+
+class RecordingConnector final : public rommsync::sysmodule::Connector {
+ public:
+  std::unique_ptr<rommsync::sysmodule::Connection> Open(
+      const rommsync::sysmodule::Origin& origin, std::chrono::milliseconds connect_timeout,
+      const http::ClientOptions& options, http::Error* error, std::string* message) override {
+    std::unique_ptr<rommsync::sysmodule::Connection> inner =
+        plain_.Open(origin, connect_timeout, options, error, message);
+    if (inner == nullptr) return nullptr;
+    return std::make_unique<RecordingConnection>(std::move(inner), &largest_asked,
+                                                 &largest_filled);
+  }
+
+  void Reset() { largest_asked = largest_filled = 0; }
+
+  std::size_t largest_asked = 0;
+  std::size_t largest_filled = 0;
+
+ private:
+  rig::TcpConnector plain_;
+};
+
+// A download reads in chunks the size of the socket's receive window, and an
+// API call keeps the small buffer.
+//
+// The expected sizes are written out rather than read from `http_wire.hpp`, so
+// that this is a statement about the wire and not the header agreeing with
+// itself: 64 KiB is `SocketBudget::tcp_rx_buf_max_size`, the most a single read
+// can find waiting (`sysmodule/source/main.cpp`), and 16 KiB is what an API
+// exchange -- the pairing thread's, concurrently with a download -- costs.
+int Chunk(const std::string& base, const std::string& asset) {
+  rig::Checks checks;
+  constexpr std::size_t kDownloadChunk = 64 * 1024;
+  constexpr std::size_t kApiChunk = 16 * 1024;
+
+  RecordingConnector connector;
+  const std::unique_ptr<http::HttpClient> client =
+      rig::Own(rommsync::sysmodule::MakeWireHttpClient(connector));
+
+  http::Request request;
+  request.url = base + asset;
+  // Whole through `Download`, since `Send` holds no body that large (#248); the
+  // API read size is then watched on a slice of it that `Send` does hold.
+  const http::Result reference = rig::Whole(*client, request);
+  checks.ExpectOk(reference, "the reference copy");
+  checks.Expect(reference.response.body.size() > 4 * kDownloadChunk,
+                "the asset is several download chunks long, so the sizes below mean something");
+  connector.Reset();
+  http::Request slice = request;
+  slice.range_start = reference.response.body.size() - 100 * 1024;
+  checks.ExpectOk(client->Send(slice), "a slice of it, over Send");
+  checks.ExpectEq(connector.largest_asked, kApiChunk, "Send reads in 16 KiB");
+
+  connector.Reset();
+  const std::string path = Scratch("chunk.bin");
+  Clear(path);
+  request.timeout = std::chrono::milliseconds{0};  // bounded by stall_timeout
+  const http::Result result = client->Download(request, DownloadTo(path));
+  checks.ExpectOk(result, "download");
+  checks.ExpectEq(rig::ReadFile(path), reference.response.body, "file contents");
+  checks.ExpectEq(connector.largest_asked, kDownloadChunk, "Download reads in 64 KiB");
+  // Asking is not the same as using: a buffer that is allocated at 64 KiB and
+  // handed to `Read` as 16 would pass the line above on a recording that lied.
+  checks.Expect(connector.largest_filled > kApiChunk,
+                "at least one download read came back larger than the old 16 KiB");
+  return checks.failures();
+}
+
+// An API body is held in exactly the room its `Content-Length` declared (M9-19,
+// #217). Appended a 16 KiB read at a time, a `std::string` doubles its way past
+// the body -- up to twice it held, and three times while the last reallocation
+// has both buffers live -- and the heap table budgets every buffered response at
+// its text, once.
+int Reserved(http::HttpClient& client, const std::string& base, const std::string& asset) {
+  rig::Checks checks;
+  // Several reads long and well under the reservation's ceiling, and an exact
+  // size the body has to arrive at, so the room it was given is checkable.
+  constexpr std::size_t kBody = 100 * 1024;
+  http::Request request;
+  request.url = base + asset;
+  const http::Result whole = rig::Whole(client, request);
+  checks.Expect(whole.successful() && whole.response.body.size() > kBody,
+                "the asset is longer than the slice asked for");
+  if (checks.failures() != 0) {
+    return checks.failures();
+  }
+  // The wire writes `Range` itself from `range_start` and drops one passed as a
+  // header, so the slice is the asset's last `kBody` bytes.
+  request.range_start = whole.response.body.size() - kBody;
+  const http::Result result = client.Send(request);
+  checks.ExpectOk(result, "a ranged GET over Send");
+  checks.ExpectEq(result.response.status, 206, "answered as a slice");
+  checks.ExpectEq(result.response.body.size(), kBody, "the range, whole");
+  checks.Expect(result.response.body.capacity() < kBody + 64,
+                "held in the room it declared, not grown past it (capacity " +
+                    std::to_string(result.response.body.capacity()) + " for " +
+                    std::to_string(kBody) + " bytes)");
+  return checks.failures();
+}
+
+// An API body that declares no length -- chunked, or ended by the close -- has
+// nothing to reserve, so it grows; and nothing used to stop it growing (M9-20,
+// #246). RomM behind its own nginx always declares one, but a reverse proxy in
+// front of it may not, and a body that doubles its way in costs up to three
+// times its text while the last reallocation has both buffers live. So such a
+// body is held to a cap whose worst case fits the heap row every response is
+// counted under, and one past it is refused rather than grown into.
+//
+// A loopback server, for `RedirectCredentials`'s reason: RomM cannot be asked to
+// answer without a `Content-Length`.
+int Undeclared(http::HttpClient& client) {
+  rig::Checks checks;
+  // Comfortably under the cap, and comfortably over it.
+  constexpr std::size_t kFits = 100 * 1024;
+  constexpr std::size_t kOver = 200 * 1024;
+  const auto chunked = [](std::size_t size) {
+    std::string response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                           "Connection: close\r\n\r\n";
+    const std::string chunk(4096, 'c');
+    for (std::size_t sent = 0; sent < size; sent += chunk.size()) {
+      const std::size_t take = std::min(chunk.size(), size - sent);
+      char line[32];
+      std::snprintf(line, sizeof(line), "%zx\r\n", take);
+      response += line + chunk.substr(0, take) + "\r\n";
+    }
+    return response + "0\r\n\r\n";
+  };
+  const auto until_close = [](std::size_t size) {
+    return "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + std::string(size, 'u');
+  };
+  struct Case {
+    const char* what;
+    std::string response;
+    std::size_t size;
+    bool fits;
+  };
+  const Case cases[] = {
+      {"a chunked body under the cap", chunked(kFits), kFits, true},
+      {"a chunked body past the cap", chunked(kOver), kOver, false},
+      {"a close-delimited body under the cap", until_close(kFits), kFits, true},
+      {"a close-delimited body past the cap", until_close(kOver), kOver, false},
+  };
+  for (const Case& served : cases) {
+    rig::LoopbackServer server;
+    if (!server.Start(1, [&](int fd, std::size_t, const std::string&) {
+          rig::WriteAll(fd, served.response);
+        })) {
+      std::cerr << "  could not start the loopback server\n";
+      return 1;
+    }
+    http::Request request;
+    request.url = server.origin() + "/api/platforms";
+    const http::Result result = client.Send(request);
+    server.Stop();
+    if (served.fits) {
+      checks.ExpectOk(result, served.what);
+      checks.ExpectEq(result.response.body.size(), served.size,
+                      std::string(served.what) + " arrives whole");
+      // At most twice what it holds: grown in powers of two, never past the cap.
+      checks.Expect(result.response.body.capacity() < 2 * served.size,
+                    std::string(served.what) + " is held in less than twice its text (capacity " +
+                        std::to_string(result.response.body.capacity()) + ")");
+    } else {
+      checks.Expect(!result.ok(), std::string(served.what) + " is refused");
+      checks.ExpectEq(static_cast<int>(result.error), static_cast<int>(http::Error::kTooLarge),
+                      std::string(served.what) + " as too large (#248)");
+      checks.Expect(result.message.find("Content-Length") != std::string::npos,
+                    std::string(served.what) + " says why: " + result.message);
+      checks.Expect(result.response.body.empty(),
+                    std::string(served.what) + " and hands back none of it");
+    }
+  }
+  return checks.failures();
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -891,7 +1296,9 @@ int main(int argc, char** argv) {
   if (scenario == "download" || scenario == "range" || scenario == "drop" ||
       scenario == "resume" || scenario == "truncate" || scenario == "cancel" ||
       scenario == "resume_empty_body" || scenario == "resume_stale_range" ||
-      scenario == "range_expected_size" || scenario == "progress") {
+      scenario == "range_expected_size" || scenario == "progress" || scenario == "chunk" ||
+      scenario == "reserved" ||
+      scenario == "disk") {
     asset = rig::DiscoverLargeAsset(*client, base);
     if (asset.empty()) {
       std::cerr << "could not find a large asset to stream from " << base << "\n";
@@ -906,6 +1313,8 @@ int main(int argc, char** argv) {
     failures = Status(*client, base);
   } else if (scenario == "post_json") {
     failures = PostJson(*client, base);
+  } else if (scenario == "post_json_spent") {
+    failures = PostJsonSpentWindow(*client, base);
   } else if (scenario == "post_form") {
     failures = PostForm(*client, base);
   } else if (scenario == "multipart") {
@@ -916,6 +1325,8 @@ int main(int argc, char** argv) {
     failures = Progress(*client, base, asset);
   } else if (scenario == "range") {
     failures = Range(*client, base, asset);
+  } else if (scenario == "disk") {
+    failures = DiskRefusals(*client, base, asset);
   } else if (scenario == "drop") {
     failures = Drop(*client, base, asset);
   } else if (scenario == "resume") {
@@ -940,6 +1351,16 @@ int main(int argc, char** argv) {
     failures = RedirectCredentials(*client);
   } else if (scenario == "multipart_grows") {
     failures = MultipartGrows(*client);
+  } else if (scenario == "too_large") {
+    failures = TooLarge(*client);
+#ifdef ROMMSYNC_TEST_WIRE_BACKEND
+  } else if (scenario == "chunk") {
+    failures = Chunk(base, asset);
+  } else if (scenario == "reserved") {
+    failures = Reserved(*client, base, asset);
+  } else if (scenario == "undeclared") {
+    failures = Undeclared(*client);
+#endif
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

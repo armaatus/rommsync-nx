@@ -10,6 +10,12 @@ It compares *shape*, not values: field names, nesting, and JSON types, plus the
 `action`/`reason` pairs each negotiate scenario is named for. Ids, timestamps and
 the per-run slot names differ every run and say nothing about the contract.
 
+Which captures depends on which RomM the rig runs (#227): ROMM_VERSION, from the
+environment or else .env. 5.2.0's are server/contract/captures/ itself, kept as
+history; every later version's are server/contract/captures/<version>/. The
+server is asked its version too, and a rig running some other RomM is a failure,
+not drift: comparing against the wrong snapshot proves nothing either way.
+
 Exit codes: 0 pass, 1 drift, 77 skipped (CTest's SKIP_RETURN_CODE) when the rig
 is not up or not provisioned.
 """
@@ -48,6 +54,16 @@ def read_env(path: str) -> dict:
             )
     except OSError:
         return {}
+
+
+# The version server/contract/captures/ itself was captured from. Every other
+# version's captures live in a subdirectory named after it.
+ROOT_CAPTURES_VERSION = "5.2.0"
+
+
+def captures_dir(repo: str, version: str) -> str:
+    root = os.path.join(repo, "server", "contract", "captures")
+    return root if version == ROOT_CAPTURES_VERSION else os.path.join(root, version)
 
 
 def shape(obj):
@@ -109,8 +125,8 @@ def main() -> int:
     ap.add_argument("--scratch", required=True)
     args = ap.parse_args()
 
-    committed = os.path.join(args.repo, "server", "contract", "captures")
     env = read_env(os.path.join(args.repo, ".env"))
+    expected = os.environ.get("ROMM_VERSION") or env.get("ROMM_VERSION")
     base = env.get("ROMM_BASE_URL")
     fixture_auth = os.path.join(args.repo, "server", "testing", "fixture-auth.env")
 
@@ -122,10 +138,24 @@ def main() -> int:
         return SKIP
     try:
         with urllib.request.urlopen(f"{base}/api/heartbeat", timeout=5) as r:
-            r.read(1)
-    except (urllib.error.URLError, OSError) as exc:
+            heartbeat = json.load(r)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"RomM at {base} is not answering ({exc}) -- skipping")
         return SKIP
+    running = (heartbeat.get("SYSTEM") or {}).get("VERSION")
+    # A .env older than ROMM_VERSION names nothing; the server is then the only
+    # word on which captures apply, which is better than guessing a default
+    # that #235 is about to move.
+    version = expected or running
+    committed = captures_dir(args.repo, version)
+    if running != version:
+        print(f"RomM at {base} is {running}, and this run expects {version} (ROMM_VERSION).\n"
+              f"Recreate the stack for {version} (docs/TESTING.md#choosing-the-romm-version), "
+              f"or set ROMM_VERSION to what is running.")
+        return 1
+    if not os.path.isdir(committed):
+        print(f"no captures for RomM {version}: {committed} does not exist")
+        return 1
 
     python = venv_python(args.repo)
     # Empty first: a leftover file from a previous run would stand in for one the
@@ -178,11 +208,11 @@ def main() -> int:
             print(f"  {p}")
         print(f"\nRe-capture with:\n  . ./.env && {python} server/probe_contract.py "
               f'--url "$ROMM_BASE_URL" --auth --negotiate --sync-scenarios '
-              f"--capture server/contract/captures\n"
+              f"--capture {os.path.relpath(committed, args.repo)}\n"
               f"and update the docs that quote them before trusting the new shapes.")
         return 1
 
-    print(f"{len(names)} capture(s) still match {base}")
+    print(f"{len(names)} capture(s) for RomM {version} still match {base}")
     return 0
 
 

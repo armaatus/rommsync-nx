@@ -35,6 +35,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/list_service.hpp"
+#include "rommsync/rom_index.hpp"
 
 namespace config = rommsync::config;
 namespace download = rommsync::download;
@@ -200,8 +201,11 @@ Walk WalkList(Console& console, const ipc::ListRequest& request, ipc::Cursor* ke
 
 /// One rom, as `GET /api/roms` would send it.
 std::string RomJson(std::int64_t id, const std::string& name, const std::string& fs_name) {
+  const std::string stem = fs_name.substr(0, fs_name.rfind('.'));
   return "{\"id\":" + std::to_string(id) + ",\"name\":" + rommsync::json::Quote(name) +
          ",\"fs_name\":" + rommsync::json::Quote(fs_name) +
+         ",\"fs_name_no_ext\":" + rommsync::json::Quote(stem) +
+         ",\"fs_name_no_tags\":" + rommsync::json::Quote(stem) +
          ",\"platform_fs_slug\":\"gba\",\"fs_size_bytes\":4096,\"has_multiple_files\":false}";
 }
 
@@ -223,6 +227,19 @@ class FakeClient : public http::HttpClient {
   /// that lost a rom between two requests looks like from here.
   void OverCount(std::size_t total) { over_count_ = total; }
 
+  /// Refuse a page of more than `rows` roms as too large, and any page holding
+  /// the rom at `wide` and more than `wide_rows` rows -- by default however few
+  /// it has -- the transport's ceiling (`http::kMaxResponseBytes`) meeting rows
+  /// RomM made wide (#248).
+  void Ceiling(std::size_t rows, std::size_t wide = static_cast<std::size_t>(-1),
+               std::size_t wide_rows = 0) {
+    ceiling_rows_ = rows;
+    wide_ = wide;
+    wide_rows_ = wide_rows;
+  }
+
+  std::vector<std::size_t> limits;  ///< every page size asked for, in order
+
   http::Result Send(const http::Request& request) override {
     ++requests;
     last_url = request.url;
@@ -234,6 +251,14 @@ class FakeClient : public http::HttpClient {
     }
     const std::size_t limit = static_cast<std::size_t>(Query(request.url, "limit", 10));
     const std::size_t offset = static_cast<std::size_t>(Query(request.url, "offset", 0));
+    limits.push_back(limit);
+    if (limit > ceiling_rows_ || (wide_ >= offset && wide_ < offset + limit && limit > wide_rows_)) {
+      http::Result refused;
+      refused.error = http::Error::kTooLarge;
+      refused.response.status = 200;
+      refused.message = "past the ceiling";
+      return refused;
+    }
 
     std::string items;
     for (std::size_t index = offset; index < library_.size() && index - offset < limit; ++index) {
@@ -274,6 +299,9 @@ class FakeClient : public http::HttpClient {
   std::vector<std::pair<std::string, std::string>> library_;
   std::string platforms_ = "[]";
   std::size_t over_count_ = 0;
+  std::size_t ceiling_rows_ = static_cast<std::size_t>(-1);
+  std::size_t wide_ = static_cast<std::size_t>(-1);
+  std::size_t wide_rows_ = 0;
 };
 
 /// A client that answers nothing and records that it was asked.
@@ -591,6 +619,96 @@ void Cursors(checks::Checks& c) {
   c.Expect(second != first, "and never carries the reclaimed one's id");
 }
 
+/// What the service holds between pumps: **one** platform snapshot and **one**
+/// built rom page, however many cursors are open (M9-20, #246).
+///
+/// Each is 40-50 KiB on aarch64 and both are held beside a sync tick, so at
+/// `kMaxCursors` of each they were the heap's largest row nobody had written.
+/// The overlay has one list on screen at a time, so the cost of the rule is a
+/// refetch on a cursor nobody is looking at -- which is what is checked here: a
+/// cursor whose snapshot or page went to another one answers `pending` and
+/// fetches again, from the offset it had, rather than failing.
+void Held(checks::Checks& c) {
+  config::Config configuration = config::Defaults();
+  configuration.server.url = "http://127.0.0.1:1";
+  download::Queue queue;
+  lists::Service service(lists::Service::FixedConfig(configuration), queue);
+  FakeClient client({{"Alpha", "Alpha.gba"}, {"Beta", "Beta.gba"}, {"Gamma", "Gamma.gba"}});
+  client.SetPlatforms(
+      R"([{"id":1,"fs_slug":"gba","name":"Game Boy Advance","rom_count":3},)"
+      R"({"id":2,"fs_slug":"nes","name":"Nintendo Entertainment System","rom_count":0}])");
+  service.UseServer(&client, "fixture-token");
+
+  // A page that needs the network: asked, pumped, and asked again for what landed.
+  const auto open = [&](ipc::ListKind kind, std::int32_t page_size) {
+    ipc::ListRequest request;
+    request.kind = kind;
+    request.page_size = page_size;
+    ipc::Cursor cursor = 0;
+    c.ExpectEq(static_cast<int>(service.ListBegin(request, &cursor)),
+               static_cast<int>(ipc::Error::kOk), "a cursor opens");
+    return cursor;
+  };
+  const auto next = [&](ipc::Cursor cursor) {
+    ipc::ListPage page;
+    c.ExpectEq(static_cast<int>(service.ListNext(cursor, &page)),
+               static_cast<int>(ipc::Error::kOk), "a page is answered");
+    return page;
+  };
+
+  // Two platform lists, each with its snapshot in hand.
+  const ipc::Cursor first = open(ipc::ListKind::kPlatforms, 1);
+  c.Expect(next(first).pending, "the first platform list fetches");
+  c.Expect(service.Pump(), "and the worker fetches it");
+  const ipc::ListPage first_page = next(first);
+  c.Expect(!first_page.pending && first_page.items.size() == 1 && first_page.has_more,
+           "its first page comes out of the snapshot");
+  const int after_first = client.requests;
+
+  const ipc::Cursor second = open(ipc::ListKind::kPlatforms, 1);
+  c.Expect(next(second).pending, "the second platform list fetches");
+  c.Expect(service.Pump(), "and the worker fetches it");
+  c.Expect(!next(second).pending, "its page comes out of its own snapshot");
+
+  // The first gave its snapshot up when the second's fetch began.
+  const ipc::ListPage refetch = next(first);
+  c.Expect(refetch.pending, "a platform list whose snapshot went to another one fetches again");
+  c.Expect(service.Pump(), "which the worker does");
+  const ipc::ListPage resumed = next(first);
+  c.Expect(!resumed.pending && resumed.items.size() == 1,
+           "and it answers its next page from the new snapshot");
+  if (!resumed.items.empty() && !first_page.items.empty()) {
+    c.Expect(Number(resumed.items.front(), keys::kPlatformId) !=
+                 Number(first_page.items.front(), keys::kPlatformId),
+             "from where it was, not from the top");
+  }
+  c.ExpectEq(client.requests, after_first + 2,
+             "one request for the second list and one for the first's refetch");
+
+  // Two rom lists, each with a built page waiting that nobody has taken.
+  const ipc::Cursor roms_a = open(ipc::ListKind::kRoms, 1);
+  c.Expect(next(roms_a).pending, "a rom list fetches");
+  c.Expect(service.Pump(), "and its page is built");
+  const ipc::Cursor roms_b = open(ipc::ListKind::kRoms, 1);
+  c.Expect(next(roms_b).pending, "a second rom list fetches");
+  c.Expect(service.Pump(), "and its page is built too");
+  const int before_take = client.requests;
+  const ipc::ListPage taken_b = next(roms_b);
+  c.Expect(!taken_b.pending && taken_b.items.size() == 1, "the second's page is handed over");
+
+  // The first's built page was dropped when the second's fetch began, so its
+  // next page is fetched again -- and it is still its *first* page.
+  c.Expect(next(roms_a).pending, "a rom list whose built page went unclaimed fetches again");
+  c.Expect(service.Pump(), "which the worker does");
+  const ipc::ListPage taken_a = next(roms_a);
+  c.Expect(!taken_a.pending && taken_a.items.size() == 1, "and the page arrives");
+  if (!taken_a.items.empty()) {
+    c.ExpectEq(Number(taken_a.items.front(), keys::kRomId), std::int64_t{1},
+               "starting where the dropped page did");
+  }
+  c.ExpectEq(client.requests, before_take + 1, "for exactly one more request");
+}
+
 /// The `queue` kind: served off the card, and never over the network.
 void QueueList(checks::Checks& c) {
   Console console(c, "lists-queue");
@@ -765,6 +883,155 @@ std::int64_t LibraryTotal(http::HttpClient& client, const harness::Fixture& fixt
   }
   const std::string total = rig::JsonNumber(result.response.body, "total");
   return total.empty() ? -1 : std::strtoll(total.c_str(), nullptr, 10);
+}
+
+/// A page past the transport's ceiling is asked for again at half the rows (#248).
+///
+/// `http::kMaxResponseBytes` refuses a body RomM made too large -- a page of
+/// roms it identified on IGDB is ~12 KiB a row -- and the two readers that page
+/// `/api/roms` are the two that can do something about it: ask for fewer.
+void TooLarge(checks::Checks& c) {
+  std::vector<std::pair<std::string, std::string>> library;
+  for (int index = 0; index < 40; ++index) {
+    library.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
+  }
+
+  // The rom index, which pages the whole library on every tick.
+  {
+    FakeClient client(library);
+    client.Ceiling(7);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.ok() && !fetched.index.truncated(),
+             "a library whose pages are past the ceiling is still indexed: " + fetched.message);
+    c.ExpectEq(fetched.index.size(), library.size(), "every rom, at the smaller page");
+    // 64, 32, 16 and 8 refused, ten pages of 4, and a page of 8 asked for again
+    // after one, two and four of them -- each refused, so each waits twice as
+    // long as the one before: a library wide everywhere is not asked for a page
+    // too large on every other request.
+    c.Expect(client.limits.size() >= 2 && client.limits[1] == client.limits[0] / 2 &&
+                 client.limits.back() <= 7,
+             "asking for half as many rows each time a page is refused");
+    c.Expect(client.requests <= 40 / 4 + 4 + 6,
+             "and for more again only now and then: " + std::to_string(client.requests));
+  }
+
+  // One rom too wide to come back even alone: left out and said so, the rest read.
+  {
+    FakeClient client(library);
+    client.Ceiling(64, 12);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.ok(), "one rom too large to read does not fail the index: " + fetched.message);
+    c.ExpectEq(fetched.index.size(), library.size() - 1, "every other rom is indexed");
+    c.Expect(fetched.index.ById(13) == nullptr && fetched.index.ById(14) != nullptr,
+             "and the one past the ceiling is the one left out");
+    c.Expect(fetched.index.truncated() && !fetched.message.empty(),
+             "which reads as an index that is not whole, and says why: " + fetched.message);
+  }
+
+  std::vector<std::pair<std::string, std::string>> large;
+  for (int index = 0; index < 400; ++index) {
+    large.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
+  }
+
+  // ...and past it the page grows back. A rom too wide to read alone halves the
+  // page down to one row on the way to it; kept there, a library of 1,024 is a
+  // request a rom and the page cap ends it a quarter of the way through, every
+  // tick -- the saves of the rest unmatched.
+  {
+    FakeClient client(large);
+    client.Ceiling(64, 1);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.ExpectEq(fetched.index.size(), large.size() - 1,
+               "every rom but the one too large to read: " + fetched.message);
+    c.Expect(fetched.index.ById(2) == nullptr && fetched.index.ById(400) != nullptr,
+             "the one left out is the one at offset 1, and the library is read to its end");
+    // The pages at the size asked for, the halvings down to the rom, and its own.
+    c.Expect(client.requests <= 400 / 64 + 1 + 2 * 7,
+             "in about as many requests as the library at full pages: " +
+                 std::to_string(client.requests));
+  }
+
+  // The same for a rom wide enough to halve the page but that fits in a short
+  // one -- RetroAchievements metadata grows a row by the achievement. Nothing is
+  // left out, so nothing marks the place to grow back from but the pages after.
+  {
+    FakeClient client(large);
+    client.Ceiling(64, 1, 2);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.ok() && !fetched.index.truncated(),
+             "a rom that fits a short page leaves the index whole: " + fetched.message);
+    c.ExpectEq(fetched.index.size(), large.size(), "every rom");
+    c.Expect(client.requests <= 400 / 64 + 2 * 7,
+             "and the pages after it are full again: " + std::to_string(client.requests));
+  }
+
+  // A refused page is not counted as a page, and is still counted: a server
+  // that refuses every one ends the fetch rather than the tick.
+  {
+    FakeClient client(library);
+    client.Ceiling(0);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.index.truncated() && fetched.index.size() == 0,
+             "a server that refuses every page is an empty index that says so: " +
+                 fetched.message);
+    c.Expect(client.requests <= 256, "in a bounded number of requests: " +
+                                         std::to_string(client.requests));
+  }
+
+  // The browser's rom list.
+  {
+    Console console(c, "lists-too-large");
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   ConfigWith("http://127.0.0.1:1")),
+             "a config with a server on it");
+    console.Boot();
+    FakeClient client(library);
+    client.Ceiling(5);
+    console.engine.UseServer(&client, "fixture-token");
+    ipc::ListRequest request;
+    request.kind = ipc::ListKind::kRoms;
+    request.page_size = ipc::kMaxPageSize;
+    const Walk walk = WalkList(console, request);
+    c.ExpectEq(static_cast<int>(walk.error), static_cast<int>(ipc::Error::kOk),
+               "a list whose pages are past the ceiling still pages");
+    c.ExpectEq(walk.items.size(), library.size(), "every rom, at the smaller page");
+  }
+
+  // ...and one rom too large to come back alone is stepped past, not asked for
+  // again on every page after it.
+  {
+    Console console(c, "lists-too-large-one");
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   ConfigWith("http://127.0.0.1:1")),
+             "a config with a server on it");
+    console.Boot();
+    FakeClient client(library);
+    client.Ceiling(64, 12);
+    console.engine.UseServer(&client, "fixture-token");
+    ipc::ListRequest request;
+    request.kind = ipc::ListKind::kRoms;
+    request.page_size = 8;
+    const Walk walk = WalkList(console, request);
+    c.ExpectEq(static_cast<int>(walk.error), static_cast<int>(ipc::Error::kOk),
+               "a list with one rom past the ceiling still pages");
+    c.ExpectEq(walk.items.size(), library.size() - 1, "every other rom, once");
+    std::set<std::int64_t> seen;
+    for (const ipc::ListItem& item : walk.items) {
+      seen.insert(Number(item, keys::kRomId));
+    }
+    c.Expect(seen.size() == library.size() - 1 && seen.count(13) == 0,
+             "and the one stepped past is the one too large");
+  }
 }
 
 /// Paging the seeded library, and the two lists that come off it.
@@ -1063,6 +1330,10 @@ int main(int argc, char** argv) {
     Cursors(checks);
   } else if (scenario == "queue") {
     QueueList(checks);
+  } else if (scenario == "held") {
+    Held(checks);
+  } else if (scenario == "too_large") {
+    TooLarge(checks);
   } else if (scenario == "library") {
     code = Library(checks);
   } else if (scenario == "faults") {

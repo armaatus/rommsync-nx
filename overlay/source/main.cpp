@@ -18,6 +18,12 @@
 // the status screen draws (`overlay_status_view.hpp`), not a reason for the
 // overlay to fail to load.
 //
+// **The hooks are `Lifecycle`'s, not this file's** (M9-6, #209): what start,
+// show and every exit path do is in `lifecycle.cpp`, where `ctest -R
+// overlay.cycles` drives each path libtesla's loop has and balances what it
+// gave back. This class only forwards -- and `overlay.cycles` greps that it
+// does, so a hook that grew logic of its own here would be logic nothing runs.
+//
 // Nothing in this directory has ever run. Overlay UI is one of the few things an
 // emulator cannot exercise, so it is verified last, on hardware, after the M8-1
 // gate; overlay/README.md carries the script that does it.
@@ -28,9 +34,14 @@
 #include <memory>
 
 #include "ipc_client.hpp"
+#include "lifecycle.hpp"
 #include "status_screen.hpp"
 
 namespace {
+
+/// `tsl::hlp::requestForeground` with its second argument left at its default,
+/// in the shape `Lifecycle::Foreground` takes.
+void RequestForeground(bool enabled) { tsl::hlp::requestForeground(enabled); }
 
 class RommsyncOverlay : public tsl::Overlay {
  public:
@@ -38,13 +49,24 @@ class RommsyncOverlay : public tsl::Overlay {
     return initially<rommsync::overlay::StatusScreen>(client_);
   }
 
-  /// Closed here rather than in the screen: Tesla tears the gui down and
-  /// rebuilds it whenever the overlay is hidden, and a session dropped on every
-  /// hide would be re-opened on every show for no reason.
-  void exitServices() override { client_.Close(); }
+  /// Gives input back before anything else: a previous instance that died
+  /// holding it left it held, and nothing in libtesla releases it at start.
+  void initServices() override { lifecycle_.Start(); }
+
+  void onShow() override { lifecycle_.Shown(); }
+
+  /// The one teardown, here rather than in a screen: Tesla tears the gui down
+  /// and rebuilds it whenever the overlay is hidden, and a session dropped on
+  /// every hide would be re-opened on every show for no reason. The destructor
+  /// runs the same `Stop`, for a library that ever deleted the overlay without
+  /// calling this.
+  void exitServices() override { lifecycle_.Stop(); }
 
  private:
   rommsync::overlay::IpcClient client_;
+  /// After `client_`, so it is destroyed first and its `Stop` finds the client
+  /// still there.
+  rommsync::overlay::Lifecycle lifecycle_{client_, &RequestForeground};
 };
 
 }  // namespace

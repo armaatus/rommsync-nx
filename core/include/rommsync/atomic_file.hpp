@@ -10,13 +10,14 @@
 // `WriteAtomically` is not for a *large* file: it takes the contents as a
 // `string_view`, so the whole record is in memory. `CopyAtomically` is the same
 // guarantee for a file that will not fit -- a save state is tens of megabytes
-// and the sysmodule's inner heap is 1.3 MiB -- and it streams. Downloads stage
+// and the sysmodule's inner heap is 1.5 MiB -- and it streams. Downloads stage
 // through `http::DownloadTarget`'s own `.part` file and land with
 // `CommitStaged`.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <string_view>
@@ -41,7 +42,8 @@ namespace rommsync::io {
 /// It takes the **path** rather than an open handle because the two platforms
 /// do not agree on what durability is a property of: the host syncs one file
 /// descriptor, and Horizon commits the whole `sdmc:` filesystem
-/// (`fsdevCommitDevice`; devkitA64's newlib exports no `fsync` at all). A hook
+/// (`fsdevCommitDevice`; a per-file `fsync` does link there, and only flushes
+/// -- `sysmodule/source/main.cpp` says why it is the wrong call). A hook
 /// that ignores the path and commits everything is a correct implementation of
 /// this contract.
 ///
@@ -60,6 +62,11 @@ namespace rommsync::io {
 ///
 /// Null -- the default -- keeps the older, weaker promise: no reader ever sees
 /// half a file. Nothing here fails for want of a hook.
+///
+/// **Callers do not call it directly.** They call `io::Sync` (disk.hpp), whose
+/// stdio implementation calls this; that keeps the durability point inside the
+/// `io::Disk` seam, where a test can record it beside the writes it orders and
+/// replay a power cut at every call (#203).
 using FileSync = bool (*)(const std::string& path);
 
 /// Install the hook, process-wide.
@@ -110,6 +117,14 @@ struct WriteResult {
   /// For logs. Names the path and what went wrong, never the contents -- these
   /// files hold bearer tokens.
   std::string message;
+
+  /// False when the commit happened and the platform would not confirm the
+  /// *name* is on the card: `FileSync` refused the destination's directory.
+  /// `ok()` stays true -- the rename did happen, and calling it a failure would
+  /// describe a commit that did not occur. For the caller whose next step
+  /// depends on that name surviving a power cut, which is `sync::BackUpFirst`
+  /// before an overwrite in a different directory (#203).
+  bool name_durable = true;
 
   bool ok() const { return error == WriteError::kNone; }
 };
@@ -180,6 +195,27 @@ std::string PreviousPathFor(std::string_view path);
 /// `kWriteFailed`, and the destination is untouched.
 WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 
+/// `WriteAtomically`, for a record produced a piece at a time rather than held
+/// whole (M9-21, #247).
+///
+/// `next` is handed an empty string, appends the next piece of the record to it
+/// and returns true, or returns false once there is no more. One piece is in
+/// memory at a time -- the buffer is cleared and reused, so it costs the
+/// largest piece and not the record. Every guarantee above is the same one: the
+/// pieces go to the temp file, and only a complete, flushed, synced temp file is
+/// renamed onto `path`.
+///
+/// For a record whose text would be a second copy of something already in
+/// memory: `queue.json`, written whole on every change to the download queue,
+/// was the queue again in text beside the queue.
+///
+/// An overload rather than a name of its own on purpose: `scripts/v1-gate.sh`
+/// counts every `io::WriteAtomically(` call in its census of what commits bytes
+/// over a file, and a writer it could not see would be an overwrite path nobody
+/// had classified.
+WriteResult WriteAtomically(const std::string& path,
+                            const std::function<bool(std::string* piece)>& next);
+
 /// Move a file that is already staged on disk onto `path`, atomically.
 ///
 /// `WriteAtomically`'s commit, on its own, for the bytes it cannot hold: a save
@@ -190,8 +226,15 @@ WriteResult WriteAtomically(const std::string& path, std::string_view contents);
 /// `PreviousPathFor(path)` first and put back if the second rename fails.
 ///
 /// On success the destination's *directory* is handed to `FileSync` as well, so
-/// the published name is as durable as the bytes behind it. Best effort: the
-/// rename has happened either way.
+/// the published name is as durable as the bytes behind it. The rename has
+/// happened either way, so a refusal there is not a failed commit: it is
+/// `name_durable == false` on a successful one, and the caller decides.
+///
+/// **The staged file must already be durable.** `CommitStaged` does not sync
+/// it: `WriteAtomically` and `CopyAtomically` do before they call it, and a
+/// download's staging is synced by the HTTP backend that wrote it. A rename that
+/// publishes bytes nothing synced is a save that can come back empty after a
+/// power cut -- which is the case tests/crash_disk.hpp exists to catch.
 ///
 /// `staged` is consumed: it is renamed away on success and removed on failure,
 /// so a caller never has to decide what to do with a half-committed pair. That
@@ -257,6 +300,10 @@ struct CopyResult {
   /// Bytes that reached the destination. Zero on every failure.
   std::uint64_t bytes_copied = 0;
 
+  /// `WriteResult::name_durable` of the commit that published the copy: false
+  /// when the copy is in place and the card would not confirm its name.
+  bool name_durable = true;
+
   bool ok() const { return error == CopyError::kNone; }
 };
 
@@ -264,7 +311,7 @@ struct CopyResult {
 ///
 /// Streamed through a 4 KiB stack chunk rather than read whole, which is the
 /// difference between this and `WriteAtomically(to, ReadFile(from).contents)`:
-/// the file being copied is a *save*, the sysmodule's inner heap is 1.3 MiB,
+/// the file being copied is a *save*, the sysmodule's inner heap is 1.5 MiB,
 /// and buffering a save state would be a `bad_alloc` on the console and a green
 /// test on a laptop (core/AGENTS.md).
 ///
@@ -274,6 +321,10 @@ struct CopyResult {
 ///
 /// It is a copy and not a move: the point of the caller is that both files
 /// exist afterwards.
+///
+/// A copy whose name the card would not confirm is still a successful copy,
+/// with `name_durable` false; `sync::BackUpFirst` refuses to count it as a
+/// backup.
 ///
 /// **Durability is `FileSync`'s**, and worth restating here because of what this
 /// one copies. Without a hook installed, a card yanked between the copy and the

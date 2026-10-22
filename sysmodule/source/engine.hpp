@@ -52,6 +52,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,7 +70,10 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/remote_install.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/scheduler.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
 #include "sized_thread.hpp"
@@ -94,8 +98,9 @@ inline constexpr const char* kConfigSdDir = "/config/rommsync";
 /// What an SD-root path from `core/` is prefixed with to open it here.
 ///
 /// The mapping `fs::FileSystem::Resolve` performs, spelled once for the callers
-/// that have no `fs::FileSystem` to ask -- which on the console today is all of
-/// them, because nothing implements one for Horizon yet. `kConfigDir` is this
+/// that have no `fs::FileSystem` to ask -- `Load`, and `BackupPresent` on a build
+/// that never called `UseCard`. The console has one since M7-2 (#37), the
+/// Horizon backend in `card.hpp`, which is built on this. `kConfigDir` is this
 /// plus the directory `core/` names, and is kept as its own constant because it
 /// is what `Load` is *given* rather than something it derives.
 inline constexpr const char* kSdRoot = "sdmc:";
@@ -148,6 +153,19 @@ inline constexpr std::chrono::milliseconds kNoDownloadDeadline =
 /// ever find out.
 inline constexpr std::chrono::milliseconds kQuiesceBudget{3'000};
 
+/// How often the worker asks whether the game has closed, **while a tick is
+/// held for it** and at no other time (M10-16, #242).
+///
+/// A poll, because nothing on Horizon says when an application exits without
+/// taking something from another process: `pmdmntHookToCreateApplicationProcess`
+/// is a single hook Atmosphere's own `dmnt:cht` holds, and pm does not start an
+/// application it is hooked for until the hooker says so; `pm:shell`'s process
+/// event is `ns`'s. So the answer is `pmdmntGetApplicationProcessId`, asked on a
+/// timer. Five seconds is one IPC round trip to `pm` -- nothing beside a game
+/// that is drawing sixty frames a second -- and is how late the sync after a
+/// game is, at most. A console with no tick held never asks at all.
+inline constexpr std::chrono::milliseconds kForegroundPollInterval{5'000};
+
 /// What a pairing attempt needs that neither `core/` nor this file can supply.
 ///
 /// Both are platform facilities. `core/` may not name a transport (hard rule 4),
@@ -156,9 +174,11 @@ inline constexpr std::chrono::milliseconds kQuiesceBudget{3'000};
 /// rather than to a file the host build compiles. Injecting them is what lets
 /// `engine.pairs` drive a whole pairing against the docker RomM with no console.
 struct PairingBackend {
-  /// **Null means this build has no way to reach a server**, which is the
-  /// console's situation today: the Horizon `ssl` `HttpClient` backend is listed
-  /// in the M8-1 gate (#43) and is not written. `StartPairing` answers
+  /// **Null means this build has no way to reach a server.** That is no longer
+  /// the console's situation -- `main.cpp` hands over M1-7 (#126)'s Horizon `ssl`
+  /// client (`http/ssl_http_client.cpp`) at boot, whether or not the network is
+  /// up -- so it is a host binary that wires no transport, and the tests that
+  /// pin the refusal (`engine.commands`). `StartPairing` answers
   /// `ipc::Error::kUnavailable` then -- "this build has no engine behind that
   /// command" -- rather than a refusal that blames the server or the card.
   ///
@@ -193,24 +213,22 @@ struct PairingBackend {
 /// `auth.json` under `card_mutex_`, a restore writes a save and a copy under
 /// `.backup/`. Taking `card_mutex_` for a restore would make a pairing grant
 /// wait behind a save-state copy of tens of megabytes, which is the thing the
-/// two-lock split exists to prevent. What would change that is a second writer
-/// of `.backup/` -- the scheduler running a tick (M7-2, #37) -- and that is the
-/// moment `history_` needs a lock of its own, not this one.
+/// two-lock split exists to prevent. A second writer of `.backup/` -- the worker
+/// running a tick (M7-2, #37) -- is what gave `history_` a lock of its own,
+/// `history_mutex_`, rather than this one.
 ///
 /// `config_` and `queue_` are deliberately *not* under it, and that is still a
 /// fact about today rather than a decision to keep: `ServiceServer::Run` is a
 /// single `svcReplyAndReceive` loop, so every command runs on one thread, and
 /// the pairing thread reads neither -- it is handed the server URL it needs when
 /// the attempt starts. `download::Queue` carries its own mutex for the reason
-/// `ipc::Engine` states.
+/// `ipc::Engine` states, and the worker drains it through that (M9-5, #197).
 ///
-/// **A mutex is not what would make `config()` safe the day a worker reads it.**
-/// It hands out a *reference*, so a swap under a lock would still free a
-/// `Config` a caller is holding. The seam to change then is that signature -- a
-/// snapshot, the way `Snapshot()` already answers -- and workers have to take
-/// theirs at a tick boundary, never mid-sync and never mid-download. The
-/// download worker is not started here yet; when it is, this is already the
-/// object it drains.
+/// **A mutex is not what makes `config()` safe for the worker.** It hands out a
+/// *reference*, so a swap under a lock would still free a `Config` a caller is
+/// holding. So the worker never calls it: it takes a `ConfigSnapshot` at an
+/// operation boundary and reads it to the end, never swapped mid-sync or
+/// mid-download (M7-2, #37).
 class SdEngine : public ipc::Engine, public power::Sink {
  public:
   SdEngine();
@@ -243,7 +261,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `fs` -- a sysmodule that cannot build what it needs should not come up
   /// half-working -- whereas failing on a button press would leave a pairing
   /// screen that never moves under the user's thumb. A backend with no transport
-  /// starts nothing, which is every console today.
+  /// starts nothing, which no console has been since M1-7 (#126).
   ///
   /// Until M9-2 (#207) this was also *the one throwing call in the class*:
   /// `std::thread`'s constructor throws when the thread or its stack cannot be
@@ -275,7 +293,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// **It is one thread, not two.** `sync::RunTick` and `lists::Service::Pump`
   /// both want a thread that is not the IPC one and neither wants a thread of
   /// its own: a list page is one request and a tick is a handful, and two
-  /// threads would cost two more stacks out of the 1.3 MiB inner heap to serialise
+  /// threads would cost two more stacks out of the 1.5 MiB inner heap to serialise
   /// on the same `http::HttpClient` anyway. A stack is `kThreadStackBytes` and
   /// the heap's table has a row for exactly the two this class starts
   /// (`kHeapThreadStacks`, `main.cpp`), so a third is a visible cost rather than
@@ -309,6 +327,35 @@ class SdEngine : public ipc::Engine, public power::Sink {
   using NetworkProbe = std::function<bool()>;
   void UseNetworkProbe(NetworkProbe probe);
 
+  /// Whether an application -- a retail game, Tico, RetroArch launched over a
+  /// title -- is in the foreground right now (M10-16, #242).
+  ///
+  /// **A tick never runs while it says yes.** A game holds its save in memory
+  /// and writes it when it closes -- Tico on exit -- so a download placed under
+  /// it is overwritten with the old copy, which the next tick uploads as the
+  /// newest; and an upload under it sends the save as it was before the
+  /// session. So a tick that falls due is handed back to the scheduler
+  /// (`sync::Scheduler::Defer`), the worker asks again every `poll`, and the
+  /// first answer of no runs **one** tick for everything that fell due.
+  ///
+  /// Injected for `NetworkProbe`'s reason: `pm:dmnt` is libnx and this file
+  /// names no libnx type. Null -- what a host build and a console whose `pm:dmnt`
+  /// did not come up pass -- is "nothing is running", which is the client as it
+  /// was before #242 rather than one that never syncs. Called on the worker and
+  /// on the IPC thread (`application_running`), never under `mutex_`, so it has
+  /// to be safe from both; a libnx service call is.
+  ///
+  /// The download queue and the list pages are **not** held: a rom is not a
+  /// save, and the overlay is used from inside a game, so a rom queued there
+  /// that waited for the game to close would be the queue screen not working.
+  using ForegroundProbe = std::function<bool()>;
+  void UseForegroundProbe(ForegroundProbe probe,
+                          std::chrono::milliseconds poll = kForegroundPollInterval);
+
+  /// The probe's answer, now. `ipc::ServiceCore::SyncNow` reads it to say a
+  /// press is held rather than started (`ipc::SyncOutcome::kDeferred`).
+  bool application_running() const override;
+
   /// The network the library is read over, and the token to read it with.
   ///
   /// **Null and empty on the console today, and no longer for want of a
@@ -338,6 +385,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// console with none never gets past the scan.
   void UseCard(fs::FileSystem* filesystem);
 
+  /// The oldest RomM a tick will sync with. `server::kMinimumVersion` unless
+  /// this is called, and the console never calls it (M10-2, #228).
+  ///
+  /// **A test seam.** The fixture runs RomM 5.4.0, which the floor accepts, so
+  /// the only way to see a refusal against a real server is to raise the floor
+  /// past it: `engine.romm_version` does, and `engine.romm_forgotten` moves it
+  /// while a heartbeat is in flight. Nothing lowers it any more -- the 5.2.0
+  /// fixture that once needed that went with #235.
+  void UseMinimumServerVersion(server::Version floor);
+
   /// Drive one list page fetch, from a thread that is **not** the IPC one.
   ///
   /// That thread is the worker `StartWorker` starts (M7-2, #37), which calls
@@ -364,7 +421,8 @@ class SdEngine : public ipc::Engine, public power::Sink {
   ///   * no `download::Drain` is running -- the worker has *returned* from it,
   ///     not merely been asked to stop (M9-5, #197);
   ///   * no `sync::RunTick` is running, and so no save write is in flight;
-  ///   * no restore is writing a save from the IPC thread either;
+  ///   * no restore is writing a save -- on the worker, which the park covers,
+  ///     or on the IPC thread of a console whose worker never started;
   ///   * no pairing poll or commit is in flight on the pairing thread;
   ///   * nothing more is written to the log **file** until `Resume`.
   ///
@@ -410,6 +468,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   const config::Config& config() const override;
   const std::vector<config::Diagnostic>& config_diagnostics() const override;
+  std::vector<config::Diagnostic> source_notes() const override;
   ipc::EngineSnapshot Snapshot() const override;
   auth::PairingStatus pairing_status() const override;
 
@@ -506,7 +565,24 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// neither touches the network -- the history is what a *previous* tick wrote,
   /// and a restore is one copy between two files on the card.
   ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override;
-  ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override;
+
+  /// M9-6 (#209): the restore is taken here and run **on the worker**, and this
+  /// answers at once.
+  ///
+  /// It used to run on the IPC thread, which held the overlay's call -- and
+  /// every other command -- for as long as the card took to copy a save. The
+  /// worker is also the thread every tick runs on, so the two save writers are
+  /// serialised by construction: a press during a tick waits its turn rather
+  /// than being refused with "try again" (`save_write_mutex_` still records the
+  /// write, for `Quiesce`). The drain is cancelled the way `RequestSync` cancels
+  /// it, so a restore does not wait out a rom.
+  ///
+  /// **With no worker, the restore runs here**, on the caller, and answers
+  /// `kDone`: a build or a boot whose worker never started still restores, at
+  /// the cost every restore had before. `StartWorker` failing is logged
+  /// (`kBoot`), so that console says why.
+  ipc::RestoreState RequestRestore(std::int64_t entry_id) override;
+  ipc::RestoreState restore_state() const override;
 
   /// Serialises `history_` -- the vector, and nothing else.
   ///
@@ -521,21 +597,23 @@ class SdEngine : public ipc::Engine, public power::Sink {
   mutable std::mutex history_mutex_;
 
   /// **The right to write a save file.** Held by the worker for the whole of a
-  /// tick's transfers, and *try*-locked by a restore.
+  /// tick's transfers, and for the whole of a restore.
   ///
   /// A second lock rather than a wider `history_mutex_`, because the two have
   /// opposite requirements: the history has to be readable while a tick runs, so
   /// its lock may not be held across the network, and the save bytes have to be
   /// exclusive *for* the length of a tick. One mutex cannot be both.
   ///
-  /// **Try-locked and never waited on**, on the IPC thread's side. Both writers
-  /// are individually atomic, so the collision they make is a lost update rather
-  /// than a corrupt file -- restored bytes replaced moments later by an
-  /// in-flight download, and the tick's `.backup/` copy taken of a half-restored
-  /// state -- and neither is something to hand a player. But *waiting* would
-  /// park the IPC thread behind a whole tick, which `ipc.hpp` forbids in as many
-  /// words. So a restore that arrives mid-tick is refused with a sentence, and
-  /// the user presses again.
+  /// Both writers are individually atomic, so the collision they would make is a
+  /// lost update rather than a corrupt file -- restored bytes replaced moments
+  /// later by an in-flight download, and the tick's `.backup/` copy taken of a
+  /// half-restored state -- and neither is something to hand a player. Until
+  /// M9-6 (#209) the restore ran on the IPC thread and *try*-locked this,
+  /// refusing a press that arrived mid-tick. It now runs on the worker, the
+  /// same thread as every tick, so the two cannot overlap at all and the lock is
+  /// simply taken -- it is still taken, because `Quiesce` reads it to know that
+  /// no save write is in flight, and because a worker that never started runs
+  /// the restore on the IPC thread instead (`RequestRestore`).
   ///
   /// Order is this one, then `history_mutex_`, on both sides.
   ///
@@ -549,12 +627,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// The conflict history, for the tick that writes it.
   ///
-  /// **Nothing in this build drives a tick**, so nothing appends to it here yet
-  /// -- since M7-2 (#37) the worker appends to it: `conflicts::RecordSaves` after
-  /// the saves half of a tick and `conflicts::RecordStates` after the states
-  /// half, both from `RunOneTick` rather than from inside `sync::RunTick`,
-  /// because `conflict_record.hpp` includes `state_sync.hpp` and recording from
-  /// in there would be a cycle. It is guarded by `history_mutex_`.
+  /// **The worker is what appends to it** (M7-2, #37): `conflicts::RecordSaves`
+  /// after the saves half of a tick and `conflicts::RecordStates` after the
+  /// states half, both from `RunOneTick` rather than from inside
+  /// `sync::RunTick`, because `conflict_record.hpp` includes `state_sync.hpp` and
+  /// recording from in there would be a cycle. It is guarded by `history_mutex_`.
   conflicts::History& history() { return history_; }
 
   /// Whether the backup `entry` names is still on the card, for
@@ -603,12 +680,26 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// The constructor exists because `auth::PairingSession` is neither copyable
   /// nor movable -- it carries the mutex `status()` is safe under -- so the
   /// session has to be built in place rather than assigned into an aggregate.
+  ///
+  /// `committed` and `commit_failure` are what the session cannot know: whether
+  /// the grant it reports reached the card. They live on the attempt rather than
+  /// on the engine so that a commit finishing after a "Start over" can only ever
+  /// mark the attempt it belongs to. Both are guarded by `SdEngine::mutex_`.
   struct PairingAttempt {
     PairingAttempt(http::HttpClient& client, auth::PairingConfig config, std::string url)
         : session(client, std::move(config)), server_url(std::move(url)) {}
 
     auth::PairingSession session;
     std::string server_url;
+
+    /// Set by `CommitGrant` in the slice that makes the console paired, after
+    /// `token.dat` is committed. Until it is, an approved session is reported as
+    /// still pending (`pairing_status`).
+    bool committed = false;
+
+    /// An approved pairing whose token would not reach the card. Reported as
+    /// `kFailed` with this as the reason.
+    std::string commit_failure;
   };
 
   /// The pairing thread. Runs one attempt at a time: `Begin()`, then `Poll()`
@@ -627,6 +718,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   bool AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt);
 
   /// Persist an approved grant, and leave the console reporting itself paired.
+  ///
+  /// **The attempt reads `kApproved` from here, and not from the poll that was
+  /// granted it** -- `pairing_status` holds it at `kPending` until this marks it
+  /// `committed`, in the same `mutex_` slice that sets `auth_` and `token_`, and
+  /// only after `token.dat` is written, renamed and synced. A commit the card
+  /// refuses marks it `commit_failure` instead, so the overlay goes from the
+  /// code straight to "Pairing failed" and never says "Paired" in between.
   ///
   /// Takes `card_mutex_` for the two writes and `mutex_` only for the checks and
   /// the assignments around them, so nothing polled every frame waits on the
@@ -765,7 +863,31 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// and `conflicts::RecordSaves`/`RecordStates` on the way out -- which live
   /// here because `conflict_record.hpp` includes `state_sync.hpp`, so recording
   /// from inside the tick would be a cycle.
-  void RunOneTick();
+  ///
+  /// **False when it stopped for a game** (#242): one launched after the worker
+  /// asked and before the first save is planned. Nothing is recorded then --
+  /// not `Finished`, not the play window -- and the caller hands the tick back
+  /// to the scheduler exactly as if the game had been running when it asked.
+  bool RunOneTick();
+
+  /// #245, on a tick: say whether this console takes remote installs, then
+  /// claim what the web UI queued for it into the download queue. Outside
+  /// `mutex_`. **Never fails the tick** -- every exchange that does not work is
+  /// a `download.remote` warning and the next tick asks again.
+  void ServeInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                     const config::Config& config, const server::ServerCapabilities& caps,
+                     const http::CancelToken* cancel);
+
+  /// Report every claimed request whose queue row has finished, and forget the
+  /// ones RomM has settled. Called after each drain and before each claim, on
+  /// the worker, outside `mutex_`.
+  void SettleInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                      const std::string& base_url, const http::CancelToken* cancel);
+
+  /// The restore `RequestRestore` took, start to finish, and its outcome
+  /// recorded in `restore_` (#209). Called on the worker, or on the caller when
+  /// there is no worker; `mutex_` not held, because a restore is card I/O.
+  void RunRestore(std::int64_t entry_id);
 
   /// Move M7-4's play-session window forward, recording nothing (#39).
   ///
@@ -821,6 +943,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// True when `*text` is what to edit; false leaves a `Diagnostic` behind.
   bool ReadConfigText(std::string* text, std::vector<config::Diagnostic>* diagnostics) const;
 
+  /// Ask the server which RomM it is again on the next tick (#228). The caller
+  /// holds `mutex_`. `different_server` also forgets what the old one said,
+  /// for a `server.url` change; a re-pairing or a new floor keeps it on the
+  /// screen until the next tick replaces it.
+  void ForgetServerLocked(bool different_server);
+
   /// Take `loaded` as the configuration in force.
   ///
   /// `auth.json`'s complaint goes **in front** of the file's rather than being
@@ -836,6 +964,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// scheduler in the same breath, so a changed interval takes effect without a
   /// reboot and a changed `server.url` lifts a TLS park.
   void AdoptConfigLocked(config::LoadResult loaded);
+
+  /// Keep what this tick's `retroarch.cfg` says for `source_notes()`, and what
+  /// `tico` says about whose Tico saves are read (#231), logging them when they
+  /// differ from the last tick's. Takes `mutex_`.
+  void NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
+                   std::vector<config::Diagnostic> tico);
 
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;
@@ -891,6 +1025,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// does not silently drop it. At most one line, and only when the file was
   /// there and would not read (M1-4, #8).
   std::vector<config::Diagnostic> auth_diagnostics_;
+
+  /// `retroarch.cfg`'s complaints and what follows from it -- "RetroArch syncs
+  /// itself" -- as the last tick read them (#230). Under `mutex_`: the sync
+  /// thread replaces it and the IPC thread serves it.
+  std::vector<config::Diagnostic> source_notes_;
 
   /// The download queue as the card holds it. Loaded once and written by every
   /// command that changes it, so the file and this never disagree by more than
@@ -1018,6 +1157,46 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// answers false on.
   bool sync_in_progress_ = false;
 
+  /// Where the one restore stands, as `GetRestoreState` reads it (#209).
+  /// Guarded by `mutex_`, and copied out rather than referenced.
+  ipc::RestoreState restore_;
+
+  /// A restore was taken and the worker has not started it. Separate from
+  /// `restore_.phase`, which says `kRunning` from the press onward: the overlay
+  /// has no use for "queued" as distinct from "copying", and the worker does.
+  bool restore_pending_ = false;
+
+  /// Roms downloaded since the last tick that negotiated, whose saves that tick
+  /// asks for with `restore_unlisted` (#241). Guarded by `mutex_`; at most
+  /// `sync::kMaxNegotiateRomIds`, past which a rom is an ordinary rom on the
+  /// card -- its save still comes, unless this device synced it before.
+  std::vector<std::int64_t> fresh_roms_;
+
+  /// Install requests from RomM's web UI this console has taken and not yet
+  /// reported (#245). Guarded by `mutex_`; at most `install::kMaxClaims`, and in
+  /// memory only, because a claim hands back every request still taken
+  /// (remote_install.hpp) -- a reboot loses nothing the next claim does not
+  /// return. Emptied by `ForgetServerLocked`: they are one device's, on one
+  /// server.
+  std::vector<install::Request> install_claims_;
+
+  /// Requests whose report RomM refused for what it said -- a 400 or a 422,
+  /// which resending does not change. Still taken on the server, so the next
+  /// claim hands them back; listed here so they are not queued and reported
+  /// again on every tick. At most `install::kMaxClaims`; forgotten with the
+  /// server, and with the boot.
+  std::vector<std::string> install_abandoned_;
+
+  /// What this boot last told the server `remote_install` is, or empty when it
+  /// has told it nothing yet. Guarded by `mutex_`, and forgotten with the server.
+  std::optional<bool> install_registered_;
+
+  /// The claim answered 404 although the heartbeat said the feature is on -- the
+  /// server turned it off since, or this pairing's device is not the one the
+  /// token is bound to -- or the registration was refused outright. Not asked
+  /// again until the server is read again, or the console wakes (`Resume`).
+  bool install_refused_ = false;
+
   /// The last tick's outcome, as the status screen reads it.
   std::int64_t last_sync_at_ = 0;
   ipc::SyncResult last_sync_result_ = ipc::SyncResult::kNever;
@@ -1026,6 +1205,40 @@ class SdEngine : public ipc::Engine, public power::Sink {
   std::int64_t conflicts_ = 0;
   std::int64_t failed_ = 0;
 
+  /// Which RomM the console is talking to, as the last heartbeat it read said
+  /// (M10-2, #228). Guarded by `mutex_`.
+  ///
+  /// **Read once a boot and once a pairing**: `server_read_` is false until the
+  /// first tick asks, and `CommitGrant` and a `server.url` change set it false
+  /// again, so the next tick asks the server it is now paired with. A server
+  /// below the floor is the exception -- it is asked again every tick, because
+  /// the remedy is upgrading it and a console that only noticed the upgrade at
+  /// its next reboot would keep refusing a server that now works. And a wake
+  /// sets it false while #245's remote install is off or refused, because a
+  /// console that sleeps rather than reboots would otherwise never see an
+  /// admin turn it on.
+  ///
+  /// Read on the worker, at the top of a tick, and never on the pairing thread:
+  /// that thread has nothing to decide with it -- #245's `install_enabled` is
+  /// read by the tick too -- and the worker already owns every other request a
+  /// tick makes.
+  server::ServerCapabilities server_caps_;
+  bool server_read_ = false;
+
+  /// Bumped by `ForgetServerLocked` and by a wake that asks again (`Resume`),
+  /// and compared by a tick before it records
+  /// what its heartbeat said: a tick that asked the old server must not mark
+  /// the new one as read.
+  std::uint64_t server_generation_ = 0;
+
+  /// The last tick was refused because the server is below the floor. What
+  /// `Status::server_supported` reports -- a finding about a tick, never a
+  /// default, so it starts false.
+  bool server_too_old_ = false;
+
+  /// `UseMinimumServerVersion`'s value.
+  server::Version server_floor_ = server::kMinimumVersion;
+
   /// The transport a tick runs on, and the token the *lists* read with. Both
   /// null/empty until `UseServer`.
   http::HttpClient* server_ = nullptr;
@@ -1033,6 +1246,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// Whether the console is on a network. Null means "up".
   NetworkProbe network_probe_;
+
+  /// Whether a game is in the foreground, and how often to ask while a tick
+  /// waits for it (#242). Null means "nothing is running". Both guarded by
+  /// `mutex_`, and the probe is copied out and called outside it.
+  ForegroundProbe foreground_probe_;
+  std::chrono::milliseconds foreground_poll_ = kForegroundPollInterval;
+
+  /// A tick is being held for a running game. Only the worker touches it; it
+  /// is what makes `sync.held` one line per game rather than one per re-check.
+  bool holding_ = false;
 
   /// Bumped by every command that gives the worker something to do, under
   /// `mutex_`, and read by the worker as part of its wait predicate.
@@ -1106,8 +1329,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// thing that lifts it.
   auth::Gate gate_;
 
-  /// The transport and the identity seed a pairing attempt runs on. Empty on the
-  /// console, which is what makes `StartPairing` answer `kUnavailable` there.
+  /// The transport and the identity seed a pairing attempt runs on. Installed on
+  /// the console at boot (`main.cpp`); left empty only by a host binary with no
+  /// transport, which is what makes `StartPairing` answer `kUnavailable` there.
   PairingBackend pairing_backend_;
 
   /// Serialises the *card* writes the two threads both make -- `token.dat` and
@@ -1129,13 +1353,14 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// Guards the in-memory state the two threads share: the attempt, `auth_`,
   /// and `gate_`. Held for assignments and never across I/O, with one exception:
-  /// `Load` holds it over the four files it reads at boot. The pairing thread
-  /// usually *does* exist by then -- `UsePairingBackend` is called before `Load`
-  /// -- so what makes that safe is not the absence of a second thread but the
-  /// absence of a reader: it is parked with no attempt to drive, and no
-  /// `ServiceCore` exists yet to answer the frame-polled commands this rule is
-  /// really about. Mutable because `Snapshot()` and `pairing_status()` are const
-  /// and both read state the pairing thread writes.
+  /// `Load` holds it over the four files it reads at boot. On a console the
+  /// pairing thread does not exist yet -- `main()` calls `Load` first -- but in
+  /// the tests' `BootPairable` it does, so what makes that safe is not the
+  /// absence of a second thread but the absence of a reader: it is parked with
+  /// no attempt to drive, and no `ServiceCore` exists yet to answer the
+  /// frame-polled commands this rule is really about. Mutable because
+  /// `Snapshot()` and `pairing_status()` are const and both read state the
+  /// pairing thread writes.
   mutable std::mutex mutex_;
 
   /// How the pairing thread is told there is something to do, and how it is
@@ -1143,10 +1368,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   std::condition_variable wake_;
 
   /// Created by `UsePairingBackend`, and only when it is handed a transport, so
-  /// a console with no `HttpClient` -- which is every console today -- creates no
-  /// thread at all. Not on the first `StartPairing`: see `UsePairingBackend` for
-  /// why a thread this process may fail to create is created at start rather
-  /// than under a user's finger.
+  /// a build with no `HttpClient` -- a host binary that wires none; never a
+  /// console since M1-7 (#126) -- creates no thread at all. Not on the first
+  /// `StartPairing`: see `UsePairingBackend` for why a thread this process may
+  /// fail to create is created at start rather than under a user's finger.
   ///
   /// **Its stack is `kThreadStackBytes`, and that is the number M9-2 (#207)
   /// derived.** It used to be devkitA64's undeclared 128 KiB default, taken out
@@ -1166,12 +1391,6 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// waits on -- and null-vs-null is "nothing is running", which that wait has to
   /// tell apart from "a new attempt started while the old one was mid-request".
   std::shared_ptr<PairingAttempt> driven_;
-
-  /// What went wrong *after* the session succeeded -- an approved pairing whose
-  /// token would not reach the card. `PairingSession` cannot know about it and
-  /// would keep reporting `kApproved`, which is a console that says it paired
-  /// and has no credentials.
-  std::string attempt_commit_failure_;
 };
 
 }  // namespace rommsync::sysmodule

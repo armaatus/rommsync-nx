@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "ipc_client.hpp"
+#include "lifecycle.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_settings_view.hpp"
 #include "screen_frame.hpp"
@@ -143,9 +144,9 @@ class SettingsScreen : public tsl::Gui {
   /// Where the cursor is in `entries_`. `-1` when there is nothing to scroll.
   int cursor_ = -1;
 
-  /// Frames since the last `GetConfig`. Starts past the cadence so the first
-  /// `update()` asks rather than waiting half a second to draw anything.
-  int since_poll_ = 0;
+  /// When the next `GetConfig` goes out: the first frame, every `kPollFrames`
+  /// after it, and the first frame of every showing (`lifecycle.hpp`).
+  Cadence cadence_;
 };
 
 }  // namespace rommsync::overlay

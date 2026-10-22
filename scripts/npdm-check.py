@@ -19,7 +19,8 @@ them.
                           --json sysmodule/sys-rommsync.json
 
 `--print` dumps the declared SVC set and the SAC instead of checking anything,
-which is what M9-11's narrowing of the service list will want to read.
+with the filesystem mask spelled out bit by bit. `--json` alone checks the
+config npdmtool will be handed, which needs no toolchain (`npdm.grants`).
 
 **This is the sysmodule's npdm and only the sysmodule's.** `ovl-rommsync` has no
 npdm of its own: `overlay/Makefile` builds an NRO plus a NACP and appends the
@@ -40,6 +41,7 @@ import argparse
 import bisect
 import io
 import json
+import os
 import re
 import struct
 import sys
@@ -148,6 +150,7 @@ class Acid:
         self.service_access = parse_sac(blob[sac_offset : sac_offset + sac_size])
         self.kernel_capabilities = blob[kc_offset : kc_offset + kc_size]
         self.syscalls = parse_syscalls(self.kernel_capabilities)
+        self.handle_table_size = parse_handle_table_size(self.kernel_capabilities)
 
     @property
     def is_retail(self):
@@ -205,9 +208,9 @@ def parse_syscalls(blob):
 def parse_handle_table_size(blob):
     """The `HandleTableSize` descriptor's value, or None if there is none.
 
-    Fifteen set low bits identify it and the size is the ten above them. M9-11
-    (#210) has to re-derive this number from a count of what the process holds
-    open at once; `--print` is where it reads today's.
+    Fifteen set low bits identify it and the size is the ten above them. Since
+    M9-11 (#210) the value is derived, in `HANDLE_BUDGET`, and `check_grants`
+    holds the NPDM to it.
     """
     for i in range(0, len(blob) - 3, 4):
         word = struct.unpack_from("<I", blob, i)[0]
@@ -341,9 +344,10 @@ def check_syscalls(npdm, elf, names):
     """Every SVC the image issues is one the npdm grants.
 
     The other direction is deliberately *not* a failure: a declared SVC nothing
-    calls is a capability held for no reason, which is M9-11's narrowing to make
-    and not a build breaker. It is printed so that narrowing has a list to start
-    from.
+    calls is a capability held for no reason, which is a narrowing to make and
+    not a build breaker. M9-11 (#210) narrowed the filesystem mask, the handle
+    table and the address space and left this set alone; it is printed so that
+    whoever narrows it has a list to start from.
     """
     called = elf.svc_calls()
     granted = npdm.aci0.syscalls
@@ -472,6 +476,155 @@ def check_placeholders(npdm, source):
     return []
 
 
+# --- the three grants M9-11 (#210) decided -----------------------------------
+#
+# Each of these was a devkitPro template value until #210, and a template is
+# exactly where the next copy-paste comes from. So each is held to the value
+# the sysmodule's README derives, in the built NPDM (`npdm.svcs`) and in the
+# config that produces it (`npdm.grants`, which needs no toolchain and so runs
+# on every push). Exact rather than "at most": a narrower value is a decision
+# too, and it deserves the same edit to the README the wider one does.
+
+# fs's names for the bits of the permission mask, as Atmosphere's fssrv spells
+# them (`fssrv_access_control_bits.hpp`, accurate to 13.4.0). The mask is what
+# `fs` checks a mount against: `CanMountSdCardRead/Write` is `Debug | SdCard`,
+# `CanFormatSdCard` is `FormatSdCard`, and `FullPermission` satisfies every
+# check there is -- so the template's 0xFFFF... grants everything twice over.
+FS_PERMISSION_NAMES = {
+    0: "ApplicationInfo", 1: "BootModeControl", 2: "Calibration", 3: "SystemSaveData",
+    4: "GameCard", 5: "SaveDataBackUp", 6: "SaveDataManagement", 7: "BisAllRaw",
+    8: "GameCardRaw", 9: "GameCardPrivate", 10: "SetTime", 11: "ContentManager",
+    12: "ImageManager", 13: "CreateSaveData", 14: "SystemSaveDataManagement",
+    15: "BisFileSystem", 16: "SystemUpdate", 17: "SaveDataMeta", 18: "DeviceSaveData",
+    19: "SettingsControl", 20: "SystemData", 21: "SdCard", 22: "Host", 23: "FillBis",
+    24: "CorruptSaveData", 25: "SaveDataForDebug", 26: "FormatSdCard", 27: "GetRightsId",
+    28: "RegisterExternalKey", 29: "RegisterUpdatePartition", 30: "SaveDataTransfer",
+    31: "DeviceDetection", 32: "AccessFailureResolution", 33: "SaveDataTransferVersion2",
+    34: "RegisterProgramIndexMapInfo", 35: "CreateOwnSaveData", 36: "MoveCacheStorage",
+    62: "Debug", 63: "FullPermission",
+}
+
+# `sdmc:` through libnx's fsdev, which is `OpenSdCardFileSystem` and nothing
+# else -- the whole of what this process asks fs for. sysmodule/README.md has
+# the bit to add, and why, for each facility that would need another.
+FS_SD_CARD = 1 << 21
+FS_PERMISSIONS = FS_SD_CARD
+
+# 39-bit (`AddressSpaceType_64Bit`, 2.0.0+). 1 is the 36-bit layout 1.0.0
+# shipped, kept for compatibility; sysmodule/README.md says why 3.
+ADDRESS_SPACE_TYPE = 3
+ADDRESS_SPACE_NAMES = {0: "32-bit", 1: "36-bit (deprecated)", 2: "32-bit, no alias region",
+                       3: "39-bit"}
+
+# The handle table's size lives where its count does, beside the terms it is
+# derived from and the `static_assert` that holds the two together.
+HANDLE_BUDGET = "sysmodule/source/handle_budget.hpp"
+HANDLE_TABLE_SIZE = re.compile(r"\bkHandleTableSize\s*=\s*(\d+)\s*;")
+
+
+class Grants:
+    """The three values #210 narrowed, read from one place or another."""
+
+    def __init__(self, fs_permissions, handle_table_size, address_space_type):
+        self.fs_permissions = fs_permissions
+        self.handle_table_size = handle_table_size
+        self.address_space_type = address_space_type
+
+
+def fs_permission_names(mask):
+    """`SdCard (21), FormatSdCard (26)` for a mask -- what `nstool -v` would list."""
+    bits = [bit for bit in range(64) if mask >> bit & 1]
+    named = ["%s (%d)" % (FS_PERMISSION_NAMES[bit], bit) for bit in bits
+             if bit in FS_PERMISSION_NAMES]
+    unnamed = [bit for bit in bits if bit not in FS_PERMISSION_NAMES]
+    if unnamed:
+        named.append("%d unnamed bit%s" % (len(unnamed), "" if len(unnamed) == 1 else "s"))
+    return ", ".join(named) or "nothing"
+
+
+def read_handle_table_size(text):
+    found = HANDLE_TABLE_SIZE.search(text)
+    if found is None:
+        raise Failure("%s declares no `kHandleTableSize = N;`" % HANDLE_BUDGET)
+    return int(found.group(1))
+
+
+def expected_grants(repo):
+    with open("%s/%s" % (repo, HANDLE_BUDGET), encoding="utf-8") as header:
+        return Grants(FS_PERMISSIONS, read_handle_table_size(header.read()), ADDRESS_SPACE_TYPE)
+
+
+def _grant_problems(side, observed, expected):
+    """Each way `observed` -- one side's three values -- differs from `expected`."""
+    problems = []
+    wider = observed.fs_permissions & ~expected.fs_permissions
+    if wider:
+        problems.append(
+            "%s grants filesystem rights the sysmodule does not use: %s. A bit the "
+            "process was never granted is one a bug cannot reach; add one only with its "
+            "row in sysmodule/README.md (#210)" % (side, fs_permission_names(wider)))
+    narrower = expected.fs_permissions & ~observed.fs_permissions
+    if narrower:
+        problems.append(
+            "%s does not grant %s, which `sdmc:` needs: every read and write of the "
+            "card would be refused" % (side, fs_permission_names(narrower)))
+    if observed.handle_table_size != expected.handle_table_size:
+        problems.append(
+            "%s sizes the handle table at %s and %s derives %d; change the count there, "
+            "not the number here (#210)" % (side, observed.handle_table_size, HANDLE_BUDGET,
+                                            expected.handle_table_size))
+    if observed.address_space_type != expected.address_space_type:
+        problems.append(
+            "%s asks for address space type %s (%s), not %d (%s); sysmodule/README.md "
+            "says why (#210)" % (side, observed.address_space_type,
+                                 ADDRESS_SPACE_NAMES.get(observed.address_space_type, "unknown"),
+                                 expected.address_space_type,
+                                 ADDRESS_SPACE_NAMES[expected.address_space_type]))
+    return problems
+
+
+def _granted(what, problems, expected):
+    if not problems:
+        print("ok: %s filesystem %s, handle table %d, address space %s"
+              % (what, fs_permission_names(expected.fs_permissions), expected.handle_table_size,
+                 ADDRESS_SPACE_NAMES[expected.address_space_type]))
+    return problems
+
+
+def check_grants(npdm, expected):
+    """The built NPDM grants exactly what #210 decided, on both sides.
+
+    Both, because `check_coherent` only asks that ACI0 not exceed the ACID: an
+    ACID that still carried the template's mask, or a wider handle table, would
+    pass it, and would be a widened declaration waiting for an ACI0 edit to make
+    it real. The address space lives in the META header, not in either side, so
+    it is asked once.
+    """
+    problems = _grant_problems(
+        "ACI0", Grants(npdm.aci0.filesystem_permissions, npdm.aci0.handle_table_size,
+                       npdm.address_space_type), expected)
+    problems += _grant_problems(
+        "the ACID", Grants(npdm.acid.filesystem_permissions, npdm.acid.handle_table_size,
+                           expected.address_space_type), expected)
+    return _granted("the NPDM grants", problems, expected)
+
+
+def check_config_grants(source, expected):
+    """The same three, in the npdmtool input -- so a push finds them without a toolchain."""
+    config = json.loads(source)
+    try:
+        fs_permissions = int(str(config["filesystem_access"]["permissions"]), 0)
+    except (KeyError, TypeError, ValueError):
+        return ["sys-rommsync.json has no readable `filesystem_access.permissions`"]
+    handle_table_size = None
+    for block in config.get("kernel_capabilities", []):
+        if block.get("type") == "handle_table_size":
+            handle_table_size = int(str(block.get("value")), 0)
+    observed = Grants(fs_permissions, handle_table_size, config.get("address_space_type"))
+    return _granted("sys-rommsync.json grants",
+                    _grant_problems("sys-rommsync.json", observed, expected), expected)
+
+
 def _named(number, names):
     return "%s (0x%02x)" % (names[number], number) if number in names else "0x%02x" % number
 
@@ -553,8 +706,13 @@ def _handle_table_descriptor(size):
 
 
 def _npdm(syscalls, acid_flags=0x9, name=b"fixture", program_id=FIXTURE_PROGRAM_ID,
-          aci0_fs=FIXTURE_ACI0_FS, acid_fs=FIXTURE_ACID_FS):
-    kc = _syscall_descriptors(syscalls) + _handle_table_descriptor(FIXTURE_HANDLE_TABLE)
+          aci0_fs=FIXTURE_ACI0_FS, acid_fs=FIXTURE_ACID_FS, handle_table=FIXTURE_HANDLE_TABLE,
+          meta_flags=0x3, acid_handle_table=None):
+    kc = _syscall_descriptors(syscalls) + _handle_table_descriptor(handle_table)
+    # npdmtool writes one block into both sides; a different ACID one is how a
+    # reader that took ACI0's value for both would be caught.
+    acid_kc = _syscall_descriptors(syscalls) + _handle_table_descriptor(
+        handle_table if acid_handle_table is None else acid_handle_table)
     aci0_fs_block = struct.pack("<IQ", 1, aci0_fs)
     acid_fs_block = struct.pack("<IQ", 1, acid_fs)
     sac = b"\x06fsp-srv"
@@ -573,12 +731,12 @@ def _npdm(syscalls, acid_flags=0x9, name=b"fixture", program_id=FIXTURE_PROGRAM_
     fs = acid_fs_block
     signed_at = 0x200 + body_at
     acid_body += struct.pack("<IIIIII", signed_at, len(fs), signed_at + len(fs), len(sac),
-                             signed_at + len(fs) + len(sac), len(kc))
-    acid_body = acid_body.ljust(body_at, b"\0") + fs + sac + kc
+                             signed_at + len(fs) + len(sac), len(acid_kc))
+    acid_body = acid_body.ljust(body_at, b"\0") + fs + sac + acid_kc
     acid = b"\0" * 0x200 + acid_body
     meta = bytearray(0x80)
     meta[0:4] = b"META"
-    meta[0xC] = 0x3
+    meta[0xC] = meta_flags
     meta[0x20 : 0x20 + len(name)] = name
     aci0_at = 0x80
     acid_at = aci0_at + len(aci0)
@@ -710,6 +868,62 @@ def self_test():
     expect(len(quietly(check_placeholders, Npdm(_npdm({0x01}, name=b"@NAME@")), None)) == 1,
            "an unsubstituted placeholder in the npdm name passed")
 
+    # The grants #210 decided. The expected table size is deliberately not the
+    # tree's: these vectors test the comparison, and the tree's value is
+    # `npdm.grants`'s to hold.
+    expected = Grants(FS_SD_CARD, 48, 3)
+
+    def grants_npdm(aci0_fs=FS_SD_CARD, acid_fs=FS_SD_CARD, handle_table=48, meta_flags=0x7,
+                    acid_handle_table=None):
+        return Npdm(_npdm({0x01}, aci0_fs=aci0_fs, acid_fs=acid_fs, handle_table=handle_table,
+                          meta_flags=meta_flags, acid_handle_table=acid_handle_table))
+
+    template = 0xFFFFFFFFFFFFFFFF
+    expect(grants_npdm().address_space_type == 3, "address space type 3 was misread")
+    expect(quietly(check_grants, grants_npdm(), expected) == [],
+           "an NPDM granting exactly what was decided was reported")
+    wide = quietly(check_grants, grants_npdm(aci0_fs=template, acid_fs=template), expected)
+    expect(len(wide) == 2 and all("FormatSdCard (26)" in p and "CorruptSaveData (24)" in p
+                                  for p in wide),
+           "the template's mask passed, or was reported without naming what it grants")
+    # The case `check_coherent` cannot see: ACI0 narrowed, ACID still the template.
+    expect(len(quietly(check_grants, grants_npdm(acid_fs=template), expected)) == 1,
+           "an ACID still carrying the template's mask passed")
+    expect(len(quietly(check_grants, grants_npdm(aci0_fs=0, acid_fs=0), expected)) == 2,
+           "a mask without SdCard passed")
+    # The fixture writes one capability block into both sides, as npdmtool does,
+    # so a wrong table is two findings -- and one would mean a side went unread.
+    expect(len(quietly(check_grants, grants_npdm(handle_table=1023), expected)) == 2,
+           "a handle table widened to 1023 passed, on ACI0 or on the ACID")
+    expect(len(quietly(check_grants, grants_npdm(handle_table=32), expected)) == 2,
+           "a handle table below the derived size passed, on ACI0 or on the ACID")
+    acid_wider = grants_npdm(acid_handle_table=FIXTURE_HANDLE_TABLE)
+    expect(acid_wider.acid.handle_table_size == FIXTURE_HANDLE_TABLE,
+           "the ACID's handle table size was misread")
+    expect(len(quietly(check_grants, acid_wider, expected)) == 1,
+           "an ACID handle table wider than ACI0's passed")
+    expect(len(quietly(check_grants, grants_npdm(meta_flags=0x3), expected)) == 1,
+           "address space type 1 passed")
+
+    # ...and the config, which is what a push checks without a toolchain.
+    def npdmtool_input(permissions, handles, space):
+        return json.dumps({"address_space_type": space,
+                           "filesystem_access": {"permissions": permissions},
+                           "kernel_capabilities": [{"type": "handle_table_size",
+                                                    "value": handles}]})
+
+    expect(quietly(check_config_grants, npdmtool_input("0x0000000000200000", 48, 3), expected) == [],
+           "a config granting exactly what was decided was reported")
+    expect(len(quietly(check_config_grants, npdmtool_input("0xffffffffffffffff", 64, 1), expected)) == 3,
+           "the template's three values did not each fail")
+    expect(read_handle_table_size("inline constexpr std::size_t kHandleTableSize = 96;") == 96,
+           "kHandleTableSize was not read out of its header")
+    try:
+        read_handle_table_size("kHandleTableSize is mentioned, not declared")
+        failures.append("a header with no kHandleTableSize declaration was accepted")
+    except Failure:
+        pass
+
     for failure in failures:
         print("FAIL: " + failure, file=sys.stderr)
     if failures:
@@ -735,8 +949,21 @@ def main():
 
     if args.self_test:
         return self_test()
+    if not args.nsp and not args.npdm and not args.json:
+        parser.error("one of --nsp, --npdm or --json is required")
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if not args.nsp and not args.npdm:
-        parser.error("one of --nsp or --npdm is required")
+        # The config alone: what npdmtool will be asked for, checked without
+        # npdmtool (`npdm.grants`).
+        try:
+            problems = check_config_grants(_read(args.json).decode("utf-8"),
+                                           expected_grants(repo))
+        except (Failure, OSError, ValueError) as failure:
+            return _malformed(failure)
+        for problem in problems:
+            print("FAIL: " + problem, file=sys.stderr)
+        return 1 if problems else 0
 
     try:
         if args.nsp:
@@ -753,30 +980,35 @@ def main():
     # `IndexError` are one truncated past an offset this reads; `OSError` is one
     # that is not there. All three are the same answer to the caller, and a
     # traceback would be the one error path in this script that does not say
-    # FAIL -- which matters most for `--print`, the interface M9-11 (#210) uses.
+    # FAIL -- which matters most for `--print`, the one a person reads.
     except (Failure, struct.error, IndexError, OSError, ValueError) as failure:
-        print("FAIL: %s: %s" % (type(failure).__name__, failure), file=sys.stderr)
-        return 1
+        return _malformed(failure)
 
     if args.dump:
         print("name: %s" % npdm.name)
         print("program_id: 0x%016X" % npdm.aci0.program_id)
         print("service_access: %s" % " ".join(npdm.aci0.service_access))
-        # The three fields M9-11 (#210) narrows, printed beside the SAC because
-        # that issue's whole job is replacing each of them with a derived number
-        # and it should not have to re-implement this parser to read the one it
-        # is replacing.
-        print("filesystem_permissions: 0x%016X" % npdm.aci0.filesystem_permissions)
+        # The three fields M9-11 (#210) decided, the mask named bit by bit: a
+        # hex number is not what a reviewer can check a grant against.
+        print("filesystem_permissions: 0x%016X (%s)" % (
+            npdm.aci0.filesystem_permissions,
+            fs_permission_names(npdm.aci0.filesystem_permissions)))
         print("handle_table_size: %s" % npdm.aci0.handle_table_size)
-        print("address_space_type: %d" % npdm.address_space_type)
+        print("address_space_type: %d (%s)" % (
+            npdm.address_space_type, ADDRESS_SPACE_NAMES.get(npdm.address_space_type, "?")))
         print("syscalls: %s" % " ".join(_named(n, names) for n in sorted(npdm.aci0.syscalls)))
         return 0
 
+    try:
+        expected = expected_grants(repo)
+    except (Failure, OSError) as failure:
+        return _malformed(failure)
     problems = []
     problems += check_flags(npdm)
     problems += check_coherent(npdm)
     problems += check_program_id(npdm, source)
     problems += check_placeholders(npdm, source)
+    problems += check_grants(npdm, expected)
     if elf is not None:
         problems += check_syscalls(npdm, elf, names)
     else:
@@ -784,6 +1016,11 @@ def main():
     for problem in problems:
         print("FAIL: " + problem, file=sys.stderr)
     return 1 if problems else 0
+
+
+def _malformed(failure):
+    print("FAIL: %s: %s" % (type(failure).__name__, failure), file=sys.stderr)
+    return 1
 
 
 def _read(path):

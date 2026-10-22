@@ -73,7 +73,7 @@ console on the LAN: pointing hardware at anything is M8 work.
 | `sni` | the name asked for and verified against; defaults to `host`. Set it to the name on the fixture certificate and hostname verification can stay **on** against an IP. |
 | `ca_pem` | a PEM handed to `sslContextImportServerPki`. Omit for a server the console's own CertStore already trusts. |
 | `verify` | `0` clears `PeerCa\|HostName` — which needs `SkipDefaultVerify` first, and is the one thing in here that is a real security decision (docs/SECURITY.md). |
-| `read_buf` | the in-flight buffer size, i.e. the download buffer under another name. |
+| `read_buf` | the in-flight buffer size, i.e. the download buffer under another name. The report's `reads` line says how many `sslConnectionRead`s the body took and the most one returned, which is what decides whether a bigger one is worth its heap (M9-10, #201). |
 | `connect_timeout_ms`, `stall_timeout_ms` | a probe that hangs proves nothing. |
 | `tcp_tx`, `tcp_rx`, `tcp_tx_max`, `tcp_rx_max`, `udp_tx`, `udp_rx`, `sb_efficiency`, `bsd_sessions` | the bsd transfer-memory budget. These *are* the heap answer, so an alternative budget is measurable by editing the ini rather than the source. |
 

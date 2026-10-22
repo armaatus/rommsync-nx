@@ -270,6 +270,61 @@ if [ -f .github/workflows/ci.yml ]; then
   ok "main's builds are never cancelled by the next merge"
 fi
 
+# A required check is matched by the name a job REPORTS, and a matrix job does
+# not report its `name:` when that name holds no matrix expression: GitHub
+# appends the matrix values, so `name: host-tests` over `matrix: romm: [5.4.0]`
+# reports `host-tests (5.4.0)`. Branch protection requires `host-tests`, which
+# then never reports, and every pull request waits on it forever (#235 shipped
+# exactly that). So: no workflow job pairs a literal name with a matrix, and the
+# job behind the required `host-tests` check is not a matrix at all and reports
+# that name and no other -- a second RomM runs as a job of its own beside it.
+#
+# One line per job: id, name (comment and quotes stripped, empty if none), and
+# 1 when it has a block-style matrix. Block-style job keys at two spaces is all
+# these workflows use; a flow-style `strategy: {matrix: ...}` is not seen.
+workflow_jobs() {
+  awk '
+    function flush() { if (id != "") printf "%s\t%s\t%d\n", id, name, matrix; id = "" }
+    /^jobs:/ { in_jobs = 1; next }
+    in_jobs && /^[^ #]/ { flush(); in_jobs = 0 }
+    !in_jobs { next }
+    /^  [^ #][^:]*:[[:space:]]*(#.*)?$/ {
+      flush(); id = $1; sub(/:.*$/, "", id); name = ""; matrix = 0; next
+    }
+    /^    name:/ {
+      name = $0
+      sub(/^    name:[[:space:]]*/, "", name)
+      if (match(name, /^"[^"]*"/) || match(name, /^\047[^\047]*\047/))
+        name = substr(name, 2, RLENGTH - 2)
+      else {
+        sub(/[[:space:]]+#.*$/, "", name)
+        sub(/[[:space:]]+$/, "", name)
+      }
+      next
+    }
+    /^      matrix:/ { matrix = 1 }
+    END { flush() }' "$1"
+}
+for wf in .github/workflows/*.yml; do
+  [ -f "$wf" ] || continue
+  bad="$(workflow_jobs "$wf" |
+    awk -F '\t' '$3 == 1 && $2 != "" && $2 !~ /\$\{\{.*matrix\./ { print $1 " (name: " $2 ")" }')"
+  [ -z "$bad" ] ||
+    fail "$wf: a matrix job with a fixed name reports as '<name> (<values>)', not its name, so a required check on it never reports: $bad"
+done
+if [ -f .github/workflows/ci.yml ]; then
+  host_tests="$(workflow_jobs .github/workflows/ci.yml | awk -F '\t' '$1 == "host-tests"')"
+  if [ -z "$host_tests" ]; then
+    fail "ci.yml has no host-tests job; branch protection requires a check of that name"
+  elif [ "$(cut -f3 <<<"$host_tests")" = 1 ]; then
+    fail "ci.yml's host-tests job is a matrix, so what it reports depends on the matrix rather than being 'host-tests'; run a second RomM as a job of its own"
+  elif ! case "$(cut -f2 <<<"$host_tests")" in "" | host-tests) true ;; *) false ;; esac; then
+    fail "ci.yml's host-tests job reports under another name; branch protection requires 'host-tests'"
+  else
+    ok "the job behind the required host-tests check reports exactly that name"
+  fi
+fi
+
 
 echo "== orca.yaml"
 if [ ! -f orca.yaml ]; then

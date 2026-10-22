@@ -11,7 +11,7 @@
 // download -- it is a write outside the mapped folder, and the folders next
 // door on a modded Switch are `atmosphere/` and `bootloader/`.
 //
-// The last needs the real RomM 5.2.0, because the one thing a literal in this
+// The last needs the real RomM, because the one thing a literal in this
 // file cannot be right about is which *field* the destination is keyed on.
 // `platform_slug` and `platform_fs_slug` both read `gba` on the seeded library
 // and only the second is the directory name the map uses, so the fixtures alone

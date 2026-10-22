@@ -4,7 +4,9 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,14 +22,19 @@
 #include "rommsync/list_service.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/placement.hpp"
 #include "rommsync/play_sessions.hpp"
+#include "rommsync/remote_install.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/rom_scope.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_finish.hpp"
 #include "rommsync/sync_tick.hpp"
+#include "rommsync/tico.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace rommsync::sysmodule {
@@ -140,6 +147,23 @@ void SdEngine::UseNetworkProbe(NetworkProbe probe) {
   network_probe_ = std::move(probe);
 }
 
+void SdEngine::UseForegroundProbe(ForegroundProbe probe, std::chrono::milliseconds poll) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  foreground_probe_ = std::move(probe);
+  foreground_poll_ = poll;
+}
+
+bool SdEngine::application_running() const {
+  ForegroundProbe probe;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    probe = foreground_probe_;
+  }
+  // Outside the lock: on a console this is a service call to `pm`, and
+  // `mutex_` guards what the frame-polled commands read.
+  return probe && probe();
+}
+
 void SdEngine::Wake() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -164,6 +188,30 @@ void SdEngine::WakeDownloads() {
 void SdEngine::UseCard(fs::FileSystem* filesystem) {
   card_ = filesystem;
   lists_.UseCard(filesystem);
+}
+
+void SdEngine::UseMinimumServerVersion(server::Version floor) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  server_floor_ = floor;
+  // What was read was judged against the old floor.
+  ForgetServerLocked(/*different_server=*/false);
+}
+
+void SdEngine::ForgetServerLocked(bool different_server) {
+  server_read_ = false;
+  ++server_generation_;
+  // One device's claims on one server, and what it was told: a re-pairing may
+  // be a different device. The next claim hands back whatever is still taken.
+  install_claims_.clear();
+  install_abandoned_.clear();
+  install_registered_.reset();
+  install_refused_ = false;
+  if (different_server) {
+    server_caps_ = server::ServerCapabilities{};
+    server_too_old_ = false;
+    // Another server's rom ids.
+    fresh_roms_.clear();
+  }
 }
 
 bool SdEngine::PumpLists() { return lists_.Pump(); }
@@ -232,6 +280,13 @@ void SdEngine::Load(const std::string& config_dir) {
     // no logger and the settings screen (#26) is the one place on this console a
     // user can read a complaint.
     auth_diagnostics_.push_back({config::Severity::kWarning, 0, "", "", verdict.diagnostic});
+  }
+  if (credentials.error == auth::StoreError::kNewerFormat) {
+    // An error, unlike the verdict above: this is the file that cannot be
+    // worked out again, and nothing syncs until one of the two remedies the
+    // sentence names is taken (#205). It is what the status screen's error
+    // count sends a user to Settings to read.
+    auth_diagnostics_.push_back({config::Severity::kError, 0, "", "", credentials.message});
   }
   if (auth_ == ipc::AuthState::kPaired) {
     gate_.Restore(verdict.value);
@@ -429,6 +484,47 @@ const std::vector<config::Diagnostic>& SdEngine::config_diagnostics() const {
   return diagnostics_;
 }
 
+std::vector<config::Diagnostic> SdEngine::source_notes() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return source_notes_;
+}
+
+void SdEngine::NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
+                           std::vector<config::Diagnostic> tico) {
+  std::vector<config::Diagnostic> notes = loaded.diagnostics;
+  for (config::Diagnostic& note : retroarch::Notes(config, loaded.value)) {
+    notes.push_back(std::move(note));
+  }
+  for (config::Diagnostic& note : tico) {
+    notes.push_back(std::move(note));
+  }
+  const auto same = [](const std::vector<config::Diagnostic>& left,
+                       const std::vector<config::Diagnostic>& right) {
+    if (left.size() != right.size()) {
+      return false;
+    }
+    for (std::size_t i = 0; i < left.size(); ++i) {
+      if (left[i].severity != right[i].severity || left[i].Describe() != right[i].Describe()) {
+        return false;
+      }
+    }
+    return true;
+  };
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (same(notes, source_notes_)) {
+      return;
+    }
+    source_notes_ = notes;
+  }
+  // Logged when they change rather than every tick: "retroarch.cfg was not
+  // found" on a console without RetroArch is worth one line, not one per tick.
+  // After the lock, which is never held across a write to the card.
+  for (const config::Diagnostic& note : notes) {
+    log::Write(LevelFor(note.severity), log::Event::kConfigDiagnostic, note.Describe());
+  }
+}
+
 ipc::EngineSnapshot SdEngine::Snapshot() const {
   ipc::EngineSnapshot snapshot;
   {
@@ -448,8 +544,15 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
     // live probe: `GetStatus` is polled every frame and may not go near the
     // network (`ipc.hpp`), so what the screen draws is the last tick's evidence
     // rather than a fresh answer nobody asked for.
+    //
+    // A tick refused for the server's version reached the server too -- it
+    // answered its heartbeat -- and "Not reached" beside "RomM is too old" would
+    // send a user to their Wi-Fi for a problem on the server (#228).
     snapshot.online = last_sync_result_ == ipc::SyncResult::kOk ||
-                      last_sync_result_ == ipc::SyncResult::kPartial;
+                      last_sync_result_ == ipc::SyncResult::kPartial ||
+                      last_sync_result_ == ipc::SyncResult::kServerDisabled || server_too_old_;
+    snapshot.server_version = server_caps_.version;
+    snapshot.server_supported = !server_too_old_;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -480,12 +583,22 @@ auth::PairingStatus SdEngine::pairing_status() const {
     // Pair did nothing, which is the exact failure `kStarting` exists to prevent.
     status.state = auth::PairingState::kStarting;
   }
-  if (!attempt_commit_failure_.empty()) {
+  if (!attempt_->commit_failure.empty()) {
     // The session succeeded and the card did not. It has no way to know that and
     // would go on reporting `kApproved` -- a console that says it paired and
     // holds no credentials.
     status.state = auth::PairingState::kFailed;
-    status.message = attempt_commit_failure_;
+    status.message = attempt_->commit_failure;
+  } else if (status.state == auth::PairingState::kApproved && !attempt_->committed) {
+    // The server has granted a token and `CommitGrant` has not put it on the
+    // card yet. Saying `kApproved` here is what `engine.pairs` caught under load:
+    // the overlay -- or anything else that stops on a terminal state -- reads
+    // "Paired" while `token.dat` is still `token.dat.tmp`, and a commit the card
+    // then refuses turns an announced success into a failure. Still pending, then,
+    // with the code on screen for the few milliseconds the write takes, and with
+    // a reason in case the card makes it longer than that.
+    status.state = auth::PairingState::kPending;
+    status.message = "approved -- saving the pairing to the SD card";
   }
   return status;
 }
@@ -613,6 +726,10 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       if (server_ != nullptr) {
         lists_.UseServer(server_, list_token_);
       }
+      // A different server is a different RomM (#228): what the old one said
+      // about its version is not drawn beside the new one, and the next tick
+      // asks.
+      ForgetServerLocked(/*different_server=*/true);
     }
     // Every other write to `attempt_` notifies, and this one has the longest
     // wait to cut short: the thread is parked in `AwaitNextPoll` until the
@@ -810,6 +927,18 @@ bool SdEngine::AwaitNetwork() {
   // would otherwise keep asking `nifm` for two minutes with `Quiesce` waiting on
   // a park that cannot come until the budget runs out (M9-4, #208).
   while (!stopping_ && !suspended_ && std::chrono::steady_clock::now() < deadline) {
+    if (restore_pending_) {
+      // A restore is a copy between two files on the card and needs no
+      // network, so it does not wait out this budget: a console that booted
+      // without Wi-Fi would otherwise draw "Restoring..." for two minutes over
+      // nothing (#209). Run here, on the worker, as `RunWorker` would.
+      restore_pending_ = false;
+      const std::int64_t entry_id = restore_.entry_id;
+      lock.unlock();
+      RunRestore(entry_id);
+      lock.lock();
+      continue;
+    }
     lock.unlock();
     // Outside the lock: `nifm` is a service call and `mutex_` guards state the
     // frame-polled commands read.
@@ -820,7 +949,8 @@ bool SdEngine::AwaitNetwork() {
     }
     // `wait_for` rather than a sleep, so a shutdown cuts this short instead of
     // costing the destructor the rest of the poll interval.
-    wake_.wait_for(lock, kNetworkPollInterval, [this] { return stopping_ || suspended_; });
+    wake_.wait_for(lock, kNetworkPollInterval,
+                   [this] { return stopping_ || suspended_ || restore_pending_; });
   }
   // False when the budget ran out, the process is going away, or the console
   // went to sleep. Only the last of those is worth another go, and `RunWorker`
@@ -858,18 +988,70 @@ void SdEngine::RunWorker() {
       continue;
     }
 
+    // A restore first: somebody pressed A on the conflicts screen and is
+    // watching it say "Restoring", and it is one copy on the card rather than a
+    // tick's worth of network (#209). Here rather than beside the list pump,
+    // because a due tick would otherwise go in front of it.
+    if (restore_pending_) {
+      restore_pending_ = false;
+      const std::int64_t entry_id = restore_.entry_id;
+      lock.unlock();
+      RunRestore(entry_id);
+      lock.lock();
+      continue;
+    }
+
     // Read **before** the decision and compared after the pump: everything that
     // gives this thread work bumps it under `mutex_`, so a notification that
     // lands while the lock is released below cannot be missed. See `wakes_`.
     const std::uint64_t decided_at = wakes_;
-    const sync::Decision decision = scheduler_.Poll();
+    sync::Decision decision = scheduler_.Poll();
     if (decision.run()) {
-      sync_in_progress_ = true;
+      // Asked only now, when a tick is actually due: a console with nothing to
+      // run never asks `pm` anything (#242). And asked **first**, ahead of
+      // everything `RunOneTick` does -- the gate, #228's heartbeat and floor,
+      // the library, and the negotiate that answers #235's "sync is disabled"
+      // -- so a held tick spends no request at all and says nothing about the
+      // server it has not asked.
       lock.unlock();
-      RunOneTick();
+      bool game = application_running();
       lock.lock();
-      sync_in_progress_ = false;
-      continue;
+      if (!game) {
+        holding_ = false;
+        sync_in_progress_ = true;
+        lock.unlock();
+        // False is a game launched while the tick fetched the library: held
+        // below exactly as if it had been running when it was asked.
+        game = !RunOneTick();
+        lock.lock();
+        sync_in_progress_ = false;
+        if (!game) {
+          continue;
+        }
+      }
+      // **Held, not run, and not lost.** A game holds its save in memory and
+      // writes it when it closes, so a download placed under it is overwritten
+      // and an upload under it sends the save from before the session (#242).
+      // The scheduler gets the tick back, and the loop below re-asks every
+      // `foreground_poll_` -- the one deadline this adds, and only while a tick
+      // is owed. However many fall due meanwhile, one runs when the game closes.
+      scheduler_.Defer(decision.trigger);
+      const bool first = !holding_;
+      holding_ = true;
+      if (first) {
+        // Outside the lock: a log line is a write to the card.
+        lock.unlock();
+        log::Info(log::Event::kSyncHeld,
+                  std::string("a game is running; the ") + sync::ToString(decision.trigger) +
+                      " tick waits until it closes");
+        lock.lock();
+      }
+      decision = sync::Decision{};
+      decision.sleep_for = foreground_poll_;
+    } else {
+      // Nothing is owed -- the switch went off under a hold, say -- so the next
+      // hold is a new one and says so.
+      holding_ = false;
     }
 
     // A list page is one request and somebody is looking at a screen waiting for
@@ -1020,6 +1202,9 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
 
   const download::DrainResult result =
       download::Drain(*client, *files, *config, queue_, options);
+  // A rom the web UI queued is reported the moment its row settles (#245),
+  // under the drain's own cancel, so a sleep or an Unpair stops this too.
+  SettleInstalls(*client, token, config->server.url, cancel.get());
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1034,6 +1219,19 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
   LogDrain(result);
 
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!result.done.empty()) {
+    // A rom that has just arrived has its save on the server and none on the
+    // card, and the user is about to launch it. The tick that brings it runs
+    // now rather than at the interval (#241); `RunSoon` does nothing while
+    // sync is switched off.
+    for (const std::int64_t rom_id : result.done) {
+      if (fresh_roms_.size() < sync::kMaxNegotiateRomIds &&
+          std::find(fresh_roms_.begin(), fresh_roms_.end(), rom_id) == fresh_roms_.end()) {
+        fresh_roms_.push_back(rom_id);
+      }
+    }
+    scheduler_.RunSoon();
+  }
   if (download_wakes_ != asked_at) {
     // A command that changes what a drain would decide landed while this one
     // was running, and cleared the pacing on the way past. Writing this drain's
@@ -1125,11 +1323,13 @@ void SdEngine::Quiesce() {
   const bool pairing_idle = !pairing_busy_;
   lock.unlock();
 
-  // The other writer of a save file: a restore, on the IPC thread, which takes
-  // this lock rather than `mutex_` (`save_write_mutex_`). It is not the worker
-  // and no cancel token reaches it -- one restore is one copy and it ends on its
-  // own -- so the only thing to do is wait for it, with what is left of the
-  // budget.
+  // The other writer of a save file: a restore, which takes this lock rather
+  // than `mutex_` (`save_write_mutex_`). On the worker since M9-6 (#209), so
+  // the park above already waited for one that was running -- but a console
+  // whose worker never started runs it on the IPC thread instead, where no
+  // park reaches it and no cancel token does either: one restore is one copy
+  // and it ends on its own. So the only thing to do is wait for it, with what
+  // is left of the budget.
   const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
   // `try_lock` and not `try_lock_for(0)` when the budget is already gone, so the
   // line below says what was actually true rather than reporting a save write in
@@ -1187,7 +1387,24 @@ void SdEngine::Resume() {
     // exactly this reason. `erpt` turns its own filesystem access back on at the
     // same point.
     log::SetSinkEnabled(true);
-    // Wake the worker, and **nothing else**.
+    // A console mostly sleeps rather than reboots, so "read again with the
+    // server" cannot wait for a boot (#245): remote install refused or off is
+    // asked again on the next tick -- one unauthenticated heartbeat a wake, and
+    // only while the feature is not working. A server that has it on is not
+    // asked.
+    //
+    // The generation moves with it, as `ForgetServerLocked`'s does: a tick
+    // `Quiesce` gave up waiting for may still be on its way back, and what its
+    // heartbeat or its claim says must not put the old answer back. Nothing
+    // else is forgotten -- the claims held, the reports given up on and the
+    // registration all stand -- and while remote install is off or refused
+    // nothing claims, so a tick's claims are not lost to the bump.
+    if (install_refused_ || !server_caps_.install_enabled) {
+      install_refused_ = false;
+      server_read_ = false;
+      ++server_generation_;
+    }
+    // Wake the worker, and **nothing else** that paces it.
     //
     // Not `WakeDownloads`'s clear of `download_due_`/`download_backoff_`, which
     // is the tempting mistake: a drain cancelled by the suspend already ends
@@ -1244,6 +1461,21 @@ void SdEngine::LogDrain(const download::DrainResult& result) {
 
 namespace {
 
+/// `state.db`, with a version-2 file's rows moved to the slots their files are
+/// synced in now (#236) -- so the first tick after the upgrade hashes nothing it
+/// already knew, and M7-4 sees the same saves either side of it.
+///
+/// Both of a tick's reads go through this: the states half re-reads the file
+/// the saves half wrote, which on a tick that wrote none is still version 2.
+state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config) {
+  state::LoadedBaseline loaded = state::LoadBaseline(path);
+  state::AdoptLegacySaves(&loaded,
+                          [&config](std::string_view old_slot) -> std::optional<std::string> {
+                            return scan::MigratedSlot(config.sync.slot, old_slot);
+                          });
+  return loaded;
+}
+
 /// The saves as the *last* tick left them, for M7-4's derivation.
 ///
 /// Two projections rather than one, because the two sides of the comparison come
@@ -1286,29 +1518,6 @@ std::vector<play::SaveObservation> ObservationsOf(const std::vector<scan::SaveFi
     observations.push_back(std::move(observation));
   }
   return observations;
-}
-
-/// Where a save or a state the console has no local copy of should be written.
-///
-/// Empty when there is nowhere to put it, which is what `ExecuteOptions::place`
-/// and `StateSyncOptions::place` both document as "fail this one rather than
-/// guessing" -- and it is the honest answer for a rom this client's index does
-/// not hold, or a platform the user never mapped a folder for.
-///
-/// **The server's file name is never trusted.** A `file_name` carrying a
-/// separator, or one that is `.` or `..`, would let a sync plan name a path
-/// outside the folder the user mapped; `sync::Validate` refuses the same shapes
-/// on the way in, and this refuses them again on the way out because this is the
-/// call that turns a name into a path.
-std::string PlaceUnder(const std::vector<std::string>& folders, std::string_view file_name) {
-  if (folders.empty() || file_name.empty() || file_name == "." || file_name == ".." ||
-      file_name.find('/') != std::string_view::npos ||
-      file_name.find('\\') != std::string_view::npos) {
-    return {};
-  }
-  // The first entry is the write target; the rest are only ever consulted when
-  // asking whether something is already there (config.hpp).
-  return folders.front() + "/" + std::string(file_name);
 }
 
 /// Write the one line that says why this console could not reach its server.
@@ -1376,7 +1585,273 @@ void SdEngine::LogPlayStore(const play::StoreResult& stored) {
   }
 }
 
-void SdEngine::RunOneTick() {
+void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                             const config::Config& config,
+                             const server::ServerCapabilities& caps,
+                             const http::CancelToken* cancel) {
+  if (!caps.install_enabled || !caps.device_capabilities || token.device_id.empty()) {
+    return;
+  }
+  // With downloads off a claimed rom would sit in the queue, so the web UI is
+  // told this console takes none rather than left offering it.
+  const bool wanted = config.downloads.enabled;
+  std::optional<bool> registered;
+  bool refused = false;
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    registered = install_registered_;
+    refused = install_refused_;
+    generation = server_generation_;
+  }
+  sync::CallPolicy policy;
+  policy.cancel = cancel;
+  policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
+
+  if (refused) {
+    return;
+  }
+  if (registered != wanted) {
+    // Once a boot, and again when the switch moves: a capability RomM already
+    // holds costs nothing to restate, and one it lost to a re-pairing is put
+    // back by the next tick.
+    const install::Exchange registration =
+        install::Register(client, config.server.url, token, wanted, policy);
+    if (!registration.ok()) {
+      if (registration.transport == http::Error::kCanceled) {
+        return;
+      }
+      log::Warn(log::Event::kRemoteInstall, registration.message);
+      if (!registration.transient() && registration.status != 401 &&
+          registration.status != 403) {
+        // Asking again every tick changes nothing but the length of the log.
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (server_generation_ == generation) {
+          install_refused_ = true;
+        }
+      }
+      return;
+    }
+    log::Info(log::Event::kRemoteInstall,
+              wanted ? "RomM's web UI can install roms on this console"
+                     : "RomM's web UI will not offer this console: [downloads] enabled = false");
+    if (!wanted) {
+      // Downloads went off with requests taken, or before a reboot left some:
+      // nothing here will fetch them, so the browser is told now rather than
+      // left waiting out the request's expiry. Once per switch, not per tick.
+      //
+      // A request whose rom already settled is reported for what it is first --
+      // done, already installed -- as the `wanted` path does; the claim then
+      // hands back only what is still taken.
+      SettleInstalls(client, token, config.server.url, cancel);
+      std::vector<install::Request> owed;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        owed = install_claims_;
+      }
+      // A settled request whose report did not go is not failed, and is not
+      // dropped either: the switch is recorded as told only once every report
+      // went, so the next tick restates it and tries again.
+      const bool settled =
+          std::none_of(owed.begin(), owed.end(), [this](const install::Request& claim) {
+            return install::VerdictFor(queue_.Find(claim.rom_id)).has_value();
+          });
+      if (!settled) {
+        return;
+      }
+      const install::Claimed held = install::Claim(client, config.server.url, token, policy);
+      if (!held.exchange.ok()) {
+        if (held.exchange.transport != http::Error::kCanceled) {
+          log::Warn(log::Event::kRemoteInstall, held.exchange.message);
+        }
+        return;
+      }
+      // The same rule as a settled request's: the switch is told only once
+      // every failure went, and the first the link did not carry stops the
+      // pass rather than spending every claim's retries on it.
+      for (const install::Request& request : held.page.requests) {
+        const install::Exchange reported = install::Report(
+            client, config.server.url, token, request.id,
+            {install::Outcome::kFailed,
+             "downloads are switched off on the console ([downloads] enabled = false)"},
+            policy);
+        if (reported.ok() || reported.ended()) {
+          continue;
+        }
+        if (reported.transport == http::Error::kCanceled) {
+          return;
+        }
+        log::Warn(log::Event::kRemoteInstall,
+                  "rom " + std::to_string(request.rom_id) + " from RomM's web UI: " +
+                      reported.message);
+        if (reported.transport != http::Error::kNone || reported.transient() ||
+            reported.status == 401 || reported.status == 403) {
+          return;
+        }
+        // Refused for what it says: resending it is not taken back either.
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (server_generation_ == generation) {
+        install_claims_.clear();
+      }
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (server_generation_ == generation) {
+      install_registered_ = wanted;
+    }
+  }
+  if (!wanted) {
+    return;
+  }
+
+  // Reports first, so a request this console finished is ended before the
+  // claim would hand it back.
+  SettleInstalls(client, token, config.server.url, cancel);
+  const install::Claimed claimed = install::Claim(client, config.server.url, token, policy);
+  if (!claimed.exchange.ok()) {
+    if (claimed.exchange.transport == http::Error::kCanceled) {
+      return;
+    }
+    log::Warn(log::Event::kRemoteInstall, claimed.exchange.message);
+    if (claimed.exchange.status == 404) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (server_generation_ == generation) {
+        install_refused_ = true;
+      }
+    }
+    return;
+  }
+
+  std::vector<install::Request> tracked;
+  std::vector<std::string> abandoned;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tracked = install_claims_;
+    abandoned = install_abandoned_;
+  }
+  const auto holds = [](const std::vector<install::Request>& requests, const std::string& id) {
+    return std::any_of(requests.begin(), requests.end(),
+                       [&id](const install::Request& request) { return request.id == id; });
+  };
+  if (claimed.page.dropped == 0) {
+    // A request the server no longer holds taken was cancelled in the web UI
+    // or expired, and has nothing left to report. Its download, if it is still
+    // queued, is left alone: it is in the user's queue now.
+    tracked.erase(std::remove_if(tracked.begin(), tracked.end(),
+                                 [&](const install::Request& request) {
+                                   return !holds(claimed.page.requests, request.id);
+                                 }),
+                  tracked.end());
+  }
+  for (const install::Request& request : claimed.page.requests) {
+    if (holds(tracked, request.id) ||
+        std::find(abandoned.begin(), abandoned.end(), request.id) != abandoned.end()) {
+      continue;
+    }
+    if (tracked.size() >= install::kMaxClaims) {
+      // Still taken on the server, and in the next claim.
+      break;
+    }
+    std::int32_t position = 0;
+    // The overlay's own path in: `queue.json`, the drain, and #241's restore.
+    const ipc::Error queued = Enqueue(request.rom_id, &position);
+    if (queued == ipc::Error::kOk || queued == ipc::Error::kDuplicate) {
+      tracked.push_back(request);
+      log::Info(log::Event::kRemoteInstall,
+                "rom " + std::to_string(request.rom_id) + " queued from RomM's web UI" +
+                    (queued == ipc::Error::kDuplicate ? "; it was already in the queue" : ""));
+    } else {
+      // Left taken on the server, which hands it back with the next claim.
+      log::Warn(log::Event::kRemoteInstall, "rom " + std::to_string(request.rom_id) +
+                                                " from RomM's web UI was not queued: " +
+                                                ipc::ToString(queued));
+    }
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (server_generation_ == generation) {
+    install_claims_ = std::move(tracked);
+  }
+}
+
+void SdEngine::SettleInstalls(http::HttpClient& client, const auth::StoredToken& token,
+                              const std::string& base_url, const http::CancelToken* cancel) {
+  std::vector<install::Request> claims;
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (install_claims_.empty() || token.device_id.empty()) {
+      return;
+    }
+    claims = install_claims_;
+    generation = server_generation_;
+  }
+  sync::CallPolicy policy;
+  policy.cancel = cancel;
+  policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
+
+  std::vector<std::string> settled;
+  std::vector<std::string> refused;
+  for (const install::Request& claim : claims) {
+    const std::optional<install::Verdict> verdict = install::VerdictFor(queue_.Find(claim.rom_id));
+    if (!verdict.has_value()) {
+      continue;
+    }
+    const install::Exchange reported =
+        install::Report(client, base_url, token, claim.id, *verdict, policy);
+    const std::string rom = "rom " + std::to_string(claim.rom_id) + " from RomM's web UI";
+    if (reported.ok()) {
+      settled.push_back(claim.id);
+      log::Info(log::Event::kRemoteInstall,
+                rom + ": reported " + install::ToString(verdict->outcome) +
+                    (verdict->reason.empty() ? "" : " (" + verdict->reason + ")"));
+    } else if (reported.ended()) {
+      settled.push_back(claim.id);
+      log::Info(log::Event::kRemoteInstall,
+                rom + ": the request had already ended on the server (HTTP " +
+                    std::to_string(reported.status) + ")");
+    } else if (reported.transport == http::Error::kCanceled) {
+      break;
+    } else if (reported.transport != http::Error::kNone) {
+      // No answer, after every retry: the next report would go down the same
+      // link, and each spends its retries on the worker that drains the queue
+      // and runs the ticks. The rest wait, unsettled, for the next pass.
+      log::Warn(log::Event::kRemoteInstall, rom + ": " + reported.message);
+      break;
+    } else {
+      log::Warn(log::Event::kRemoteInstall, rom + ": " + reported.message);
+      // Kept for the next pass while asking again could work: a
+      // server having a bad minute, or credentials a re-pairing restores. A
+      // report RomM refused for what it says is not taken back by resending it.
+      if (!reported.transient() && reported.status != 401 && reported.status != 403) {
+        settled.push_back(claim.id);
+        refused.push_back(claim.id);
+      }
+    }
+  }
+  if (settled.empty()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (server_generation_ != generation) {
+    return;
+  }
+  install_claims_.erase(
+      std::remove_if(install_claims_.begin(), install_claims_.end(),
+                     [&settled](const install::Request& claim) {
+                       return std::find(settled.begin(), settled.end(), claim.id) !=
+                              settled.end();
+                     }),
+      install_claims_.end());
+  // Still taken on the server, which keeps handing them back; not queued again.
+  for (std::string& id : refused) {
+    if (install_abandoned_.size() >= install::kMaxClaims) {
+      install_abandoned_.erase(install_abandoned_.begin());
+    }
+    install_abandoned_.push_back(std::move(id));
+  }
+}
+
+bool SdEngine::RunOneTick() {
   const std::shared_ptr<const config::Config> config = ConfigSnapshot();
   http::HttpClient* client = nullptr;
   fs::FileSystem* files = nullptr;
@@ -1436,7 +1911,7 @@ void SdEngine::RunOneTick() {
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kUnauthorized);
     RecordFailedTickLocked();
-    return;
+    return true;
   }
   if (client == nullptr || files == nullptr || token.access_token.empty() ||
       !config->configured()) {
@@ -1466,7 +1941,103 @@ void SdEngine::RunOneTick() {
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(sync::TickOutcome::kOffline);
     RecordFailedTickLocked();
-    return;
+    return true;
+  }
+
+  // M10-2 (#228): which RomM this is, before anything is asked of it. Once a
+  // boot and once a pairing -- see `server_caps_` -- and every tick while the
+  // answer is "too old".
+  server::ServerCapabilities caps;
+  server::Version floor;
+  // Which answer this tick may record. A `server.url` change or a pairing
+  // landing while the heartbeat is in flight bumps it, and the old server's
+  // answer must not overwrite the "ask again" that stands for the new one.
+  std::uint64_t generation = 0;
+  {
+    bool read = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      read = server_read_;
+      caps = server_caps_;
+      floor = server_floor_;
+      generation = server_generation_;
+    }
+    if (!read) {
+      sync::CallPolicy policy;
+      policy.cancel = cancel.get();
+      // A backoff a shutdown or a sleep cuts short, as a drain's is.
+      policy.wait = [this](std::chrono::milliseconds delay) { AwaitBackoff(delay); };
+      const server::Probe probe = server::ReadServer(*client, config->server.url, policy, floor);
+      if (!probe.ok()) {
+        // The heartbeat is unauthenticated, so nothing here is evidence about
+        // the credentials and `auth::Gate` hears nothing. A link that is down
+        // or a RomM having a bad minute is `kOffline`, the way the library
+        // fetch below treats one; an answer that is not a heartbeat at all is
+        // somebody else answering the URL, which does not change by asking
+        // again soon.
+        StampPlayWindow();
+        sync::TickOutcome outcome = sync::TickOutcome::kRefused;
+        if (probe.transport == http::Error::kCanceled) {
+          outcome = sync::TickOutcome::kCanceled;
+        } else if (probe.transient()) {
+          outcome = sync::TickOutcome::kOffline;
+          if (probe.transport != http::Error::kNone) {
+            LogTransportFailure(probe.transport, "GET /api/heartbeat", probe.message);
+          } else {
+            log::Warn(log::Event::kNetOffline, "GET /api/heartbeat: " + probe.message);
+          }
+        } else {
+          log::Warn(log::Event::kSyncRefused, "GET /api/heartbeat: " + probe.message);
+        }
+        LogTickEnd(outcome);
+        std::lock_guard<std::mutex> lock(mutex_);
+        scheduler_.Finished(outcome, probe.transport);
+        if (outcome != sync::TickOutcome::kCanceled) {
+          RecordFailedTickLocked();
+        }
+        return true;
+      }
+      caps = probe.capabilities;
+      if (caps.supported) {
+        // Said once per read rather than per tick: it is the answer to "which
+        // server", and a log that repeated it every half hour would push the
+        // lines that answer anything else out of the ring.
+        log::Info(log::Event::kServerVersion,
+                  caps.known ? "RomM " + caps.version
+                             : "RomM did not give a version it can read (\"" + caps.version +
+                                   "\"); treated as the newest");
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (server_generation_ == generation) {
+        server_caps_ = caps;
+        // A refused server is not remembered as read, so the next tick asks
+        // again and an upgrade is noticed without a reboot.
+        server_read_ = caps.supported;
+      }
+    }
+  }
+  if (!caps.supported) {
+    // Before the library and before the scan: nothing a tick would ask a 5.2 or
+    // a 5.3 is worth its requests, and `sync::RunTick` would refuse the
+    // negotiate anyway (`TickOutcome::kUnsupported`).
+    StampPlayWindow();
+    log::Error(log::Event::kServerUnsupported,
+               "RomM " + caps.version + " is older than " + server::ToString(floor) +
+                   ", the oldest this build syncs with; nothing is synced until it is upgraded");
+    LogTickEnd(sync::TickOutcome::kUnsupported);
+    std::lock_guard<std::mutex> lock(mutex_);
+    scheduler_.Finished(sync::TickOutcome::kUnsupported);
+    RecordFailedTickLocked();
+    if (server_generation_ == generation) {
+      server_too_old_ = true;
+    }
+    return true;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (server_generation_ == generation) {
+      server_too_old_ = false;
+    }
   }
 
   // Step 0, the half `sync::RunTick` deliberately does not own: the library the
@@ -1508,12 +2079,55 @@ void SdEngine::RunOneTick() {
                                                          : sync::TickOutcome::kOffline,
                         library.transport);
     RecordFailedTickLocked();
-    return;
+    return true;
+  }
+  if (!library.message.empty()) {
+    // An index that is not whole -- cut at its bound, a library that moved
+    // mid-fetch, a rom too large to read (#248) -- is read anyway, and the
+    // scan's unmatched lines say a save "may be a rom that was never read". This
+    // is the line that says why.
+    log::Warn(log::Event::kScanSkipped, "GET /api/roms: " + library.message);
   }
 
+  // **Asked again, here** (#242). The worker asked before this tick started,
+  // and the rom index can be several pages: a game launched meanwhile has
+  // already read the save a download would replace. This is the last moment
+  // before anything is planned, placed, sent -- or stamped into the play window
+  // -- and the GETs above wrote nothing. The tick goes back to the scheduler
+  // as if the game had been running when the worker asked.
+  //
+  // Not the last time: each later chunk and a 409's resolution ask again
+  // (`TickOptions::hold`), and so does the states half before it starts.
+  if (application_running()) {
+    return false;
+  }
+
+  // What RomM's web UI queued for this console (#245). Here, past the library
+  // fetch, so a console that is offline spends nothing more on it; it only
+  // fills the download queue, which drains after the tick.
+  ServeInstalls(*client, token, *config, caps, cancel.get());
+
   const std::string baseline_path = files->Resolve(sync::kStateSdPath);
-  const state::LoadedBaseline loaded = state::LoadBaseline(baseline_path);
-  const scan::ScanResult scanned = scan::ScanSaves(*config, library.index, *files, loaded.value);
+  state::LoadedBaseline loaded = LoadBaselineFor(baseline_path, *config);
+  // Taken here and let go only once a negotiation has asked for them, so an
+  // offline tick keeps them for the next (#241).
+  std::vector<std::int64_t> fresh;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fresh = fresh_roms_;
+  }
+  // Where RetroArch keeps its saves this tick, and whether it syncs them itself
+  // (#230). Read every tick rather than at boot: RetroArch rewrites its file on
+  // exit, from another process, and a client that kept the boot-time answer
+  // would go on walking a layout the user has since switched away from -- or
+  // keep syncing beside a Cloud Sync they have just turned on.
+  const retroarch::LoadResult retroarch_cfg =
+      retroarch::Load(files->Resolve(retroarch::kConfigSdPath));
+  // Tico's layout is read off the card the same way, every tick: a Tico
+  // update or a new account changes it without touching config.ini.
+  NoteSources(*config, retroarch_cfg, tico::Notes(*config, *files));
+  scan::ScanResult scanned =
+      scan::ScanSaves(*config, retroarch_cfg.value, library.index, *files, loaded.value);
   // One line per file the scan would not report, at the spelling the scanner
   // already renders for a log -- an unmatched name, a name on two platforms with
   // no platform hint, a save reported without a digest. Never guessed at
@@ -1531,7 +2145,8 @@ void SdEngine::RunOneTick() {
     target.rom_id = save.rom_id;
     target.slot = save.slot;
     target.sd_path = save.sd_path;
-    target.file_name = save.file_name;
+    // The name negotiate was told, so the upload and the plan agree (#236).
+    target.file_name = reported.back().file_name;
     targets.push_back(std::move(target));
   }
 
@@ -1570,7 +2185,36 @@ void SdEngine::RunOneTick() {
   // true against a second caller (M6-2, #33). The scheduler never gets this far
   // with it off, which is the other half of the same promise.
   options.enabled = config->sync.enabled;
+  // What the heartbeat said, for every stage that asks (#228). Already known
+  // to be supported -- the refusal above returned -- and passed anyway, so the
+  // tick's own gate is the same fact rather than a default.
+  options.server = caps;
+  // Only the lineages this console can load are paired or offered (#236): a
+  // PlayStation core's save in the shared slot is not this console's to
+  // download. Off when a scanned save names no emulator (`EmulatorFilter`).
+  if (caps.emulators_filter) {
+    options.negotiate.emulators = scan::EmulatorFilter(*config, scanned.saves);
+  }
+  // Only the roms on the card are asked about, so a save of a game this
+  // console does not hold is not placed beside nothing (#241) -- and a rom
+  // just downloaded is asked about on its own, so its save comes with it.
+  if (caps.rom_ids) {
+    sync::RomsOnCard on_card = sync::FindRomsOnCard(*config, library.index, *files);
+    for (const std::string& folder : on_card.truncated) {
+      log::Warn(log::Event::kScanSkipped,
+                folder + " holds more than " + std::to_string(fs::kMaxDirectoryEntries) +
+                    " entries; roms past the first ones by name get no first-time restore");
+    }
+    options.rom_scope = std::move(on_card.rom_ids);
+    options.restore_roms = fresh;
+  }
+  // The check above is the last before the first plan. Each later chunk's plan,
+  // and a 409's resolution, are transfers after it, so they ask again (#242).
+  options.hold = [this]() { return application_running(); };
   options.execute.backup_dir = sync::kBackupDir;
+  // What a save RomM deleted does here (#233): backed up, then removed, unless
+  // `keep` says leave it.
+  options.execute.on_server_delete = config->sync.on_server_delete;
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = cancel.get();
   // The save folders and `.backup/`, and deliberately **not** `/config/rommsync`
@@ -1578,30 +2222,38 @@ void SdEngine::RunOneTick() {
   // the overlay writes `config.ini` from another thread, where a sweep removing
   // a `.tmp` between the write and its rename would cost a setting the user had
   // just changed (`sync::RecoverStaging`).
+  //
+  // And every folder the scan read, which since #230 is more than the map: a
+  // save found under RetroArch's sorted `<CoreFolder>/` is overwritten there.
   options.recover_dirs = config->SaveScanDirs();
+  for (const std::string& folder : scanned.folders) {
+    if (std::find(options.recover_dirs.begin(), options.recover_dirs.end(), folder) ==
+        options.recover_dirs.end()) {
+      options.recover_dirs.push_back(folder);
+    }
+  }
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
+  // The scan's records go here, before the plan arrives: everything the rest of
+  // the tick reads of them is in `reported`, `targets` and the options above,
+  // and held to the end they were a third copy of every save beside the plan --
+  // ~450 bytes a save on aarch64 (`kHeapTickSaves`, main.cpp; M9-20, #246).
+  std::vector<scan::SaveFile>().swap(scanned.saves);
+  // A card the scan stopped short of is not a clean sync, however well the saves
+  // it did see went (#246): the status screen says partial, beside the
+  // `scan.skipped` line above that says why.
+  const bool scan_cut = scanned.stopped_at_bound;
   for (const play::BufferedSession& buffered : play_sent) {
     options.finish.play_sessions.push_back(buffered.session);
   }
   const roms::RomIndex* index = &library.index;
-  // One placement rule, applied to the two folder lists. Saves and states are
-  // placed the same way -- find the rom, find the platform the user mapped, put
-  // it in the first folder -- and the only thing that differs is which list.
-  // Written once so the two cannot drift into placing a state where a save goes.
-  const auto placer = [index, config](std::vector<std::string> config::PlatformFolders::*which) {
-    return [index, config, which](std::int64_t rom_id,
-                                  const std::string& file_name) -> std::string {
-      const roms::Rom* rom = index->ById(rom_id);
-      if (rom == nullptr) {
-        return {};
-      }
-      const config::PlatformFolders* folders = config->Platform(rom->platform_fs_slug);
-      return folders == nullptr ? std::string() : PlaceUnder(folders->*which, file_name);
-    };
-  };
-  options.execute.place = [place = placer(&config::PlatformFolders::saves)](
-                              const sync::SyncOperation& operation) {
-    return place(operation.rom_id, operation.file_name);
+  // A save or a state the card has never held goes to the emulator the
+  // platform is played in, in the layout the card is in this tick, under the
+  // name that emulator loads (#237) -- one placer for both, so the two cannot
+  // drift into placing a state where a save goes. It reads the card only when
+  // something is placed, and lives as long as both halves of the tick.
+  place::Placer placer(*config, retroarch_cfg.value, library.index, *files);
+  options.execute.place = [&placer](const sync::SyncOperation& operation) {
+    return placer.Save(operation);
   };
 
   // **Every save byte this tick writes happens under this**, so a restore
@@ -1609,22 +2261,6 @@ void SdEngine::RunOneTick() {
   // (`save_write_mutex_`). Held across the transfers and the states half, and
   // released before the counters go under `mutex_`.
   std::unique_lock<std::timed_mutex> writing(save_write_mutex_);
-
-  const sync::TickResult tick =
-      sync::RunTick(*client, *files, token, reported, targets, loaded.value, options);
-  ObserveAnswer(tick.answer);
-
-  // The other half of M7-4: drop the sessions RomM accounted for, and keep the
-  // ones it did not. A tick that never reached the server releases nothing, and
-  // the next one re-sends the same sessions -- which RomM answers `duplicate` if
-  // this one secretly landed (`sync::Ingested`). Nothing here can fail the tick
-  // either.
-  if (tick.finished.play_sessions_sent > 0 &&
-      tick.finished.reported.value.play_session_ingest.has_value()) {
-    const play::Reconciliation reconciled =
-        play::Reconcile(play_sent, *tick.finished.reported.value.play_session_ingest);
-    LogPlayStore(play_.Release(reconciled.release));
-  }
 
   // M7-1 (#36)'s call site, which nothing in this build had. It is outside
   // `sync::RunTick` because `conflict_record.hpp` includes `state_sync.hpp`, so
@@ -1638,25 +2274,168 @@ void SdEngine::RunOneTick() {
     // failure: the screen falls back to the file name.
     return rom == nullptr ? std::string() : rom->fs_name_no_ext;
   };
-  {
+
+  // **Every operation is read here, plan by plan**, and not off the result:
+  // a tick runs each chunk's plan on its own and frees it before the next
+  // (#246), so `tick.executed` is the last plan's alone (`TickOptions::on_plan`).
+  //
+  // A rom whose restore was cut off -- the link, the server, the card -- keeps
+  // its place in `fresh_roms_`, or the next tick would read its save as one the
+  // user deleted and never bring it. A refusal that asking again cannot change
+  // (a file already at the path, a format nothing here reads) lets go, so it is
+  // not re-asked with `restore_unlisted` on every tick.
+  std::vector<std::int64_t> ask_again;
+  std::int64_t uploaded = 0;
+  std::int64_t downloaded = 0;
+  std::int64_t arbitrated = 0;
+  options.on_plan = [&](const sync::SyncPlan& plan, const sync::ExecutionReport& executed) {
+    for (const sync::OperationResult& operation : executed.operations) {
+      bool again = operation.outcome == sync::OperationOutcome::kCanceled;
+      if (operation.outcome == sync::OperationOutcome::kFailed) {
+        switch (operation.error) {
+          case sync::OperationError::kTransferFailed:
+          case sync::OperationError::kRefused:
+          case sync::OperationError::kUnauthorized:
+          case sync::OperationError::kForbidden:
+          case sync::OperationError::kBackupFailed:
+          case sync::OperationError::kCommitFailed:
+            again = true;
+            break;
+          default:
+            break;
+        }
+      }
+      if (again) {
+        ask_again.push_back(operation.rom_id);
+      }
+      // Counted off the operations rather than off `TickCompletion::counts`,
+      // which carries only what the *server* is told -- completed and failed --
+      // and not which way each transfer went. The status screen draws three
+      // separate numbers (`ipc::Status`), and a conflict is an overwrite the
+      // server arbitrated rather than a fourth outcome, so it is counted where
+      // the backup was written.
+      if (operation.outcome == sync::OperationOutcome::kUploaded) {
+        ++uploaded;
+      } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
+        ++downloaded;
+      }
+      // A removal (#233) leaves a backup too, and is not an arbitration.
+      if (!operation.backup_sd_path.empty() &&
+          operation.outcome != sync::OperationOutcome::kRemoved) {
+        ++arbitrated;
+      }
+      // A save leaving the card, or staying on it against the server's word,
+      // is never silent (#233). The message names the save's path and its
+      // backup.
+      if (operation.outcome == sync::OperationOutcome::kRemoved ||
+          operation.outcome == sync::OperationOutcome::kKept) {
+        log::Info(log::Event::kSaveDeleted, operation.message);
+      }
+    }
+    // Every operation that did not do what the plan asked. These are the lines
+    // `ExecutionReport::warnings` was built for: a card that is full shows up
+    // here as a backup that could not be taken, and a backup that could not be
+    // taken is an overwrite that did not happen (hard rule 2).
+    log::WriteEach(log::Level::kError, log::Event::kSaveFailed, executed.warnings);
     std::lock_guard<std::mutex> history(history_mutex_);
-    conflicts::RecordSaves(&history_, tick.negotiated.plan, tick.executed, reported, record);
+    conflicts::RecordSaves(&history_, plan, executed, reported, record);
+  };
+
+  // The baseline is **moved** in, not copied: `RunTick` takes it by value and
+  // hands its own on to the finish, and a copy left here was a third set of its
+  // rows beside the two the finish holds -- the rows and the text they are
+  // written as -- for the length of the tick (`kHeapStateBaseline`, main.cpp;
+  // #247). Nothing below reads it: the states half re-reads the file.
+  sync::TickResult tick = sync::RunTick(*client, *files, token, reported, targets,
+                                        std::move(loaded.value), options);
+  ObserveAnswer(tick.answer);
+  if (tick.totals.plans > 0 && tick.outcome != sync::TickOutcome::kCanceled && !fresh.empty()) {
+    // Asked for, and done -- unless it was asked again for, or a plan never
+    // reached it this tick (`TickResult::unasked_roms`). A rom downloaded while
+    // this tick ran is not in `fresh`, and keeps its place too.
+    const auto done = [&fresh, &tick, &ask_again](std::int64_t rom_id) {
+      return std::find(fresh.begin(), fresh.end(), rom_id) != fresh.end() &&
+             std::find(ask_again.begin(), ask_again.end(), rom_id) == ask_again.end() &&
+             !std::binary_search(tick.unasked_roms.begin(), tick.unasked_roms.end(), rom_id);
+    };
+    std::lock_guard<std::mutex> lock(mutex_);
+    fresh_roms_.erase(std::remove_if(fresh_roms_.begin(), fresh_roms_.end(), done),
+                      fresh_roms_.end());
   }
 
+  // The other half of M7-4: drop the sessions RomM accounted for, and keep the
+  // ones it did not. A tick that never reached the server releases nothing, and
+  // the next one re-sends the same sessions -- which RomM answers `duplicate` if
+  // this one secretly landed (`sync::Ingested`). Nothing here can fail the tick
+  // either.
+  if (tick.finished.play_sessions_sent > 0 &&
+      tick.finished.reported.value.play_session_ingest.has_value()) {
+    const play::Reconciliation reconciled =
+        play::Reconcile(play_sent, *tick.finished.reported.value.play_session_ingest);
+    LogPlayStore(play_.Release(reconciled.release));
+  }
+
+  // A rom whose own saves on the server are more than one plan carries was left
+  // out of this tick (#246): its saves were not offered and nothing of it was
+  // touched. Named, so the one game that is not syncing can be found.
+  for (const std::int64_t rom_id : tick.oversized_roms) {
+    const roms::Rom* rom = index->ById(rom_id);
+    log::Warn(log::Event::kSyncRefused,
+              (rom != nullptr ? rom->fs_name_no_ext : std::string("rom")) + " (rom " +
+                  std::to_string(rom_id) + "): the server holds more saves for it than the " +
+                  std::to_string(sync::kMaxPlanOperations) +
+                  " one plan can carry, so it was left out of this sync");
+  }
+  if (tick.totals.plans > 0 && !tick.negotiated.ok()) {
+    // A chunk after the first failed to negotiate: what ran stands, the rest
+    // waits for the next tick, and the outcome is partial -- which the switch
+    // below would otherwise leave unexplained.
+    log::Warn(log::Event::kSyncRefused,
+              "negotiate: " + std::string(sync::ToString(tick.negotiated.error)) + "; " +
+                  tick.negotiated.message + "; " + std::to_string(tick.unasked_roms.size()) +
+                  " roms wait for the next sync");
+  }
+
+  // The saves half is done with, and it lets go of every save here, before the
+  // states half takes its own (#247): what was reported and targeted, and the
+  // last plan and what it did, which `tick` keeps for nothing past this point --
+  // the scheduler reads the outcome and the transport, and the summary the
+  // totals. Held on, they were the saves' worst phase beside the states', and
+  // `kHeapTickSaves` (main.cpp) is the larger of the two rather than their sum
+  // because of this.
+  std::vector<sync::ClientSaveState>().swap(reported);
+  std::vector<sync::SaveTarget>().swap(targets);
+  std::vector<sync::SyncOperation>().swap(tick.negotiated.plan.operations);
+  std::vector<sync::OperationResult>().swap(tick.executed.operations);
+  std::vector<std::string>().swap(tick.executed.warnings);
+
   sync::StateSyncReport states;
-  if (config->sync.states && tick.outcome != sync::TickOutcome::kCanceled &&
-      tick.outcome != sync::TickOutcome::kDisabled) {
+  // Not when RomM says sync is off for this console either: states have no
+  // negotiate of their own to refuse them, and the user who turned the switch
+  // off did not mean "saves only" (#235). Nor after a 401 or a link that
+  // carried nothing: the same token and the same link, asked again.
+  const bool states_due = config->sync.states && tick.outcome != sync::TickOutcome::kCanceled &&
+                          tick.outcome != sync::TickOutcome::kDisabled &&
+                          tick.outcome != sync::TickOutcome::kServerDisabled &&
+                          tick.outcome != sync::TickOutcome::kUnauthorized &&
+                          tick.outcome != sync::TickOutcome::kOffline;
+  // **Asked again before the states half** (#242): the saves half is transfers,
+  // and a game launched during them has read the states this half would place.
+  // Skipped rather than handed back, because the saves half ran and is
+  // recorded below; the tick asked for after it is held until the game closes.
+  const bool states_held = states_due && application_running();
+  if (states_due && !states_held) {
     // The baseline is re-read rather than carried: `sync::RunTick` persisted its
     // own copy on the way out, and `SyncStates` advances the same file. Reading
     // it back is one small file and is what keeps the two halves from writing
     // over each other's rows.
-    state::Baseline baseline = state::LoadBaseline(baseline_path).value;
+    state::Baseline baseline = LoadBaselineFor(baseline_path, *config).value;
     sync::StateSyncOptions state_options;
     state_options.backup_dir = sync::kBackupDir;
     state_options.cancel = cancel.get();
-    state_options.place = [place = placer(&config::PlatformFolders::states)](
-                              const sync::ServerState& server) {
-      return place(server.rom_id, server.file_name);
+    state_options.retroarch = retroarch_cfg.value;
+    state_options.place = [&placer](const sync::ServerState& server) {
+      return placer.State(server.rom_id, server.file_name, server.emulator);
     };
     states = sync::SyncStates(*client, *files, token, *config, library.index, &baseline,
                               state_options);
@@ -1666,6 +2445,15 @@ void SdEngine::RunOneTick() {
     conflicts::RecordStates(&history_, states, record);
   }
   writing.unlock();
+  // The states half's requests went out on the same token, so what they were
+  // answered counts towards the one verdict, as the saves half's did.
+  ObserveAnswer(sync::AnswerOf(states));
+  if (tick.held || states_held) {
+    log::Info(log::Event::kSyncHeld, tick.held ? "a game started during this sync; the rest of "
+                                                 "its saves wait until it closes"
+                                               : "a game started during this sync; its save "
+                                                 "states wait until it closes");
+  }
 
   // Everything the tick has to say, before the counters go under `mutex_`: a
   // sink writes to the SD card, and holding the lock the frame-polled `GetStatus`
@@ -1703,6 +2491,10 @@ void SdEngine::RunOneTick() {
                  "the server stopped accepting this console's token: " + tick.negotiated.message);
       break;
     case sync::TickOutcome::kRefused:
+    case sync::TickOutcome::kServerDisabled:
+      // The switch in RomM is still logged as a refusal: it is the server
+      // saying no, and docs/TROUBLESHOOTING.md's `sync.refused` section is
+      // where a user reading the log is sent for it. Only the status differs.
       log::Warn(log::Event::kSyncRefused,
                 sync::ToString(tick.negotiated.error) + std::string(": ") +
                     tick.negotiated.message);
@@ -1713,15 +2505,13 @@ void SdEngine::RunOneTick() {
     case sync::TickOutcome::kCanceled:
     case sync::TickOutcome::kDisabled:
     case sync::TickOutcome::kRescanNeeded:
+    case sync::TickOutcome::kUnsupported:
       break;
   }
 
-  // Every operation that did not do what the plan asked, and every leftover the
-  // sweep could not deal with. These are the lines `ExecutionReport::warnings`
-  // and `RecoveryReport::warnings` were built for and had nowhere to go: a card
-  // that is full shows up here as a backup that could not be taken, and a backup
-  // that could not be taken is an overwrite that did not happen (hard rule 2).
-  log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.executed.warnings);
+  // Every leftover the sweep could not deal with, and every baseline row the
+  // finish could not write. The operations' own lines went out plan by plan
+  // (`options.on_plan` above).
   log::WriteEach(log::Level::kError, log::Event::kSaveFailed, tick.finished.warnings);
   log::WriteEach(log::Level::kWarn, log::Event::kSaveFailed, tick.recovered.warnings);
   if (states.ran) {
@@ -1730,33 +2520,24 @@ void SdEngine::RunOneTick() {
 
   // The one line a user is asked for first. Last, so it reads as the summary of
   // everything above it.
-  LogTickEnd(tick.outcome, tick.executed.completed, tick.executed.failed, states.completed,
-             states.failed, tick.finished.stored.ok());
+  LogTickEnd(tick.outcome, tick.totals.completed, tick.totals.failed, states.completed,
+             states.failed, tick.totals.stored);
 
   std::lock_guard<std::mutex> lock(mutex_);
   scheduler_.Finished(tick);
+  if (tick.held || states_held) {
+    // The chunks or states it skipped, once the game closes: the worker holds
+    // this tick until then, as it does any (#242).
+    scheduler_.RunSoon();
+  }
   last_sync_at_ = static_cast<std::int64_t>(
       std::chrono::duration_cast<std::chrono::seconds>(
           scheduler_.last_tick_at().time_since_epoch())
           .count());
-  // Counted off the operations rather than off `TickCompletion::counts`, which
-  // carries only what the *server* is told -- completed and failed -- and not
-  // which way each transfer went. The status screen draws three separate
-  // numbers (`ipc::Status`), and a conflict is an overwrite the server arbitrated
-  // rather than a fourth outcome, so it is counted where the backup was written.
-  uploaded_ = 0;
-  downloaded_ = 0;
-  conflicts_ = 0;
-  for (const sync::OperationResult& operation : tick.executed.operations) {
-    if (operation.outcome == sync::OperationOutcome::kUploaded) {
-      ++uploaded_;
-    } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
-      ++downloaded_;
-    }
-    if (!operation.backup_sd_path.empty()) {
-      ++conflicts_;
-    }
-  }
+  // Counted plan by plan, in `options.on_plan`, for the reasons given there.
+  uploaded_ = uploaded;
+  downloaded_ = downloaded;
+  conflicts_ = arbitrated;
   for (const sync::StateOperationResult& operation : states.operations) {
     if (operation.outcome == sync::StateOutcome::kUploaded) {
       ++uploaded_;
@@ -1764,11 +2545,13 @@ void SdEngine::RunOneTick() {
       ++downloaded_;
     }
   }
-  failed_ = static_cast<std::int64_t>(tick.executed.failed) +
+  failed_ = static_cast<std::int64_t>(tick.totals.failed) +
             static_cast<std::int64_t>(states.failed);
   switch (tick.outcome) {
     case sync::TickOutcome::kCompleted:
-      last_sync_result_ = states.failed > 0 ? ipc::SyncResult::kPartial : ipc::SyncResult::kOk;
+      last_sync_result_ = states.failed > 0 || scan_cut || states_held
+                              ? ipc::SyncResult::kPartial
+                              : ipc::SyncResult::kOk;
       break;
     case sync::TickOutcome::kPartial:
     case sync::TickOutcome::kUnreported:
@@ -1780,12 +2563,18 @@ void SdEngine::RunOneTick() {
       // Nothing happened that a status screen should report as a sync. The last
       // result stands, which for a first boot is `kNever`.
       break;
+    case sync::TickOutcome::kServerDisabled:
+      // A setting, not a failure, and the overlay says whose (#235).
+      last_sync_result_ = ipc::SyncResult::kServerDisabled;
+      break;
     case sync::TickOutcome::kOffline:
     case sync::TickOutcome::kRefused:
     case sync::TickOutcome::kUnauthorized:
+    case sync::TickOutcome::kUnsupported:
       last_sync_result_ = ipc::SyncResult::kFailed;
       break;
   }
+  return true;
 }
 
 ipc::Error SdEngine::StartPairing() {
@@ -1856,7 +2645,6 @@ ipc::Error SdEngine::StartPairing() {
     // `PairingConfig`, which is `core/`'s to add.
     attempt_ = std::make_shared<PairingAttempt>(*pairing_backend_.http, std::move(pairing),
                                                 ConfigSnapshot()->server.url);
-    attempt_commit_failure_.clear();
   }
   wake_.notify_all();
   // `pairing_status()` already answers `kStarting`, which is the contract
@@ -1865,10 +2653,7 @@ ipc::Error SdEngine::StartPairing() {
   return ipc::Error::kOk;
 }
 
-void SdEngine::AbandonPairingLocked() {
-  attempt_.reset();
-  attempt_commit_failure_.clear();
-}
+void SdEngine::AbandonPairingLocked() { attempt_.reset(); }
 
 bool SdEngine::AwaitNextPoll(const std::shared_ptr<PairingAttempt>& attempt) {
   // Until the session says the next request is due, rather than on a tick of our
@@ -1982,6 +2767,13 @@ void SdEngine::DrivePairing() {
       // acknowledged between `token.dat` and `auth.json` is the transition
       // taking `fsp-srv` away in the middle of a commit.
       CommitGrant(attempt, *granted);
+    } else {
+      // `PairingSession` promises a token with every `kApproved`, so this is a
+      // defect rather than a state. Named anyway: `pairing_status` holds an
+      // uncommitted approval at `kPending`, and without this the screen would
+      // show a code that can never complete.
+      std::lock_guard<std::mutex> lock(mutex_);
+      attempt->commit_failure = "the pairing was approved and no token came with it -- pair again";
     }
     SetPairingBusy(false);
   }
@@ -2029,9 +2821,12 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
   if (!saved.ok()) {
     // Said out loud on the pairing screen rather than left to be discovered at
     // the next sync tick: the approval is spent, so the remedy is to pair again,
-    // and a screen still reading `kApproved` would tell the user the opposite.
+    // and a screen still showing the code as pending would tell them to wait.
+    //
+    // On the attempt, not the engine: a "Start over" pressed during the write
+    // has already replaced `attempt_`, and the new code must not inherit this.
     std::lock_guard<std::mutex> lock(mutex_);
-    attempt_commit_failure_ =
+    attempt->commit_failure =
         std::string("the pairing was approved and the token could not be saved (") +
         auth::ToString(saved.error) + ") -- pair again";
     return;
@@ -2047,6 +2842,11 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     std::lock_guard<std::mutex> lock(mutex_);
     gate_.Reset();
     auth_ = ipc::AuthState::kPaired;
+    // ...and only now does the attempt read `kApproved`: in the slice that makes
+    // the console paired, after `token.dat` is on the card. Whoever sees the
+    // pairing screen say "Paired" sees a `GetStatus` that agrees, and a card
+    // that does too.
+    attempt->committed = true;
     // The credentials the worker and the lists use, replaced in the same slice
     // as the state that says the console is paired -- so the first tick after a
     // pairing runs on the token that pairing just produced rather than on
@@ -2056,6 +2856,10 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     if (server_ != nullptr) {
       lists_.UseServer(server_, list_token_);
     }
+    // Once a pairing (#228): the first tick on these credentials asks the
+    // server which RomM it is, rather than trusting what an earlier pairing's
+    // server said.
+    ForgetServerLocked(/*different_server=*/false);
   }
   // A paired console usually has a tick due: `[sync] on_boot` fired long before
   // there were credentials to fire it with -- and a queue too, if a drain gave
@@ -2235,52 +3039,81 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
   return ipc::Error::kOk;
 }
 
-ipc::Error SdEngine::RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) {
-  // **Refused while a tick is writing saves**, because both write the same
-  // bytes.
-  //
-  // Until M7-2 (#37) this was the only thing in the sysmodule that wrote a save,
-  // so there was nothing to be atomic against. Now the worker runs
-  // `sync::Execute` and `sync::SyncStates` over the same `sd_path` a restore
-  // targets. Each write is individually atomic, so the collision is a lost
-  // update rather than a corrupt file -- the restored bytes replaced moments
-  // later by an in-flight download, and the tick's `.backup/` copy taken of a
-  // half-restored state -- and neither is something to hand a player.
-  //
-  // **The lock is taken for the whole check-and-act, not consulted and
-  // dropped.** A flag read under a lock that is then released is a race with a
-  // handful of instructions in it rather than an unbounded one, which is not the
-  // same as no race: the worker could take the flag and start writing in exactly
-  // that gap. Holding `save_write_mutex_` until the restore has finished is what
-  // actually excludes it.
-  //
-  // Try-locked rather than waited on: waiting would park the **IPC thread**
-  // behind a whole tick, which `ipc.hpp` forbids in as many words.
-  // `kBackupFailed` is the outcome whose promise is exactly what holds here --
-  // nothing was written -- and the sentence beside it is what the screen draws,
-  // so the user is told to press again rather than told their backup is gone.
-  std::unique_lock<std::timed_mutex> writing(save_write_mutex_, std::try_to_lock);
-  if (!writing.owns_lock()) {
-    report->outcome = conflicts::RestoreOutcome::kBackupFailed;
-    report->message = "a sync is running; try the restore again when it finishes";
-    return ipc::Error::kOk;
+ipc::RestoreState SdEngine::RequestRestore(std::int64_t entry_id) {
+  bool handed = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (restore_.phase == ipc::RestorePhase::kRunning) {
+      // One at a time, and the answer says which one is out -- a screen that
+      // compares the id can say "another restore is still running" rather than
+      // drawing a press that did nothing (`ipc::RestoreState`).
+      return restore_;
+    }
+    restore_ = ipc::RestoreState{};
+    restore_.phase = ipc::RestorePhase::kRunning;
+    restore_.entry_id = entry_id;
+    if (worker_live_) {
+      restore_pending_ = true;
+      // The press must not wait out a rom, for `RequestSync`'s reason: the drain
+      // ends at its next boundary with its `.part` kept, the restore runs, and
+      // the next pass picks the transfer back up. A tick is *not* cancelled --
+      // it is writing saves, and the restore waits for it rather than racing
+      // it, which is the exclusion `save_write_mutex_` used to buy by refusing.
+      CancelDrainLocked();
+      handed = true;
+    }
+  }
+  if (handed) {
+    Wake();
+    return restore_state();
+  }
+  // No worker to hand it to. Run here, as every restore did before #209 --
+  // a console that cannot restore at all would be the worse failure.
+  RunRestore(entry_id);
+  return restore_state();
+}
+
+ipc::RestoreState SdEngine::restore_state() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return restore_;
+}
+
+void SdEngine::RunRestore(std::int64_t entry_id) {
+  conflicts::RestoreReport report;
+  {
+    // **Held for the whole check-and-act**, which on the worker is the same
+    // thread as every tick and so cannot contend with one; it is taken anyway
+    // because `Quiesce` reads it to know that no save write is in flight, and
+    // because with no worker this runs on the IPC thread beside one that may
+    // yet be started. Waited on rather than tried: nothing that holds it holds
+    // it for longer than a save copy, and this thread is not the one a screen
+    // is waiting on any more.
+    std::lock_guard<std::timed_mutex> writing(save_write_mutex_);
+
+    // The vector, for the read and the entry it hands back. Inside the write
+    // lock, which is the order both sides take them in.
+    std::lock_guard<std::mutex> history(history_mutex_);
+
+    if (card_ == nullptr) {
+      // A build that never called `UseCard`; a console always has (`card.hpp`,
+      // since M7-2, #37). `kBackupFailed` rather than a transport failure: its
+      // promise is that nothing was written, which is the one thing a build
+      // that cannot open the card is certain of.
+      report.outcome = conflicts::RestoreOutcome::kBackupFailed;
+      report.message = "this build cannot open the SD card, so nothing was written";
+    } else {
+      report = conflicts::Restore(*card_, history_, entry_id);
+    }
   }
 
-  // The vector, for the read and the entry it hands back. Inside the write lock,
-  // which is the order both sides take them in.
-  std::lock_guard<std::mutex> history(history_mutex_);
-
-  if (card_ == nullptr) {
-    // Nothing implements `fs::FileSystem` for Horizon yet (`engine.hpp`).
-    // `kBackupFailed` rather than a transport failure: its promise is that
-    // nothing was written, which is the one thing a build that cannot open the
-    // card is certain of.
-    report->outcome = conflicts::RestoreOutcome::kBackupFailed;
-    report->message = "this build cannot open the SD card, so nothing was written";
-    return ipc::Error::kOk;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (restore_.entry_id != entry_id) {
+    // Not reachable while only one restore runs at a time, and it is cheap to
+    // refuse rather than write one restore's outcome under another's id.
+    return;
   }
-  *report = conflicts::Restore(*card_, history_, entry_id);
-  return ipc::Error::kOk;
+  restore_.phase = ipc::RestorePhase::kDone;
+  restore_.report = std::move(report);
 }
 
 }  // namespace rommsync::sysmodule

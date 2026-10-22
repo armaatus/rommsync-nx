@@ -81,7 +81,7 @@ inline constexpr int kFormatVersion = 1;
 ///
 /// Sized against the sysmodule's heap the way `state::kMaxRecords` is, and
 /// deliberately far smaller: `state.db` holds a row per save on the card and
-/// peaks near 240 KiB of the ~1.2 MiB left after the socket transfer memory
+/// peaks near 60 KiB of the ~1.4 MiB left after the socket transfer memory
 /// (docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision), so this has to
 /// fit in what is left over beside it *and* beside a transfer.
 ///
@@ -141,11 +141,36 @@ enum class Event {
   /// showing as its own thing rather than folded into `kConflict`, which would
   /// have the screen offer a restore of a file nothing replaced.
   kKeptBoth,
+
+  /// **A save RomM deleted, taken off the card** (#233): a `delete`
+  /// obeyed under `[sync] on_server_delete = remove`, with the bytes under
+  /// `.backup/` first. Not an overwrite, and listed for the same reason one
+  /// is: the file is gone from where the player had it, and this is how they
+  /// find it again. Restoring it puts the file back; the next sync then
+  /// offers it to RomM as new progress, which is RomM's to accept.
+  kDeleted,
 };
 const char* ToString(Event event);
 
-/// True when this event replaced bytes, and therefore owes a backup.
+/// True when this event replaced or removed bytes, and therefore owes a backup.
 bool Overwrote(Event event);
+
+/// Where else a conflict's losing local bytes are, besides `backup_sd_path`
+/// (#240). Keep both uploads them as an archival (`null`-slot) save before the
+/// server's copy lands, so another device can recover them; when that upload
+/// fails they are on this card alone, and the screen says so.
+enum class LocalCopy {
+  /// Not recorded: anything that is not a save conflict, and every entry
+  /// written before #240.
+  kUnrecorded,
+
+  /// On the server too, as the archival save `Entry::archive_save_id`.
+  kOnServer,
+
+  /// On this card only: the server holds no copy.
+  kCardOnly,
+};
+const char* ToString(LocalCopy copy);
 
 /// One overwrite, as the overlay reads it back.
 struct Entry {
@@ -214,6 +239,20 @@ struct Entry {
   /// the header note.
   std::string backup_sd_path;
 
+  /// Whether the server holds the bytes `backup_sd_path` does (#240).
+  ///
+  /// **Optional in the file**, unlike every field above, and written only when
+  /// recorded: a row written before #240 has neither key and reads as
+  /// `kUnrecorded`, and one with nothing recorded is still written exactly as
+  /// before it (`compat.fixtures`). So a history survives the
+  /// upgrade whole without a format version an older build would refuse. An
+  /// older build ignores both keys, so a downgrade loses nothing but them.
+  LocalCopy local_copy = LocalCopy::kUnrecorded;
+
+  /// The archival save's id when `kOnServer` and the server's answer named it;
+  /// zero otherwise.
+  std::int64_t archive_save_id = 0;
+
   /// True when this entry could be restored if the backup is still there.
   bool restorable() const { return Overwrote(event) && !backup_sd_path.empty(); }
 };
@@ -256,6 +295,14 @@ struct LoadedHistory {
   /// In the order they were found, bounded by `kMaxDiagnostics`. A first boot
   /// produces exactly one, saying there is no file yet.
   std::vector<std::string> diagnostics;
+
+  /// The header's version when it is above `kFormatVersion`, else zero.
+  ///
+  /// A file from a later release is the one failure here that is not a bad
+  /// file: it is the only index to backups that release made, and this build
+  /// cannot read it and must not write over it (#205). `entries` is empty, as
+  /// for any refusal, and `History` holds its writes back -- see `Append`.
+  int newer_version = 0;
 };
 
 /// Parse the contents of a `conflicts.db`.
@@ -288,6 +335,7 @@ enum class StoreError {
   kOpenFailed,    ///< the temp file could not be created -- usually a missing directory
   kWriteFailed,   ///< the bytes did not all reach the card; the destination is untouched
   kCommitFailed,  ///< the rename onto `path` failed; see atomic_file.hpp
+  kNewerFormat,   ///< the file on the card is a later release's; it was left as it is
 };
 const char* ToString(StoreError error);
 
@@ -342,6 +390,12 @@ class History {
   /// overlay can still show what just happened, and the next append tries
   /// again. Losing the in-memory entry as well would mean a card that would not
   /// write turned a backup that exists into a backup nobody can name.
+  ///
+  /// Over a file `Load` found to be a later release's, every append is
+  /// `kNewerFormat` and the file is never written: that is the downgrade case,
+  /// and the newer history indexes backups this build has no other record of.
+  /// The entry lives in memory for this boot, and its backup is on the card
+  /// whatever happens to the index.
   StoreResult Append(Entry entry);
 
 
@@ -352,6 +406,9 @@ class History {
   std::string path_;
   std::vector<Entry> entries_;
   std::int64_t next_id_ = 1;
+
+  /// `LoadedHistory::newer_version` of the last `Load`: nonzero holds writes back.
+  int newer_version_ = 0;
 };
 
 /// Cut `text` to `kMaxTextBytes` on a UTF-8 boundary, `...` in place of the

@@ -22,6 +22,7 @@
 #include "checks.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
+#include "rommsync/version.hpp"
 
 namespace {
 
@@ -40,7 +41,8 @@ constexpr std::int64_t kNow = 1757030400;
 ipc::Status Healthy() {
   ipc::Status status;
   status.interface = ipc::kVersion;
-  status.build = "0.4.2";
+  // The overlay's own build: a healthy install is both halves of one release.
+  status.build = rommsync::kVersion;
   status.enabled = true;
   status.auth = ipc::AuthState::kPaired;
   status.configured = true;
@@ -121,8 +123,10 @@ void CheckHealthy(Checks& checks) {
   checks.ExpectEq(ValueOf(view, "Result"), std::string("Finished"), "how it went");
   checks.ExpectEq(ValueOf(view, "Uploaded"), std::string("2"), "uploaded");
   checks.ExpectEq(ValueOf(view, "Downloaded"), std::string("3"), "downloaded");
-  checks.ExpectEq(ValueOf(view, "Build"), std::string("0.4.2"),
+  checks.ExpectEq(ValueOf(view, "Build"), std::string(rommsync::kVersion),
                   "the build a support thread starts with");
+  checks.Expect(!HasLabel(view, "Overlay"), "and one build is one row");
+  checks.Expect(view.hint.empty(), "a healthy console has nothing to be told");
   checks.Expect(view.progress.kind == overlay::Progress::Kind::kNone,
                 "an idle console draws no bar");
 }
@@ -216,6 +220,27 @@ void CheckResults(Checks& checks) {
                   "a partial sync is not a failed one");
   checks.ExpectEq(ValueOf(second, "Conflicts"), std::string("1"), "conflicts are shown");
   checks.ExpectEq(ValueOf(second, "Failed"), std::string("2"), "and so are failures");
+
+  // #235: RomM answered that sync is off for this console. The server was
+  // reached and nothing is broken, so neither "Offline" nor "Last sync failed"
+  // is true -- and the switch that would fix it is RomM's, not the overlay's.
+  ipc::Status server_off = Healthy();
+  server_off.last_sync_result = ipc::SyncResult::kServerDisabled;
+  const overlay::StatusView off_view = RenderOverWire(checks, server_off);
+  ExpectNothingBlank(checks, off_view, "server_disabled");
+  checks.ExpectEq(off_view.headline, std::string("Sync disabled on server"),
+                  "the server's switch is named as the server's");
+  checks.Expect(off_view.hint.find("RomM") != std::string::npos,
+                "and the hint says where to turn it back on: " + off_view.hint);
+  checks.ExpectEq(std::string(overlay::ToString(off_view.tone)), std::string("warn"),
+                  "a setting reads as a warning, not as a fault");
+  checks.ExpectEq(ValueOf(off_view, "Result"), std::string("Disabled on server"),
+                  "and the result row says the same");
+  // The local switch is the one the user is holding, so it still comes first.
+  ipc::Status both_off = server_off;
+  both_off.enabled = false;
+  checks.ExpectEq(RenderOverWire(checks, both_off).headline, std::string("Sync is off"),
+                  "the console's own switch outranks the server's");
 
   ipc::Status never_run = Healthy();
   never_run.last_sync_at = 0;
@@ -393,16 +418,69 @@ void CheckUnreachable(Checks& checks) {
       std::string_view(R"({"interface":1,"build":"0.4.2","enabled":"yes"})"));
   checks.Expect(!wrong_type.ok(), "a wrong-typed field does not decode either");
 
-  const overlay::StatusView old = overlay::RenderUnreachable(overlay::Link::kIncompatible, 99);
+  const overlay::StatusView old =
+      overlay::RenderUnreachable(overlay::Link::kIncompatible, ipc::kVersion - 1);
   ExpectNothingBlank(checks, old, "incompatible");
   checks.ExpectEq(old.headline, std::string("sysmodule unreachable"), "the same headline");
   // ...but a different hint, because there is something to do about this one and
   // command 0's frozen encoding is what makes it knowable (`ipc::Command`).
   checks.Expect(old.hint.find("Update the sysmodule") != std::string::npos,
                 "and 'update the sysmodule' rather than a decode failure");
-  checks.Expect(old.hint.find("99") != std::string::npos, "naming what it answered");
+  checks.Expect(old.hint.find(std::to_string(ipc::kVersion - 1)) != std::string::npos,
+                "naming what it answered");
   checks.Expect(old.hint.find(std::to_string(ipc::kVersion)) != std::string::npos,
                 "and what this overlay speaks");
+
+  // The other half of a partial update: an overlay left behind beside a newer
+  // sysmodule. Sending that user to update the sysmodule would have them
+  // reinstall the half that is already right (#205).
+  const overlay::StatusView behind = overlay::RenderUnreachable(overlay::Link::kIncompatible, 99);
+  ExpectNothingBlank(checks, behind, "incompatible, overlay older");
+  checks.Expect(behind.hint.find("Update the overlay") != std::string::npos,
+                "a newer sysmodule says to update the overlay -- " + behind.hint);
+  checks.Expect(behind.hint.find("99") != std::string::npos, "naming what it answered");
+}
+
+// --- one release, two files (#205) --------------------------------------------
+
+/// The sysmodule and the overlay are separate files, and a partial unzip or a
+/// user replacing one of them leaves two releases on one card. While the IPC
+/// contract still matches, everything works -- until an edit names a key the
+/// older half does not have, or a file the newer one wrote is refused. So the
+/// skew is said before that, on the screen that already shows the build.
+void CheckVersionSkew(Checks& checks) {
+  ipc::Status skewed = Healthy();
+  skewed.build = "0.9.0";
+  const overlay::StatusView view = RenderOverWire(checks, skewed);
+  ExpectNothingBlank(checks, view, "skewed");
+  checks.ExpectEq(view.headline, std::string("Up to date"),
+                  "a skewed install that works still says it works");
+  checks.ExpectEq(ValueOf(view, "Build"), std::string("0.9.0"), "the sysmodule's build");
+  checks.ExpectEq(ValueOf(view, "Overlay"), std::string(rommsync::kVersion),
+                  "beside the overlay's, because they differ");
+  for (const overlay::Line& line : view.lines) {
+    if (line.label == "Build" || line.label == "Overlay") {
+      checks.Expect(line.tone == overlay::Tone::kWarn, line.label + " is drawn as a warning");
+    }
+  }
+  checks.Expect(view.hint.find("same release") != std::string::npos,
+                "and the hint says what to do -- " + view.hint);
+
+  // A worse problem keeps its own hint; the rows still say it.
+  skewed.online = false;
+  const overlay::StatusView offline = RenderOverWire(checks, skewed);
+  checks.ExpectEq(offline.headline, std::string("Offline"), "the headline is the worse problem");
+  checks.Expect(offline.hint.find("same release") == std::string::npos,
+                "and so is its hint -- " + offline.hint);
+  checks.ExpectEq(ValueOf(offline, "Overlay"), std::string(rommsync::kVersion),
+                  "while the rows still show the skew");
+
+  // A sysmodule that reported no build is not a skew: there is nothing to
+  // compare, and "Unknown" already says so.
+  ipc::Status unreported = Healthy();
+  unreported.build.clear();
+  const overlay::StatusView silent = RenderOverWire(checks, unreported);
+  checks.Expect(!HasLabel(silent, "Overlay"), "an unreported build is not called a mismatch");
 }
 
 // --- the four states, not two (M6-2, #33) -------------------------------------
@@ -553,8 +631,60 @@ void CheckFormatting(Checks& checks) {
 
 }  // namespace
 
+/// M10-2 (#228): the server's version is on the screen, and a server below the
+/// floor is the headline -- with the remedy, because nothing on the console
+/// fixes it.
+void CheckServerVersion(Checks& checks) {
+  ipc::Status current = Healthy();
+  current.server_version = "5.4.0";
+  const overlay::StatusView shown = RenderOverWire(checks, current);
+  checks.ExpectEq(ValueOf(shown, "RomM"), std::string("5.4.0"), "the server's version is drawn");
+  checks.ExpectEq(shown.headline, std::string("Up to date"),
+                  "and a supported one changes nothing else");
+  ExpectNothingBlank(checks, shown, "version shown");
+
+  // Before the first tick has asked -- or from a server whose heartbeat named
+  // no version, which `Status` cannot tell apart and neither can a user act on
+  // differently -- the row is there and says so.
+  const overlay::StatusView unasked = RenderOverWire(checks, Healthy());
+  checks.ExpectEq(ValueOf(unasked, "RomM"), std::string("Unknown"),
+                  "a version nobody has read is a word, not a blank");
+  ExpectNothingBlank(checks, unasked, "version not read");
+
+  ipc::Status old = Healthy();
+  old.server_version = "5.2.0";
+  old.server_supported = false;
+  old.last_sync_result = ipc::SyncResult::kFailed;
+  const overlay::StatusView refused = RenderOverWire(checks, old);
+  checks.ExpectEq(refused.headline, std::string("RomM is too old to sync with"),
+                  "a refused server is the headline");
+  checks.Expect(refused.tone == overlay::Tone::kBad, "in the bad tone");
+  checks.ExpectEq(refused.hint, std::string("Upgrade RomM to 5.4.0 or later (it runs 5.2.0)"),
+                  "and the hint names the floor and the server's own version");
+  checks.ExpectEq(ValueOf(refused, "RomM"), std::string("5.2.0 (too old)"), "and so does the row");
+  checks.ExpectEq(ValueOf(refused, "Server"), std::string("Reachable"),
+                  "it was reached: being too old is not being offline");
+  ExpectNothingBlank(checks, refused, "too old");
+
+  // A console that is not paired still says that first: pairing is the user's
+  // next step whatever the server runs.
+  ipc::Status unpaired = old;
+  unpaired.auth = ipc::AuthState::kNeverPaired;
+  checks.ExpectEq(RenderOverWire(checks, unpaired).headline, std::string("Not paired"),
+                  "pairing outranks the version");
+
+  // A refused server whose version was not stated still gets a sentence.
+  ipc::Status unnamed = old;
+  unnamed.server_version.clear();
+  const overlay::StatusView nameless = RenderOverWire(checks, unnamed);
+  checks.ExpectEq(nameless.hint, std::string("Upgrade RomM to 5.4.0 or later"),
+                  "no version, no parenthesis");
+  ExpectNothingBlank(checks, nameless, "too old, unnamed");
+}
+
 int main() {
   Checks checks;
+  CheckServerVersion(checks);
   CheckHealthy(checks);
   CheckNever(checks);
   CheckAuthStates(checks);
@@ -564,6 +694,7 @@ int main() {
   CheckConfigErrors(checks);
   CheckDownloads(checks);
   CheckUnreachable(checks);
+  CheckVersionSkew(checks);
   CheckFourStates(checks);
   CheckFormatting(checks);
 

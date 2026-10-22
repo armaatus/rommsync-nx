@@ -35,7 +35,7 @@
 // ## The bounds
 //
 // `kMaxPayloadBytes` caps **every** single request and response. The sysmodule's
-// inner heap is `0x150000` with ~1.2 MiB left after the trimmed bsd transfer
+// inner heap is `0x180000` with ~1.4 MiB left after the trimmed bsd transfer
 // memory (docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision), and that
 // budget already owes a download buffer and the `state.db` baseline. Nothing
 // here may grow with the size of the library: lists page (`ListBegin` /
@@ -74,6 +74,14 @@
 // `PairingSession::status()` already documents, and the reason it exists: an
 // overlay redrawing at 60 Hz cannot be parked on a socket, and a sysmodule may
 // not park a thread at all when the rule is that nothing blocks boot.
+//
+// **Nor on the card for longer than a small write.** `RestoreBackup` copies a
+// whole save, and a save is as large as a game makes it, so since M9-6 (#209)
+// it starts the restore on the worker and answers at once; `GetRestoreState` is
+// what the overlay polls. What is still answered on the IPC thread after a card
+// write is `SetConfig`/`SetEnabled` (one `config.ini`) and the queue commands
+// (one `queue.json`) -- small, bounded files, and the overlay bounds its wait
+// for them anyway (`overlay/source/ipc_client.hpp`, `kCallBudget`).
 #pragma once
 
 #include <array>
@@ -114,7 +122,27 @@ inline constexpr const char* kServiceName = "rommsync";
 /// sysmodule's `Status` fails to decode. Without the bump that arrives as
 /// "sysmodule unreachable", which is the sentence this constant exists to
 /// replace with "update the sysmodule".
-inline constexpr std::uint32_t kVersion = 2;
+///
+/// **3** since M9-6 (#209), which moved `RestoreBackup`'s meaning: it answered
+/// the finished `RestoreReport` and now answers a `RestoreState` the moment the
+/// restore is taken. A v2 overlay decoding that as a report would fail, and a
+/// v3 one reading a v2 sysmodule's report would wait for a restore that had
+/// already happened -- so the two say "update" to each other instead.
+///
+/// **4** since M10-9 (#235), which added `SyncResult::kServerDisabled`. An enum
+/// value is a field's value a decoder does not tolerate either: a v3 overlay
+/// reading `"server_disabled"` fails to decode the whole `Status`.
+///
+/// **5** since M10-2 (#228), which added `server_version` and
+/// `server_supported` to `Status` -- required fields, so a bump by the rule
+/// above.
+///
+/// **6** since M10-16 (#242), which added `SyncOutcome::kDeferred`: a v5
+/// overlay reading `"deferred"` fails to decode `SyncNow`'s whole answer.
+///
+/// **7** since M10-7 (#233), which added `conflicts::Event::kDeleted`: a v6
+/// overlay reading `"deleted"` fails to decode the whole `ConflictPage`.
+inline constexpr std::uint32_t kVersion = 7;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -173,6 +201,7 @@ enum class Command : std::uint32_t {
   kListConflicts = 14,
   kRestoreBackup = 15,
   kGetLog = 16,
+  kGetRestoreState = 17,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -184,7 +213,7 @@ inline constexpr std::array kAllCommands = {
     Command::kStartPair,           Command::kGetPairState, Command::kUnpair,
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
     Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
-    Command::kRestoreBackup,       Command::kGetLog,
+    Command::kRestoreBackup,       Command::kGetLog,       Command::kGetRestoreState,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -333,7 +362,11 @@ const char* ToString(AuthState state);
 /// `kPartial` is its own answer because M2-7 makes it one: a tick that uploaded
 /// four saves and failed the fifth is not a failed sync, and telling the user it
 /// was sends them looking for a problem with the four that worked.
-enum class SyncResult { kNever, kOk, kPartial, kFailed };
+///
+/// `kServerDisabled` is the same argument for a setting (#235): RomM answered
+/// that sync is switched off for this console, which is the user's switch on
+/// the server rather than a failure, and the screen has to say which switch.
+enum class SyncResult { kNever, kOk, kPartial, kFailed, kServerDisabled };
 const char* ToString(SyncResult result);
 
 /// What the download worker is doing with the entry it is on.
@@ -427,6 +460,16 @@ struct Status {
   /// (`config::Severity`), and a status screen that counted those would be red
   /// on a console with nothing wrong with it.
   std::int64_t config_error_count = 0;
+
+  /// The RomM version the sysmodule last read off the server's heartbeat, as
+  /// the server spelled it (M10-2, #228). Empty until a tick has asked, or
+  /// when the server did not say. At most `server::kMaxVersionBytes`.
+  std::string server_version;
+
+  /// False when the last tick was refused because the server is older than
+  /// `server::kMinimumVersion`. True otherwise, including before anything was
+  /// asked -- "too old" is a finding, never a default.
+  bool server_supported = true;
 
   DownloadSnapshot download;
 };
@@ -533,12 +576,18 @@ inline constexpr std::size_t kMaxAssignments = config::kMaxEditAssignments;
 /// `kDisabled` is a distinct outcome from `kAccepted` because M4-2 (#24) renders
 /// it: a user who pressed "Sync now" with auto-sync switched off has to be told
 /// which switch to flip, not shown a spinner that never moves.
+///
+/// `kDeferred` is a press that was **taken** and will not run yet (#242): a game
+/// is in the foreground, and a tick under it is the one that loses a save --
+/// the game writes its in-memory copy over a download when it closes. The tick
+/// runs once it has. Not a refusal, so the screen says when rather than no.
 enum class SyncOutcome {
   kAccepted,
   kAlreadyRunning,
   kNotConfigured,
   kUnauthenticated,
   kDisabled,
+  kDeferred,
 };
 const char* ToString(SyncOutcome outcome);
 
@@ -748,10 +797,13 @@ struct ListPage {
 /// does not fit a payload, which is a projection that needs shortening rather
 /// than a page that needs splitting.
 ///
-/// It re-encodes the page per append, which is O(n^2) in a page of at most 64
-/// items fetched at the speed a human scrolls. That is the right trade for a
+/// It measures the whole page per append, which is O(n^2) in a page of at most
+/// 64 items fetched at the speed a human scrolls. That is the right trade for a
 /// bound that is checked rather than estimated: an estimate that drifted would be
-/// a `kTooLarge` on a real user's library and on nobody's test.
+/// a `kTooLarge` on a real user's library and on nobody's test. **Measured, not
+/// encoded** (#248): the count is `EncodeListPage`'s own writer, so the size a
+/// page is judged by is the size it is sent at -- and an encode per append held
+/// the page's text as it doubled past the payload, ~24 KiB beside the page.
 bool AppendIfItFits(ListPage* page, ListItem item);
 
 /// A cursor names one open list. `0` is never a valid one, so a
@@ -849,6 +901,40 @@ bool AppendIfItFits(ConflictPage* page, ConflictRow row);
 /// bounded rather than trusted: it names two paths, and a path is as long as a
 /// card lets it be.
 inline constexpr std::size_t kMaxRestoreMessageBytes = 512;
+
+/// Where the sysmodule's one restore stands (M9-6, #209).
+enum class RestorePhase {
+  /// No restore has been asked for since this process started. A restore a
+  /// screen is waiting for and the sysmodule answers this about is one it has
+  /// lost track of -- it restarted -- and the screen says so rather than
+  /// waiting for ever.
+  kIdle,
+
+  /// Taken, and not finished: waiting for the worker, or copying.
+  kRunning,
+
+  /// Finished, and `report` says how. Kept until the next restore is taken, so
+  /// a screen that was hidden while it ran still reads the outcome.
+  kDone,
+};
+const char* ToString(RestorePhase phase);
+
+/// `RestoreBackup`'s answer and `GetRestoreState`'s.
+///
+/// **One restore at a time**, and `entry_id` says which. A press while one is
+/// running starts nothing and is answered with the one that is -- so a screen
+/// compares the id with the one it asked for, and "another restore is still
+/// running" is a sentence it can say rather than a press that silently did
+/// nothing.
+struct RestoreState {
+  RestorePhase phase = RestorePhase::kIdle;
+
+  /// The restore this is about. `0` when `kIdle`.
+  std::int64_t entry_id = 0;
+
+  /// `kDone` only; defaulted otherwise.
+  conflicts::RestoreReport report;
+};
 
 // --- the log tail -------------------------------------------------------------
 
@@ -965,6 +1051,12 @@ Decoded<std::int64_t> DecodeEntryId(std::string_view text);
 std::string EncodeRestoreReport(const conflicts::RestoreReport& report);
 Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text);
 
+/// `{"phase":...,"entry_id":<int>,"report":{...}}`. The report is the
+/// `EncodeRestoreReport` object, carried whole in every phase so the decoder has
+/// one shape to refuse rather than three.
+std::string EncodeRestoreState(const RestoreState& state);
+Decoded<RestoreState> DecodeRestoreState(std::string_view text);
+
 /// `{"lines":<int>}` -- `GetLog`'s request: how many of the last lines to send.
 ///
 /// Spelled apart from every other bare integer on this wire for `EncodeEntryId`'s
@@ -1000,6 +1092,9 @@ struct EngineSnapshot {
   std::int64_t conflicts = 0;
   std::int64_t failed = 0;
   std::int64_t queue_depth = 0;
+  /// See `Status::server_version` and `Status::server_supported` (#228).
+  std::string server_version;
+  bool server_supported = true;
   DownloadSnapshot download;
 };
 
@@ -1029,6 +1124,16 @@ class Engine {
   virtual const config::Config& config() const = 0;
   virtual const std::vector<config::Diagnostic>& config_diagnostics() const = 0;
 
+  /// What the last tick found about how the emulators' folders are read --
+  /// `retroarch.cfg`'s complaints, and "RetroArch syncs itself" (#230). Served
+  /// after `config_diagnostics()` by `GetConfig`, which is where the settings
+  /// screen reads them.
+  ///
+  /// A value rather than a reference, because a tick on another thread replaces
+  /// it. Empty by default: an engine that never reads `retroarch.cfg` has
+  /// nothing to say about it.
+  virtual std::vector<config::Diagnostic> source_notes() const { return {}; }
+
   virtual EngineSnapshot Snapshot() const = 0;
 
   /// The live pairing attempt, or an idle status when there is none.
@@ -1047,6 +1152,15 @@ class Engine {
   /// already established that there is a server, a token and a switch that is
   /// on -- see `ServiceCore::SyncNow`.
   virtual bool RequestSync() = 0;
+
+  /// An application is in the foreground, so a tick asked for now waits for it
+  /// to close (#242). What turns a taken `RequestSync` into
+  /// `SyncOutcome::kDeferred` rather than `kAccepted`.
+  ///
+  /// Asks the platform, never the network. False by default: an engine that
+  /// cannot tell is one that never holds a tick, which is every engine before
+  /// #242 and every host build without a probe.
+  virtual bool application_running() const { return false; }
 
   /// Start a pairing attempt, discarding whatever the last one left behind.
   ///
@@ -1086,14 +1200,24 @@ class Engine {
   /// the sysmodule lie about what it recorded. See conflict_log.hpp.
   virtual Error ListConflicts(const ConflictQuery& query, ConflictPage* page) = 0;
 
-  /// Put the bytes an entry names back on the card.
+  /// Ask for the bytes an entry names to be put back on the card, and answer
+  /// where that stands **without waiting for it** (M9-6, #209).
   ///
-  /// Never fails at the transport either, for `SetConfig`'s reason: what
-  /// happened is a `conflicts::RestoreOutcome` inside a successful reply,
-  /// because a `Result` that says the call failed takes the answer with it --
-  /// and "the backup is gone" and "the sysmodule is not running" must not arrive
-  /// at a screen as the same thing.
-  virtual Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) = 0;
+  /// A restore copies a whole save, so an implementation hands it to a thread
+  /// of its own and answers `kRunning`; one with no such thread may run it here
+  /// and answer `kDone`. While one is running a second ask starts nothing and is
+  /// answered with the running one -- see `RestoreState`.
+  ///
+  /// Never fails at the transport, for `SetConfig`'s reason: what happened is a
+  /// `conflicts::RestoreOutcome` inside a successful reply, because a `Result`
+  /// that says the call failed takes the answer with it -- and "the backup is
+  /// gone" and "the sysmodule is not running" must not arrive at a screen as the
+  /// same thing.
+  virtual RestoreState RequestRestore(std::int64_t entry_id) = 0;
+
+  /// Where the last restore stands. Safe at any rate, from the IPC thread,
+  /// while one runs.
+  virtual RestoreState restore_state() const = 0;
 };
 
 /// The service, as a plain C++ class with one method per command.
@@ -1164,8 +1288,12 @@ class ServiceCore {
   /// implementation is held to the same cap.
   ConflictPage ListConflicts(const ConflictQuery& query);
 
-  /// Command 15. Never fails; the outcome is in the answer.
-  conflicts::RestoreReport RestoreBackup(std::int64_t entry_id);
+  /// Command 15. Starts the restore and answers at once; never fails. The
+  /// outcome arrives through command 17.
+  RestoreState RestoreBackup(std::int64_t entry_id);
+
+  /// Command 17. Where the restore stands. Never fails.
+  RestoreState GetRestoreState() const;
 
   /// Command 16. The last `lines` lines of this process's log, clamped to
   /// `[0, kMaxLogLines]`. Never fails: a console that has logged nothing has an
@@ -1191,6 +1319,10 @@ class ServiceCore {
   /// verification URLs come off a server response, so their length is not this
   /// client's to assume, and both commands that answer one never fail.
   static auth::PairingStatus Bounded(auth::PairingStatus status);
+
+  /// A restore state cut to what a payload carries: the report's message is a
+  /// sentence `core/` wrote around two paths (`kMaxRestoreMessageBytes`).
+  static RestoreState Bounded(RestoreState state);
 
   Engine& engine_;
 };

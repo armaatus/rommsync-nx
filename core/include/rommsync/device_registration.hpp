@@ -20,6 +20,8 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -66,7 +68,29 @@ struct DeviceRecord {
 Parsed<DeviceRecord> ParseDeviceRecord(std::string_view body);
 
 /// Parse a 200 body from `GET /api/devices`: a JSON array, possibly empty.
+///
+/// **Every row, held** -- a user's devices are theirs to multiply, and nothing
+/// bounds how many. That is a test's view of the server; the console's own
+/// search is `FindInDeviceList`, which keeps one (#248).
 Parsed<std::vector<DeviceRecord>> ParseDeviceList(std::string_view body);
+
+/// What a search of the device list found.
+struct DeviceSearch {
+  /// The first row carrying the identifier, when one did.
+  std::optional<DeviceRecord> device;
+
+  /// How many rows carried it: more than one is `FindByIdentifier`'s ambiguity.
+  std::size_t matches = 0;
+};
+
+/// `ParseDeviceList` and `FindByIdentifier` in one pass, holding one row (#248).
+///
+/// Every row is still read and held to `DeviceSchema` -- one that will not parse
+/// is the drift this exists to catch -- but only the match is kept: the list is
+/// every device the user owns, and the one row that is this console's is all
+/// `FindRegistration` asks of it. An empty `identifier` matches nothing, for
+/// `FindByIdentifier`'s reason.
+Parsed<DeviceSearch> FindInDeviceList(std::string_view body, std::string_view identifier);
 
 /// The one device that names `identifier`, or nullptr.
 ///

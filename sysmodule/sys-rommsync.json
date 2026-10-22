@@ -10,12 +10,16 @@
 	"is_retail": true,
 	"pool_partition": 2,
 	"is_64_bit": true,
-	"address_space_type": 1,
+	"//address_space_type": "39-bit, the 64-bit layout since 2.0.0; 1 is the deprecated 36-bit one. sysmodule/README.md, M9-11 (#210).",
+	"address_space_type": 3,
+	"//filesystem_access": "SdCard (bit 21) and nothing else: sdmc: is all this process opens. The README maps each bit to the facility that would need it; npdm.grants fails on any other bit (#210).",
 	"filesystem_access": {
-		"permissions": "0xffffffffffffffff"
+		"permissions": "0x0000000000200000"
 	},
-	"service_access": ["fsp-srv", "set:sys", "ssl", "bsd:u", "sfdnsres", "nifm:u", "time:s", "psc:m"],
+	"//service_access": "Every name here is one __appInit waits for and opens; boot.* (tests/test_sysmodule_boot.py) reads this list. A new grant goes in this array, with its WaitForService in main.cpp and its handles in source/handle_budget.hpp -- as pm:dmnt did for #242's foreground-application probe.",
+	"service_access": ["fsp-srv", "set:sys", "ssl", "bsd:u", "sfdnsres", "nifm:u", "time:s", "psc:m", "pm:dmnt"],
 	"service_host": ["rommsync"],
+	"//handle_table_size": "Derived, not the template's: kHandleTableSize in source/handle_budget.hpp is twice the handles this process holds, rounded up to a power of two, and npdm.grants fails when the two disagree (#210).",
 	"kernel_capabilities": [{
 			"type": "kernel_flags",
 			"value": {

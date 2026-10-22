@@ -6,6 +6,8 @@
 #include <vector>
 
 #include "rommsync/ipc.hpp"
+#include "rommsync/server_capabilities.hpp"
+#include "rommsync/version.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -128,6 +130,18 @@ void SetHeadline(StatusView* view, const ipc::Status& status) {
     view->tone = Tone::kBad;
     return;
   }
+  // Above everything a tick decides, because no tick will decide anything
+  // until the server is upgraded (#228) -- and the upgrade is the one thing on
+  // this screen a user cannot do from the console, so it is said in full.
+  if (!status.server_supported) {
+    view->headline = "RomM is too old to sync with";
+    view->hint = "Upgrade RomM to " + server::ToString(server::kMinimumVersion) + " or later";
+    if (!status.server_version.empty()) {
+      view->hint += " (it runs " + status.server_version + ")";
+    }
+    view->tone = Tone::kBad;
+    return;
+  }
   // A running tick outranks the switch: `SetEnabled` turns auto-sync off
   // without stopping the tick already in flight, and a screen that showed "Sync
   // is off" over a sync that is moving files is worse than one that is a few
@@ -155,6 +169,15 @@ void SetHeadline(StatusView* view, const ipc::Status& status) {
   if (!status.online) {
     view->headline = "Offline";
     view->hint = "The last attempt did not reach the server";
+    view->tone = Tone::kWarn;
+    return;
+  }
+  // Below the console's own switch and below "Offline" -- a server that
+  // answered this was reached -- and above "failed", because it is not one: it
+  // is a setting, and the one place to change it is RomM (#235).
+  if (status.last_sync_result == ipc::SyncResult::kServerDisabled) {
+    view->headline = "Sync disabled on server";
+    view->hint = "Turn sync on for this console in RomM's device settings";
     view->tone = Tone::kWarn;
     return;
   }
@@ -192,6 +215,8 @@ const char* ToString(Link link) {
       return "unreadable";
     case Link::kIncompatible:
       return "incompatible";
+    case Link::kNotResponding:
+      return "not_responding";
   }
   return "unknown";
 }
@@ -220,6 +245,8 @@ std::string SyncResultText(ipc::SyncResult result) {
       return "Partly finished";
     case ipc::SyncResult::kFailed:
       return "Failed";
+    case ipc::SyncResult::kServerDisabled:
+      return "Disabled on server";
   }
   return "Unknown";
 }
@@ -234,6 +261,8 @@ Tone SyncResultTone(ipc::SyncResult result) {
       return Tone::kWarn;
     case ipc::SyncResult::kFailed:
       return Tone::kBad;
+    case ipc::SyncResult::kServerDisabled:
+      return Tone::kWarn;
   }
   return Tone::kNeutral;
 }
@@ -309,6 +338,18 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
                                                : "Not set",
       status.configured ? (status.online ? Tone::kGood : Tone::kWarn) : Tone::kWarn);
 
+  // The release the sysmodule read off the heartbeat (#228), beside the server
+  // it describes. Present in every state, for the header's reason: a missing
+  // row reads as one that failed to load. "Unknown" is both "not asked yet"
+  // and "the heartbeat named none", which `Status` does not tell apart.
+  const std::string release =
+      status.server_version.empty() ? std::string("Unknown") : status.server_version;
+  if (status.server_supported) {
+    Add(&view.lines, "RomM", release);
+  } else {
+    Add(&view.lines, "RomM", release + " (too old)", Tone::kBad);
+  }
+
   switch (status.auth) {
     case ipc::AuthState::kNeverPaired:
       Add(&view.lines, "Pairing", "Not paired", Tone::kWarn);
@@ -344,8 +385,22 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
   AddDownload(&view, status.download);
   // Last, because it is the line a user reads once and a support thread reads
   // first (`ipc::Status::build`).
-  Add(&view.lines, "Build",
-      status.build.empty() ? std::string("Unknown") : status.build);
+  //
+  // Two releases on one card is the ordinary result of a partial unzip, and
+  // while the IPC contract matches nothing else notices: the screens work until
+  // an edit names a key the older half lacks, or a file the newer half wrote is
+  // refused (#205). So a build that is not this overlay's is said here, before
+  // either -- with the remedy as the hint unless a worse problem already holds
+  // it. An empty build is no evidence of anything and is left as "Unknown".
+  const bool skewed = !status.build.empty() && status.build != rommsync::kVersion;
+  Add(&view.lines, "Build", status.build.empty() ? std::string("Unknown") : status.build,
+      skewed ? Tone::kWarn : Tone::kNeutral);
+  if (skewed) {
+    Add(&view.lines, "Overlay", rommsync::kVersion, Tone::kWarn);
+    if (view.hint.empty()) {
+      view.hint = "Install the sysmodule and overlay from the same release";
+    }
+  }
   return view;
 }
 
@@ -378,9 +433,19 @@ StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface) {
       break;
     case Link::kIncompatible:
       view.headline = "sysmodule unreachable";
-      view.hint = "Update the sysmodule: it speaks version " +
-                  std::to_string(sysmodule_interface) + ", this overlay speaks " +
-                  std::to_string(ipc::kVersion);
+      // Whichever half is behind is the one to update. Zero is "it did not
+      // say", which only an older sysmodule does.
+      view.hint = std::string(sysmodule_interface > ipc::kVersion ? "Update the overlay"
+                                                                  : "Update the sysmodule") +
+                  ": it speaks version " + std::to_string(sysmodule_interface) +
+                  ", this overlay speaks " + std::to_string(ipc::kVersion);
+      break;
+    case Link::kNotResponding:
+      // Running, and busy or stuck. Nothing for the user to fix and nothing to
+      // restart from here: the screen comes back by itself on the first answer,
+      // and B still leaves, because the overlay stopped waiting (#209).
+      view.headline = "sys-rommsync is not responding";
+      view.hint = "It is busy or stuck; this screen recovers when it answers";
       break;
   }
   // No rows at all. Every one of them would be a number this overlay does not

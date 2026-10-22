@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "rommsync/disk.hpp"
 #include "rommsync/version.hpp"
 
 #if LIBCURL_VERSION_NUM < 0x073800  // 7.56.0
@@ -96,6 +97,8 @@ struct Transfer {
   std::string range;
 
   std::string* body = nullptr;  ///< where Send() collects the body
+  /// Send's body ran past `http::kMaxResponseBytes` and was let go of.
+  bool too_large = false;
 
   // Download-only state.
   std::FILE* file = nullptr;
@@ -105,6 +108,9 @@ struct Transfer {
   /// yet said whether they are still part of the file.
   bool restart_needed = false;
   bool write_failed = false;
+  /// `errno` as the refused write left it, so a full card is named as one
+  /// (`http::ErrorForWrite`) rather than as any other refusal.
+  int write_errno = 0;
 
   /// The caller's progress sink, or null. Borrowed from the `DownloadTarget`,
   /// which must outlive the call, and set only by `Download` -- so a `Send`
@@ -145,6 +151,14 @@ std::size_t OnHeader(char* data, std::size_t size, std::size_t nmemb, void* cont
 std::size_t OnBodyToString(char* data, std::size_t size, std::size_t nmemb, void* context) {
   auto* transfer = static_cast<Transfer*>(context);
   const std::size_t length = size * nmemb;
+  // The ceiling every backend holds a buffered body to (#248), for a body that
+  // did not declare its length -- one that did is refused before it is read
+  // (`CURLOPT_MAXFILESIZE_LARGE`, in `Send`).
+  if (transfer->body->size() + length > http::kMaxResponseBytes) {
+    transfer->too_large = true;
+    std::string().swap(*transfer->body);
+    return 0;  // aborts the transfer with CURLE_WRITE_ERROR
+  }
   transfer->body->append(data, length);
   transfer->received += length;
   return length;
@@ -174,14 +188,17 @@ std::size_t OnBodyToFile(char* data, std::size_t size, std::size_t nmemb, void* 
           ftruncate(fileno(transfer->file), 0) != 0 ||
           std::fseek(transfer->file, 0, SEEK_SET) != 0) {
         transfer->write_failed = true;
+        transfer->write_errno = errno;
         return 0;  // aborts the transfer with CURLE_WRITE_ERROR
       }
       transfer->resume_from = 0;
     }
   }
 
-  if (std::fwrite(data, 1, length, transfer->file) != length) {
+  errno = 0;
+  if (io::Write(transfer->file, data, length) != length) {
     transfer->write_failed = true;
+    transfer->write_errno = errno;
     return 0;
   }
   transfer->received += length;
@@ -249,10 +266,16 @@ Error Classify(CURLcode code, const Transfer& transfer) {
       // The connection died with bytes still owed. This is the shape a reset
       // mid-download takes, and the one the fault proxy's `drop` mode forces.
       return Error::kTruncated;
+    case CURLE_FILESIZE_EXCEEDED:
+      return Error::kTooLarge;
     case CURLE_WRITE_ERROR:
-      // Our write callback is the only thing that can short-change libcurl, and
-      // it only does so when the destination file refused the bytes.
-      return transfer.write_failed ? Error::kWriteFailed : Error::kTransport;
+      // Our write callbacks are the only things that can short-change libcurl:
+      // a destination file that refused the bytes, or a body past the ceiling.
+      if (transfer.too_large) {
+        return Error::kTooLarge;
+      }
+      return transfer.write_failed ? http::ErrorForWrite(transfer.write_errno)
+                                   : Error::kTransport;
     default:
       return Error::kTransport;
   }
@@ -387,8 +410,13 @@ class CurlHttpClient final : public http::HttpClient {
     }
     curl_easy_setopt(exchange.handle(), CURLOPT_WRITEFUNCTION, OnBodyToString);
     curl_easy_setopt(exchange.handle(), CURLOPT_WRITEDATA, &transfer);
+    curl_easy_setopt(exchange.handle(), CURLOPT_MAXFILESIZE_LARGE,
+                     static_cast<curl_off_t>(http::kMaxResponseBytes));
 
     Perform(exchange, transfer, result);
+    if (result.error == Error::kTooLarge) {
+      std::string().swap(result.response.body);
+    }
     return result;
   }
 
@@ -423,8 +451,9 @@ class CurlHttpClient final : public http::HttpClient {
     transfer.progress = target.progress ? &target.progress : nullptr;
     transfer.file = OpenPartial(partial_path, resuming);
     if (transfer.file == nullptr) {
-      result.error = Error::kWriteFailed;
-      result.message = "could not open " + partial_path + ": " + std::strerror(errno);
+      const int why = errno;
+      result.error = http::ErrorForWrite(why);
+      result.message = "could not open " + partial_path + ": " + std::strerror(why);
       return result;
     }
 
@@ -445,10 +474,25 @@ class CurlHttpClient final : public http::HttpClient {
       transfer.resume_from = 0;
     }
 
-    const bool flushed = std::fflush(transfer.file) == 0 && fsync(fileno(transfer.file)) == 0;
+    // A real full card often shows here first rather than in the callback:
+    // stdio held the last buffer, and the flush is what the card refused.
+    errno = 0;
+    const bool flushed = std::fflush(transfer.file) == 0;
+    int flush_errno = errno;
     const std::uint64_t written = transfer.resume_from + transfer.received;
     std::fclose(transfer.file);
     transfer.file = nullptr;
+    // Durable through `io::Disk`, after the close and before the rename below
+    // publishes the file -- the order `io::CommitStaged` relies on. It used to be
+    // an `fsync` on the descriptor here, which was just as durable and invisible
+    // to the seam: the crash replay saw a staged save renamed into place with
+    // bytes nothing had synced, and could not tell it from one nothing had (#203).
+    errno = 0;
+    const bool synced = flushed && io::Sync(partial_path);
+    if (flushed && !synced) {
+      // A hook may refuse without saying why; a refusal is still an I/O one.
+      flush_errno = errno != 0 ? errno : EIO;
+    }
 
     result.response.body = std::move(transfer.error_body);
     if (!result.ok()) {
@@ -461,7 +505,7 @@ class CurlHttpClient final : public http::HttpClient {
       // were building on are worthless -- and keeping them would make every
       // future resume ask for the same impossible range. Start the next attempt
       // clean instead.
-      std::remove(partial_path.c_str());
+      io::Remove(partial_path);
       result.error = Error::kTruncated;
       result.message = "the partial file no longer matches the resource; retry from the start";
       return result;
@@ -471,13 +515,14 @@ class CurlHttpClient final : public http::HttpClient {
       // nothing at the destination. Do not leave the empty part file we just
       // created lying next to it.
       if (!resuming) {
-        std::remove(partial_path.c_str());
+        io::Remove(partial_path);
       }
       return result;
     }
-    if (!flushed) {
-      result.error = Error::kWriteFailed;
-      result.message = "could not flush " + partial_path;
+    if (!flushed || !synced) {
+      result.error = http::ErrorForWrite(flush_errno);
+      result.message = std::string(flushed ? "could not make durable " : "could not flush ") +
+                       partial_path + ": " + std::strerror(flush_errno);
       return result;
     }
 
@@ -504,7 +549,7 @@ class CurlHttpClient final : public http::HttpClient {
       return result;
     }
 
-    if (std::rename(partial_path.c_str(), target.path.c_str()) != 0) {
+    if (io::Rename(partial_path, target.path) != 0) {
       result.error = Error::kWriteFailed;
       result.message = "could not rename " + partial_path + ": " + std::strerror(errno);
     }
@@ -514,13 +559,13 @@ class CurlHttpClient final : public http::HttpClient {
  private:
   static std::FILE* OpenPartial(const std::string& path, bool keep_existing) {
     if (!keep_existing) {
-      return std::fopen(path.c_str(), "wb");
+      return io::OpenForWriting(path, "wb");
     }
     // "r+b" rather than "ab": O_APPEND would ignore the seek we need when the
     // server turns out to have ignored our Range header.
-    std::FILE* file = std::fopen(path.c_str(), "r+b");
+    std::FILE* file = io::OpenForWriting(path, "r+b");
     if (file == nullptr) {
-      return std::fopen(path.c_str(), "wb");
+      return io::OpenForWriting(path, "wb");
     }
     if (std::fseek(file, 0, SEEK_END) != 0) {
       std::fclose(file);

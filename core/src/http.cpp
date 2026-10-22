@@ -6,6 +6,8 @@
 #include <string>
 #include <string_view>
 
+#include "rommsync/disk.hpp"
+
 namespace rommsync::http {
 namespace {
 
@@ -27,6 +29,23 @@ bool EqualsIgnoreCase(std::string_view a, std::string_view b) {
 
 }  // namespace
 
+Error ErrorForWrite(int error_number) {
+  switch (io::RefusalOf(error_number)) {
+    case io::Refusal::kFull:
+      return Error::kDiskFull;
+    case io::Refusal::kFileTooLarge:
+      return Error::kFileTooLarge;
+    case io::Refusal::kRefused:
+      break;
+  }
+  return Error::kWriteFailed;
+}
+
+bool AnsweredTooLarge(const Result& result) {
+  return result.error == Error::kTooLarge && result.response.status >= 200 &&
+         result.response.status < 300;
+}
+
 const char* ToString(Error error) {
   switch (error) {
     case Error::kNone:           return "ok";
@@ -37,8 +56,11 @@ const char* ToString(Error error) {
     case Error::kTimeout:        return "timed out";
     case Error::kCanceled:       return "canceled";
     case Error::kTruncated:      return "body ended early";
-    case Error::kWriteFailed:    return "could not write the destination file";
+    case Error::kWriteFailed:    return "the card refused the write to the destination file";
+    case Error::kDiskFull:       return "the card is full";
+    case Error::kFileTooLarge:   return "the file is too large for the card's format";
     case Error::kTransport:      return "transport failure";
+    case Error::kTooLarge:       return "the response is larger than this client holds";
   }
   return "unknown error";
 }
@@ -48,6 +70,18 @@ std::string JoinUrl(std::string_view server_url, std::string_view path) {
     server_url.remove_suffix(1);
   }
   return std::string(server_url) + std::string(path);
+}
+
+bool IsUrlPathSegment(std::string_view value) {
+  for (const char byte : value) {
+    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
+                            byte == '_' || byte == '~';
+    if (!unreserved) {
+      return false;
+    }
+  }
+  return !value.empty();
 }
 
 const std::string* FindHeader(const Headers& headers, std::string_view name) {

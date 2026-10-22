@@ -40,11 +40,55 @@ enum class Error {
   kCanceled,         ///< the caller's CancelToken fired
   kTruncated,        ///< the body ended before the length the server declared
   kWriteFailed,      ///< the destination file could not be written
+  kDiskFull,         ///< ...because the card is full (ENOSPC)
+  kFileTooLarge,     ///< ...because the card's format holds no file that large (EFBIG)
   kTransport,        ///< anything else the backend could not classify
+  kTooLarge,         ///< a `Send` body past `kMaxResponseBytes`, or past what the backend holds
 };
+
+/// The largest body `Send` hands back, on every backend (#248). Past it the call
+/// is `Error::kTooLarge` and the body is empty -- refused on a declared
+/// `Content-Length` before a byte of it is read, and on an undeclared one as it
+/// crosses the line.
+///
+/// A ceiling because a buffered body is heap on the console, and it is the one
+/// size RomM decides: a page of roms it identified on IGDB is ~12 KiB a row, so
+/// 64 of them are ~750 KiB -- half the sysmodule's heap, and a `std::terminate`.
+/// The table that heap is sized from (`sysmodule/source/main.cpp`) counts every
+/// buffered response at no more than this and one row of it in flight. A caller
+/// that pages can ask for less (`roms::FetchRomIndex`); one that cannot fails by
+/// name. 200 KiB is the platforms list at its row bound, which is the response
+/// the table was already sized for.
+///
+/// **What a user loses**: `/api/platforms` is the one list RomM will not page,
+/// so a platforms list past this fails the overlay's library screen rather than
+/// coming back smaller -- ~230 platforms at the 877 bytes a row 5.4.0 sends with
+/// no description, fewer if RomM carries a long one for each. A single rom whose
+/// own row is past it is left out of the rom index, and the tick says so. And a
+/// rom whose detail (`GET /api/roms/{id}`) is past it cannot be downloaded: the
+/// queue fails it for good. That answer carries every user's saves, states,
+/// screenshots and notes for the rom and its RetroAchievements, so a rom much
+/// played on a busy server can grow into it. Parsing it streamed, as the rom
+/// pages are, would lift that; nothing does yet.
+inline constexpr std::size_t kMaxResponseBytes = 200 * 1024;
+
+struct Result;
+
+/// A **successful** answer `Send` refused for its size (`kMaxResponseBytes`) --
+/// the one a caller can do something about by asking for less. An error page
+/// past the ceiling is `kTooLarge` too, and is the server failing: asking for
+/// fewer rows, or reading it as a plan too large, would not be true of it.
+bool AnsweredTooLarge(const Result& result);
 
 /// Stable, log-friendly name for an error. Never null.
 const char* ToString(Error error);
+
+/// The `Error` a refused write to the destination is, from the `errno` the
+/// refusal left: `kDiskFull` for ENOSPC, `kFileTooLarge` for EFBIG, and
+/// `kWriteFailed` for everything else. One mapping rather than one per backend,
+/// because the two backends are held to the same scenarios (`http.disk`,
+/// `wire.disk`) and the sentence a user reads depends on which it is (#202).
+Error ErrorForWrite(int error_number);
 
 struct Header {
   std::string name;
@@ -69,6 +113,14 @@ const std::string* FindHeader(const Headers& headers, std::string_view name);
 /// `path` is not escaped and must not be built from server data -- it is a
 /// literal plus ids this client holds.
 std::string JoinUrl(std::string_view server_url, std::string_view path);
+
+/// True for a non-empty value of RFC 3986's unreserved set only: one an id can
+/// be pasted into a URL *path* as without being escaped. The one place a stray
+/// character stops being data -- a `?` or `#` truncates the path, a `/` calls a
+/// different endpoint than the one checked, a `%` invites a second decoding --
+/// so an id read off the card or out of a response is held to this before
+/// `JoinUrl` takes it.
+bool IsUrlPathSegment(std::string_view value);
 
 /// Percent-encode one query-string *value*, RFC 3986 unreserved set only.
 ///
@@ -288,7 +340,8 @@ class HttpClient {
   HttpClient& operator=(const HttpClient&) = delete;
 
   /// Perform a request and buffer the response body in memory. For API calls;
-  /// never for rom or save content.
+  /// never for rom or save content. A body past `kMaxResponseBytes` is
+  /// `Error::kTooLarge`.
   virtual Result Send(const Request& request) = 0;
 
   /// Perform a request and stream the response body to `target`, never holding

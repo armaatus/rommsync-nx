@@ -6,13 +6,15 @@
 #                       ELF: every `svc` instruction the image contains is a
 #                       capability the NPDM grants, ACI0 and ACID agree, the
 #                       ACID carries AcidFlag_Production and pool partition 2,
-#                       and no @PLACEHOLDER@ reached the artifact.
+#                       no @PLACEHOLDER@ reached the artifact, and the
+#                       filesystem mask, handle table and address space are the
+#                       ones M9-11 (#210) decided -- on both ACI0 and ACID.
 #
 # The parser half is `npdm.parser` in tests/CMakeLists.txt -- the same script's
 # --self-test, which reads no artifact and so runs everywhere. This entry cannot:
 # an NPDM only exists once npdmtool has run, and npdmtool is in the container.
-# It therefore skips on every runner this project has today, which is M9-12's
-# (#211) problem to fix and not a reason to invent a second mechanism here.
+# It skips without the image, and the `switch-build` job runs it inside the
+# image with the rest of the `toolchain` label, where a skip fails (#211).
 #
 # This is the sysmodule's NPDM and only the sysmodule's. `ovl-rommsync` has none:
 # an overlay runs inside nx-ovlloader's process and inherits its capabilities, so
@@ -21,7 +23,9 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="devkitpro/devkita64:latest"
+# The pinned image (#199), named in one place.
+# shellcheck source=../scripts/toolchain.sh
+. "$REPO_ROOT/scripts/toolchain.sh"
 SKIP=77
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -32,10 +36,8 @@ cleanup() { [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"; return 0; }
 trap cleanup EXIT
 
 phase_svcs() {
-  command -v docker >/dev/null 2>&1 || skip "no docker"
-  docker info >/dev/null 2>&1 || skip "docker daemon not running"
-  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
-    skip "$IMAGE not pulled (docker pull $IMAGE)"
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
 
   # A copy, not the worktree, for the reasons tests/test_switch_build.sh gives
   # in full: the container builds as root and three worktrees may be running
@@ -56,8 +58,7 @@ phase_svcs() {
   done
 
   local log="$SCRATCH/build.log"
-  if ! docker run --rm --user "$(id -u):$(id -g)" -v "$SCRATCH:/work" -w /work "$IMAGE" \
-        bash -lc 'make -C sysmodule -j"$(nproc)"' >"$log" 2>&1; then
+  if ! toolchain_run "$SCRATCH" 'make -C sysmodule -j"$(nproc)"' >"$log" 2>&1; then
     cat "$log" >&2
     fail "the sysmodule cross-compile failed"
   fi

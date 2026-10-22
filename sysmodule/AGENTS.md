@@ -17,11 +17,17 @@ Runs under Atmosphère with a tight heap.
   `http/ssl_http_client.*`). `http/` is the worked example of the rule since
   M1-7 (#126): `http_wire.*` and `posix_connection.*` name no libnx type and are
   driven against the real docker RomM by `wire.*`, and `ssl_http_client.*` is the
-  `ssl` service and is the only part of the transport no test can reach.
+  `ssl` service and is the only part of the transport no test can reach. `card.*`
+  joined them in M9-13 (#202): the SD card's `fs::FileSystem` is `<dirent.h>`,
+  `<sys/stat.h>` and `<sys/statvfs.h>` over the `sdmc:` devoptab, and `test_card`
+  roots it at a scratch directory through `MakeSdCardAt`. The one thing about the
+  card that needs libnx -- what format it is -- is asked in `main.cpp` and passed
+  in.
 - TLS is the project's biggest technical risk. Use the Horizon `ssl` system
   service through libnx; see `docs/DEVELOPMENT.md#tls-in-a-sysmodule` and issue
   M0-1 before choosing anything else.
-- **Heap discipline:** size for one in-flight download buffer plus a TLS context.
+- **Heap discipline:** size for the in-flight buffers -- one download's, one API
+  call's (`http/http_wire.hpp`) -- plus a TLS context.
   Stream to file; never hold a whole rom in RAM.
 - **Never block boot.** Every network call has a timeout and is offline-safe.
 - **`__appInit` runs before global constructors, and before there is anywhere to

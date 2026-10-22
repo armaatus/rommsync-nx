@@ -72,14 +72,52 @@ jobs:
             exit 1
           fi
 
+  # Has the nightly soak (.github/workflows/soak.yml) passed in the last three
+  # days? A schedule can stop without a word -- GitHub disables one after 60
+  # days of repository inactivity -- and a nightly that fails every night is a
+  # red X on a page nobody opens. This makes either a red build on main, which
+  # is the page people do look at (M9-15, #204).
+  #
+  # On pushes to main only. On a pull request it would fail every PR for a
+  # reason none of them caused, and hold up work that has nothing to do with
+  # the soak; on main it says the same thing without blocking anyone.
+  soak-fresh:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The script measures a soak that has never passed from the day
+          # soak.yml was added, and only history can say when that was.
+          fetch-depth: 0
+      - name: The soak has passed recently
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/soak-fresh.sh 3
+
   # The primary rig (docs/TESTING.md): the core engine built natively and run
-  # against a REAL RomM 5.2.0 in Docker, reached through the fault proxy so the
+  # against a REAL RomM in Docker, reached through the fault proxy so the
   # failure paths are exercised too.
   #
   # ROMMSYNC_REQUIRE_RIG=ON means an unreachable fixture FAILS here rather than
   # skipping. A green run must mean the tests actually ran.
+  #
+  # Against one RomM: 5.4.0 since #235 -- the default, the floor, and the
+  # version every suite asserts. NOT a matrix, even a one-leg one: a matrix job
+  # whose name holds no matrix expression reports as `host-tests (5.4.0)`, and
+  # branch protection requires `host-tests`, a check that then never arrives.
+  # A second RomM beside it runs as a job of its own, so this one stays plain
+  # `host-tests`; agent.config (evals/lint.sh) fails a host-tests matrix.
   host-tests:
+    name: host-tests
     runs-on: ubuntu-latest
+    env:
+      # Read by scripts/orca/env.sh, which writes it into .env for compose and
+      # the tests -- every later step sees the same version.
+      ROMM_VERSION: "5.4.0"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -110,6 +148,11 @@ jobs:
       - name: Start the RomM fixture
         run: ./scripts/orca/compose.sh up -d
 
+      # Five minutes is ample for 5.4.0: RomM migrates before it
+      # answers, and on the empty volume a runner starts from 5.4.0's migrations
+      # take seconds (21 s to first heartbeat, measured for #227). The 15-20
+      # minutes in its release notes is an upgrade of a volume with data in it,
+      # which no runner has.
       - name: Wait for RomM
         run: |
           set -a; . ./.env; set +a
@@ -172,13 +215,24 @@ jobs:
   # the -fsyntax-only check that stood in for it while the Makefiles did not
   # exist: a real compile and link catches everything that did, plus the
   # codegen and linker errors it could not see.
+  #
+  # The image is a dated tag, never `:latest` (#199): scripts/toolchain.sh names
+  # it, `ctest -R toolchain.pins` holds this line and the release job's to it,
+  # and docs/DEVELOPMENT.md#the-toolchain-pin is how to move it.
   switch-build:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
+    container: devkitpro/devkita64:20260219
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+
+      # Before the build, because a libnx below the floor builds perfectly well:
+      # what it produces crashes on HOS 21.0.0 and Ultrahand will not list the
+      # overlay (#199, #211). The pin is what makes this true; this is what
+      # says it still is.
+      - name: libnx is new enough for HOS 21.0.0
+        run: bash scripts/toolchain.sh libnx
 
       - name: Build sysmodule
         run: make -C sysmodule -j"$(nproc)"
@@ -227,6 +281,18 @@ jobs:
             tlsprobe/rommsync-tlsprobe.nro
           if-no-files-found: error
 
+      # The sysmodule's memory budget, measured off the linked image rather than
+      # added up in a comment (M9-15, #204). The heap is a `.bss` array, so the
+      # toolchain's section sizes are the exact bytes the loader maps; the
+      # script holds the mapped image under a budget it states, ties `.bss` to
+      # `kInnerHeapSize`, and writes the numbers to the run summary either way.
+      # This is the only CI job where the linked ELF exists (M9-12, #211).
+      #
+      # After the upload, for the reason Package is: a red budget is when the
+      # artifacts are worth having to look at.
+      - name: The image fits its budget
+        run: bash scripts/image-budget.sh
+
       # Packaged on every push, not only on a tag. `ctest -R package.builds` is the
       # only other thing that runs scripts/package.sh inside this container, and
       # it skips on every runner `host-tests` uses -- so without this step a
@@ -240,6 +306,50 @@ jobs:
       # them with it.
       - name: Package
         run: scripts/package.sh
+
+      # The ctest entries that need this image -- `ctest -L toolchain` -- run
+      # here, in it (M9-12, #211). They skip on every runner host-tests uses, so
+      # until this step their assertions had run nowhere: the symbols in the
+      # linked images, the NPDM's grants against the SVCs the sysmodule issues,
+      # libnx's LNY2 stamp that Ultrahand reads off the card, the overlay's
+      # NACP, toolbox.json against the built NPDM, the release zip's layout.
+      # `--here` runs them in place, since this container has no Docker to start
+      # the image again, and fails on a skip, since in here nothing they need
+      # can be missing. Each builds its own copy of the tree, so this is a few
+      # minutes; host-tests takes longer, and runs beside it.
+      #
+      # Last, for the reason Package is after the upload.
+      - name: The toolchain's ctest entries
+        run: bash tests/toolchain_suite.sh --here
+
+  # The same three builds against `:latest`, so a devkitPro release that breaks
+  # us is learned here, as one red job, rather than as a red required check on
+  # an unrelated PR the day the pin moves (#199; ovl-sysmodules#32 is what that
+  # looks like). Allowed to fail and needed by nothing: it is news, not a gate.
+  # When it goes red, the fix is either ours or a reason not to move the pin --
+  # docs/DEVELOPMENT.md#the-toolchain-pin. No artifacts and no packaging: what
+  # ships is built by switch-build, in the pinned image.
+  switch-build-canary:
+    name: switch-build (devkita64:latest, may fail)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: libnx is new enough for HOS 21.0.0
+        run: bash scripts/toolchain.sh libnx
+
+      - name: Build sysmodule
+        run: make -C sysmodule -j"$(nproc)"
+
+      - name: Build overlay
+        run: make -C overlay -j"$(nproc)"
+
+      - name: Build the TLS probe
+        run: make -C tlsprobe -j"$(nproc)"
 
   # A tag becomes something a user can download. Nothing else publishes: the
   # `if` below is what keeps this job off every other push, since the tag
@@ -260,7 +370,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [static, host-tests, switch-build]
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64:latest
+    container: devkitpro/devkita64:20260219
     # Every other job runs on the runner, where a `run:` step is bash. This one
     # runs in a container, where the default is `sh -e` -- and dash has no
     # `pipefail`, so seven of this job's twelve run steps died on `set: Illegal

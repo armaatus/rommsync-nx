@@ -40,6 +40,11 @@ constexpr const char* kNotRecorded = "not recorded";
 constexpr const char* kNoServerDigest =
     "RomM computes no digest for a save state, so the two were never compared by content";
 
+/// A conflict's row when its losing bytes could not be put on the server
+/// (#240). Another device cannot recover them, and a lost card loses them.
+constexpr const char* kCardOnlyNote =
+    "The server holds no copy of this console's bytes -- only the backup on this card does";
+
 std::string Number(std::int64_t value) { return std::to_string(value); }
 
 /// `1234 bytes`. Bytes rather than a rounded unit: the number is here so a user
@@ -73,6 +78,8 @@ const char* EventText(conflicts::Event event, conflicts::EntryKind kind) {
       return kind == conflicts::EntryKind::kState ? "state replaced" : "save replaced";
     case conflicts::Event::kKeptBoth:
       return "both copies kept";
+    case conflicts::Event::kDeleted:
+      return "deleted on RomM";
   }
   return "overwritten";
 }
@@ -205,9 +212,12 @@ void ConflictsModel::Reset() {
   opened_ = 0;
   restore_wanted_ = 0;
   restoring_ = 0;
+  awaiting_ = false;
+  lost_ = 0;
   restored_ = false;
   last_restore_ = {};
   issued_ = Command::Kind::kNone;
+  stale_ = false;
 }
 
 const ipc::ConflictRow* ConflictsModel::Current() const {
@@ -232,6 +242,15 @@ ConflictsModel::Command ConflictsModel::Next() {
     command.kind = Command::Kind::kRestore;
     command.entry_id = restore_wanted_;
     restoring_ = restore_wanted_;
+    issued_ = command.kind;
+    return command;
+  }
+  // A restore the sysmodule is copying, asked after once a frame. Ahead of a
+  // page for `restore_wanted_`'s reason: somebody is watching it say
+  // "Restoring", and the poll is one small answer from memory.
+  if (awaiting_) {
+    command.kind = Command::Kind::kRestoreState;
+    command.entry_id = restoring_;
     issued_ = command.kind;
     return command;
   }
@@ -290,19 +309,65 @@ void ConflictsModel::OnPage(const ipc::ConflictPage& page) {
   has_more_ = page.has_more && rows_.size() < conflicts::kMaxEntries;
 }
 
-void ConflictsModel::OnRestored(const conflicts::RestoreReport& report) {
-  if (issued_ != Command::Kind::kRestore) {
+void ConflictsModel::OnRestoreState(const ipc::RestoreState& state) {
+  const Command::Kind asked = issued_;
+  if (asked != Command::Kind::kRestore && asked != Command::Kind::kRestoreState) {
     return;
   }
   issued_ = Command::Kind::kNone;
-  const std::int64_t restored = restoring_;
   restore_wanted_ = 0;
+
+  if (state.entry_id == restoring_ && state.phase == ipc::RestorePhase::kRunning) {
+    // Taken, or still copying. The screen says "Restoring" and asks again next
+    // frame; the confirmation is behind it, because the press has happened.
+    awaiting_ = true;
+    if (mode_ == ConflictsMode::kConfirm && opened_ == restoring_) {
+      mode_ = ConflictsMode::kDetail;
+    }
+    return;
+  }
+  if (state.entry_id == restoring_ && state.phase == ipc::RestorePhase::kDone) {
+    FinishRestore(state.report);
+    return;
+  }
+  if (asked == Command::Kind::kRestore && state.phase == ipc::RestorePhase::kRunning) {
+    // Another restore is out -- one started by an earlier open of this overlay
+    // -- and this press started nothing. `kBackupFailed`'s promise is exactly
+    // what holds: nothing was written.
+    conflicts::RestoreReport refused;
+    refused.outcome = conflicts::RestoreOutcome::kBackupFailed;
+    refused.message = "another restore is still running; try again when it finishes";
+    FinishRestore(refused);
+    return;
+  }
+  // The sysmodule no longer knows about the restore this screen is waiting for:
+  // it restarted. Whether the copy happened is not something this side can say,
+  // so it says that, and stops asking.
+  lost_ = restoring_;
   restoring_ = 0;
-  restored_ = true;
-  last_restore_ = report;
-  // Back to the entry, with the outcome on it. Staying on the confirmation
-  // would invite a second press of a thing that has already happened.
-  mode_ = ConflictsMode::kDetail;
+  awaiting_ = false;
+  restored_ = false;
+  if (mode_ == ConflictsMode::kConfirm && opened_ == lost_) {
+    mode_ = ConflictsMode::kDetail;
+  }
+}
+
+void ConflictsModel::FinishRestore(const conflicts::RestoreReport& report) {
+  const std::int64_t restored = restoring_;
+  restoring_ = 0;
+  awaiting_ = false;
+  // The outcome is drawn on the entry it is about, and only there: a user who
+  // left for the list while it copied is not pulled back to it, and one who
+  // opened a different entry is not shown this one's outcome over it.
+  if (opened_ == restored) {
+    restored_ = true;
+    last_restore_ = report;
+    // Back to the entry, with the outcome on it. Staying on the confirmation
+    // would invite a second press of a thing that has already happened.
+    if (mode_ == ConflictsMode::kConfirm) {
+      mode_ = ConflictsMode::kDetail;
+    }
+  }
 
   // **The loaded pages are not re-read**, and that is not laziness. A restore
   // rewrites nothing in the history and deletes nothing from `.backup/`: it
@@ -328,17 +393,15 @@ void ConflictsModel::OnRestored(const conflicts::RestoreReport& report) {
 void ConflictsModel::OnRefused(ipc::Error error) {
   const Command::Kind refused = issued_;
   issued_ = Command::Kind::kNone;
-  if (refused == Command::Kind::kRestore) {
-    // `RestoreBackup` is documented never to fail at the transport (ipc.hpp), so
-    // a refusal here is the two halves disagreeing about the contract. Reported
+  if (refused == Command::Kind::kRestore || refused == Command::Kind::kRestoreState) {
+    // Neither command is documented to fail at the transport (ipc.hpp), so a
+    // refusal here is the two halves disagreeing about the contract. Reported
     // as a restore that did not happen, which is the true and actionable half.
     restore_wanted_ = 0;
-    restoring_ = 0;
-    restored_ = true;
-    last_restore_ = {};
-    last_restore_.outcome = conflicts::RestoreOutcome::kWriteFailed;
-    last_restore_.message = ipc::ToString(error);
-    mode_ = ConflictsMode::kDetail;
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kWriteFailed;
+    report.message = ipc::ToString(error);
+    FinishRestore(report);
     return;
   }
   if (refused == Command::Kind::kListConflicts) {
@@ -351,12 +414,36 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
   if (link == Link::kOk) {
     return;
   }
+  link_ = link;
+  sysmodule_interface_ = sysmodule_interface;
+  if (link == Link::kNotResponding) {
+    // **Slow is not gone** (#209). The client kept the session, so the
+    // sysmodule on the far side is the one that answered every page here and
+    // nothing loaded is stale -- only the command that ran out of budget is in
+    // doubt, and its answer was dropped.
+    switch (issued_) {
+      case Command::Kind::kListConflicts:
+        loading_ = false;  // asked again once it answers
+        break;
+      case Command::Kind::kRestore:
+        // It may have been taken. Asked about, never sent again: a second
+        // press the user did not make is a second overwrite of their save.
+        restore_wanted_ = 0;
+        awaiting_ = true;
+        break;
+      case Command::Kind::kRestoreState:
+      case Command::Kind::kNone:
+        break;
+    }
+    issued_ = Command::Kind::kNone;
+    return;
+  }
   issued_ = Command::Kind::kNone;
   loading_ = false;
   restore_wanted_ = 0;
   restoring_ = 0;
-  link_ = link;
-  sysmodule_interface_ = sysmodule_interface;
+  awaiting_ = false;
+  stale_ = true;
 }
 
 void ConflictsModel::OnLinkRestored() {
@@ -364,7 +451,11 @@ void ConflictsModel::OnLinkRestored() {
     return;
   }
   link_ = Link::kOk;
-  Reset();
+  if (stale_) {
+    // The session was dropped on the way, so the sysmodule answering now may
+    // not be the one that answered the pages here.
+    Reset();
+  }
 }
 
 void ConflictsModel::MoveSelection(int delta) {
@@ -408,6 +499,9 @@ void ConflictsModel::Activate() {
       }
       opened_ = rows_[static_cast<std::size_t>(selected_)].entry.id;
       restored_ = false;
+      if (lost_ != opened_) {
+        lost_ = 0;
+      }
       mode_ = ConflictsMode::kDetail;
       return;
     }
@@ -419,7 +513,13 @@ void ConflictsModel::Activate() {
         // offering it.
         return;
       }
+      if (restoring_ != 0) {
+        // One restore at a time, and one is out. Not a confirmation for a
+        // press that would be answered "another restore is running".
+        return;
+      }
       restored_ = false;
+      lost_ = 0;
       mode_ = ConflictsMode::kConfirm;
       return;
     }
@@ -487,6 +587,12 @@ ConflictsView ConflictsModel::Render() const {
                          ? std::string("Press A for both copies and the backup")
                          : entry.reason;
         drawn.tone = entry.event == conflicts::Event::kConflict ? Tone::kWarn : Tone::kNeutral;
+        if (entry.local_copy == conflicts::LocalCopy::kCardOnly) {
+          // The one fact that outranks the server's sentence (#240): the bytes
+          // this console lost are on this card and nowhere else.
+          drawn.note = kCardOnlyNote;
+          drawn.tone = Tone::kWarn;
+        }
       } else {
         drawn.note = RestorabilityText(drawn.restorable);
         drawn.tone = RestorabilityTone(drawn.restorable);
@@ -596,8 +702,19 @@ ConflictsView ConflictsModel::Render() const {
     line("Backup", entry.backup_sd_path,
          restorable == Restorability::kBackupGone ? Tone::kWarn : Tone::kNeutral);
   }
+  // Where else this console's bytes are (#240). Drawn only when recorded: an
+  // entry from before it says nothing rather than guessing.
+  if (entry.local_copy == conflicts::LocalCopy::kOnServer) {
+    line("On the server", entry.archive_save_id > 0
+                              ? "this console's bytes, as archival save " +
+                                    Number(entry.archive_save_id)
+                              : std::string("this console's bytes, as an archival save"));
+  } else if (entry.local_copy == conflicts::LocalCopy::kCardOnly) {
+    line("On the server", "no copy -- the upload failed, so the backup is the only one",
+         Tone::kWarn);
+  }
 
-  view.can_restore = restorable == Restorability::kReady && !restored_;
+  view.can_restore = restorable == Restorability::kReady && !restored_ && restoring_ == 0;
 
   if (mode_ == ConflictsMode::kConfirm) {
     view.headline = "Put this console's bytes back at " + entry.sd_path + "?";
@@ -606,6 +723,20 @@ ConflictsView ConflictsModel::Render() const {
     return view;
   }
 
+  if (restoring_ != 0 && restoring_ == entry.id) {
+    // Taken, and copying on the sysmodule's worker. A frame is never held for
+    // it (#209); this is what the screen says while it is not.
+    view.headline = "Restoring...";
+    view.hint = "The bytes there now are backed up first. B goes back to the list.";
+    return view;
+  }
+  if (lost_ != 0 && lost_ == entry.id) {
+    view.headline = "sys-rommsync lost track of this restore";
+    view.hint = "It may not have run, or it restarted before it finished. Check the file "
+                "before restoring again.";
+    view.tone = Tone::kWarn;
+    return view;
+  }
   if (restored_) {
     view.headline = RestoreOutcomeText(last_restore_);
     view.tone = RestoreOutcomeTone(last_restore_.outcome);

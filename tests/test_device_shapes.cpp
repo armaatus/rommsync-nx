@@ -1,8 +1,8 @@
 // `DeviceSchema` against the real captured payload, and the states around it.
 //
 // The body here is not typed out from the docs: it is read from
-// server/contract/captures/devices-get.json, the unedited response a live RomM
-// 5.2.0 sent for the device its own pairing flow had just created.
+// server/contract/captures/5.4.0/devices-get.json, the unedited response a live
+// RomM 5.4.0 sent for the device its own pairing flow had just created.
 // contract.captures keeps that file honest against a running server; this keeps
 // `DeviceRecord` honest against the file.
 //
@@ -38,8 +38,9 @@ std::string ReadCapture(checks::Checks& c, const std::string& name) {
   return body;
 }
 
-/// Every field `DeviceSchema` carries -- the six this client reads and the ten
-/// it deliberately does not.
+/// Every field `DeviceSchema` carries -- the six this client reads and the
+/// eleven it deliberately does not. `capabilities` is 5.4.0's: remote_install
+/// writes it (#245) and nothing here reads it back.
 ///
 /// The unread ones are listed anyway, because the thing worth catching is a
 /// *new* field: RomM growing one that matters to sync is exactly the drift that
@@ -50,7 +51,7 @@ const std::vector<std::string> kDeviceSchemaFields = {
     "id",        "user_id",     "name",        "platform",
     "client",    "client_version", "ip_address", "mac_address",
     "hostname",  "client_device_identifier",   "sync_mode", "sync_enabled",
-    "sync_config", "last_seen",  "created_at", "updated_at",
+    "sync_config", "capabilities", "last_seen", "created_at", "updated_at",
 };
 
 void SchemaFields(checks::Checks& c, const std::string& body) {
@@ -252,6 +253,32 @@ void List(checks::Checks& c) {
       auth::ParseDeviceRecord(WithField(c, body, "platform", "7"));
   c.Expect(!wrong_type.ok(), "a platform that is not a string is refused");
   c.ExpectEq(wrong_type.error.field, std::string("platform"), "...and it is named");
+
+  // The console's own search, one row held (#248): the same answers as
+  // `FindByIdentifier` over the parsed list.
+  {
+    const auth::Parsed<auth::DeviceSearch> found =
+        auth::FindInDeviceList("[" + body + "," + other + "]", "probe-contract-script");
+    c.Expect(found.ok() && found.value.matches == 1 && found.value.device.has_value() &&
+                 found.value.device->id == two.value[0].id,
+             "the search finds the console's own device: " + found.error.Describe());
+    const auth::Parsed<auth::DeviceSearch> none =
+        auth::FindInDeviceList("[" + body + "," + other + "]", "nx-0123456789abcdef");
+    c.Expect(none.ok() && none.value.matches == 0 && !none.value.device.has_value(),
+             "an identifier no device carries finds nothing");
+    c.Expect(auth::FindInDeviceList("[" + body + "]", "").value.matches == 0,
+             "an empty identifier matches no device");
+    const auth::Parsed<auth::DeviceSearch> both = auth::FindInDeviceList(
+        "[" + body + "," + WithField(c, body, "id", "\"33333333-3333-3333-3333-333333333333\"") +
+            "]",
+        "probe-contract-script");
+    c.Expect(both.ok() && both.value.matches == 2, "two rows for one console are counted");
+    c.Expect(!auth::FindInDeviceList("[" + body + "," +
+                                         WithField(c, body, "sync_enabled", "\"yes\"") + "]",
+                                     "probe-contract-script")
+                  .ok(),
+             "and a row that will not parse still fails the list");
+  }
 
   c.Expect(!auth::ParseDeviceList(body).ok(), "one device is not a device list");
   const auth::Parsed<std::vector<auth::DeviceRecord>> broken =

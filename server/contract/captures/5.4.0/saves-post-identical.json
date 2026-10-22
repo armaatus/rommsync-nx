@@ -1,0 +1,33 @@
+{
+  "is_favorite": false,
+  "labels": [],
+  "id": 5,
+  "rom_id": 4,
+  "user_id": 1,
+  "file_name": "probe [2026-10-21_09-02-16].srm",
+  "file_name_no_tags": "probe",
+  "file_name_no_ext": "probe [2026-10-21_09-02-16]",
+  "file_extension": "srm",
+  "file_path": "users/557365723a31/saves/nes/4/probe-emulator",
+  "file_size_bytes": 23,
+  "full_path": "users/557365723a31/saves/nes/4/probe-emulator/probe [2026-10-21_09-02-16].srm",
+  "download_path": "/api/saves/5/content?timestamp=2026-10-21 09:02:14&name=probe%20%5B2026-10-21_09-02-16%5D.srm",
+  "missing_from_fs": false,
+  "created_at": "2026-10-21T09:02:13+00:00",
+  "updated_at": "2026-10-21T09:02:14+00:00",
+  "emulator": "probe-emulator",
+  "slot": "probe-89654803-versions",
+  "content_hash": "abd8fff93894e8112c7dd17386e54a5f",
+  "is_public": false,
+  "screenshot": null,
+  "origin_device_id": "026d4ee6-c92a-42d9-bd24-ee5212e98b8f",
+  "device_syncs": [
+    {
+      "device_id": "026d4ee6-c92a-42d9-bd24-ee5212e98b8f",
+      "device_name": "probe-89654803-versions",
+      "last_synced_at": "2026-10-21T09:02:14+00:00",
+      "is_untracked": false,
+      "is_current": true
+    }
+  ]
+}

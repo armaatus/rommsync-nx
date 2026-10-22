@@ -11,9 +11,9 @@ TOPDIR ?= $(CURDIR)
 TARGET      := sys-rommsync
 CONFIG_JSON := sys-rommsync.json
 
-# Compile and link core/ into the sysmodule. That is the point of this target
-# today: the .nsp is a skeleton, but proving the portable engine links for
-# aarch64 is what stops core/ from drifting host-only between here and M2.
+# Compile and link core/ into the sysmodule. The portable engine is this
+# target's engine, and linking it for aarch64 on every build is also what stops
+# core/ from drifting host-only.
 ROMMSYNC_USE_CORE := 1
 
 # The IPC binding (M5-2) and the Horizon HTTP backend (M1-7, #126). Separate

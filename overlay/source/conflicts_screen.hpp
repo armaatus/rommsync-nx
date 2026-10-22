@@ -70,11 +70,9 @@ class ConflictsScreen : public tsl::Gui {
                    HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
 
  private:
-  /// Send at most one command, and tell the model what came back.
+  /// Send at most one command, tell the model what came back, and render.
+  /// The first two are `PumpConflicts`'s (`conflicts_pump.hpp`).
   void Pump();
-
-  /// Send `command`, and report its answer to the model.
-  void Send(const ConflictsModel::Command& command);
 
   /// How many prompt rows this view will draw. Read before the body so the
   /// space can be held back for them -- `library_screen.cpp`'s reason: a list

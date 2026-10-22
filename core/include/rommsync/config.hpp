@@ -30,6 +30,7 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -49,6 +50,21 @@ inline constexpr const char* kConfigFileName = "config.ini";
 /// form of the directory; the overlay reads this file too (`card_probe.cpp`) and
 /// has no engine to ask for the path.
 inline constexpr const char* kConfigSdPath = "/config/rommsync/config.ini";
+
+/// The format of `config.ini` this build reads and writes: the `version = N`
+/// line above the first section (#205, docs/CONFIG.md#version).
+///
+/// **Versioned is the file, not the parser.** A key added with a default -- every
+/// key since v1.0.0-rc1, `emulator` included -- needs no bump, because an older
+/// file simply lacks it. What does is a key whose *meaning* changes, since an
+/// older file would then be read as saying something it never said. A bump
+/// comes with the code that reads the previous version into the new meaning.
+///
+/// A file with no `version` line is version 1: that is every file v1.0.0-rc1
+/// left on a card, and the fixture `compat.fixtures` reads. A version above
+/// this one is a file written for a later release, and it is **refused** --
+/// see `LoadResult::version`.
+inline constexpr int kConfigVersion = 1;
 
 /// The largest `config.ini` that will be read.
 ///
@@ -88,6 +104,26 @@ inline constexpr std::size_t kMaxPathLength = 768;
 inline constexpr int kMinIntervalMinutes = 0;
 inline constexpr int kMaxIntervalMinutes = 7 * 24 * 60;
 
+/// `[sync] slot`'s default: RomM's `AUTOSAVE_SLOT`, the slot RetroArch's Cloud
+/// Sync, the web player, Argosy and Grout file a game's save RAM under (#226 R2,
+/// D2). A save in any other slot is seen by this client and nobody else.
+inline constexpr const char* kDefaultSlot = "autosave";
+
+/// The longest `[sync] slot` accepted. RomM takes 255, and a companion file's
+/// slot is this one plus `-<extension>` (`scan::SlotFor`).
+///
+/// **24, because every `state.db` row carries it**: `state::kMaxRecords` rows
+/// at this slot plus `-save` have to fit `state::kMaxStateBytes`, which
+/// `core.state_db` asserts. At 64 a full baseline was 35 KiB, refused on every
+/// tick. Three times `autosave`, and nothing a private slot name needs more of.
+inline constexpr std::size_t kMaxSlotLength = 24;
+
+/// True for a `[sync] slot` value: 1 to `kMaxSlotLength` ASCII letters, digits,
+/// `-` or `_`. Narrow because the slot is a key this client must reproduce
+/// byte for byte on every tick, and RomM shows it in its web UI as the slot's
+/// name. Sets `why` on refusal.
+bool ValidSlot(std::string_view slot, std::string* why);
+
 /// `[server]`.
 struct ServerConfig {
   /// Origin, with any trailing slash removed: `https://romm.example.com`, or
@@ -99,7 +135,20 @@ struct ServerConfig {
   std::string url;
 };
 
+/// `[sync] on_server_delete`: what a save RomM deleted does on the card (#233).
+enum class OnServerDelete {
+  /// Backed up under `.backup/`, then removed. The default: the server is the
+  /// source of truth, and the backup is what makes obeying it safe.
+  kRemove,
+
+  /// Left on the card and never offered to the server while it holds the bytes
+  /// RomM deleted (`state::SaveRecord::deleted_on_server`). New bytes are new
+  /// progress and are offered.
+  kKeep,
+};
+
 /// `[sync]`.
+
 struct SyncConfig {
   bool enabled = true;
 
@@ -109,13 +158,31 @@ struct SyncConfig {
   bool on_boot = true;
   bool saves = true;
 
+  /// The slot every save is negotiated and uploaded in (#236): `kDefaultSlot`
+  /// unless `[sync] slot` names another. `scan::SlotFor` derives a companion
+  /// file's slot from it.
+  ///
+  /// Changing it moves every save to a new slot on the next tick: the old one
+  /// is left on the server, and the new one is negotiated as a first meeting.
+  std::string slot = kDefaultSlot;
+
   /// Off by default: a save state is a snapshot of an emulator core's memory,
   /// so it survives neither a core update nor a different core, and syncing one
   /// onto a console running a different build is how a player loses a session
   /// they thought was safe. Opt-in, per docs/CONFIG.md.
   bool states = false;
 
+  /// Sync a Tico state of a libretro module under RetroArch's name for its
+  /// slot -- Auto `.state5` as `.state.auto`, menu slot k `.state{k-1}` as
+  /// `.state{k}` -- and place RetroArch's back under Tico's (#239,
+  /// `scan::RetroArchStateName`). Off by default (#226 D4): a state resumes only
+  /// in the same core at the same version, and turning this on renames every
+  /// Tico state the server holds, so it is the user's to choose.
+  bool map_state_slots = false;
+
   bool conflict_show = true;
+
+  OnServerDelete on_server_delete = OnServerDelete::kRemove;
 };
 
 /// `[downloads]`.
@@ -124,6 +191,62 @@ struct DownloadsConfig {
   bool verify_hash = true;
   bool resume = true;
 };
+
+/// `[sources] retroarch`: whether RetroArch's folders are synced.
+enum class SourceMode {
+  /// Yes, unless RetroArch's own Cloud Sync is syncing its saves
+  /// (`retroarch::Enabled`). The default.
+  kAuto,
+  kOn,   ///< yes, even alongside RetroArch's Cloud Sync -- two writers, said so
+  kOff,  ///< no RetroArch folder is read, wherever the folder map lists one
+};
+
+/// `[sources]`: which emulators' saves this client syncs, where the answer is
+/// not simply "the folders the map lists" (#230).
+struct SourcesConfig {
+  SourceMode retroarch = SourceMode::kAuto;
+
+  /// Read RetroArch saves and states kept beside the roms
+  /// (`savefiles_in_content_dir` in `retroarch.cfg`). Off by default because the
+  /// folders it reads are rom folders: what is in them is roms, and only
+  /// RetroArch's own save and state extensions are taken out of them even then.
+  bool retroarch_content_dir = false;
+};
+
+/// `[tico] account`: which Switch account's saves Tico 0.8 keeps are synced.
+enum class TicoAccount {
+  /// The one account under `<root>/users/`, when there is exactly one; none
+  /// when there are several, with a note asking which (`tico::Resolve`). With
+  /// no `users/` at all, Tico's layout before 0.8.0. The default.
+  kAuto,
+  kLegacy,  ///< Tico's layout before 0.8.0, `<root>/<slug>/`, even beside a `users/`
+  kNamed,   ///< `TicoConfig::uid`'s, wherever a `users/` exists
+};
+
+/// `[tico]` (#231).
+struct TicoConfig {
+  TicoAccount account = TicoAccount::kAuto;
+
+  /// For `kNamed`: the Switch `AccountUid` as 32 lowercase hex digits -- the
+  /// name of its folder under `users/`. Empty otherwise.
+  std::string uid;
+};
+
+/// `[platform.<slug>] play_with`: the emulator a platform is played in on this
+/// console, which decides where a save or a state the card has never held is
+/// written (#237, `place::Placer`). A file already on the card stays where it
+/// was found.
+enum class PlayWith {
+  kTico,
+  kRetroArch,
+};
+
+/// `tico` or `retroarch`. Never null.
+const char* ToString(PlayWith play_with);
+
+/// True when `text` is a Tico account folder's name: 32 hex digits, either case
+/// (FAT32 does not keep case apart; Tico writes lowercase).
+bool IsTicoUid(std::string_view text);
 
 /// Where one RomM platform lives on the SD card.
 ///
@@ -197,11 +320,29 @@ struct Config {
   ServerConfig server;
   SyncConfig sync;
   DownloadsConfig downloads;
+  SourcesConfig sources;
+  TicoConfig tico;
 
   /// Keyed by RomM `platform_fs_slug` -- the on-disk folder name under RomM's
   /// `library/roms/`, so it is case-sensitive and not lowercased on the way in.
   /// A platform with no entry here has no mapping and is skipped entirely.
   std::map<std::string, PlatformFolders, std::less<>> platforms;
+
+  /// `[platform.<slug>] emulator`, keyed like `platforms`: the RomM emulator id
+  /// this platform's saves and states are sent under wherever their folder does
+  /// not name a core (scan::ResolveSource). Absent means the built-in id.
+  ///
+  /// Kept apart from `PlatformFolders` because it is not a folder: a section
+  /// that sets only this key leaves the platform's folders as they were rather
+  /// than replacing them with none, and a platform with an override and no
+  /// folders is still a platform that maps nothing.
+  std::map<std::string, std::string, std::less<>> emulators;
+
+  /// `[platform.<slug>] play_with`, keyed like `platforms`, for the platforms
+  /// whose section says so; `PlayWithFor` adds the default. Not a folder key,
+  /// for `emulators`' reason: a section that sets only this keeps the
+  /// platform's built-in folders.
+  std::map<std::string, PlayWith, std::less<>> play_with;
 
   /// There is a server to talk to. False on a first boot, and after an edit
   /// that made `server.url` unusable.
@@ -210,6 +351,15 @@ struct Config {
   /// The mapping for `slug`, or nullptr when there is none -- which is the
   /// signal to skip the platform, not a reason to guess a folder.
   const PlatformFolders* Platform(std::string_view slug) const;
+
+  /// The `emulator` override for `slug`, or empty when there is none.
+  std::string_view EmulatorOverride(std::string_view slug) const;
+
+  /// The emulator `slug` is played in: its `play_with` line, else Tico for
+  /// every system Tico runs (#226 D5) -- the ones `scan::TicoModuleFor` knows
+  /// and the off-by-default `OptionalPlatforms` -- else none, which places
+  /// nothing rather than guessing.
+  std::optional<PlayWith> PlayWithFor(std::string_view slug) const;
 
   /// Where a download for `slug` is written: the first `roms` entry, or empty
   /// when the platform is unmapped or maps no rom folder.
@@ -332,6 +482,21 @@ struct LoadResult {
   /// file with fifty thousand strings has turned a typo into an outage.
   std::vector<Diagnostic> diagnostics;
 
+  /// The file's `version` line, or `kConfigVersion` when it has none or one that
+  /// does not read as a version (a `kWarning`, not a refusal: a typo there is not
+  /// a release).
+  ///
+  /// Above `kConfigVersion` the file was written for a later release, and none
+  /// of it is applied: `value` is the built-in defaults and `diagnostics` holds
+  /// the one `kError` saying which half to update. Reading the keys this build
+  /// knows would be exactly the misparse the version exists to prevent -- a key
+  /// whose meaning moved is the only reason a version moves. `ApplyEdit` refuses
+  /// such a file too, so an older build never writes over a newer one.
+  int version = kConfigVersion;
+
+  /// The file is from a later release; see `version`.
+  bool newer() const { return version > kConfigVersion; }
+
   /// No `kError`. Warnings are compatible with a working client.
   bool ok() const;
 
@@ -346,14 +511,22 @@ inline constexpr std::size_t kMaxDiagnostics = 64;
 /// saves and states, for the systems the Switch actually has an emulator for.
 ///
 /// `config.ini` overrides entries in this map; it does not have to restate it.
-/// Platforms deliberately absent (ps2, ps3, ps4, wii, ngc, 3ds) are absent
-/// because nothing on the console runs them -- mapping one is a supported
-/// override, not a defect in this list.
+/// Platforms deliberately absent (ps2, ps3, ps4) are absent because nothing on
+/// the console runs them -- mapping one is a supported override, not a defect
+/// in this list.
 ///
 /// The keys are a *guess* at the user's RomM folder names, since a
 /// `platform_fs_slug` is whatever they called the directory. They are the
-/// conventional ones; a library that uses other names needs overrides.
+/// conventional ones, both spellings where two are common (`dc` and
+/// `dreamcast`, `arcade` and `fbneo`); a library that uses other names needs
+/// overrides. The folders are Tico's names for the system, which are not
+/// always RomM's (`scan::TicoSlugFor`): `sms` is `/tico/roms/master-system`.
 const std::map<std::string, PlatformFolders, std::less<>>& DefaultPlatforms();
+
+/// Platforms Tico runs that are **off** by default -- `ngc`, `wii`, `3ds` --
+/// with the folders `[platform.<slug>] enabled = true` turns on. Heavy enough
+/// on the console that downloading their roms unasked would be a disservice.
+const std::map<std::string, PlatformFolders, std::less<>>& OptionalPlatforms();
 
 /// The configuration of a console with no `config.ini` at all.
 Config Defaults();

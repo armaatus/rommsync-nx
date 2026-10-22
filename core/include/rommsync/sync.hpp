@@ -167,7 +167,8 @@ struct ClientSaveState {
   /// empty string is refused rather than quietly treated as one or the other.
   std::optional<std::string> slot;
 
-  /// Which emulator wrote it (`retroarch`, `tico`), when that is known.
+  /// RomM's id for the emulator that wrote it -- a libretro core id such as
+  /// `snes9x`, or a `tico-*` one (`scan::ResolveSource`) -- when that is known.
   std::optional<std::string> emulator;
 
   /// **MD5** of the file's bytes, 32 lowercase hex digits. `null` when it has
@@ -201,7 +202,49 @@ struct SyncNegotiatePayload {
   /// nothing is how a client asks "what am I missing?", and it is the read-only
   /// shape the probe uses (docs/API_CONTRACT.md).
   std::vector<ClientSaveState> saves;
+
+  /// The roms this negotiation is about (`rom_ids`, RomM 5.3+), or absent for
+  /// all of them -- and absent is not sent at all.
+  ///
+  /// A negotiation offers every server save this device has no history for,
+  /// reported or not, so one that reports a few saves without this is answered
+  /// with a download for every other save in the library. The scope is what
+  /// keeps a narrow question a narrow answer (`sync-negotiate-rom-ids-scope.json`).
+  ///
+  /// At most `kMaxNegotiateRomIds` positive ids; the encoder refuses more, or a
+  /// non-positive one, rather than sending a body RomM answers with a 422.
+  std::optional<std::vector<std::int64_t>> rom_ids;
+
+  /// The emulators whose saves this console can load (`emulators`, RomM 5.4),
+  /// or absent for every save -- and absent is not sent at all: `[]` would match
+  /// none. RomM then pairs and offers only server saves one of these wrote, so a
+  /// lineage this console cannot load is never downloaded over one it can (#236).
+  /// Its slot guard still sees every lineage (sync_resolve.hpp).
+  ///
+  /// No entry may be empty; the encoder refuses one by name.
+  std::optional<std::vector<std::string>> emulators;
+
+  /// Offer every current server save this request does not list as a download,
+  /// including one this device already synced (`restore_unlisted`, RomM 5.4).
+  /// Sent only when true.
+  ///
+  /// RomM otherwise reads a save it synced here that the card no longer lists as
+  /// one the user deleted, and offers nothing. That is right on an ordinary tick
+  /// and wrong for a rom that has just been downloaded, so only that negotiation
+  /// sets it -- scoped by `rom_ids` to the downloaded roms, so nothing else this
+  /// console deleted comes back (#241, sync_tick.hpp).
+  bool restore_unlisted = false;
 };
+
+/// RomM 5.4.0's `maxItems` on `SyncNegotiatePayload.rom_ids`.
+inline constexpr std::size_t kMaxNegotiateRomIds = 500;
+
+/// What `rom_ids` adds to one negotiate body at most: `,"rom_ids":[]` and 500
+/// ids of up to 19 digits, each with its comma. For the negotiate row #246 adds
+/// to the heap table (#217): one body is built and sent at a time. The scope's
+/// ids are held besides, as integers -- at most `roms::kMaxIndexRoms` of them,
+/// 8 KiB, chunked or not.
+inline constexpr std::size_t kMaxRomScopeBytes = kMaxNegotiateRomIds * 20 + 16;
 
 /// A request body, or the reason there isn't one. `body` is empty on failure and
 /// must not be sent -- check `ok()`.
@@ -261,6 +304,20 @@ bool IsSingleFileName(std::string_view value);
 /// worse than no body, since the plan that comes back looks complete.
 Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload);
 
+/// The same body, over saves and roms the caller already holds (#248).
+///
+/// A `SyncNegotiatePayload` is a copy of every save, and `Negotiate` built one
+/// beside the tick's own list -- ~300 bytes a save at `scan::kMaxSaves`, in the
+/// plan phase, for a body it then built from the copy. This reads them where
+/// they are, and the body it returns is exactly its length: measured first and
+/// then written, where a body appended to doubled its way there and held up to
+/// twice itself.
+Encoded EncodeNegotiateRequest(const std::optional<std::string>& device_id,
+                               const std::vector<ClientSaveState>& saves,
+                               const std::vector<std::int64_t>* rom_ids,
+                               const std::optional<std::vector<std::string>>& emulators,
+                               bool restore_unlisted);
+
 // --- the answer ---------------------------------------------------------------
 
 /// What the server decided to do about one save.
@@ -269,12 +326,18 @@ Encoded EncodeNegotiateRequest(const SyncNegotiatePayload& payload);
 /// where an `action` this build does not recognise lands: on a save, the default
 /// branch is the one that can overwrite it, so an unknown action is pinned to
 /// the only action that touches nothing (`ClassifyAction`).
-enum class Action { kUpload, kDownload, kConflict, kNoOp };
+///
+/// `kDelete` is 5.4.0's (#233): the client holds a version of a slot the server
+/// has emptied, and must not upload it again. It is the one action that removes
+/// a file from the card, and `ExecutePlan` backs that file up first like any
+/// overwrite (sync_execute.hpp).
+enum class Action { kUpload, kDownload, kConflict, kNoOp, kDelete };
 
 /// The wire spelling, which doubles as the log-friendly name. Never null.
 const char* ToString(Action action);
 
-/// `upload` / `download` / `conflict` / `no_op`, and `kNoOp` for anything else.
+/// `upload` / `download` / `conflict` / `no_op` / `delete`, and `kNoOp` for
+/// anything else.
 ///
 /// `recognized`, when not null, is set false for that last case. It is the only
 /// way a caller can tell a planned no-op from a server this build has stopped
@@ -285,17 +348,18 @@ Action ClassifyAction(std::string_view action, bool* recognized = nullptr);
 /// Which arbitration produced an operation.
 ///
 /// This is the **complete** set 5.2.0 can emit, tabulated in
-/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete. Only five of
-/// the thirteen appear in server/contract/captures/, so `contract.captures`
-/// cannot guard the rest and `sync.plan` holds this enum to the document
-/// instead.
+/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete, plus 5.4.0's
+/// `delete` reason. Only five of the thirteen 5.2.0 ones appear in
+/// server/contract/captures/, so `contract.captures` cannot guard the rest and
+/// `sync.plan` holds this enum to the document instead.
 ///
 /// The client obeys `action` and not `reason` -- the server is the source of
 /// truth (docs/SYNC_PROTOCOL.md). What the reason is for is everything around
 /// obeying it: the two `conflict` reasons are different situations with
 /// different things to tell a user, `kUntracked` is a `no_op` the user asked
 /// for rather than one the bytes earned, and the three no-history reasons are
-/// the ones that say an upload will need `overwrite=true`.
+/// the ones whose upload meets RomM's slot guard when the slot is occupied
+/// (sync_resolve.hpp).
 enum class Reason {
   /// A string this build does not know. First, so it is what a
   /// default-constructed operation carries.
@@ -314,6 +378,7 @@ enum class Reason {
   kNoChanges,                      ///< no_op: neither side moved past the record
   kAppearIdentical,                ///< no_op: no record, equal timestamps, hashes not comparable
   kUntracked,                      ///< no_op: the device's sync row is marked untracked
+  kDeletedOnServer,                ///< delete: the slot was emptied after this copy was written
 };
 
 /// A stable slug for logs -- `both_changed`, not the server's sentence. Never
@@ -401,6 +466,10 @@ struct SyncPlan {
   std::int64_t total_conflict = 0;
   std::int64_t total_no_op = 0;
 
+  /// 5.4.0's count of `delete`s. The one total read as optional: absent is a
+  /// plan with no deletions, which is what every body shaped like 5.2.0's is.
+  std::int64_t total_delete = 0;
+
   /// One line per operation this build did not fully understand: an unknown
   /// `action` (downgraded to `no_op`), an unknown `reason`, or a `file_name`
   /// that is not a single path component.
@@ -429,7 +498,35 @@ struct SyncPlan {
 /// are a server that moved, and refusing the whole tick over a `no_op` nobody
 /// had to act on would be the client breaking itself on a RomM upgrade. They
 /// are downgraded, recorded in `SyncPlan::warnings`, and reported.
-auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body);
+///
+/// **A plan past `kMaxPlanOperations` is refused**, for the same reason and in
+/// the same way. The operations are read one at a time (`json::ParseEach`) and
+/// the plan is held for the whole tick, so it is the operations' count that the
+/// heap pays for -- `sysmodule/source/main.cpp` counts the plan at this bound
+/// (M9-20, #246).
+///
+/// `too_large`, when given, is set to whether that is why it was refused, which
+/// `Negotiate` reports as `NegotiateError::kPlanTooLarge` rather than
+/// `kMalformed`.
+///
+/// `keep`, when given, decides which operations are held (#248): every one is
+/// still read and held to the shape above, and one it answers false to is
+/// dropped as it streams past, its warnings with it. The bound counts what is
+/// held. For the caller that asks a question only some of the answer is about:
+/// the #232 resolution, which plans a few refused uploads and is answered for
+/// every save of their roms.
+auth::Parsed<SyncPlan> ParseNegotiateResponse(
+    std::string_view body, bool* too_large = nullptr,
+    const std::function<bool(const SyncOperation&)>& keep = {});
+
+/// The most operations a plan may carry: as many saves as `state.db` can record
+/// (`state::kMaxRecords`, which `state_db.hpp` asserts this equals).
+///
+/// A plan names every save the server holds for this console's roms as well as
+/// the ones it was told about, so its length is the server's, and a library with
+/// more saves than one console can track is refused here, by name, rather than
+/// held on a heap that was never sized for it.
+inline constexpr std::size_t kMaxPlanOperations = 128;
 
 /// Why a negotiation did not produce a plan.
 ///
@@ -465,6 +562,14 @@ enum class NegotiateError {
   kUnreachable,      ///< the exchange never completed -- offline, stalled, dropped
   kServerError,      ///< 5xx, or the 429/408 a rate limiter or a proxy answers with
   kMalformed,        ///< a 2xx that is not a plan -- truncated, or a shape that moved
+
+  /// A 2xx plan of more than `kMaxPlanOperations` operations (M9-20, #246).
+  ///
+  /// Not `kMalformed`: the body is a plan, just a larger one than this console
+  /// holds, and the remedy is to ask about fewer roms at once -- which a scoped
+  /// tick does, down to one rom (`sync::RunTick`). Asking the same question
+  /// again gets the same answer, so it is no more retried than a malformed one.
+  kPlanTooLarge,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -548,9 +653,24 @@ struct CallPolicy {
   const http::CancelToken* cancel = nullptr;
 };
 
-/// The spelling `Negotiate` takes. An alias rather than a struct of its own:
-/// see `CallPolicy`.
-using NegotiateOptions = CallPolicy;
+/// The spelling `Negotiate` takes: `CallPolicy`, plus the one thing a caller says
+/// about *what* is asked rather than how hard.
+struct NegotiateOptions : CallPolicy {
+  /// `SyncNegotiatePayload::emulators`: absent sends none (#236). A tick's first
+  /// negotiation carries it; the 409's second one deliberately does not, because
+  /// the slot guard is not filtered (sync_resolve.cpp).
+  std::optional<std::vector<std::string>> emulators;
+
+  /// `SyncNegotiatePayload::restore_unlisted`. Only `RunTick`'s negotiation for
+  /// freshly downloaded roms sets it (#241).
+  bool restore_unlisted = false;
+
+  /// `ParseNegotiateResponse`'s `keep`: the operations of the answer that are
+  /// held. Empty holds every one. Called once for each operation of the one
+  /// answer that is parsed, in order -- a negotiation is never parsed twice
+  /// (`ShouldRetry`) -- so it may keep count of what it has held.
+  std::function<bool(const SyncOperation&)> keep;
+};
 
 /// A plan, or the reason there isn't one. `plan` is left default-constructed on
 /// failure and must not be used -- check `ok()`.
@@ -605,6 +725,17 @@ struct Negotiation {
 Negotiation Negotiate(http::HttpClient& client, const auth::StoredToken& token,
                       const std::vector<ClientSaveState>& saves,
                       const NegotiateOptions& options = {});
+
+/// The same call, scoped to `rom_ids` (`SyncNegotiatePayload::rom_ids`).
+///
+/// A name of its own rather than an overload, because `Negotiate(c, t, s, {})`
+/// would then be ambiguous. The one caller today is #232's second negotiation
+/// (sync_resolve.hpp), which asks about a handful of saves and must not be
+/// answered with the whole library.
+Negotiation NegotiateRoms(http::HttpClient& client, const auth::StoredToken& token,
+                          const std::vector<ClientSaveState>& saves,
+                          const std::vector<std::int64_t>& rom_ids,
+                          const NegotiateOptions& options = {});
 
 // --- step 3: complete ---------------------------------------------------------
 //
@@ -877,7 +1008,7 @@ enum class CompleteError {
   /// FastAPI's own is `{"detail":"Not Found"}`.
   ///
   /// **This is not what a stale session id looks like** -- a session RomM
-  /// cancelled still exists, and answers `kSuperseded` below. Reaching here
+  /// closed still exists, and answers `kSuperseded` below. Reaching here
   /// means an id that was never a session, or a server that is not RomM.
   kNoSuchSession,
 
@@ -894,13 +1025,18 @@ enum class CompleteError {
   /// one would be reporting counts nothing confirmed.
   kAlreadyCompleted,
 
-  /// 400 `Session is already CANCELLED` -- another negotiation took this device.
+  /// 400 `Session is already <any status but COMPLETED>` -- something other
+  /// than this tick closed the session.
   ///
-  /// The other half of the same 400, and the reachable one: each
-  /// `POST /api/sync/negotiate` cancels the device's previous `IN_PROGRESS`
-  /// session (docs/API_CONTRACT.md), so a tick that gave up on one negotiation
-  /// and made another is completing a session RomM has already ended. Verified
-  /// against the live 5.2.0.
+  /// The other half of the same 400. The name is 5.2.0's: there, each
+  /// `POST /api/sync/negotiate` cancelled the device's previous `IN_PROGRESS`
+  /// session, so a tick that gave up on one negotiation and made another was
+  /// completing a session RomM had already ended -- CANCELLED, verified live.
+  /// 5.4.0 cancels nothing and completes a session its 24-hour cleanup expired
+  /// (#235, docs/API_CONTRACT.md), so what still reaches here is a session
+  /// closed on purpose: cancelled before an upgrade, or FAILED by whatever ran
+  /// it. Every such status is read as this one, a status a later RomM adds
+  /// included.
   ///
   /// Apart from `kAlreadyCompleted` because the two say opposite things about
   /// the accounting: that one means the counts were recorded, this one means
@@ -914,8 +1050,9 @@ enum class CompleteError {
 
   /// `CallPolicy::cancel` fired. Neither a failure of the server nor of the
   /// body: the call was stopped rather than answered, which is what a shutdown
-  /// looks like, and the session it would have closed is one the next negotiate
-  /// cancels anyway.
+  /// looks like, and the session it would have closed is one RomM closes
+  /// itself -- the next negotiate cancelled it on 5.2.0, the 24-hour cleanup
+  /// fails it on 5.4.0.
   kCanceled,
 
   kUnreachable,     ///< the exchange never completed -- offline, stalled, dropped
@@ -930,9 +1067,10 @@ const char* ToString(CompleteError error);
 /// `ShouldRetry(NegotiateError)` picks, for the same reason.
 ///
 /// **Retrying this is cheap and losing it is not.** A `complete` that never
-/// lands leaves the session `IN_PROGRESS`, which the next negotiate cancels --
-/// so the cost is a session RomM shows as cancelled in a history a user reads,
-/// not a corrupted anything.
+/// lands leaves the session `IN_PROGRESS` until RomM closes it -- at the next
+/// negotiate on 5.2.0, after 24 hours on 5.4.0 -- so the cost is a session RomM
+/// shows as cancelled or failed in a history a user reads, not a corrupted
+/// anything.
 bool ShouldRetry(CompleteError error);
 
 /// What this error says about the credentials, for `auth::Gate`. The same
@@ -965,10 +1103,13 @@ struct Completion {
 /// The counts are the ones the *execution* produced, not the plan's totals:
 /// `sync::CountsFor` (sync_finish.hpp) derives them from an `ExecutionReport`.
 ///
-/// **Only the last session id is worth completing.** Each negotiate cancels the
-/// device's previous `IN_PROGRESS` session, verified against a live 5.2.0
-/// (docs/API_CONTRACT.md), so a tick that gave up on one negotiation and made
-/// another must complete the second id.
+/// **Complete the id the plan carried.** On 5.2.0 each negotiate cancelled the
+/// device's previous `IN_PROGRESS` session, so only the last id was worth
+/// completing. 5.4.0 cancels nothing: every session stays completable until it
+/// is completed, and one nobody completes is failed by RomM's cleanup after 24
+/// hours -- and can still be completed after that (#235). The one this client
+/// cannot complete is a session whose negotiate response it never received,
+/// because it never learned the id; that one ends as the cleanup's FAILED.
 /// `play_sessions` rides along on the request that is already being made, which
 /// is the whole reason this client prefers it to `POST /api/play-sessions`: a
 /// console on battery spends no second request on play time.

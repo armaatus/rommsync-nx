@@ -10,6 +10,10 @@
 //   3. copy the save's current bytes into `.backup/`
 //   4. `io::CommitStaged` the verified bytes onto the save
 //
+// A conflict puts one more step between 3 and 4: the bytes step 3 preserved go
+// up as an archival save (`Archive`, #240). It writes nothing local and cannot
+// stop the overwrite.
+//
 // Every step before 4 can fail without the save changing at all, and step 4
 // cannot start until step 3 has succeeded. That is docs/SYNC_PROTOCOL.md's hard
 // rule expressed as a sequence rather than as a promise, and
@@ -26,8 +30,10 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/save_source.hpp"
 #include "rommsync/state_db.hpp"
 
 namespace rommsync::sync {
@@ -168,7 +174,7 @@ class StagedFile {
   explicit StagedFile(std::string path) : path_(std::move(path)) {}
   ~StagedFile() {
     if (!path_.empty()) {
-      std::remove(path_.c_str());
+      io::Remove(path_);
     }
   }
 
@@ -221,8 +227,40 @@ const char* ToString(OperationOutcome outcome) {
       return "not_understood";
     case OperationOutcome::kCanceled:
       return "canceled";
+    case OperationOutcome::kRemoved:
+      return "removed";
+    case OperationOutcome::kKept:
+      return "kept";
   }
   return "failed";
+}
+
+const char* ToString(ArchiveOutcome outcome) {
+  switch (outcome) {
+    case ArchiveOutcome::kNone:
+      return "none";
+    case ArchiveOutcome::kKept:
+      return "kept";
+    case ArchiveOutcome::kFailed:
+      return "failed";
+  }
+  return "none";
+}
+
+std::string ArchiveFileName(std::string_view file_name, std::int64_t unix_seconds) {
+  const std::string_view extension = ExtensionOf(file_name);
+  const std::string_view stem = file_name.substr(0, file_name.size() - extension.size());
+  // `2025-09-04T15:33:22Z` respelt the way RomM tags its own versions,
+  // `2025-09-04_15-33-22`: a name a FAT32 card and RomM's sanitiser both keep.
+  std::string when =
+      FormatTimestamp(Timestamp{std::chrono::seconds{unix_seconds}});
+  if (!when.empty() && when.back() == 'Z') {
+    when.pop_back();
+  }
+  for (char& character : when) {
+    character = character == 'T' ? '_' : character == ':' ? '-' : character;
+  }
+  return std::string(stem) + " [switch-conflict " + when + "]" + std::string(extension);
 }
 
 const char* ToString(OperationError error) {
@@ -245,8 +283,12 @@ const char* ToString(OperationError error) {
       return "forbidden";
     case OperationError::kRefused:
       return "refused";
+    case OperationError::kNewerOnServer:
+      return "newer_on_server";
     case OperationError::kUnverified:
       return "unverified";
+    case OperationError::kOtherEmulator:
+      return "other_emulator";
     case OperationError::kCommitFailed:
       return "commit_failed";
     case OperationError::kUnconfirmed:
@@ -274,7 +316,9 @@ auth::Answer AnswerOf(OperationError error) {
     case OperationError::kBackupFailed:
     case OperationError::kTransferFailed:
     case OperationError::kRefused:
+    case OperationError::kNewerOnServer:
     case OperationError::kUnverified:
+    case OperationError::kOtherEmulator:
     case OperationError::kCommitFailed:
     case OperationError::kUnconfirmed:
     case OperationError::kCanceled:
@@ -286,7 +330,7 @@ auth::Answer AnswerOf(OperationError error) {
 std::string SlotBackupDiscriminator(const std::optional<std::string>& slot) {
   if (!slot.has_value()) {
     // Archival, which pairs with nothing. It cannot collide with a derived slot
-    // because `scan::SlotFor` always carries an emulator and an extension.
+    // because `scan::SlotFor` always carries a source and an extension.
     return "archival";
   }
   std::string safe_slot = Sanitize(*slot);
@@ -394,6 +438,18 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
       *message = "the previous bytes could not be preserved: " + copied.message;
       return OperationError::kBackupFailed;
     }
+    if (!copied.name_durable) {
+      // The copy is in place and the card would not confirm its *name*. The
+      // overwrite this protects is in another directory, and a power cut can
+      // keep that and lose this (#203) -- so it is not a backup yet, and the
+      // overwrite does not happen. The copy goes: the save it duplicates is
+      // untouched, and a file no history records is litter the next attempt
+      // would only step past.
+      io::Remove(destination);
+      *message = "the previous bytes were copied to " + backup_path +
+                 ", and the card would not confirm the copy is on it";
+      return OperationError::kBackupFailed;
+    }
     *backup_sd_path = backup_path;
     return OperationError::kNone;
   }
@@ -406,17 +462,35 @@ namespace {
 
 /// `BackUpFirst` with a save's discriminator and this execution's clock filled
 /// in. The order and the primitives are the shared ones; only the name differs.
+///
+/// `stamped`, when given, receives the second the backup was named for, so a
+/// conflict's archival upload (#240) carries the same one.
 OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
                       const SyncOperation& operation, const SaveTarget& target,
-                      std::string* backup_sd_path, std::string* message) {
+                      std::string* backup_sd_path, std::string* message,
+                      std::int64_t* stamped = nullptr) {
   const std::int64_t stamp =
       UnixSeconds(options.now != nullptr ? options.now() : std::chrono::system_clock::now());
+  if (stamped != nullptr) {
+    *stamped = stamp;
+  }
   return BackUpFirst(files, options.backup_dir, target.sd_path, operation.rom_id,
                      SlotBackupDiscriminator(operation.slot), target.file_name, stamp,
                      backup_sd_path, message);
 }
 
-/// `POST /api/saves?...&overwrite=true` with the local file as `saveFile`.
+/// Whether the player chose "Keep local" for this save (`ExecuteOptions::keep_local`).
+bool KeepsLocal(const ExecuteOptions& options, const SyncOperation& operation) {
+  for (const auto& key : options.keep_local) {
+    if (key.first == operation.rom_id && key.second == operation.slot) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// `POST /api/saves?...&content_hash=<md5>&overwrite=false` with the local file
+/// as `saveFile`.
 OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                        const auth::StoredToken& token, const SyncPlan& plan,
                        const SyncOperation& operation, const SaveTarget* target,
@@ -431,10 +505,10 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                 "the local save " + target->sd_path + " could not be opened to upload");
   }
 
-  // `overwrite=true` is not optional; see `Refused`. `session_id` ties the
-  // upload to this negotiation and `device_id` is what writes the `device_syncs`
-  // row the *next* negotiation arbitrates against -- skip either and the device
-  // stays in the no-history branch forever (docs/API_CONTRACT.md).
+  // `session_id` ties the upload to this negotiation and `device_id` is what
+  // writes the `device_syncs` row the *next* negotiation arbitrates against --
+  // skip either and the device stays in the no-history branch forever
+  // (docs/API_CONTRACT.md).
   std::string url = http::JoinUrl(token.server_url, kSavesPath) +
                     "?rom_id=" + std::to_string(operation.rom_id);
   if (operation.emulator.has_value()) {
@@ -445,7 +519,29 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   }
   url += "&session_id=" + std::to_string(plan.session_id);
   url += "&device_id=" + http::EncodeQueryValue(token.device_id);
-  url += "&overwrite=true";
+  if (options.send_content_hash) {
+    // Hashed here, just before the transport streams the file, rather than
+    // taken from the scan: the card may have moved on since step 0, and RomM
+    // keeps this digest as proof of what this device holds. A report matching
+    // it later reads as "this side did not change", so it has to be the digest
+    // of the bytes that go up -- a stale one would be a proof of something
+    // false (#234). What is left is the gap between this read and the
+    // transport's; #242 holds a tick while a game is in the foreground, so
+    // nothing should be writing the save inside it. A save that cannot be
+    // hashed is not uploaded without one.
+    const state::HashOutcome digest = state::HashFile(source);
+    if (!digest.ok()) {
+      return Fail(operation, OperationError::kUnreadableCard,
+                  "the local save " + target->sd_path +
+                      " could not be hashed to upload: " + digest.message);
+    }
+    url += "&content_hash=" + digest.content_hash;
+  }
+  // `overwrite=false` is RomM's slot guard, asked for by name: a slot that holds
+  // a save this device has not synced -- another device's, since the plan was
+  // made or before it -- answers 409 instead of being superseded. Only a player
+  // who chose "Keep local" for this save lifts it (#232).
+  url += KeepsLocal(options, operation) ? "&overwrite=true" : "&overwrite=false";
 
   http::Request request =
       Authed(http::Method::kPost, std::move(url), token, options.timeout, options.cancel);
@@ -460,16 +556,16 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
 
   const http::Result result = client.Send(request);
   if (const auto refused = Refused(result, "the upload")) {
-    std::string message = refused->second;
-    if (result.response.status == 409) {
-      // The one status worth spelling out, and only here: RomM answers it when
-      // this device has no sync row for the slot's current save, which is
-      // exactly the state the plan calls `Client save is newer (no sync
-      // history)`. A plan executed as issued must never draw one, so seeing it
-      // means the request went out without `overwrite=true`.
-      message += "; the slot has a newer save and the upload did not say overwrite=true";
+    if (refused->first == OperationError::kRefused && result.response.status == 409) {
+      // The slot guard, and the one refusal worth its own name: the slot holds a
+      // save this device has not synced, and the remedy is the tick's -- ask the
+      // server for its head and take it -- not another post (sync_resolve.hpp).
+      return Fail(operation, OperationError::kNewerOnServer,
+                  refused->second +
+                      "; the slot holds a newer save than this device last synced, so nothing "
+                      "was uploaded over it");
     }
-    return Fail(operation, refused->first, std::move(message));
+    return Fail(operation, refused->first, refused->second);
   }
 
   OperationResult uploaded;
@@ -488,6 +584,87 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
     uploaded.save_id = SaveIdOf(document.value);
   }
   return uploaded;
+}
+
+/// The emulator step 0 reported for `target`, or empty.
+std::string ReportedEmulator(const ExecuteOptions& options, const SaveTarget& target) {
+  if (options.reported != nullptr) {
+    for (const ClientSaveState& save : *options.reported) {
+      if (save.rom_id == target.rom_id && save.slot == target.slot) {
+        return save.emulator.value_or(std::string());
+      }
+    }
+  }
+  return {};
+}
+
+/// A conflict's losing local copy, put on the server as an archival save before
+/// the server's copy replaces it (#240): `POST /api/saves` with **no `slot`**,
+/// the bytes `BackUpFirst` just preserved, the local emulator and
+/// `ArchiveFileName`. What happened is written onto `result`.
+///
+/// Never a reason to stop the conflict. A failure leaves the bytes in
+/// `.backup/` exactly as before #240, and says -- on the result, for the
+/// overlay, and in a warning -- that the server holds no copy.
+///
+/// No `session_id`: RomM counts every upload naming one as a completed
+/// operation of that session, and this is not one the plan had. `device_id`
+/// is sent, so the row records which console it came from; a `null`-slot row
+/// never enters negotiate, so the sync row it writes pairs with nothing.
+void Archive(http::HttpClient& client, fs::FileSystem& files, const auth::StoredToken& token,
+             const SyncOperation& operation, const SaveTarget& target,
+             const ExecuteOptions& options, std::int64_t unix_seconds, OperationResult* result,
+             std::vector<std::string>* warnings) {
+  const auto failed = [&](const std::string& why) {
+    result->archive = ArchiveOutcome::kFailed;
+    warnings->push_back(Describe(operation) + ": the local copy could not be kept on the server (" +
+                        why + "); it is only in " + result->backup_sd_path + " on this card");
+  };
+  const std::string source = files.Resolve(result->backup_sd_path);
+  if (source.empty()) {
+    failed("the backup is not a path on this card");
+    return;
+  }
+  std::string url = http::JoinUrl(token.server_url, kSavesPath) +
+                    "?rom_id=" + std::to_string(operation.rom_id);
+  if (const std::string emulator = ReportedEmulator(options, target); !emulator.empty()) {
+    url += "&emulator=" + http::EncodeQueryValue(emulator);
+  }
+  url += "&device_id=" + http::EncodeQueryValue(token.device_id);
+  if (options.send_content_hash) {
+    const state::HashOutcome digest = state::HashFile(source);
+    if (!digest.ok()) {
+      failed("the backup could not be hashed: " + digest.message);
+      return;
+    }
+    url += "&content_hash=" + digest.content_hash;
+  }
+  // RomM keeps a `null`-slot name as sent and replaces the row of that rom,
+  // emulator and name if there is one. `ArchiveFileName`'s second is what keeps
+  // that from happening. `overwrite=false` guards only a narrower case: a
+  // same-name row this device synced and another device moved since is a 409
+  // rather than replaced. A row this device wrote itself is not protected by it.
+  url += "&overwrite=false";
+
+  http::Request request =
+      Authed(http::Method::kPost, std::move(url), token, options.timeout, options.cancel);
+  http::FormPart part;
+  part.name = "saveFile";
+  part.file_path = source;
+  part.file_name = ArchiveFileName(target.file_name, unix_seconds);
+  part.content_type = "application/octet-stream";
+  request.form.push_back(std::move(part));
+
+  const http::Result posted = client.Send(request);
+  if (const auto refused = Refused(posted, "the archival upload")) {
+    failed(refused->second);
+    return;
+  }
+  const json::ParseResult document = json::Parse(posted.response.body);
+  result->archive = ArchiveOutcome::kKept;
+  // Read for the overlay, not to decide anything: the bytes are on the server
+  // whether or not the row can be read back.
+  result->archive_save_id = document.ok() ? SaveIdOf(document.value) : std::nullopt;
 }
 
 /// `GET /api/saves/{id}` -- the size and digest the download is judged against.
@@ -537,6 +714,54 @@ ServerSave DescribeServerSave(http::HttpClient& client, const auth::StoredToken&
   return described;
 }
 
+/// Why the server's copy may not be written at `target`, or empty when it may
+/// (#238). Asked before anything is fetched, and for a placement before its
+/// folder is made: a refusal costs no request and leaves nothing behind.
+///
+/// A matched save is read as what step 0 reported for its `(rom_id, slot)`. A
+/// placed one (`placement` set) as the emulator the placement says it wrote
+/// for, else as what `reads_as` says of its path. With none of them to ask,
+/// nothing says who reads the file, so an isolated format is not written there
+/// and anything else is held to the rules it had before.
+std::string OtherEmulator(const SyncOperation& operation, const SaveTarget& target,
+                          const place::Placement* placement, const ExecuteOptions& options) {
+  const std::string server = operation.emulator.value_or(std::string());
+  const bool placed = placement != nullptr;
+  const char* const outcome =
+      placed ? "; nothing was placed" : "; the local file was not touched";
+  std::string local;
+  bool known = true;
+  if (placed && !placement->emulator.empty()) {
+    local = placement->emulator;
+  } else if (placed && options.reads_as != nullptr) {
+    local = options.reads_as(operation, target.sd_path);
+  } else if (!placed && options.reported != nullptr) {
+    for (const ClientSaveState& save : *options.reported) {
+      if (save.rom_id == target.rom_id && save.slot == target.slot) {
+        local = save.emulator.value_or(std::string());
+        break;
+      }
+    }
+  } else {
+    known = false;
+  }
+  if (!known) {
+    if (!scan::IsIsolated(server)) {
+      return {};
+    }
+    return "the server's copy is " + server + "'s, a format only that emulator reads, and " +
+           "nothing says who reads " + target.sd_path + outcome;
+  }
+  if (scan::Interchangeable(local, server)) {
+    return {};
+  }
+  const auto name = [](const std::string& id) {
+    return id.empty() ? std::string("an unnamed emulator") : id;
+  };
+  return "the server's copy is " + name(server) + "'s and " + target.sd_path + " is read as " +
+         name(local) + "'s, which is not the same save format (#238)" + outcome;
+}
+
 /// The download half of `download` and of `conflict`: fetch, verify, back up,
 /// commit, confirm. The two differ in what they are called and in nothing else
 /// -- keeping both *is* writing the server's copy over a local file whose
@@ -550,26 +775,73 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                 "the plan says to fetch a save the server named no id for");
   }
   const std::int64_t save_id = *operation.save_id;
+  // A placed file replaces no local copy, so a conflict landing there has no
+  // losing side to keep (#240).
+  const bool matched = target != nullptr;
 
   // Where it goes. A matched local file keeps its own path; a save the client
   // has never seen needs one invented, which the plan cannot do -- the server's
   // `file_name` is tagged and the directory depends on the rom's platform.
   SaveTarget placed;
   if (target == nullptr) {
-    const std::string sd_path = options.place != nullptr ? options.place(operation) : std::string();
+    const place::Placement placement =
+        options.place != nullptr ? options.place(operation) : place::Placement{};
+    const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
       return Fail(operation, OperationError::kNoLocalSave,
-                  "there is no local save for this (rom_id, slot) and nothing said where a new "
-                  "one should go");
+                  placement.reason.empty()
+                      ? "there is no local save for this (rom_id, slot) and nothing said where a "
+                        "new one should go"
+                      : "there is no local save for this (rom_id, slot), and none was placed: " +
+                            placement.reason);
+    }
+    // **A placement only creates.** "No local save matched" is not "nothing is
+    // at that path": a save the scan skipped, or one it read in another slot,
+    // still sits there, and writing over it on the strength of a row this
+    // console has no history for is not a restore. Asked before anything is
+    // fetched; the backup below still covers a file that appears meanwhile.
+    const std::string resolved = files.Resolve(sd_path);
+    if (resolved.empty()) {
+      return Fail(operation, OperationError::kUnreadableCard,
+                  "the save path " + sd_path + " is not a path on this card");
+    }
+    if (io::Exists(resolved)) {
+      return Fail(operation, OperationError::kNoLocalSave,
+                  "there is no local save for this (rom_id, slot), and " + sd_path +
+                      " is already a file this sync did not pair with it; it was not touched");
     }
     placed.rom_id = operation.rom_id;
     placed.slot = operation.slot;
     placed.sd_path = sd_path;
+    // A format only one emulator reads is never placed where another reads it
+    // (#238) -- asked before the folder is made, so a refusal leaves nothing.
+    if (std::string why = OtherEmulator(operation, placed, &placement, options); !why.empty()) {
+      OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+      refused.sd_path = sd_path;
+      return refused;
+    }
+    // The emulator makes a system's folder the first time it saves one, which
+    // for a save the console has never held is after this.
+    const std::size_t parent = sd_path.rfind('/');
+    if (parent != std::string::npos && parent > 0) {
+      const fs::MakeDirResult made = files.CreateDirectory(sd_path.substr(0, parent));
+      if (!made.ok()) {
+        return Fail(operation, OperationError::kUnreadableCard,
+                    "the folder for " + sd_path + " could not be made: " + made.message);
+      }
+    }
     // The extension the backup would take, from the path the caller chose. The
     // server's `file_name` is never used for this: it carries RomM's ingest tag.
     const std::size_t leaf = sd_path.rfind('/');
     placed.file_name = leaf == std::string::npos ? sd_path : sd_path.substr(leaf + 1);
     target = &placed;
+  } else if (std::string why = OtherEmulator(operation, *target, nullptr, options);
+             !why.empty()) {
+    // Nor is one written over a save another emulator reads (#238) -- whatever
+    // the slot pairing put in the plan.
+    OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+    refused.sd_path = target->sd_path;
+    return refused;
   }
 
   const std::string destination = files.Resolve(target->sd_path);
@@ -588,7 +860,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // refuses -- it is not a replace -- so it goes first. The bytes in it are a
   // download that never completed and belong to nothing.
   io::StagedFile staged(io::TempPathFor(destination));
-  std::remove(staged.path().c_str());
+  io::Remove(staged.path());
 
   http::Request request = Authed(http::Method::kGet,
                                  http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
@@ -616,7 +888,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // remove it. `<path>.part` is `http::DownloadTarget`'s documented staging
     // name, not a guess. The staged file goes with it, by the guard above: an
     // incomplete download is not a save.
-    std::remove((staged.path() + ".part").c_str());
+    io::Remove(staged.path() + ".part");
     return Fail(operation, refused->first, refused->second);
   }
 
@@ -656,12 +928,24 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   result.save_id = save_id;
 
   std::string message;
+  std::int64_t stamp = 0;
   const OperationError backed_up =
-      BackUp(files, options, operation, *target, &result.backup_sd_path, &message);
+      BackUp(files, options, operation, *target, &result.backup_sd_path, &message, &stamp);
   if (backed_up != OperationError::kNone) {
     OperationResult failed = Fail(operation, backed_up, std::move(message));
     failed.sd_path = target->sd_path;
     return failed;
+  }
+
+  // The losing side of a conflict, kept where another device can reach it
+  // (#240). After the backup, so it uploads exactly the bytes `.backup/` holds
+  // and a card that refuses a backup refuses before anything is sent -- a
+  // conflict that fails there every tick would otherwise archive every tick.
+  // Before the commit, so the server holds the copy before the card loses it.
+  // A commit that then fails repeats the conflict next tick, and with it the
+  // archive under a new second -- at the rate the backups already repeat.
+  if (success == OperationOutcome::kKeptBoth && matched && !result.backup_sd_path.empty()) {
+    Archive(client, files, token, operation, *target, options, stamp, &result, warnings);
   }
 
   const std::string staged_path = staged.path();
@@ -674,6 +958,8 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
              "the verified bytes could not be put in place: " + committed.message);
     failed.sd_path = target->sd_path;
     failed.backup_sd_path = result.backup_sd_path;
+    failed.archive = result.archive;
+    failed.archive_save_id = result.archive_save_id;
     return failed;
   }
 
@@ -686,7 +972,14 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                     std::string(kSavesPath) + "/" + std::to_string(save_id) + "/downloaded"),
              token, options.timeout, options.cancel);
   confirm.headers.push_back({"Content-Type", "application/json"});
-  confirm.body = "{\"device_id\":" + json::Quote(token.device_id) + "}";
+  // The digest of the bytes now on the card, verified equal to the plan's above,
+  // is what records this device's baseline (#234): a claim about the card that
+  // is true by construction, never one about a copy this device does not hold.
+  confirm.body = "{\"device_id\":" + json::Quote(token.device_id);
+  if (options.send_content_hash) {
+    confirm.body += ",\"content_hash\":" + json::Quote(digest.content_hash);
+  }
+  confirm.body += "}";
   const http::Result confirmed = client.Send(confirm);
   if (const auto refused = Refused(confirmed, "the download confirmation")) {
     // Counted failed on purpose, even though the bytes are correct: as far as
@@ -713,6 +1006,8 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     failed.sd_path = target->sd_path;
     failed.backup_sd_path = result.backup_sd_path;
     failed.save_id = save_id;
+    failed.archive = result.archive;
+    failed.archive_save_id = result.archive_save_id;
     return failed;
   }
 
@@ -721,6 +1016,128 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                    (result.backup_sd_path.empty()
                         ? std::string(", replacing nothing")
                         : ", after backing up its previous bytes to " + result.backup_sd_path);
+  if (result.archive == ArchiveOutcome::kKept) {
+    result.message += ", and keeping them on the server as archival save " +
+                      (result.archive_save_id.has_value() ? std::to_string(*result.archive_save_id)
+                                                          : std::string("(id unread)"));
+  } else if (result.archive == ArchiveOutcome::kFailed) {
+    result.message += "; the server holds no copy of them";
+  }
+  return result;
+}
+
+/// The digest step 0 reported for `target`, or empty when it reported none.
+std::string ReportedDigest(const std::vector<ClientSaveState>& reported,
+                           const SaveTarget& target) {
+  for (const ClientSaveState& save : reported) {
+    if (save.rom_id == target.rom_id && save.slot == target.slot) {
+      return save.content_hash.value_or(std::string());
+    }
+  }
+  return {};
+}
+
+/// A `delete` (#233): back up, check the backup is the bytes the server ruled
+/// on, remove. Hard rule 2 with the overwrite replaced by a removal, and the
+/// same `BackUpFirst` -- so a power cut at any call leaves the save on the card
+/// or its bytes under `.backup/`, never neither (`execute.crash_delete`).
+OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
+                       const SaveTarget* target, const ExecuteOptions& options) {
+  if (target == nullptr) {
+    // Never `place`: that invents a path for a save the client does not have,
+    // and a removal aimed at an invented path is a removal of whatever is there
+    // -- a save in a Tico account the scan has not decided on (#231), say. A
+    // delete acts on what this tick reported and on nothing else.
+    return Fail(operation, OperationError::kNoLocalSave,
+                "there is no local save for this (rom_id, slot) to remove; nothing was touched");
+  }
+
+  OperationResult result;
+  result.action = operation.action;
+  result.rom_id = operation.rom_id;
+  result.slot = operation.slot;
+  result.sd_path = target->sd_path;
+
+  if (options.on_server_delete == config::OnServerDelete::kKeep) {
+    result.outcome = OperationOutcome::kKept;
+    result.message = Describe(operation) + ": deleted on the server; " + target->sd_path +
+                     " stays on the card ([sync] on_server_delete = keep), and these bytes are not "
+                     "offered to RomM again";
+    return result;
+  }
+
+  const std::string source = files.Resolve(target->sd_path);
+  if (source.empty()) {
+    return Fail(operation, OperationError::kUnreadableCard,
+                "the save path " + target->sd_path + " is not a path on this card");
+  }
+  // Asked before anything is copied: with no digest to hold the backup to,
+  // the removal will not happen, and a copy made first would only be litter.
+  const std::string expected =
+      options.reported != nullptr ? ReportedDigest(*options.reported, *target) : std::string();
+  if (expected.empty()) {
+    OperationResult failed =
+        Fail(operation, OperationError::kUnverified,
+             "this tick reported no digest for the save, so nothing says it is the copy the "
+             "server deleted; it was left on the card");
+    failed.sd_path = target->sd_path;
+    return failed;
+  }
+
+  std::string message;
+  const OperationError backed_up =
+      BackUp(files, options, operation, *target, &result.backup_sd_path, &message);
+  if (backed_up != OperationError::kNone) {
+    OperationResult failed = Fail(operation, backed_up, std::move(message));
+    failed.sd_path = target->sd_path;
+    return failed;
+  }
+  if (result.backup_sd_path.empty()) {
+    // `BackUpFirst` found nothing at the path: the file left the card between
+    // the scan and now. That is where the plan wanted it.
+    result.outcome = OperationOutcome::kRemoved;
+    result.message = Describe(operation) + ": deleted on the server, and " + target->sd_path +
+                     " was already gone from the card";
+    return result;
+  }
+
+  // The backup, not the save, is what is hashed: it is the copy that has to be
+  // right for the removal to be safe, and it is the bytes the removal takes.
+  const state::HashOutcome digest = state::HashFile(files.Resolve(result.backup_sd_path));
+  if (!digest.ok() || digest.content_hash != expected) {
+    // The server ruled on the bytes this tick reported, and these are not
+    // them: progress the ruling never saw. The save stays, and the copy goes
+    // with it -- it duplicates a file nothing replaced, so it backs up
+    // nothing, which is `BackUpFirst`'s own reasoning for an unconfirmed one.
+    io::Remove(files.Resolve(result.backup_sd_path));
+    OperationResult failed =
+        Fail(operation, OperationError::kUnverified,
+             "the save is not the bytes this tick reported, so the server's ruling is not "
+             "about it; it was left on the card");
+    failed.sd_path = target->sd_path;
+    return failed;
+  }
+
+  if (io::Remove(source) != 0) {
+    OperationResult failed =
+        Fail(operation, OperationError::kCommitFailed,
+             "the card refused to remove " + target->sd_path +
+                 "; it is still there, and a copy is at " + result.backup_sd_path);
+    failed.sd_path = target->sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
+    return failed;
+  }
+  // The removal's name made durable, asked and not required: a card that keeps
+  // the file through a power cut has the save and its backup both, and the
+  // next tick is answered `delete` again.
+  const std::size_t slash = source.find_last_of('/');
+  if (slash != std::string::npos) {
+    io::Sync(slash == 0 ? std::string("/") : source.substr(0, slash));
+  }
+
+  result.outcome = OperationOutcome::kRemoved;
+  result.message = Describe(operation) + ": deleted on the server; removed " + target->sd_path +
+                   " after backing it up to " + result.backup_sd_path;
   return result;
 }
 
@@ -780,6 +1197,20 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
           result.message = Describe(operation) + ": nothing to do (" +
                            ToString(operation.reason) + ")";
           break;
+        case Action::kDelete:
+          if (!options.delete_action) {
+            // A server that does not say it means `delete` (#228): obeyed as
+            // nothing, and counted with the actions this build does not know.
+            result.action = operation.action;
+            result.rom_id = operation.rom_id;
+            result.slot = operation.slot;
+            result.outcome = OperationOutcome::kNotUnderstood;
+            result.message = Describe(operation) +
+                             ": this server does not offer delete, so it was not acted on";
+            break;
+          }
+          result = Remove(files, operation, target, options);
+          break;
       }
     }
 
@@ -804,6 +1235,10 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       case OperationOutcome::kUploaded:
       case OperationOutcome::kDownloaded:
       case OperationOutcome::kKeptBoth:
+      case OperationOutcome::kRemoved:
+      case OperationOutcome::kKept:
+        // A kept delete is the plan obeyed too: the server's ruling was that
+        // this copy is not to be uploaded, and it is not.
         ++report.completed;
         break;
     }

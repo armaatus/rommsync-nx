@@ -3,7 +3,7 @@
   "protected_paths": [
     {"path": "server/contract/captures/",
      "tail": "captures/",
-     "reason": "the pinned RomM 5.2.0 contract; a test diffs a live probe against it"}
+     "reason": "the pinned RomM contract (5.2.0, and 5.4.0 under captures/5.4.0/); a test diffs a live probe against it"}
   ],
   "secret_suffixes": ["/config.ini", "/token.dat", "/device.dat", "/server/testing/fixture-auth.env"],
   "secret_contains": ["/token.dat", "/device.dat", "fixture-auth.env"],

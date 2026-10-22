@@ -2,6 +2,7 @@
 
 #include <tesla.hpp>
 
+#include <cstdint>
 #include <string>
 
 #include "draw_list.hpp"
@@ -44,6 +45,18 @@ void DrawBounded(tsl::gfx::Renderer* renderer, const std::string& text, s32 x, s
     return;
   }
   renderer->drawString(text, false, x, y, font_size, color, static_cast<ssize_t>(max_width));
+}
+
+void RendererDrawList::String(const std::string& text, std::int32_t x, std::int32_t y,
+                              std::int32_t font_size, Rgba4444 color, std::int32_t wrap_width) {
+  DrawBounded(renderer_, text, static_cast<s32>(x), static_cast<s32>(y),
+              static_cast<s32>(font_size), tsl::Color(color), static_cast<s32>(wrap_width));
+}
+
+void RendererDrawList::Rect(std::int32_t x, std::int32_t y, std::int32_t width,
+                            std::int32_t height, Rgba4444 color) {
+  renderer_->drawRect(static_cast<s32>(x), static_cast<s32>(y), static_cast<s32>(width),
+                      static_cast<s32>(height), tsl::Color(color));
 }
 
 }  // namespace rommsync::overlay

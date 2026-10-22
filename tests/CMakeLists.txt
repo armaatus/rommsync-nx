@@ -98,39 +98,41 @@ target_link_libraries(test_json PRIVATE rommsync::core)
 target_include_directories(test_json PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_test(NAME core.json COMMAND test_json)
 
-# The auth structs against the committed captures in server/contract/captures/.
-# It reads those files rather than restating them, so the structs are pinned to
-# the same bytes the docs quote and contract.captures re-checks against a live
-# RomM. No network, so it never skips either.
+# The auth structs against the committed captures in
+# server/contract/captures/5.4.0/, the floor the product accepts; the root
+# captures are 5.2.0's, kept as history, and contract.captures compares them
+# only against a 5.2.0 fixture. It reads those files rather than restating
+# them, so the structs are pinned to the bytes contract.captures re-checks
+# against a live RomM. No network, so it never skips either.
 add_executable(test_auth_shapes test_auth_shapes.cpp)
 target_link_libraries(test_auth_shapes PRIVATE rommsync::core)
 target_include_directories(test_auth_shapes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_auth_shapes PRIVATE
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0")
 add_test(NAME auth.shapes COMMAND test_auth_shapes)
 
 # The negotiate request payload, against the pinned OpenAPI snapshot rather than
-# against a second copy of the field names. server/contract/romm-openapi-5.2.0.json
-# is what M0-4 pinned; this keeps `ClientSaveState` honest against it in both
-# directions -- a field the snapshot grew, and a field the encoder invented, are
-# both red. No network, so it never skips.
+# against a second copy of the field names. server/contract/romm-openapi-5.4.0.json
+# is the floor's snapshot (M0-4 pinned 5.2.0's); this keeps `ClientSaveState`
+# honest against it in both directions -- a field the snapshot grew, and a field
+# the encoder invented, are both red. No network, so it never skips.
 add_executable(test_sync_payload test_sync_payload.cpp)
 target_link_libraries(test_sync_payload PRIVATE rommsync::core)
 target_include_directories(test_sync_payload PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_sync_payload PRIVATE
-  ROMMSYNC_OPENAPI="${CMAKE_SOURCE_DIR}/server/contract/romm-openapi-5.2.0.json")
+  ROMMSYNC_OPENAPI="${CMAKE_SOURCE_DIR}/server/contract/romm-openapi-5.4.0.json")
 add_test(NAME sync.payload COMMAND test_sync_payload)
 
 # The other direction: the plan RomM sends back, against the captured responses
-# in server/contract/captures/ rather than against a second copy of the field
-# names. The reason table is the part no capture can pin -- only five of the
-# thirteen strings 5.2.0 emits appear in one -- so it is checked against the
+# in server/contract/captures/5.4.0/ rather than against a second copy of the
+# field names. The reason table is the part no capture can pin -- most of the
+# strings RomM emits appear in none -- so it is checked against the
 # table in docs/API_CONTRACT.md instead. No network, so it never skips.
 add_executable(test_sync_plan test_sync_plan.cpp)
 target_link_libraries(test_sync_plan PRIVATE rommsync::core)
 target_include_directories(test_sync_plan PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_sync_plan PRIVATE
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures")
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0")
 add_test(NAME sync.plan COMMAND test_sync_plan)
 
 # token.dat. Pure filesystem and parsing, so this never skips either -- and the
@@ -190,7 +192,7 @@ add_executable(test_device_shapes test_device_shapes.cpp)
 target_link_libraries(test_device_shapes PRIVATE rommsync::core)
 target_include_directories(test_device_shapes PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(test_device_shapes PRIVATE
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures"
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
 add_test(NAME device.shapes COMMAND test_device_shapes)
 
@@ -223,6 +225,18 @@ target_compile_definitions(test_config PRIVATE
   ROMMSYNC_CONFIG_EXAMPLE="${CMAKE_SOURCE_DIR}/packaging/config.ini.example")
 add_test(NAME core.config COMMAND test_config)
 
+# Every on-card file as v1.0.0-rc1 wrote it, read by this build, and each as a
+# later release would write it (#205). The fixtures are that release's own bytes
+# (tests/fixtures/v1.0.0-rc1/generate.cpp), so a format that moves without a
+# version bump and a migration fails here rather than on a card after an upgrade.
+add_executable(test_compat test_compat.cpp)
+target_link_libraries(test_compat PRIVATE rommsync::core)
+target_include_directories(test_compat PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_compat PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+add_test(NAME compat.fixtures COMMAND test_compat)
+
 # The write half of `config.ini` (M5-3). Pure text in and text out -- no file,
 # no server -- because what it has to prove is a claim about *bytes*: the one
 # setting changes and every other byte the user typed is the byte it was. A
@@ -236,6 +250,7 @@ set(CONFIG_WRITE_SCENARIOS
   rejects    # a refused edit changes nothing, and never quotes a URL
   absent     # a missing key, and a missing section, both land where they read
   removes    # `remove` drops every occurrence and the default comes back
+  emulator   # the [platform.x] emulator override, and the folders it must not unmap
 )
 foreach(scenario IN LISTS CONFIG_WRITE_SCENARIOS)
   add_test(NAME config.write_${scenario} COMMAND test_config_write ${scenario})
@@ -354,6 +369,8 @@ set(LIST_UNIT_SCENARIOS
   platforms  # an empty list, one shorter than a page, and a rom with no name
   cursors    # the cap, the TTL, and what a reclaimed cursor answers
   queue      # served off the card, and never over the network
+  held       # one platform snapshot and one built page, however many cursors (M9-20)
+  too_large  # a page past the transport ceiling is asked for at half the rows (#248)
 )
 foreach(scenario IN LISTS LIST_UNIT_SCENARIOS)
   add_test(NAME lists.${scenario} COMMAND test_lists ${scenario})
@@ -478,13 +495,15 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `overlay/source/` had been built by anything but devkitPro and none of them had
 # run anywhere. `status_screen.hpp` said so in its header comment.
 #
-# Four of them are compiled in here. Two needed nothing but a seam --
+# Seven of them are compiled in here. Two needed nothing but a seam --
 # `card_probe.cpp` a parameter for the `sdmc:` mount, `status_paint.cpp` a
 # `DrawList` instead of a `tsl::gfx::Renderer` -- and two reach libnx and get
 # `tests/hostswitch/switch.h` instead, which stubs only what those two files
-# name. `sysmodule/source/ipc/result.cpp` is
-# the far side's `Error` -> `Result` mapping, compiled in so the overlay's
-# inverse is tested against the real one rather than against a copy of it.
+# name. M9-6 (#209) added `conflicts_pump.cpp`, `lifecycle.cpp` and
+# `log_paint.cpp`, each split out of a screen so the claim about it runs.
+# `sysmodule/source/ipc/result.cpp` is the far side's `Error` -> `Result`
+# mapping, compiled in so the overlay's inverse is tested against the real
+# one rather than against a copy of it.
 #
 # `tesla.hpp` is deliberately NOT stubbed. `tsl::gfx::Renderer` is `final` with
 # non-virtual inline methods, so there is no faking it, and stubbing the whole
@@ -496,13 +515,17 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `<switch.h>`, and `sysmodule/source/ipc` as `"result.hpp"`.
 add_executable(test_overlay_native
   test_overlay_native.cpp
+  count_new.cpp
   "${CMAKE_SOURCE_DIR}/tests/hostswitch/switch.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/card_probe.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/conflicts_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/ipc_client.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/log_paint.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
   "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc/result.cpp")
-target_link_libraries(test_overlay_native PRIVATE rommsync::core)
+target_link_libraries(test_overlay_native PRIVATE rommsync::core Threads::Threads)
 target_include_directories(test_overlay_native PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   "${CMAKE_SOURCE_DIR}/tests/hostswitch"
@@ -511,6 +534,16 @@ target_include_directories(test_overlay_native PRIVATE
 target_compile_definitions(test_overlay_native PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
   ROMMSYNC_OVERLAY_SOURCE_DIR="${CMAKE_SOURCE_DIR}/overlay/source")
+# `overlay.cycles` balances the heap across repeated open/close cycles with
+# `count_new.hpp` (#209), so allocation elision is off here for the reason it is
+# off for `test_heap_steady` below: a count that passes because a `new` never
+# happened passes for the wrong reason.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(test_overlay_native PRIVATE
+    -fno-builtin-operator-new -fno-builtin-operator-delete)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(test_overlay_native PRIVATE -fno-allocation-dce)
+endif()
 
 foreach(scenario
         card       # the card the status screen reads when nothing answers
@@ -518,6 +551,11 @@ foreach(scenario
         roundtrip  # the payloads, through both real codecs
         version    # a contract mismatch, end to end
         errors     # a refusal is not a transport failure, and neither is a bad payload
+        timeout    # a sysmodule that does not answer holds no frame past one budget
+        restore    # a restore that is still copying holds no frame at all
+        cycles     # every exit path gives back everything, the same way, every time
+        hidden     # polling is by showing, because update() stops while hidden
+        log        # the log the sysmodule serves, readable without an SD reader
         portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn
   add_test(NAME overlay.${scenario} COMMAND test_overlay_native ${scenario})
@@ -591,6 +629,18 @@ if(NOT ROMMSYNC_REQUIRE_RIG)
 endif()
 set_tests_properties(rig.recycling_live PROPERTIES TIMEOUT 60)
 
+# Which RomM the rig is (#227). The slot cap is pinned in the file so pruning is
+# deterministic across releases, and the running image is checked against the
+# ROMM_VERSION .env names -- a stack started before it changed would otherwise
+# answer every rig test for the wrong server.
+add_test(NAME rig.slot_cap COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" slot_cap)
+add_test(NAME rig.version_live
+         COMMAND "${BASH_PROGRAM}" "${RIG_FIXTURE_TEST}" version_live)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(rig.version_live PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(rig.slot_cap rig.version_live PROPERTIES TIMEOUT 60)
+
 # --- the native HttpClient against the real rig ------------------------------
 # One CTest entry per scenario, selected by argv[1], so a red run names the
 # behaviour that broke. The scratch directory is per build tree, because three
@@ -615,6 +665,7 @@ set(HTTP_SCENARIOS
   progress          # ...reporting how far it has got while it is still going
   range             # fetch a slice and prove it is the right slice
   drop              # a TCP reset mid-body: an error, and no file at the destination
+  disk              # M9-13: a full card, a file too large, an EIO -- each named, no file left
   resume            # pick that interrupted download back up
   resume_no_range   # ...even when the server ignores Range and starts over
   resume_empty_body # ...and a bodyless 2xx never promotes the stale partial
@@ -626,6 +677,7 @@ set(HTTP_SCENARIOS
   cancel            # cancellation from another thread, and nothing left behind
   redirect_credentials # a bearer token does not follow a redirect off this origin
   multipart_grows   # a save still being written does not overrun its Content-Length
+  too_large         # #248: a body past http::kMaxResponseBytes is kTooLarge, declared or not
 )
 
 foreach(scenario IN LISTS HTTP_SCENARIOS)
@@ -638,6 +690,16 @@ foreach(scenario IN LISTS HTTP_SCENARIOS)
   # to the client that armed it.
   set_tests_properties(http.${scenario} PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endforeach()
+
+# `post_json` once RomM's device-init window is already spent -- the state a
+# full suite can leave it in by the time `post_json` runs, made deterministic.
+# Only here, not in `wire.*`: what it holds is the test's own handling of a 429,
+# the same code in both binaries, and it costs a whole rate-limit window.
+add_test(NAME http.post_json_spent COMMAND test_http_native post_json_spent)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(http.post_json_spent PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(http.post_json_spent PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
 # --- refusing a leaf rather than adopting one --------------------------------
 # #169. `scratch::Dir()` memoizes in a function-local static, so the fork this
@@ -737,7 +799,16 @@ target_compile_definitions(test_http_wire PRIVATE
   # GETs, and the reason to think twice before giving it a negotiate (#174).
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-wire")
 
-foreach(scenario IN LISTS HTTP_SCENARIOS)
+# Plus what only this backend has: a `Connector` whose reads can be watched.
+# `chunk` is M9-10's (#201) -- the read size is the console's `ssl` IPC count
+# per gigabyte, and libcurl's chunk is not ours to assert on.
+set(WIRE_ONLY_SCENARIOS
+  chunk             # a download reads 64 KiB at a time, an API call 16 KiB
+  reserved          # an API body is held in the room Content-Length declared (M9-19)
+  undeclared        # one that declares no length is capped, not grown into (M9-20)
+)
+
+foreach(scenario IN LISTS HTTP_SCENARIOS WIRE_ONLY_SCENARIOS)
   add_test(NAME wire.${scenario} COMMAND test_http_wire ${scenario})
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(wire.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
@@ -842,6 +913,7 @@ set(SYNC_SCENARIOS
   understood  # a renamed OPTIONAL one is a silent 200 with a different plan
   negotiates  # sync::Negotiate end to end: a session and an operation, typed
   discovers   # an empty `saves` is how a client learns what it is missing
+  filters     # `emulators` keeps a lineage this console cannot load out of the plan
   revoked     # 401 is a revoked token, not a parse failure, and nothing changes
   truncated   # a clean short body is a named json error and no plan
   stalled     # a stall times out and is retried, with the backoff doubling
@@ -880,6 +952,12 @@ set(EXECUTE_UNIT_SCENARIOS
   naming   # the backup path carries the slot, so one rom's two saves are two files
   staging  # the streamed copy and the two-rename commit an overwrite goes through
   counting # no-op, a downgraded action, and the two refusals that need no server
+  crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
+  overwrite # #232: overwrite=false unless Keep local, and a 409 named as a newer save in the slot
+  content_hash # #234: an upload and a /downloaded carry the MD5 of the bytes that moved
+  delete   # M10-7: a server delete is backed up, then removed -- or kept, or refused
+  crash_delete # M10-7: ...and a power cut at every call of it leaves the save or its backup
+  isolated # #238: a tico-* save is never written where another emulator reads, nor over by one
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -888,13 +966,16 @@ endforeach()
 
 
 set(EXECUTE_RIG_SCENARIOS
-  upload          # overwrite=true, session_id and device_id -- and no 409
+  upload          # overwrite=false, session_id and device_id -- and no 409 into a fresh slot
   download        # verify, back up, commit, confirm -- in that order
-  conflict        # both sides changed: keep both, lose nothing
+  crash           # M9-14: ...and a power cut at every call of it loses nothing
+  placed          # M10-11: a first-time restore makes its folder and writes over nothing, all or none
+  conflict        # both sides changed: keep both, lose nothing -- and #240: the local copy on the server too
+  conflict_unarchived # #240: ...and when that upload fails, the server holds none and the result says so
   same_timestamp  # ...and the no-history conflict, resolved the same way
   truncate        # a clean short body never replaces a save
   corrupted       # ...and neither do the right number of the wrong bytes
-  occupied        # overwrite=true, in the state it exists for: a 409 without it
+  occupied        # #232: the slot guard answers 409, and only Keep local goes over it
   dropped         # a TCP reset mid-download costs a tick, not a save
   collision       # two saves of one rom, one second, two backups
   revoked         # M1-4: a 401 stops the plan where it stands, and touches no save
@@ -968,10 +1049,93 @@ set(SCAN_UNIT_SCENARIOS
   unusable     # a record sync::Validate refuses costs one file, not the tick
   truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
   hashing      # the digest is real, reused when nothing changed, null only when unreadable
+  sources      # fixture trees for each source scan to the emulator id that wrote them
+  grown        # the index is reserved from total; a library that grows mid-fetch stops there
+  retroarch    # flat, sorted, beside the content and cloud-synced, as retroarch.cfg says
+  tico         # Tico 0.7.9 and 0.8.0 with one and two accounts; litter is never a save
+  isolated     # #238: tico-* ids, DuckStation's cards, and PPSSPP's folders as a named skip
 )
 foreach(scenario IN LISTS SCAN_UNIT_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
   set_tests_properties(scan.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# M10-3: which emulator wrote a save. Pure tables and rules, so it never skips;
+# `retroarch_table` diffs the core-folder table against RomM's own, pinned.
+add_executable(test_save_source test_save_source.cpp)
+target_link_libraries(test_save_source PRIVATE rommsync::core)
+target_include_directories(test_save_source PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_save_source PRIVATE
+  ROMMSYNC_EMULATOR_NAMES="${CMAKE_SOURCE_DIR}/server/contract/romm-5.4.0-emulator_names.py")
+
+set(SOURCE_SCENARIOS
+  retroarch_table  # the core-folder table is RomM 5.4.0's, entry for entry
+  tico_table       # every Tico slug's module and id; isolated formats are tico-*
+  ids              # RomM's rule for an emulator id, refused before it is sent
+  layouts          # what a folder alone says, and what the platform adds
+  isolation        # #238: a tico-* format meets only itself, and what a path reads as
+)
+foreach(scenario IN LISTS SOURCE_SCENARIOS)
+  add_test(NAME source.${scenario} COMMAND test_save_source ${scenario})
+  set_tests_properties(source.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# M10-11: where a save or a state the console has never held is written. Against
+# scratch directories and no server, so it never skips; every placement it
+# accepts is scanned back as the same rom in the same slot.
+add_executable(test_placement test_placement.cpp)
+target_link_libraries(test_placement PRIVATE rommsync::host)
+target_include_directories(test_placement PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_placement PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+set(PLACE_SCENARIOS
+  config   # play_with, and Tico by default for every system Tico runs (#226 D5)
+  names    # folder, core folder, the rom's name and the emulator's extension
+  saves    # Tico's layouts and RetroArch's, read back by the scan -- and every refusal
+  states   # the same rule for a state, under the name it pairs on
+  cards    # #238: DuckStation's cards under the game's name, card 2 apart, never disc 2 over disc 1
+  state_table  # #239: Tico's state slots under RetroArch's names and back, row by row
+  state_slots  # #239: a state placed only where its emulator loads it, under that frontend's name
+)
+foreach(scenario IN LISTS PLACE_SCENARIOS)
+  add_test(NAME place.${scenario} COMMAND test_placement ${scenario})
+  set_tests_properties(place.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# #241: what a negotiation is about -- the roms on the card, chunked to RomM's
+# 500, with a freshly downloaded rom asked about apart. Scratch directories and
+# no server, so it never skips.
+add_executable(test_rom_scope test_rom_scope.cpp)
+target_link_libraries(test_rom_scope PRIVATE rommsync::host)
+target_include_directories(test_rom_scope PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_rom_scope PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+foreach(scenario chunks on_card)
+  add_test(NAME scope.${scenario} COMMAND test_rom_scope ${scenario})
+  set_tests_properties(scope.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# M10-4: retroarch.cfg, read for where RetroArch keeps saves and whether it syncs
+# them itself. Pure apart from scratch files, so it never skips.
+add_executable(test_retroarch_cfg test_retroarch_cfg.cpp)
+target_link_libraries(test_retroarch_cfg PRIVATE rommsync::core)
+target_include_directories(test_retroarch_cfg PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_retroarch_cfg PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+
+set(RETROARCH_CFG_SCENARIOS
+  parse     # every key read, quoted or not, with the device prefix; the last line wins
+  fallback  # missing, malformed and oversized files fall back to the defaults, said
+  notes     # [sources] against RetroArch's Cloud Sync, and what the overlay is told
+)
+foreach(scenario IN LISTS RETROARCH_CFG_SCENARIOS)
+  add_test(NAME retroarch.${scenario} COMMAND test_retroarch_cfg ${scenario})
+  set_tests_properties(retroarch.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
 set(SCAN_RIG_SCENARIOS
@@ -1075,6 +1239,7 @@ set(CONFLICT_UNIT_SCENARIOS
   record       # a tick's reports become entries -- both conflict reasons, and the state kinds
   restore      # the old bytes exactly, and a new backup written FIRST (the sandbox audit checks it)
   interrupted  # a restore killed mid-write leaves old or new, never a splice, and no .tmp
+  crash        # M9-14: a power cut at every call of a restore, and one the card would not confirm
   service      # both commands through ipc::Dispatch over a real SdEngine
   overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
 )
@@ -1199,6 +1364,7 @@ set(STATES_UNIT_SCENARIOS
   placing   # a state this console lacks is created, never written over
   listing   # a listing this client cannot work from stops the run
   recording # an upload's row comes from the scan, and the next tick is a no-op
+  emulators # #239: only the same core's state moves; Tico's Auto goes up as .state.auto
 )
 foreach(scenario IN LISTS STATES_UNIT_SCENARIOS)
   add_test(NAME states.${scenario} COMMAND test_state_sync ${scenario})
@@ -1209,8 +1375,10 @@ set(STATES_RIG_SCENARIOS
   upsert     # POST /api/states replaces the row with that name, in place
   roundtrip  # local -> server -> a second sandbox -> identical bytes
   overwrite  # the server's copy moved: back up first, then replace
+  crash      # M9-14: ...and a power cut at every call of it loses nothing
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
+  mapped     # #239: Tico's Auto up as .state.auto with its screenshot, down as Tico's and RetroArch's
 )
 foreach(scenario IN LISTS STATES_RIG_SCENARIOS)
   add_test(NAME states.${scenario} COMMAND test_state_sync ${scenario})
@@ -1240,7 +1408,7 @@ target_include_directories(test_sync_complete PRIVATE "${CMAKE_CURRENT_SOURCE_DI
 target_compile_definitions(test_sync_complete PRIVATE
   ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
-  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures"
+  ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0"
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 
 set(COMPLETE_UNIT_SCENARIOS
@@ -1342,6 +1510,8 @@ set(SCHEDULER_SCENARIOS
   suspend   # a clock advanced past several intervals is ONE catch-up tick
   skew      # a wall clock corrected in either direction: no storm, no stall
   failures  # backoff after a failed tick, floor again after a success
+  server_disabled  # #235: sync off in RomM keeps the interval, never the backoff
+  held      # #242: ticks due under a running game are held, and one runs after it
   tls       # a handshake failure is capped rather than retried forever
   idle      # a day switched off costs no wakeups; a day offline costs tens of ticks
   pairing   # PairingSession polls on the shared curve, not on one of its own
@@ -1379,6 +1549,11 @@ set(TICK_UNIT_SCENARIOS
   offline    # an unreachable server: the card is byte-for-byte what it was
   rescan     # a restored save stops the tick rather than negotiating without it
   canceled   # a token already fired ends the tick without a single request
+  unsupported  # M10-2: a server below the floor is never negotiated with
+  newer_rule   # #232: a 409'd save becomes a download or a conflict, never another upload
+  newer_bounds # #232: ...held while a game runs (#242), and never placed where step 0 found nothing
+  migrated_kept  # #236: a delete #233 kept stays withheld when rc1's row moves to the shared slot
+  too_large    # #248: a plan past the transport ceiling is a plan too large, which a scoped tick splits
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because
@@ -1397,6 +1572,7 @@ endforeach()
 set(TICK_RIG_SCENARIOS
   negotiate_5xx    # a 5xx past the retry budget: nothing is written at all
   negotiate_drop   # ...and neither is anything by a reset mid-plan
+  server_disabled  # #235: sync off in RomM is its own outcome, and writes nothing
   upload_5xx       # refused before RomM saw it: no row, no save touched
   upload_truncate  # a short 200 is a *completed* upload whose save_id is unknown
   upload_drop      # the row exists and the client cannot know -- and must not re-post
@@ -1404,10 +1580,74 @@ set(TICK_RIG_SCENARIOS
   download_5xx     # a refusal never replaces a save
   download_stall   # ...and neither does a transfer that stopped moving; next tick recovers
   download_401     # M1-4's stop, met at a download rather than at an upload
+  download_full    # M9-13: the card fills under the transfer; save and baseline untouched
+  download_eio     # M9-13: ...or refuses it with EIO, the stand-in for a pulled card
+  backup_full      # M9-13: ...or fills under the backup, which stops the overwrite
   complete_drop    # the accounting is lost and the baseline is not
   complete_stall   # the same on the timeout, and the next tick finds no work to redo
+  complete_closed  # #235: a session closed elsewhere (400 already CANCELLED/FAILED) ends nothing
   resumes          # a reset mid-download, then a second tick: one save, one row
+  newer_download   # #232: another device uploads mid-tick; unchanged bytes take its head, backed up
+  newer_conflict   # #232: ...and changed bytes are a conflict -- never a blind upload over it
+  baseline_touch      # #234: the same bytes under a newer mtime are a no_op
+  baseline_moved      # #234: ...and, the server's row moved in place, a download -- not a conflict
+  baseline_downloaded # #234: ...the same from a /downloaded baseline
+  baseline_conflict   # #234: real progress against a moved row is still a conflict
+  baseline_other_row  # #234: ...and against another device's new row (#227), never suppressed
+  scoped           # #241: rom_ids on every negotiate, 500 at a time, and nothing off the card offered
+  held             # #242: a game launched mid-tick holds the chunks after the one running
+  restore          # #241: a downloaded rom's save comes back, even one this device synced and lost
+  oversized        # #246: a plan past 128 operations is split down to one rom, not refused forever
+  deleted          # M10-7: deleted in RomM -> backed up and removed, and never re-uploaded
+  deleted_keep     # ...and under on_server_delete = keep, left on the card, never re-uploaded
+  migrated         # #236: rc1's v2 row moves to the shared slot; its newer head lands, backed up
+  isolated         # #238: a RetroArch save for a tico-* format never lands on the card
+  isolated_ids     # #238: psx, n64, dc, nds and saturn upload under their tico-* ids; psp does not
 )
+
+# M10-2 (#228): which RomM this console is talking to. `versions` and
+# `heartbeat` need no server -- the version rule, and the shallow read of a
+# heartbeat body -- so they stay checked with docker stopped. `live` asks the
+# fixture, whichever ROMM_VERSION started it, and holds the capability set to
+# what that version must yield; `faults` drives the retry through the proxy.
+add_executable(test_server_capabilities test_server_capabilities.cpp)
+target_link_libraries(test_server_capabilities PRIVATE rommsync::host)
+target_include_directories(test_server_capabilities PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_server_capabilities PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+foreach(scenario versions heartbeat)
+  add_test(NAME server.${scenario} COMMAND test_server_capabilities ${scenario})
+  set_tests_properties(server.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+foreach(scenario live faults)
+  add_test(NAME server.${scenario} COMMAND test_server_capabilities ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(server.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(server.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+
+# M10-19 (#245): "Install on device" from RomM's web UI. `parse` needs no
+# server; `live` and `faults` pair a device of their own, because the install
+# endpoints answer only to the token bound to the device -- and serial, because
+# RomM paces device inits per IP and the whole suite is one.
+add_executable(test_remote_install test_remote_install.cpp)
+target_link_libraries(test_remote_install PRIVATE rommsync::host)
+target_include_directories(test_remote_install PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_remote_install PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+add_test(NAME install.parse COMMAND test_remote_install parse)
+set_tests_properties(install.parse PROPERTIES TIMEOUT 60)
+foreach(scenario live faults)
+  add_test(NAME install.${scenario} COMMAND test_remote_install ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(install.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(install.${scenario} PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
+endforeach()
 
 # M7-2 (#37), registered under `sched.` because what they check is the schedule
 # around a tick rather than the tick. They live in this executable because the
@@ -1505,9 +1745,14 @@ add_test(NAME orca.env_replaces_dead_venv
 add_test(NAME orca.env_setup_fails_fast
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" setup_fails_fast)
 
+# The RomM version the fixture runs (#227): chosen once per worktree, and kept
+# across the regenerations compose.sh and seed.sh do on their own.
+add_test(NAME orca.env_romm_version
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" romm_version)
+
 set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
                      orca.env_picks_python orca.env_replaces_dead_venv
-                     orca.env_setup_fails_fast
+                     orca.env_setup_fails_fast orca.env_romm_version
                      PROPERTIES TIMEOUT 60)
 
 # --- the Switch targets: sysmodule/, overlay/ and switch.mk ------------------
@@ -1531,31 +1776,73 @@ set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 # wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
 # failure under that option precisely so CI cannot go green on a skip -- and
 # that is the right default, so each exception needs its reason recorded rather
-# than inferred. There are four, and only two of them have this one's reason:
-# `switch.builds` and `switch.tlsprobe` are enforced by a different CI job --
-# `switch-build` in .github/workflows/ci.yml runs the same builds, in the same
-# image, on every push, and fails there -- so these entries are its local
-# equivalent, not its enforcement. `package.builds` is the third and does NOT
-# have that reason; see the note on it below. `npdm.svcs` is the fourth and does
-# not have it either: nothing in CI parses the built NPDM today, so it runs
-# where a cross-compile can and nowhere else until M9-12 (#211) makes the
-# `switch.*` job able to host it. Its parser half, `npdm.parser`, never skips.
+# than inferred. There are six, all with this one's reason, and all carrying
+# the `toolchain` label: `switch.builds`, `switch.tlsprobe`, `toolchain.libnx`,
+# `npdm.svcs`, `package.builds` and `stack.measured`.
+#
+# They skip in host-tests and run in `switch-build` instead. That job is inside
+# the pinned image already, and it runs tests/toolchain_suite.sh --here, which
+# runs exactly these six in place and treats a skip as a failure (M9-12, #211).
+# Until then the assertions in them had never run anywhere: the job built the
+# artifacts and read four bytes of each. `switch.toolchain_suite` below holds
+# the suite to this label, so an entry added here without both runs nowhere.
 #
 # So do not "fix" it by wrapping it like the others. That would fail the
 # host-tests job on a runner that has no devkitpro image -- which is every runner
 # the host job uses.
 add_test(NAME switch.builds
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" builds)
-set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
-                     RUN_SERIAL TRUE)
+set_tests_properties(switch.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # The M0-1 probe (tlsprobe/README.md). Same image, same reason it may skip as
 # switch.builds above -- and the same enforcement elsewhere: the `switch-build`
-# job builds it on every push and checks the NRO magic there.
+# job runs this entry, in the image, on every push.
 add_test(NAME switch.tlsprobe
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" tlsprobe)
-set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
-                     RUN_SERIAL TRUE)
+set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# The suite the `switch-build` job runs is the `toolchain` label, no more and
+# no less, and it fails on a skip: checked against stubs here, so it needs no
+# image and never skips. ctest's own --show-only output is what it reads.
+add_test(NAME switch.toolchain_suite
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" suite
+                 "${CMAKE_CTEST_COMMAND}" "${CMAKE_BINARY_DIR}")
+set_tests_properties(switch.toolchain_suite PROPERTIES TIMEOUT 60
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# --- M9-8: the toolchain and libultrahand are pinned -------------------------
+# Every Switch build pulled devkitpro/devkita64's moving tag and compiled a
+# libultrahand `main` head upstream calls a pre-release, so a break in either
+# arrived unannounced on whatever PR was open at the time (#199).
+# scripts/toolchain.sh names the image; docs/DEVELOPMENT.md#the-toolchain-pin
+# is how both pins move.
+set(TOOLCHAIN_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_toolchain.sh")
+
+# These read the tree only, so none of them ever skips.
+foreach(scenario
+        pins        # every file naming the image names the pin; :latest only in the canary
+        submodule   # the libultrahand gitlink is the tag .gitmodules records
+        floor       # the libnx comparison orders 4.9 below 4.10
+        check)      # ...and the check CI runs says why it refused, against a stub pacman
+  add_test(NAME toolchain.${scenario}
+           COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" ${scenario})
+  set_tests_properties(toolchain.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# The pinned image's libnx is >= 4.10.0 -- asked of the image, not assumed.
+# Its SKIP_RETURN_CODE is unwrapped for switch.builds' reason, given at length
+# above: the host runner has no devkitpro image. The `switch-build` job runs the
+# same `scripts/toolchain.sh libnx` as a step before it builds -- the fast
+# answer, which `toolchain.pins` says is there -- and this entry again with the
+# rest of the `toolchain` label, rather than as a special case.
+add_test(NAME toolchain.libnx
+         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" libnx)
+set_tests_properties(toolchain.libnx PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300
+                     LABELS toolchain)
 
 # --- M9-3: the capabilities the NPDM grants, against the ones the image uses --
 # An SVC a process was not granted is not a soft failure on Horizon: the kernel
@@ -1568,22 +1855,32 @@ set(NPDM_CHECK "${CMAKE_SOURCE_DIR}/scripts/npdm-check.py")
 
 # The parser, against vectors hand-built from the NPDM and AArch64 formats
 # rather than from the artifact. It reads nothing that has to be compiled, so
-# it runs on every push -- which matters more here than usual: the entry below
-# it can run nowhere in CI today, so without this the byte offsets this all
-# rests on would have no coverage at all. The fixtures are chosen so that a
-# parser reading the wrong offset gets a wrong answer rather than a lucky one;
-# each one of them is a mutation that survived before it was chosen.
+# it runs on every runner -- which matters more here than usual: the entry
+# below it runs only inside the devkitPro image, so without this the byte
+# offsets this all rests on would be checked in one CI job and on no laptop.
+# The fixtures are chosen so that a parser reading the wrong offset gets a wrong
+# answer rather than a lucky one; each one of them is a mutation that survived
+# before it was chosen.
 add_test(NAME npdm.parser
          COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}" --self-test)
 set_tests_properties(npdm.parser PROPERTIES TIMEOUT 60)
 
+# M9-11 (#210): the three grants that were devkitPro's template until somebody
+# decided them -- the filesystem mask (SdCard only, not the `FormatSdCard` and
+# `CorruptSaveData` 0xFFFF... carried), the handle table (derived in
+# sysmodule/source/handle_budget.hpp) and the address space type. Read from the
+# config npdmtool is handed, so it runs on every push and on every runner;
+# `npdm.svcs` asks the same of the NPDM npdmtool actually wrote.
+add_test(NAME npdm.grants
+         COMMAND ${Python3_EXECUTABLE} "${NPDM_CHECK}"
+                 --json "${CMAKE_SOURCE_DIR}/sysmodule/sys-rommsync.json")
+set_tests_properties(npdm.grants PROPERTIES TIMEOUT 60)
+
 # The real diff, over a real cross-compile. Its SKIP_RETURN_CODE is unwrapped
 # for the reason the long note above gives -- there is no NPDM without
 # npdmtool, and npdmtool is in the devkitpro image the host runner does not
-# have. Unlike `switch.builds` it has no equivalent elsewhere yet: the
-# `switch-build` job builds the module but does not parse what it built. M9-12
-# (#211) is where that is fixed; this entry is written so that fixing it is a
-# CI change and not a rewrite here.
+# have. The `switch-build` job runs it, in the image, with the rest of the
+# `toolchain` label (#211).
 set(NPDM_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_npdm.sh")
 add_test(NAME npdm.svcs COMMAND "${BASH_PROGRAM}" "${NPDM_TEST}" svcs)
 #
@@ -1593,9 +1890,20 @@ add_test(NAME npdm.svcs COMMAND "${BASH_PROGRAM}" "${NPDM_TEST}" svcs)
 # cross-compile in whichever of them lost. The failure is at least honest --
 # the build failing and the NPDM being wrong are two different messages here --
 # but it is a red build about nothing.
-set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# --- M9-12: what the console's loaders read out of the artifacts -------------
+# libnx's LNY2 stamp in MOD0, the overlay's NACP by Ultrahand's route, and the
+# build marker -- each a failure that builds green and is silent on a console
+# (#211). `switch.builds` runs scripts/artifact-check.py over a real build; this
+# is the script's own vectors, hand-built from the formats, so the offsets it
+# rests on are checked on every runner and not only where a cross-compile can.
+add_test(NAME artifacts.parser
+         COMMAND ${Python3_EXECUTABLE} "${CMAKE_SOURCE_DIR}/scripts/artifact-check.py"
+                 --self-test)
+set_tests_properties(artifacts.parser PROPERTIES TIMEOUT 60)
 
 # --- the release zip: scripts/package.sh -------------------------------------
 # The install layout is the one thing about this project a user meets before
@@ -1605,11 +1913,12 @@ set_tests_properties(npdm.svcs PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
 # settings an upgrade was supposed to keep.
 set(PACKAGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_package.sh")
 
-# All four of these stub the two Switch artifacts -- four bytes of magic is all
-# the script inspects -- so they need neither Docker nor a cross-compiler and
-# none of them ever skips.
+# These stub the two Switch artifacts -- four bytes of magic is all the script
+# inspects -- or, for `toolbox`, need none at all, so they need neither Docker
+# nor a cross-compiler and none of them ever skips.
 foreach(scenario
-        layout          # the unpacked tree is exactly the six paths #32 and #33 specify
+        layout          # the unpacked tree is exactly the install layout, flags/ included
+        toolbox         # every toolbox.json ovl-sysmodules skips or aborts on is refused (#211)
         refuses         # a wrong .nsp, an unsigned .ovl, a missing input
         deterministic   # the same inputs, the same bytes
         upgrade)        # unzipping over an install keeps config.ini and the rest
@@ -1626,13 +1935,14 @@ endforeach()
 # it uses.
 #
 # It now has the same enforcement elsewhere that switch.builds has: `switch-build`
-# runs scripts/package.sh on every push, and the `release` job runs it again on a
-# tag (#34). That is what keeps a failure specific to packaging in the container
-# -- a missing `zip`, say -- from first appearing on a tag. `release.ci` is what
+# runs scripts/package.sh on every push and this entry with the `toolchain`
+# label (#211), and the `release` job runs the script again on a tag (#34).
+# That is what keeps a failure specific to packaging in the container -- a
+# missing `zip`, say -- from first appearing on a tag. `release.ci` is what
 # says that step is still there.
 add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
-set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
                      RUN_SERIAL TRUE)
 
 # --- the install guide: docs/INSTALL.md --------------------------------------
@@ -1652,7 +1962,11 @@ foreach(scenario
         links       # every relative link and anchor resolves
         safety      # no account secret on the console, no weakened TLS
         pairing     # the state table is exactly what PairingState exposes
-        structure)  # #35's ten sections, the hardware note, the README link
+        structure   # #35's ten sections, the hardware note, the README link
+        # docs/INTEROP.md (#243): the other devices' half of the install guide.
+        interop          # its sections, the links to it, the two config pages
+        interop_facts    # versions, limits, keys and names read off the code
+        interop_table)   # the per-system table both ways against save_source.cpp
   add_test(NAME docs.install_${scenario}
            COMMAND ${Python3_EXECUTABLE} "${DOCS_INSTALL_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
@@ -1676,7 +1990,9 @@ foreach(scenario
         emitted    # every documented tag has a call site outside the log module
         links      # every relative link and anchor resolves
         safety     # no step weakens TLS; the bug-report section names what not to send
-        structure) # #38's sections, the hardware note, the cap, the README/INSTALL links
+        structure  # #38's sections, the hardware note, the cap, the README/INSTALL links
+        sections   # every failure section quotes a line; skip reasons are the scanner's
+        limits)    # the saves/states/roms bounds are the code's (#243)
   add_test(NAME docs.troubleshooting_${scenario}
            COMMAND ${Python3_EXECUTABLE} "${DOCS_TROUBLESHOOTING_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
@@ -1911,6 +2227,9 @@ set(DOWNLOAD_RIG_SCENARIOS
   nested     # ...and a directory holding ONE file is downloaded, not refused
   nestedname # #92: a nested rom this client will not name is skipped, not guessed
   missing    # a rom the server's library no longer holds fails with a sentence
+  fullcard   # M9-13: the card fills mid-transfer; nothing destroyed, and it says so
+  cardgone   # M9-13: the card refuses a write, then goes away and comes back
+  toolarge   # M9-13: a rom the card cannot hold is refused before a byte moves
 )
 foreach(scenario IN LISTS DOWNLOAD_RIG_SCENARIOS)
   add_test(NAME download.${scenario} COMMAND test_download ${scenario})
@@ -1979,13 +2298,17 @@ set(ENGINE_SCENARIOS
   unpairs   # M5-3: a server change discards the pairing before it writes
   stale     # M5-3: "did the server change" is a question about the card
   unauthenticated  # M1-4: the verdict the card carries, and the re-pair that lifts it
+  newer     # #205: a later release's config.ini and token.dat, said and never written over
   commands  # what is still `kUnavailable`, so the list shrinks deliberately
   unreachable  # M1-6: a server that answers nothing refuses the attempt, and writes nothing
   syncnow   # M7-2: Sync now starts a tick and says so, instead of "one is already running"
-  restore_race  # M7-2: a restore pressed while a tick is writing saves is refused, not interleaved
+  restore_race  # M7-2: a restore pressed while a tick is writing saves waits its turn, not interleaved
+  restore_polled  # M9-6: a restore on a slow card holds no IPC call while it copies
+  restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
+  romm_forgotten  # M10-2: a heartbeat answered after the engine forgot the server is not recorded
 )
 foreach(scenario IN LISTS ENGINE_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -2026,8 +2349,22 @@ set(ENGINE_RIG_SCENARIOS
   pairs        # start to committed token, and the token works against the server
   nonblocking  # `StartPair` returns while the init is stalled: `ipc.hpp`'s contract
   repairs      # `StartPair` then `Unpair`, with neither instant leaving nothing
+  pair_commit  # `kApproved` only once token.dat is committed; a refused commit keeps the old one
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
+  server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
   drains       # M9-5: a rom queued over IPC becomes a file on the card
+  romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
+  tico_accounts  # #231: two Tico accounts and none named reach the settings screen
+  foreground   # #242: no tick under a running game, and one after it closes
+  server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
+  interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
+  upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
+  placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save
+  download_restores  # #241: a downloaded rom's save is placed before the next scheduled tick
+  remote_install     # #245: a rom queued in RomM's web UI is claimed, downloaded and reported done
+  states_guard       # review: no states half under a game or after a refused saves half; its 401 counts
+  install_settle     # review: an install report the link did not carry stops the pass, not each claim
+  install_wake       # review: a refused remote-install claim is asked again after a wake
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -2053,6 +2390,32 @@ foreach(scenario downloading preempts discards repoints shutdown sleep_download)
   set_tests_properties(engine.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M9-13: the console's SD card, compiled for the host ------------------------
+# `sysmodule/source/card.cpp` names no libnx type -- it is <dirent.h>,
+# <sys/stat.h> and <sys/statvfs.h> over the `sdmc:` devoptab -- so it compiles
+# here unchanged, rooted at a scratch directory through `MakeSdCardAt` (#202).
+# Until this target it was built only by devkitPro.
+add_executable(test_card test_card.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/card.cpp")
+target_link_libraries(test_card PRIVATE rommsync::host)
+target_include_directories(test_card PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_card PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch")
+
+foreach(scenario resolve list bounded mkdir volume)
+  add_test(NAME card.${scenario} COMMAND test_card ${scenario})
+  set_tests_properties(card.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# A real FAT32 volume: an image the script makes and mounts -- `hdiutil` on a
+# Mac, a loop mount on Linux when `sudo -n` is allowed -- and skips (77) where it
+# can do neither, saying which. docs/TESTING.md lists where it runs.
+add_test(NAME card.fat32 COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/test_fat_volume.sh"
+  "$<TARGET_FILE:test_card>")
+set_tests_properties(card.fat32 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180 RUN_SERIAL TRUE)
+
 # --- M9-4: the console going to sleep, and coming back -----------------------
 # `psc:m` is a service, so the console's `power::Module` cannot be reached from a
 # laptop -- but everything the module is FOR can be, and every one of those is a
@@ -2062,8 +2425,8 @@ endforeach()
 # heard of still being answered (#208).
 #
 # `power.cpp` is the portable half and is compiled here; `power_psc.cpp` is the
-# libnx one and is compiled by nothing but devkitPro, which is `card.cpp`'s
-# arrangement for `card.cpp`'s reason.
+# libnx one and is compiled by nothing but devkitPro, which is `main.cpp`'s
+# arrangement for `main.cpp`'s reason.
 add_executable(test_power test_power.cpp
   "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
 target_link_libraries(test_power PRIVATE rommsync::host Threads::Threads)
@@ -2115,7 +2478,7 @@ add_test(NAME boot.journal COMMAND test_boot_services journal)
 set_tests_properties(boot.resolve boot.wait boot.journal PROPERTIES TIMEOUT 60)
 
 set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
-foreach(scenario IN ITEMS dns clock bounded comments psc)
+foreach(scenario IN ITEMS dns clock bounded comments psc foreground)
   add_test(NAME boot.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${SYSMODULE_BOOT_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
@@ -2144,4 +2507,129 @@ foreach(scenario IN ITEMS rows pinned margin dirs prose)
            COMMAND ${Python3_EXECUTABLE} "${HEAP_BUDGET_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
   set_tests_properties(heap.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# --- M9-18: the main thread's stack, against the deepest JSON it parses -------
+# The heap above is the inner heap; this is the one stack the npdm sizes. Its
+# 0x8000 and `json::kMaxDepth`'s 64 were never checked against each other, and
+# a max-depth document cost the main thread ~33 KiB of its 32 (#216). The budget
+# is sysmodule/source/stack_budget.hpp; scripts/stack-budget.py says how each
+# number is held.
+#
+# `fit`, `contract` and `walk` read the tree only and never skip.
+set(STACK_BUDGET "${CMAKE_SOURCE_DIR}/scripts/stack-budget.py")
+foreach(scenario IN ITEMS fit contract walk)
+  add_test(NAME stack.${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${STACK_BUDGET}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(stack.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# The frames themselves, from a cross-compile. Its SKIP_RETURN_CODE is
+# unwrapped for `switch.builds`'s reason, given at length beside it: the frame
+# sizes exist only in the devkitpro image. It carries the `toolchain` label and
+# is an entry in tests/toolchain_suite.sh, so the `switch-build` job runs it in
+# place on every push and fails on a skip. RUN_SERIAL for the other container
+# builds' reason: two `make -j$(nproc)` at once is a red build about nothing.
+add_test(NAME stack.measured
+         COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_stack_budget.sh" measured)
+set_tests_properties(stack.measured PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# --- M9-15: what the sysmodule holds between ticks, measured -----------------
+# The heap's table above is a bound added up from constants; this is the
+# process measured. Every `operator new` in the executable is counted
+# (count_new.hpp), the sysmodule's own `SdEngine` is driven tick after tick
+# against the fixture RomM, and what is outstanding between ticks must not grow
+# with the number of ticks (#204).
+#
+# Its own executable, because replacing the global allocation functions
+# replaces them for everything linked beside them. Built with allocation
+# elision off: [expr.new]/14 lets a compiler drop a `new` whose result is
+# unused, and a count that passes because an allocation never happened passes
+# for the wrong reason. `alloc.counts` checks that the flag took. Never built
+# under a sanitizer -- ASan replaces `operator new` itself -- and if one is ever
+# added to this build, the scenarios skip rather than assert over its counts.
+add_executable(test_heap_steady test_heap_steady.cpp count_new.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
+target_link_libraries(test_heap_steady PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_heap_steady PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_heap_steady PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(test_heap_steady PRIVATE
+    -fno-builtin-operator-new -fno-builtin-operator-delete)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(test_heap_steady PRIVATE -fno-allocation-dce)
+endif()
+
+foreach(scenario counts judge log_ring page_parse heartbeat response_parse wrong_shape
+                 queue_write wide_rows negotiate_exchange list_build tick_chunks
+                 conflict_history)
+  add_test(NAME alloc.${scenario} COMMAND test_heap_steady ${scenario})
+  set_tests_properties(alloc.${scenario} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+endforeach()
+
+# The two against the rig. `alloc.steady` is the acceptance's assertion; its
+# warm-up alone is `log::kTailLines` + 8 ticks, then sixteen measured.
+# `soak.smoke` is the nightly soak (.github/workflows/soak.yml) at four rounds,
+# so the soak's own code runs on every push and the nightly is never the first
+# time it does. Serial for the reason every rig test is: they negotiate as the
+# shared fixture device and download its roms.
+add_test(NAME alloc.steady COMMAND test_heap_steady steady 16)
+add_test(NAME soak.smoke COMMAND test_heap_steady soak 4)
+foreach(name alloc.steady soak.smoke)
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(${name} PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+endforeach()
+
+# The nightly soak's two halves that are not the soak itself: the workflow that
+# runs it on a schedule and keeps what it measured, and the check on main that
+# goes red when it has stopped passing (scripts/soak-fresh.sh). Neither needs a
+# network or a token, so neither skips.
+set(SOAK_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_soak.sh")
+foreach(phase workflow fresh)
+  add_test(NAME soak.${phase} COMMAND "${BASH_PROGRAM}" "${SOAK_TEST}" ${phase})
+  set_tests_properties(soak.${phase} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# --- M10-18 (#244): the interop matrix -----------------------------------------
+# The Switch's whole engine against the clients a RomM 5.4 library is shared
+# with -- RetroArch's Cloud Sync over WebDAV, a Grout-like negotiating device,
+# and the web player as its 5.4 bundle syncs -- one test per cell, named
+# `interop.<client>.<cell>` so the output says which meeting broke. Built from
+# the engine's sources like test_engine; serial with the rest of the rig tests,
+# because they share the fixture user's library.
+add_executable(test_interop test_interop.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp")
+target_link_libraries(test_interop PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_interop PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_interop PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+set(INTEROP_CELLS
+  from_switch  # the Switch's save is what the other client loads
+  to_switch    # theirs: not without the rom on the card, then placed, then updated over a backup
+  conflict     # both moved: theirs on the card, the Switch's backed up and archived, theirs kept
+  delete       # gone from the card deletes nothing; deleted by them is removed, backed up, not re-sent
+  states       # their core's PSX state and DuckStation's never meet, whichever came first
+)
+foreach(client retroarch grout web)
+  foreach(cell IN LISTS INTEROP_CELLS)
+    add_test(NAME interop.${client}.${cell} COMMAND test_interop ${client}.${cell})
+    if(NOT ROMMSYNC_REQUIRE_RIG)
+      set_tests_properties(interop.${client}.${cell} PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    set_tests_properties(interop.${client}.${cell} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+  endforeach()
 endforeach()

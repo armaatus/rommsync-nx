@@ -14,7 +14,7 @@
 //   scanning  -- an ambiguous state is skipped, and two states of one name are one
 //   decides   -- the whole decision table, including every keep-both branch
 //
-// ...and five need the real RomM 5.2.0, because they are claims about the
+// ...and five need the real RomM, because they are claims about the
 // server that no fake can be wrong about:
 //
 //   upsert    -- POST /api/states replaces the row with that name, in place
@@ -30,8 +30,10 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "crash_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/host/native_file_system.hpp"
@@ -140,8 +142,14 @@ class ScriptedClient final : public http::HttpClient {
 
   std::vector<std::string> requests;
 
+  /// Every form part sent, as `<part name>=<file name>`, in order.
+  std::vector<std::string> parts;
+
   http::Result Send(const http::Request& request) override {
     requests.push_back(std::string(Verb(request.method)) + " " + Path(request.url));
+    for (const http::FormPart& part : request.form) {
+      parts.push_back(part.name + "=" + part.file_name);
+    }
     http::Result result;
     result.response.status = 200;
     if (request.method == http::Method::kGet) {
@@ -384,7 +392,7 @@ void Scanning(rig::Checks& checks) {
   }
 
   state::Baseline baseline;
-  const scan::ScanResult result = scan::ScanStates(configured, index, *files, baseline);
+  const scan::ScanResult result = scan::ScanStates(configured, rommsync::retroarch::Settings{}, index, *files, baseline);
 
 
   checks.ExpectEq(result.states.size(), std::size_t{1},
@@ -392,8 +400,8 @@ void Scanning(rig::Checks& checks) {
   if (result.states.size() == 1) {
     checks.ExpectEq(result.states.front().file_name, std::string("Game.state"),
                     "and it is the first one in scan order");
-    checks.ExpectEq(result.states.front().emulator, std::string("retroarch"),
-                    "carrying the emulator its folder implied");
+    checks.ExpectEq(result.states.front().emulator, std::string("fceumm"),
+                    "carrying the core RetroArch runs for that rom's platform");
     checks.Expect(!result.states.front().content_hash.empty(), "and a digest of its bytes");
   }
 
@@ -445,8 +453,10 @@ void Decides(rig::Checks& checks) {
   token.device_id = "not-used";
   const roms::RomIndex index = IndexOf(1, "Game", "nes");
   const std::string kBytes = "a snapshot of a core's memory";
+  // The core the card's state is from (`/retroarch/states`, nes), so the row is
+  // one this console loads (#239; `emulators` is the scenario for another's).
   const std::string kServerRow =
-      StateRowJson(9, 1, "Game.state", "retroarch", 40, "2026-09-06T03:00:00+00:00");
+      StateRowJson(9, 1, "Game.state", "fceumm", 40, "2026-09-06T03:00:00+00:00");
 
   /// One run: a card with `local` in it, a server holding `listing`, and a
   /// baseline of `rows`.
@@ -545,6 +555,237 @@ void Decides(rig::Checks& checks) {
 
   // Both moved, and RomM arbitrates neither.
   run("both moved", "[" + kServerRow + "]", true, false, false, sync::StateOutcome::kKeptBoth);
+}
+
+// --- emulators ----------------------------------------------------------------
+
+/// #239: states move only between devices that can load them, and Tico's slots
+/// travel under RetroArch's names when asked.
+///
+///   - a server row another core moved is never downloaded over this console's
+///     state, though the same row moved by the same core is;
+///   - a row the placer calls `foreign` is filtered, silently -- not a failure
+///     on every tick;
+///   - with `map_state_slots`, Tico's Auto goes up as `.state.auto`, with the
+///     screenshot beside it as the row's.
+void Emulators(rig::Checks& checks) {
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+  const roms::RomIndex index = IndexOf(1, "Game", "nes");
+  const std::string kBytes = "a snapshot of a core's memory";
+
+  // The baseline names row 9, the card is unchanged, and the row has moved.
+  // Only who moved it differs.
+  const auto moved_by = [&](const std::string& emulator) {
+    Sandbox sandbox(checks, "states-emulators-" + emulator);
+    const std::unique_ptr<fs::FileSystem> inner =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedState(StatePath("Game.state"), kBytes);
+    fs::Directories directories(*inner);
+    state::FileFacts facts;
+    std::string why;
+    checks.Expect(state::ReadBackFile(*inner, directories, StatePath("Game.state"), &facts, &why),
+                  "the seeded state can be read back -- " + why);
+    state::StateRecord row;
+    row.rom_id = 1;
+    row.file_name = "Game.state";
+    row.emulator = "fceumm";
+    row.content_hash = facts.content_hash;
+    row.mtime = facts.mtime;
+    row.file_size_bytes = facts.file_size_bytes;
+    row.server_state_id = 9;
+    row.server_updated_at = sync::Timestamp{} + std::chrono::seconds{1'700'000'000};
+    row.server_file_size_bytes = 40;
+    state::Baseline baseline;
+    baseline.SetState(row);
+
+    ScriptedClient client;
+    client.listing =
+        "[" + StateRowJson(9, 1, "Game.state", emulator, 40, "2026-09-06T03:00:00+00:00") + "]";
+    client.content = std::string(40, 'z');
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *inner, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+    return std::make_pair(report, sandbox.Read(StatePath("Game.state")));
+  };
+  {
+    const auto [report, bytes] = moved_by("nestopia");
+    checks.ExpectEq(report.kept_both, 1,
+                    "a row another core moved is kept apart from this console's state");
+    checks.ExpectEq(bytes, kBytes, "and nothing it holds is written over the card's");
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations.front().message.find("nestopia") != std::string::npos,
+                  "the reason names who wrote it");
+  }
+  {
+    const auto [report, bytes] = moved_by("fceumm");
+    checks.ExpectEq(report.completed, 1, "the same core's move is downloaded, as before");
+    checks.ExpectEq(bytes, std::string(40, 'z'), "with the server's bytes");
+  }
+
+  // A row this console's emulator does not load: filtered, not failed.
+  {
+    Sandbox sandbox(checks, "states-emulators-filtered");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    ScriptedClient client;
+    client.listing =
+        "[" + StateRowJson(9, 1, "Game.state1", "nestopia", 40, "2026-09-06T03:00:00+00:00") + "]";
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.reason = "the server's copy was written by nestopia";
+      placement.foreign = true;
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.failed, 0, "another core's state is not a failure");
+    checks.ExpectEq(report.filtered, 1, "it is filtered, and counted as such");
+    checks.Expect(report.operations.empty() && report.warnings.empty(),
+                  "and said nowhere: it is the normal shape of a shared library");
+    checks.ExpectEq(client.requests.size(), std::size_t{1}, "nothing but the listing was sent");
+  }
+
+  // Tico's Auto, under RetroArch's name, with its screenshot.
+  for (const bool screenshot : {true, false}) {
+    Sandbox sandbox(checks, screenshot ? "states-emulators-mapped" : "states-emulators-bare");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.MakeDirs("/tico/states/nes");
+    sandbox.Write("/tico/states/nes/Game.state5", kBytes);
+    if (screenshot) {
+      sandbox.Write("/tico/states/nes/Game.state5.png", "a picture of where play stopped");
+    }
+    config::Config mapped = StatesOn(true);
+    mapped.sync.map_state_slots = true;
+
+    ScriptedClient client;
+    client.upload_response =
+        StateRowJson(9, 1, "Game.state.auto", "fceumm", static_cast<std::int64_t>(kBytes.size()),
+                     "2026-09-06T03:00:00+00:00");
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, mapped, index, &baseline, OptionsAt(kStamp));
+    checks.ExpectEq(report.completed, 1, "Tico's Auto state uploaded: " +
+                                             (report.warnings.empty() ? "" : report.warnings[0]));
+    const std::vector<std::string> expected =
+        screenshot ? std::vector<std::string>{"stateFile=Game.state.auto",
+                                              "screenshotFile=Game.state.auto.png"}
+                   : std::vector<std::string>{"stateFile=Game.state.auto"};
+    checks.Expect(client.parts == expected,
+                  screenshot ? "under RetroArch's name, its .png as the row's screenshot"
+                             : "and with no .png beside it, the state alone");
+    checks.Expect(baseline.FindState(1, "Game.state.auto") != nullptr,
+                  "paired under the name the server knows it by");
+    checks.Expect(client.Sent("POST /api/states?rom_id=1&emulator=fceumm"),
+                  "as the libretro core Tico runs");
+  }
+
+  // Turning the mapping on renames Tico's slots one up: the card's `Game.state0`
+  // is now keyed `Game.state1`, the name `Game.state1` itself synced under
+  // until now. That row describes another file on this card, so the renamed one
+  // must not be uploaded over it -- which would move menu slot 1's state into
+  // menu slot 2's row for every device that reads it.
+  {
+    Sandbox sandbox(checks, "states-emulators-toggled");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.MakeDirs("/tico/states/nes");
+    sandbox.Write("/tico/states/nes/Game.state0", "menu slot 1's session");
+    sandbox.Write("/tico/states/nes/Game.state1", "menu slot 2's session, a longer one");
+
+    // The baseline as an unmapped tick left it: each file paired under its own name.
+    state::Baseline baseline;
+    std::string listing = "[";
+    for (const auto& [name, id] : {std::make_pair(std::string("Game.state0"), 7),
+                                   std::make_pair(std::string("Game.state1"), 8)}) {
+      fs::Directories directories(*files);
+      state::FileFacts facts;
+      std::string why;
+      checks.Expect(state::ReadBackFile(*files, directories, "/tico/states/nes/" + name, &facts,
+                                        &why),
+                    "the seeded state can be read back -- " + why);
+      state::StateRecord row;
+      row.rom_id = 1;
+      row.file_name = name;
+      row.emulator = "fceumm";
+      row.content_hash = facts.content_hash;
+      row.mtime = facts.mtime;
+      row.file_size_bytes = facts.file_size_bytes;
+      row.server_state_id = id;
+      row.server_updated_at = sync::Timestamp{} + std::chrono::seconds{1'788'663'600};
+      row.server_file_size_bytes = facts.file_size_bytes;
+      baseline.SetState(row);
+      listing += (id == 7 ? "" : ",") + StateRowJson(id, 1, name, "fceumm", facts.file_size_bytes,
+                                                      "2026-09-06T03:00:00+00:00");
+    }
+    listing += "]";
+
+    config::Config mapped = StatesOn(true);
+    mapped.sync.map_state_slots = true;
+    ScriptedClient client;
+    client.listing = listing;
+    client.upload_response =
+        StateRowJson(10, 1, "Game.state2", "fceumm", 35, "2026-09-06T03:00:00+00:00");
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, mapped, index, &baseline, OptionsAt(kStamp));
+    checks.Expect(std::find(client.parts.begin(), client.parts.end(),
+                            "stateFile=Game.state1") == client.parts.end(),
+                  "the renamed slot 1 is not uploaded over the row slot 2 synced under");
+    bool said = false;
+    for (const sync::StateOperationResult& operation : report.operations) {
+      said = said || (operation.file_name == "Game.state1" &&
+                      operation.outcome == sync::StateOutcome::kKeptBoth &&
+                      operation.message.find("map_state_slots") != std::string::npos);
+    }
+    checks.Expect(said, "it is kept apart, and the reason names the setting that renamed it");
+  }
+
+  // A state downloaded under RetroArch's name lands on the Tico file it is, and
+  // backs that file up first (the sandbox's teardown audit judges the order).
+  {
+    Sandbox sandbox(checks, "states-emulators-mapped-download");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.MakeDirs("/tico/states/nes");
+    sandbox.SeedState("/tico/states/nes/Game.state5", kBytes);
+    fs::Directories directories(*files);
+    state::FileFacts facts;
+    std::string why;
+    checks.Expect(state::ReadBackFile(*files, directories, "/tico/states/nes/Game.state5", &facts,
+                                      &why),
+                  "the seeded state can be read back -- " + why);
+    state::StateRecord row;
+    row.rom_id = 1;
+    row.file_name = "Game.state.auto";
+    row.emulator = "fceumm";
+    row.content_hash = facts.content_hash;
+    row.mtime = facts.mtime;
+    row.file_size_bytes = facts.file_size_bytes;
+    row.server_state_id = 9;
+    row.server_updated_at = sync::Timestamp{} + std::chrono::seconds{1'700'000'000};
+    row.server_file_size_bytes = 40;
+    state::Baseline baseline;
+    baseline.SetState(row);
+
+    config::Config mapped = StatesOn(true);
+    mapped.sync.map_state_slots = true;
+    ScriptedClient client;
+    client.listing = "[" +
+                     StateRowJson(9, 1, "Game.state.auto", "fceumm", 40,
+                                  "2026-09-06T03:00:00+00:00") +
+                     "]";
+    client.content = std::string(40, 'r');
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, mapped, index, &baseline, OptionsAt(kStamp));
+    checks.ExpectEq(report.completed, 1, "RetroArch's newer Auto came down");
+    checks.ExpectEq(sandbox.Read("/tico/states/nes/Game.state5"), std::string(40, 'r'),
+                    "onto Tico's Auto file");
+    checks.Expect(sandbox.HasBackupOf(kBytes), "and the bytes it replaced are under .backup/");
+  }
 }
 
 // --- recording ----------------------------------------------------------------
@@ -669,7 +910,11 @@ void Placing(rig::Checks& checks) {
     client.content = std::string(40, 'z');
 
     sync::StateSyncOptions options = OptionsAt(kStamp);
-    options.place = [](const sync::ServerState& server) { return StatePath(server.file_name); };
+    options.place = [](const sync::ServerState& server) {
+      rommsync::place::Placement placement;
+      placement.sd_path = StatePath(server.file_name);
+      return placement;
+    };
 
     // An index the local file does NOT match, so the scan claims nothing and the
     // server row reaches the placement branch with a file already at its path.
@@ -683,6 +928,143 @@ void Placing(rig::Checks& checks) {
                     "the file that was there is exactly as it was");
     checks.Expect(baseline.state_rows().empty(),
                   "and nothing was recorded as paired that is not");
+  }
+
+  // Into a folder nothing has made yet (#237): the emulator makes a system's
+  // folder the first time it saves one, which for a placement is after.
+  {
+    Sandbox sandbox(checks, "states-placing-folder");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    ScriptedClient client;
+    client.listing = "[" + kServerRow + "]";
+    client.content = std::string(40, 'z');
+    const std::string target = "/tico/states/users/0123456789abcdef0123456789abcdef/nes/Game.state";
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [&target](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.sd_path = target;
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.completed, 1, "a state is placed into a folder that was not there");
+    checks.ExpectEq(sandbox.Read(target), std::string(40, 'z'), "with the server's bytes");
+  }
+
+  // More of the server's states than one tick places (#247): every one is an
+  // operation the tick holds to its end, and a listing at its byte bound is ~220
+  // rows, so one tick places at most `kMaxStatePlacements` and the next places
+  // the rest -- which are this console's by then, and so claimed, not placed.
+  {
+    Sandbox sandbox(checks, "states-placing-bounded");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    constexpr std::size_t kMore = 5;
+    const std::size_t rows = sync::kMaxStatePlacements + kMore;
+    std::string listing = "[";
+    for (std::size_t at = 0; at < rows; ++at) {
+      listing += (at == 0 ? "" : ",") +
+                 StateRowJson(static_cast<std::int64_t>(at) + 100, 1,
+                              "Game " + std::to_string(at) + ".state", "retroarch", 40,
+                              "2026-09-06T03:00:00+00:00");
+    }
+    ScriptedClient client;
+    client.listing = listing + "]";
+    client.content = std::string(40, 'z');
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState& server) {
+      rommsync::place::Placement placement;
+      placement.sd_path = "/placed/" + server.file_name;
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.operations.size(), sync::kMaxStatePlacements,
+                    "one tick places at most kMaxStatePlacements of the server's states");
+    checks.ExpectEq(report.completed, static_cast<int>(sync::kMaxStatePlacements),
+                    "and each of those was placed");
+    checks.Expect(!sandbox.Exists("/placed/Game " + std::to_string(rows - 1) + ".state"),
+                  "the last row waits for the next tick");
+    checks.Expect(std::any_of(report.warnings.begin(), report.warnings.end(),
+                              [](const std::string& warning) {
+                                return warning.find("next sync") != std::string::npos;
+                              }),
+                  "and the tick says the rest wait for the next");
+  }
+
+  // Rows that place nothing come back every run -- their path is taken, so
+  // nothing the next scan finds claims them -- and they must not be what the
+  // budget goes on: a listing that leads with `kMaxStatePlacements` of them still
+  // places the rows behind them, and the taken ones are named in what is left.
+  {
+    Sandbox sandbox(checks, "states-placing-taken-first");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    constexpr std::size_t kPlaceable = 3;
+    const std::size_t taken = sync::kMaxStatePlacements;
+    checks.Expect(files->CreateDirectory("/placed").ok(), "the folder the taken ones sit in");
+    std::string listing = "[";
+    for (std::size_t at = 0; at < taken + kPlaceable; ++at) {
+      const std::string name = (at < taken ? "Taken " : "Free ") + std::to_string(at) + ".state";
+      if (at < taken) {
+        sandbox.SeedState("/placed/" + name, "a state the scan never read");
+      }
+      listing += (at == 0 ? "" : ",") + StateRowJson(static_cast<std::int64_t>(at) + 100, 1, name,
+                                                     "retroarch", 40, "2026-09-06T03:00:00+00:00");
+    }
+    ScriptedClient client;
+    client.listing = listing + "]";
+    client.content = std::string(40, 'z');
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState& server) {
+      rommsync::place::Placement placement;
+      placement.sd_path = "/placed/" + server.file_name;
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.completed, static_cast<int>(kPlaceable),
+                    "the placeable rows behind the taken ones are placed");
+    for (std::size_t at = taken; at < taken + kPlaceable; ++at) {
+      checks.ExpectEq(sandbox.Read("/placed/Free " + std::to_string(at) + ".state"),
+                      std::string(40, 'z'), "row " + std::to_string(at) + " landed");
+    }
+    checks.ExpectEq(report.kept_both, static_cast<int>(taken - kPlaceable),
+                    "the taken rows have what the placements left");
+    checks.ExpectEq(report.operations.size(), sync::kMaxStatePlacements,
+                    "and the run still holds no more than the bound");
+    checks.Expect(std::any_of(report.warnings.begin(), report.warnings.end(),
+                              [](const std::string& warning) {
+                                return warning.find("not listed one by one") != std::string::npos;
+                              }),
+                  "the taken rows past it are one line");
+  }
+
+  // And a placement that says why it places nothing carries the reason.
+  {
+    Sandbox sandbox(checks, "states-placing-reason");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    ScriptedClient client;
+    client.listing = "[" + kServerRow + "]";
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.reason = "RetroArch syncs its own states itself";
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.Expect(report.operations.size() == 1 &&
+                      report.operations.front().error == sync::StateError::kNoPlacement &&
+                      report.operations.front().message.find("syncs its own") !=
+                          std::string::npos,
+                  "the reason reaches the result");
   }
 }
 
@@ -950,7 +1332,9 @@ void RoundTrip(rig::Checks& checks, http::HttpClient& client, const std::string&
     // says which folder it belongs in -- that is the caller's, exactly as
     // `sync::ExecuteOptions::place` is.
     options.place = [](const sync::ServerState& server) {
-      return StatePath(server.file_name);
+      rommsync::place::Placement placement;
+      placement.sd_path = StatePath(server.file_name);
+      return placement;
     };
 
     state::Baseline baseline;
@@ -993,12 +1377,14 @@ void Overwrite(rig::Checks& checks, http::HttpClient& client, const std::string&
   const std::int64_t state_id = row->server_state_id;
 
   // Another console moves the server's copy. A second later, so the timestamps
-  // are distinguishable at the granularity RomM renders them at.
+  // are distinguishable at the granularity RomM renders them at. Running the
+  // core this one does -- Gambatte, gb's -- since another core's state is never
+  // downloaded (#239).
   PassASecond();
   const std::string elsewhere = sandbox.Host("/elsewhere.state");
   rig::WriteFile(elsewhere, theirs);
   sync::ServerState replaced;
-  if (!harness::UploadState(checks, client, base, fixture, rom_id, "retroarch", elsewhere, name,
+  if (!harness::UploadState(checks, client, base, fixture, rom_id, "gambatte", elsewhere, name,
                             &replaced)) {
     harness::DeleteState(client, base, fixture, state_id);
     return;
@@ -1026,6 +1412,81 @@ void Overwrite(rig::Checks& checks, http::HttpClient& client, const std::string&
     said = said || warning.find("not an integrity check") != std::string::npos;
   }
   checks.Expect(said, "and the report says a length match is not an integrity check");
+
+  harness::DeleteState(client, base, fixture, state_id);
+}
+
+/// M9-14 (#203): `overwrite`, with a power cut at every call the second run
+/// makes. A state is a save (hard rule 2) and arrives through the same `.part`
+/// staging, so it is held to the same replay.
+void Crash(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+           const Fixture& fixture, std::int64_t rom_id, const std::string& rom_base) {
+  Sandbox sandbox(checks, "states-crash");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const auth::StoredToken token = TokenFor(base, fixture);
+  const roms::RomIndex index = IndexOf(rom_id, rom_base, "gb");
+  const std::string name = rom_base + ".state";
+  const std::string mine = "the session a power cut must not cost";
+  const std::string theirs = "the session the other console pushed, which replaces it";
+
+  sandbox.SeedState(StatePath(name), mine);
+  state::Baseline baseline;
+  const sync::StateSyncReport first =
+      sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+  checks.ExpectEq(first.failed, 0, "the first run uploaded this console's state");
+  const state::StateRecord* row = baseline.FindState(rom_id, name);
+  if (row == nullptr) {
+    checks.Expect(false, "the first run recorded a row");
+    return;
+  }
+  const std::int64_t state_id = row->server_state_id;
+
+  PassASecond();
+  const std::string elsewhere = sandbox.Host("/elsewhere.state");
+  rig::WriteFile(elsewhere, theirs);
+  sync::ServerState replaced;
+  if (!harness::UploadState(checks, client, base, fixture, rom_id, "gambatte", elsewhere, name,
+                            &replaced)) {
+    harness::DeleteState(client, base, fixture, state_id);
+    return;
+  }
+
+  {
+    crash::Recorder recorder(sandbox.root());
+    const sync::StateSyncReport second = sync::SyncStates(client, *files, token, StatesOn(true),
+                                                          index, &baseline, OptionsAt(kStamp));
+    checks.ExpectEq(second.completed, 1, "the second run replaced the local state");
+    checks.ExpectEq(sandbox.Read(StatePath(name)), theirs, "the card holds the server's copy");
+    crash::ExpectSurvives(checks, recorder,
+                          {StatePath(name), mine, theirs, harness::kBackupDir},
+                          rig::ScratchDir() + "/crash-state", "a state download over a state");
+  }
+
+  // #237: the same state reaching a console that has never held it, placed in
+  // Tico's folder -- no file, or all of it, and nothing beside it touched.
+  {
+    Sandbox fresh(checks, "states-crash-placed");
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(fresh.root().string());
+    const std::string target = "/tico/states/gb/" + name;
+    fresh.MakeDirs("/tico/states/gb");
+    fresh.Write("/tico/states/gb/other.state", "another game's state, beside it");
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [&target](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.sd_path = target;
+      return placement;
+    };
+    state::Baseline none;
+    crash::Recorder recorder(fresh.root());
+    const sync::StateSyncReport placed =
+        sync::SyncStates(client, *card, token, StatesOn(true), index, &none, options);
+    checks.ExpectEq(placed.completed, 1, "the state was placed on a card that never held it");
+    checks.ExpectEq(fresh.Read(target), theirs, "with the server's bytes");
+    crash::ExpectCreated(checks, recorder, crash::Created{target, theirs},
+                         rig::ScratchDir() + "/crash-state-placed", "a state placement");
+  }
 
   harness::DeleteState(client, base, fixture, state_id);
 }
@@ -1059,7 +1520,7 @@ void Truncate(rig::Checks& checks, http::HttpClient& client, const std::string& 
   const std::string elsewhere = sandbox.Host("/elsewhere.state");
   rig::WriteFile(elsewhere, std::string(8192, 't'));
   sync::ServerState replaced;
-  if (!harness::UploadState(checks, client, base, fixture, rom_id, "retroarch", elsewhere, name,
+  if (!harness::UploadState(checks, client, base, fixture, rom_id, "gambatte", elsewhere, name,
                             &replaced)) {
     harness::DeleteState(client, base, fixture, state_id);
     return;
@@ -1144,6 +1605,101 @@ void KeepsBoth(rig::Checks& checks, http::HttpClient& client, const std::string&
   harness::DeleteState(client, base, fixture, state_id);
 }
 
+/// #239, against the real server: Tico's Auto state goes up under RetroArch's
+/// name with its screenshot, and comes down as Tico's Auto on a second Switch
+/// and as RetroArch's on a third -- resume-on-another-device, end to end.
+void Mapped(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+            const Fixture& fixture, std::int64_t rom_id, const std::string& rom_base) {
+  const auth::StoredToken token = TokenFor(base, fixture);
+  const roms::RomIndex index = IndexOf(rom_id, rom_base, "gb");
+  const std::string server_name = rom_base + ".state.auto";
+  const std::string bytes = "where play stopped, " + harness::UniqueSlot("mapped");
+  config::Config mapped = StatesOn(true);
+  mapped.sync.map_state_slots = true;
+  const rommsync::retroarch::Settings ra_defaults;
+
+  // A run that failed before its cleanup leaves the row behind, and a console
+  // with no history for it would keep both rather than upload.
+  for (const sync::ServerState& row : harness::ListStates(checks, client, base, fixture, rom_id)) {
+    if (row.file_name == server_name) {
+      harness::DeleteState(client, base, fixture, row.id);
+    }
+  }
+
+  std::int64_t uploaded_id = 0;
+  {
+    Sandbox first(checks, "states-mapped-tico");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(first.root().string());
+    first.MakeDirs("/tico/states/gb");
+    first.Write("/tico/states/gb/" + rom_base + ".state5", bytes);
+    first.Write("/tico/states/gb/" + rom_base + ".state5.png", "a picture of where play stopped");
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, mapped, index, &baseline, OptionsAt(kStamp));
+    const state::StateRecord* row = baseline.FindState(rom_id, server_name);
+    checks.Expect(row != nullptr, "Tico's Auto state went up as " + server_name + ": " +
+                                      (report.warnings.empty() ? "" : report.warnings.front()));
+    if (row == nullptr) {
+      return;
+    }
+    uploaded_id = row->server_state_id;
+  }
+
+  // The row as RomM keeps it: the name sent, Gambatte's, with the screenshot
+  // bound to it by stem.
+  {
+    const http::Result listed = client.Send(harness::Authed(
+        http::Method::kGet, base + "/api/states?rom_id=" + std::to_string(rom_id), fixture));
+    const json::ParseResult parsed = json::Parse(listed.response.body);
+    const json::Value* found = nullptr;
+    if (parsed.ok() && parsed.value.is_array()) {
+      for (const json::Value& one : parsed.value.elements()) {
+        if (harness::Number(one, "id") == uploaded_id) {
+          found = &one;
+        }
+      }
+    }
+    checks.Expect(found != nullptr, "the server lists the row it answered with");
+    if (found != nullptr) {
+      checks.ExpectEq(harness::Field(*found, "file_name"), server_name,
+                      "under RetroArch's name, unchanged");
+      checks.ExpectEq(harness::Field(*found, "emulator"), std::string("gambatte"),
+                      "as the core Tico runs for gb");
+      const json::Value* screenshot = found->Find("screenshot");
+      checks.Expect(screenshot != nullptr && screenshot->is_object(),
+                    "with the .png beside it as its screenshot");
+    }
+  }
+
+  /// A console that has never held it, playing gb in `config`: where it lands.
+  const auto place_on = [&](const std::string& label, const config::Config& config,
+                            const std::string& expected) {
+    Sandbox card(checks, "states-mapped-" + label);
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(card.root().string());
+    rommsync::place::Placer placer(config, ra_defaults, index, *files);
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [&placer](const sync::ServerState& server) {
+      return placer.State(server.rom_id, server.file_name, server.emulator);
+    };
+    state::Baseline baseline;
+    sync::SyncStates(client, *files, token, config, index, &baseline, options);
+    checks.ExpectEq(card.Exists(expected) ? card.Read(expected) : std::string("(nothing)"), bytes,
+                    label + ": the state landed at " + expected);
+    checks.Expect(baseline.FindState(rom_id, server_name) != nullptr,
+                  label + ": paired under the server's name");
+  };
+  place_on("tico", mapped, "/tico/states/gb/" + rom_base + ".state5");
+  config::LoadResult retro = config::ParseConfig("[platform.gb]\nplay_with = retroarch\n");
+  retro.value.sync.states = true;
+  retro.value.sync.map_state_slots = true;
+  place_on("retroarch", retro.value,
+           "/retroarch/cores/savestates/Gambatte/" + rom_base + ".state.auto");
+
+  harness::DeleteState(client, base, fixture, uploaded_id);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1160,7 +1716,7 @@ int main(int argc, char** argv) {
 
   if (scenario == "silent" || scenario == "naming" || scenario == "scanning" ||
       scenario == "decides" || scenario == "trims" || scenario == "placing" ||
-      scenario == "listing" || scenario == "recording") {
+      scenario == "listing" || scenario == "recording" || scenario == "emulators") {
     if (scenario == "silent") {
       Silent(checks);
     } else if (scenario == "naming") {
@@ -1175,6 +1731,8 @@ int main(int argc, char** argv) {
       Listing(checks);
     } else if (scenario == "recording") {
       Recording(checks);
+    } else if (scenario == "emulators") {
+      Emulators(checks);
     } else {
       Decides(checks);
     }
@@ -1213,10 +1771,14 @@ int main(int argc, char** argv) {
     RoundTrip(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "overwrite") {
     Overwrite(checks, *client, base, fixture, rom.id, rom_base);
+  } else if (scenario == "crash") {
+    Crash(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "truncate") {
     Truncate(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "keeps_both") {
     KeepsBoth(checks, *client, base, fixture, rom.id, rom_base);
+  } else if (scenario == "mapped") {
+    Mapped(checks, *client, base, fixture, rom.id, rom_base);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

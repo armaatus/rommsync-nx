@@ -39,6 +39,8 @@
 //   nonblocking -- M1-6: `StartPair` returns while the init is still in flight
 //   repairs   -- M1-6: `StartPair` then `Unpair`, with neither instant losing
 //                both the old pairing and the new attempt
+//   pair_commit -- `kApproved` is said only once `token.dat` is committed, and a
+//                  commit the card refuses is a failure that keeps the old token
 //   stale_active -- M9-5: an `active` row a power cut left behind is work, not a
 //                   transfer in flight
 //   drains    -- M9-5: a rom queued over IPC becomes a file on the card
@@ -56,7 +58,18 @@
 //                acknowledgement, and nothing goes out until MinimumAwake
 //   sleep_download -- M9-4: a rom in flight at SleepReady is stopped, and the worker
 //                is back from download::Drain before the acknowledgement
+//   foreground -- M10-16: nothing reaches the server or the card while a game
+//                runs, and one tick runs once it closes
+//   remote_install -- M10-19: a rom queued in RomM's web UI is claimed on a tick,
+//                downloaded, and reported done
+//   states_guard -- the states half does not run under a game, nor after a saves
+//                half refused or offline, and its own 401 counts towards the gate
+//   install_settle -- a report the link did not carry stops the pass; the rest are
+//                reported once it does
+//   install_wake -- a refused claim is asked again after a wake, not only a boot
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -65,6 +78,9 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -72,18 +88,27 @@
 #include <vector>
 
 #include "engine.hpp"
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "power.hpp"
 #include "power_fake.hpp"
 #include "rig.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/conflict_log.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/download.hpp"
+#include "rommsync/file_system.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/json.hpp"
 #include "rommsync/log.hpp"
+#include "rommsync/md5.hpp"
+#include "rommsync/overlay_status_view.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/remote_install.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/sha1.hpp"
 #include "rommsync/token_store.hpp"
 
@@ -93,6 +118,7 @@ namespace conflicts = rommsync::conflicts;
 namespace download = rommsync::download;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
+namespace install = rommsync::install;
 namespace ipc = rommsync::ipc;
 // Aliased `rlog` and not `log`: at global scope that name is already taken by
 // `::log`, the C library's logarithm, and GCC refuses a namespace alias that
@@ -200,6 +226,40 @@ class Console {
     std::string response;
     Call(ipc::Command::kGetLog, ipc::EncodeLogRequest(ipc::kMaxLogLines), &response);
     return ipc::DecodeLogTail(response).value;
+  }
+
+  /// Command 15, read off the wire: where the restore stands the instant the
+  /// press was taken (M9-6, #209).
+  ipc::RestoreState Restore(std::int64_t entry_id, ipc::Error* answered = nullptr) {
+    std::string response;
+    const ipc::Error answer =
+        Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(entry_id), &response);
+    if (answered != nullptr) {
+      *answered = answer;
+    }
+    return ipc::DecodeRestoreState(response).value;
+  }
+
+  /// Command 17: what the overlay polls while a restore runs.
+  ipc::RestoreState RestoreState() {
+    std::string response;
+    Call(ipc::Command::kGetRestoreState, ipc::EncodeEmpty(), &response);
+    return ipc::DecodeRestoreState(response).value;
+  }
+
+  /// Poll command 17 until the restore of `entry_id` is done, the way the
+  /// conflicts screen does. A state that never got there is returned as it
+  /// last stood, so the caller's assertion names what it saw.
+  ipc::RestoreState AwaitRestore(std::int64_t entry_id) {
+    ipc::RestoreState state = RestoreState();
+    for (int waited = 0; waited < 400; ++waited) {
+      if (state.phase == ipc::RestorePhase::kDone && state.entry_id == entry_id) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      state = RestoreState();
+    }
+    return state;
   }
 
   /// The queue as the *card* holds it, which is the only copy that survives a
@@ -621,13 +681,13 @@ void Reenable(checks::Checks& c) {
            "with the card written once more");
 
   // `SyncNow` stops answering `kDisabled` the moment the switch is back on, with
-  // no restart in between -- which is this issue's criterion. It does not yet
-  // answer `kAccepted`: `SdEngine::RequestSync` returns false until there is a
-  // scheduler to start a tick, and `ServiceCore` reports that as
-  // `kAlreadyRunning` (M7-2, #37, "What M4-1 left here"). The switch is what
-  // this issue owns; the tick behind it is #37's.
+  // no restart in between -- which is this issue's criterion. It is not pinned
+  // to `kAccepted`: what answers instead -- a tick started, or one already
+  // running -- has been M7-2 (#37)'s since it gave `SdEngine::RequestSync` a
+  // worker to start (`engine.syncnow`). The switch is what this issue owns; the
+  // tick behind it is #37's.
   c.Expect(console.SyncNow() != ipc::SyncOutcome::kDisabled,
-           "and a sync asked for now is refused by something other than the switch");
+           "and a sync asked for now is no longer refused for the switch");
 
   // The card and the engine still agree after a real reboot, so nothing above
   // was true only in memory.
@@ -910,6 +970,51 @@ void Unauthenticated(checks::Checks& c) {
   corrupt.Boot();
   c.Expect(corrupt.Status().auth == ipc::AuthState::kPaired,
            "which stops nothing: the console will find out by asking");
+}
+
+// --- #205: files a later release wrote, read by this one ------------------------
+
+/// The downgrade, as the engine meets it: a `config.ini` and a `token.dat` from
+/// a release this build predates. Neither is misread, both are said on the one
+/// screen a user can read a sentence on, and neither is written over -- not by
+/// the boot, and not by an edit from the overlay.
+void NewerFiles(checks::Checks& c) {
+  Console console(c, "engine-newer");
+  const std::string settings = "version = " + std::to_string(config::kConfigVersion + 1) +
+                               "\n[server]\nurl = https://romm.example.com\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", settings),
+           "a config.ini from a later release");
+  const std::string credentials =
+      "{\"version\":" + std::to_string(auth::kTokenFormatVersion + 1) +
+      ",\"server_url\":\"https://romm.example.com\",\"access_token\":\"not-a-real-token\","
+      "\"device_id\":\"console-1\",\"scopes\":[],\"expires_at\":null}\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/token.dat", credentials),
+           "and a token.dat from one");
+  console.Boot();
+
+  const ipc::Status status = console.Status();
+  c.Expect(!status.configured, "none of the newer config.ini is in force");
+  c.ExpectEq(status.config_error_count, std::int64_t{2},
+             "two errors on the status screen: the config and the token");
+  c.Expect(status.auth == ipc::AuthState::kPaired,
+           "the console is still paired -- it is this build that cannot use the token");
+  bool config_said = false;
+  bool token_said = false;
+  for (const config::Diagnostic& diagnostic : console.Configured().diagnostics) {
+    const std::string line = diagnostic.Describe();
+    config_said = config_said || (diagnostic.key == "version" && line.find("newer") != std::string::npos);
+    token_said = token_said || (line.find("token.dat") != std::string::npos &&
+                                line.find("newer") != std::string::npos);
+  }
+  c.Expect(config_said, "Settings says the config.ini is a newer release's");
+  c.Expect(token_said, "and that the token.dat is");
+
+  const ipc::ConfigResult edited = console.Set(Edit("sync", "interval_min", "15"));
+  c.Expect(edited.outcome != ipc::WriteOutcome::kApplied, "an edit from the overlay is refused");
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/config.ini"), settings,
+             "and the newer config.ini is byte for byte as it was");
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/token.dat"), credentials,
+             "and so is the newer token.dat");
 }
 
 // --- M1-6: the pairing attempt the console starts -----------------------------
@@ -1214,6 +1319,230 @@ int Repairs(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// A card that lets a scenario look at the console from *inside* the pairing
+/// commit: every write, rename, remove and sync that touches the credentials
+/// stops first to ask the engine what it is telling the overlay.
+///
+/// The race `engine.pairs` and `engine.repairs` lost under `-j4` was the overlay
+/// reading `kApproved` while `token.dat` was still `token.dat.tmp` -- a window
+/// of a few hundred microseconds a poll every 100 ms almost never lands in. This
+/// lands in it every time, because the look *is* the commit's next step.
+///
+/// The engine is asked directly rather than through `ipc::Dispatch`: the look
+/// runs on the pairing thread, concurrently with the scenario's own polls, and
+/// `ServiceCore` is served by one thread on the console.
+class CommitWatch final : public rommsync::io::Disk {
+ public:
+  CommitWatch(Console& console, std::string directory)
+      : console_(console), directory_(std::move(directory)) {
+    previous_ = rommsync::io::SetDisk(this);
+  }
+  ~CommitWatch() override { rommsync::io::SetDisk(previous_); }
+
+  CommitWatch(const CommitWatch&) = delete;
+  CommitWatch& operator=(const CommitWatch&) = delete;
+
+  std::FILE* Open(const std::string& path, const char* mode) override {
+    Look("open " + path);
+    return Inner().Open(path, mode);
+  }
+  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
+    return Inner().Write(file, data, size);
+  }
+  int Rename(const std::string& from, const std::string& to) override {
+    Look("rename " + from + " -> " + to);
+    const int renamed = Inner().Rename(from, to);
+    Look("renamed " + from + " -> " + to);
+    return renamed;
+  }
+  int Remove(const std::string& path) override {
+    Look("remove " + path);
+    return Inner().Remove(path);
+  }
+  bool Sync(const std::string& path) override {
+    Look("sync " + path);
+    return Inner().Sync(path);
+  }
+
+  /// How many times the engine was asked -- non-zero, or the scenario proved
+  /// nothing about the commit.
+  int looks() const {
+    std::lock_guard<std::mutex> hold(mutex_);
+    return looks_;
+  }
+
+  /// Every moment the engine said `kApproved` while the commit was still on the
+  /// card's side of the line. Empty is the whole assertion.
+  std::vector<std::string> premature() const {
+    std::lock_guard<std::mutex> hold(mutex_);
+    return premature_;
+  }
+
+ private:
+  rommsync::io::Disk& Inner() const {
+    return previous_ != nullptr ? *previous_ : rommsync::io::StdioDisk();
+  }
+
+  /// The credentials, `auth.json` beside them, and the directory a commit syncs
+  /// once its rename has landed. Nothing else: the worker writes this directory
+  /// too, and its files are no part of what the pairing state promises.
+  bool Watched(const std::string& path) const {
+    return path.find(auth::kTokenFileName) != std::string::npos ||
+           path.find(auth::kAuthStateFileName) != std::string::npos ||
+           path + "/" == directory_;
+  }
+
+  void Look(const std::string& what) {
+    if (!Watched(what.substr(what.find(' ') + 1))) {
+      return;
+    }
+    const auth::PairingStatus seen = console_.engine.pairing_status();
+    std::lock_guard<std::mutex> hold(mutex_);
+    ++looks_;
+    if (seen.state == auth::PairingState::kApproved) {
+      // Named relative to the config directory: the sandbox path is long, and the
+      // file is the part of the line that says which step of the commit it was.
+      std::string moment = what;
+      for (std::string::size_type at = moment.find(directory_); at != std::string::npos;
+           at = moment.find(directory_)) {
+        moment.erase(at, directory_.size());
+      }
+      premature_.push_back(moment);
+    }
+  }
+
+  Console& console_;
+  std::string directory_;
+  rommsync::io::Disk* previous_ = nullptr;
+  mutable std::mutex mutex_;
+  int looks_ = 0;
+  std::vector<std::string> premature_;
+};
+
+/// The pairing state follows the card, not the server (bug found by
+/// `engine.pairs` and `engine.repairs` at `-j4`).
+///
+/// `kApproved` tells the overlay "Paired -- this console can now sync". It may
+/// only be said once the grant is a committed `token.dat`: while the commit is
+/// in flight the attempt reads as still pending, and a commit the card refuses
+/// reads as failed -- never as approved first and failed afterwards.
+///
+/// Played as a re-pair over a working credential, because that is the commit
+/// that overwrites one: the refused commit has to leave the previous token
+/// exactly where it was, and the one that lands replaces it whole.
+int PairCommit(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+
+  Console console(c, "engine-pair-commit");
+  auth::StoredToken old_token;
+  old_token.server_url = base;
+  old_token.access_token = fixture.token;
+  old_token.device_id = fixture.device_id;
+  const std::string token_path = console.directory + auth::kTokenFileName;
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[server]\nurl = " + base + "\n"),
+           "the console is configured for the fixture RomM");
+  c.Expect(auth::SaveToken(token_path, old_token).ok(), "and already paired with it");
+  console.engine.UsePairingBackend(Backend(client));
+  console.Boot();
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired, "so it comes up paired");
+
+  // --- a card that refuses the new token ---------------------------------------
+  {
+    const auth::PairingStatus showing = BeginAndShow(console, c);
+    c.Expect(showing.state == auth::PairingState::kPending,
+             std::string("the re-pair reaches a live code (") + auth::ToString(showing.state) +
+                 ": " + showing.message + ")");
+
+    // Full the moment the new token is written: the temp file takes nothing.
+    // Declared before the watch, so the watch sits on top and sees every call.
+    faulty::Plan plan;
+    plan.aimed_at = auth::kTokenFileName;
+    plan.error = ENOSPC;
+    plan.after = 0;
+    faulty::Disk full(plan);
+    CommitWatch watch(console, console.directory);
+
+    const http::Result approved =
+        rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
+    c.Expect(approved.successful(),
+             "approving the code -- HTTP " + std::to_string(approved.response.status));
+    const auth::PairingStatus settled = Terminal(console, c);
+
+    c.Expect(full.refusals() > 0, "the card really did refuse the commit");
+    c.Expect(watch.looks() > 0, "and the commit was watched while it ran");
+    for (const std::string& moment : watch.premature()) {
+      c.Expect(false, "the overlay was told kApproved before token.dat was committed, at: " +
+                          moment);
+    }
+    c.Expect(settled.state == auth::PairingState::kFailed,
+             std::string("a commit the card refuses is a failed pairing, not an approved one (") +
+                 auth::ToString(settled.state) + ": " + settled.message + ")");
+    c.Expect(settled.message.find("could not be saved") != std::string::npos,
+             "and says the token could not be saved: " + settled.message);
+  }
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.tmp"),
+           "a refused commit leaves no partial file beside the token");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.old"),
+           "nor the previous one moved aside");
+  {
+    const auth::LoadedToken kept = auth::LoadToken(token_path);
+    c.Expect(kept.ok(), "the previous credential is still on the card: " + kept.message);
+    c.Expect(kept.value.access_token == fixture.token, "and it is the previous one, untouched");
+  }
+  c.Expect(console.Status().auth == ipc::AuthState::kPaired,
+           "so the console is still paired, on the credential it had");
+
+  // --- a card that takes it -------------------------------------------------------
+  {
+    const auth::PairingStatus showing = BeginAndShow(console, c);
+    c.Expect(showing.state == auth::PairingState::kPending,
+             std::string("pairing again reaches a live code (") + auth::ToString(showing.state) +
+                 ": " + showing.message + ")");
+
+    CommitWatch watch(console, console.directory);
+    const http::Result approved =
+        rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
+    c.Expect(approved.successful(),
+             "approving the code -- HTTP " + std::to_string(approved.response.status));
+    const auth::PairingStatus granted = Terminal(console, c);
+
+    c.Expect(watch.looks() > 0, "the commit was watched while it ran");
+    for (const std::string& moment : watch.premature()) {
+      c.Expect(false, "the overlay was told kApproved before token.dat was committed, at: " +
+                          moment);
+    }
+    c.Expect(granted.state == auth::PairingState::kApproved,
+             std::string("the re-pair completes (") + auth::ToString(granted.state) + ": " +
+                 granted.message + ")");
+    // The instant the overlay reads `kApproved` -- before anything else runs --
+    // the card and the engine both have to agree with it. This is the check
+    // `engine.pairs` lost to the scheduler.
+    c.Expect(console.Status().auth == ipc::AuthState::kPaired,
+             "and the instant it says so, the console is paired");
+    c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.tmp"),
+             "with no partial file beside the token");
+    c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat.old"),
+             "and nothing moved aside left behind");
+  }
+  const auth::LoadedToken replaced = auth::LoadToken(token_path);
+  c.Expect(replaced.ok(), "the new credential is on the card: " + replaced.message);
+  c.Expect(replaced.value.access_token != fixture.token,
+           "and it is the new one, not the previous one");
+
+  http::Request mine;
+  mine.url = base + "/api/users/me";
+  mine.headers.push_back({"Authorization", "Bearer " + replaced.value.access_token});
+  const http::Result whoami = client.Send(mine);
+  c.Expect(whoami.response.status == 200,
+           "and RomM accepts it -- HTTP " + std::to_string(whoami.response.status));
+  return c.failures();
+}
+
 /// A server that answers nothing. The attempt is refused, and the refusal is the
 /// attempt's own failure rather than a command that lied about starting one --
 /// and, above all, the card is untouched.
@@ -1245,7 +1574,7 @@ void Unreachable(checks::Checks& c) {
            "so it is exactly the console it was");
 }
 
-// --- what is still not built --------------------------------------------------
+// --- what M4-1 left unbuilt, and the issues that built it ---------------------
 
 /// M7-2 (#37): "Sync now" starts a tick, and says so.
 ///
@@ -1325,6 +1654,14 @@ class HeldServer final : public http::HttpClient {
  public:
   http::Result Send(const http::Request& request) override {
     ++requests_;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      // A server the floor accepts (#228), so the tick gets as far as the
+      // negotiation this server exists to hold.
+      http::Result result;
+      result.response.status = 200;
+      result.response.body = R"({"SYSTEM":{"VERSION":"5.4.0"}})";
+      return result;
+    }
     if (request.url.find("/api/roms") != std::string::npos) {
       http::Result result;
       result.response.status = 200;
@@ -1385,7 +1722,7 @@ class HeldServer final : public http::HttpClient {
 /// M7-2 (#37): a restore and a running tick both write saves, and only one of
 /// them may.
 ///
-/// Until this issue nothing else in the sysmodule wrote a save, so
+/// Until that issue nothing else in the sysmodule wrote a save, so
 /// `RestoreBackup` had the card to itself. The worker changed that: it runs
 /// `sync::Execute` and `sync::SyncStates` over the same `sd_path` a restore
 /// targets. Each write is atomic on its own, so what a collision produces is a
@@ -1394,12 +1731,14 @@ class HeldServer final : public http::HttpClient {
 /// which is hard rule 2 defeated by timing rather than by a bug in either
 /// writer.
 ///
-/// **The check has to be concurrent**, not a sequential call that finds a flag
-/// set: an earlier version of this fix read `sync_in_progress_` under a lock and
-/// then let it go, which is a race with a handful of instructions in it rather
-/// than no race. So this holds a tick open *inside* `sync::RunTick` -- a stub
-/// server that blocks on the negotiation -- and presses restore while it is
-/// there.
+/// **What M9-6 (#209) changed is the answer, not the exclusion.** The restore
+/// used to run on the IPC thread and was *refused* while a tick held the card.
+/// It now runs on the worker, which is the thread the tick is on -- so it
+/// cannot interleave with one by construction, and a press during a tick
+/// **waits its turn** instead of being turned away. Still held open inside
+/// `sync::RunTick`, because the claim is about a tick that is demonstrably
+/// mid-flight: the restore is accepted, stays running while the tick is held,
+/// and runs the moment it lets go.
 void RestoreDuringSync(checks::Checks& c) {
   Console console(c, "engine-restore-during-sync");
   c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
@@ -1428,36 +1767,235 @@ void RestoreDuringSync(checks::Checks& c) {
   c.Expect(server.AwaitNegotiate(), "the worker reaches the negotiation and is held there");
 
   // The press, while the tick is demonstrably mid-flight. The entry id is one
-  // nothing has: the refusal has to come from the write lock and not from the
-  // history, which is what tells this apart from `kNoSuchEntry`.
-  std::string response;
-  const ipc::Error answered =
-      console.Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(1), &response);
+  // nothing has, so what the restore finally answers says it reached the
+  // history -- `kNoSuchEntry` -- rather than a lock.
+  ipc::Error answered = ipc::Error::kInternal;
+  const ipc::RestoreState taken = console.Restore(1, &answered);
   c.Expect(answered == ipc::Error::kOk, "the command is answered rather than failing");
-  const conflicts::RestoreReport report = ipc::DecodeRestoreReport(response).value;
-  c.Expect(report.outcome == conflicts::RestoreOutcome::kBackupFailed,
-           "a restore during a tick is refused, with the outcome whose promise is "
-           "'nothing was written'");
-  c.Expect(report.message.find("a sync is running") != std::string::npos,
-           "and the sentence names the reason, so the screen can say press again -- got: " +
-               report.message);
+  c.Expect(taken.phase == ipc::RestorePhase::kRunning && taken.entry_id == 1,
+           std::string("a restore during a tick is taken, not refused: ") +
+               ipc::ToString(taken.phase));
+
+  // ...and it does not run while the tick does. Asked a few times over, so a
+  // restore that ran *beside* the tick would have had the time to finish.
+  for (int look = 0; look < 4; ++look) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    c.Expect(console.RestoreState().phase == ipc::RestorePhase::kRunning,
+             "it waits while the tick holds the card");
+  }
 
   server.Release();
 
-  // And once the tick has let go, the same press reaches the history again --
-  // `kNoSuchEntry` for an id nothing has, which is the answer that proves the
-  // refusal above was the lock and not a permanent state.
-  conflicts::RestoreReport after;
-  for (int waited = 0; waited < 200; ++waited) {
-    console.Call(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(1), &response);
-    after = ipc::DecodeRestoreReport(response).value;
-    if (after.outcome != conflicts::RestoreOutcome::kBackupFailed) {
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  // And once the tick has let go, it runs: `kNoSuchEntry` for an id nothing
+  // has, which is the answer that proves it reached the history.
+  const ipc::RestoreState after = console.AwaitRestore(1);
+  c.Expect(after.phase == ipc::RestorePhase::kDone,
+           std::string("the restore runs the moment the tick is done: ") +
+               ipc::ToString(after.phase));
+  c.Expect(after.report.outcome == conflicts::RestoreOutcome::kNoSuchEntry,
+           std::string("and it reached the history: ") +
+               conflicts::ToString(after.report.outcome) + " -- " + after.report.message);
+}
+
+/// A card that can be made to stop answering in the middle of a restore.
+///
+/// Every file `conflicts::Restore` touches is reached through `Resolve` first,
+/// so holding that one call is holding the restore -- a large save copying on
+/// a slow card, which is the case #209 names -- without timing anything.
+class SlowCard final : public fs::FileSystem {
+ public:
+  explicit SlowCard(std::unique_ptr<fs::FileSystem> real) : real_(std::move(real)) {}
+
+  fs::Listing List(std::string_view sd_path) override { return real_->List(sd_path); }
+  fs::MakeDirResult CreateDirectory(std::string_view sd_path) override {
+    return real_->CreateDirectory(sd_path);
   }
-  c.Expect(after.outcome == conflicts::RestoreOutcome::kNoSuchEntry,
-           "and the restore is available again the moment the tick is done");
+  fs::Volume VolumeOf(std::string_view sd_path) const override { return real_->VolumeOf(sd_path); }
+
+  std::string Resolve(std::string_view sd_path) const override {
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      if (armed_) {
+        held_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [this] { return !armed_; });
+      }
+    }
+    return real_->Resolve(sd_path);
+  }
+
+  void Arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      armed_ = false;
+    }
+    changed_.notify_all();
+  }
+
+  /// A call is being held. False if none arrived, which is a scenario that
+  /// proved nothing rather than one that passed.
+  bool AwaitHeld() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds{10}, [this] { return held_; });
+  }
+
+ private:
+  std::unique_ptr<fs::FileSystem> real_;
+  mutable std::mutex mutex_;
+  mutable std::condition_variable changed_;
+  bool armed_ = false;
+  mutable bool held_ = false;
+};
+
+/// The bytes `SeedRestorable` lays out: what a sync overwrote, and what it
+/// wrote over them.
+constexpr const char* kRestorePrevious = "the bytes this console had\n";
+constexpr const char* kRestoreServerCopy = "the server's copy\n";
+
+/// One overwrite on `console`'s card, with its backup present and its entry in
+/// the history, before the engine boots. Answers the entry's id.
+std::int64_t SeedRestorable(checks::Checks& c, Console& console) {
+  // Switched off, so the worker's only work is the restore: a tick here would
+  // be a second thing on the card and a different scenario.
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[sync]\nenabled = false\n"),
+           "a card with sync switched off");
+  const std::string save = harness::SavePath("game.srm");
+  const std::string backup = std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+  c.Expect(console.sandbox.SeedSave(save, kRestoreServerCopy),
+           "the save a sync wrote is on the card");
+  c.Expect(console.sandbox.Write(backup, kRestorePrevious),
+           "and so is the backup of what it replaced");
+  conflicts::History history(console.directory + conflicts::kHistoryFileName);
+  history.Load();
+  conflicts::Entry entry;
+  entry.kind = conflicts::EntryKind::kSave;
+  entry.event = conflicts::Event::kReplaced;
+  entry.rom_id = 4;
+  entry.rom_name = "Game";
+  entry.file_name = "game.srm";
+  entry.slot = "retroarch-srm";
+  entry.when = 1'757'000'000;
+  entry.sd_path = save;
+  entry.backup_sd_path = backup;
+  const auto appended = history.Append(entry);
+  c.Expect(appended.ok(), "the overwrite is in the history");
+  return appended.id;
+}
+
+/// M9-6 (#209), found in review: a restore pressed while the worker is still
+/// in its boot wait for the network runs now, not when the wait ends.
+///
+/// `RunWorker` waits up to `kNetworkWaitBudget` -- two minutes -- for `nifm` on
+/// a console that booted without Wi-Fi, and again after every wake from sleep
+/// until it has seen the network once. A restore is a copy between two files
+/// on the card and needs no network at all, so handing it to a worker parked
+/// in that wait would draw "Restoring..." for two minutes over nothing.
+void RestoreDuringBootWait(checks::Checks& c) {
+  Console console(c, "engine-restore-boot-wait");
+  const std::int64_t entry_id = SeedRestorable(c, console);
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  std::atomic<int> probes{0};
+  // The network never comes up, so the worker stays in the wait for the
+  // whole of this scenario unless something gets it out.
+  console.engine.UseNetworkProbe([&probes] {
+    ++probes;
+    return false;
+  });
+  console.engine.StartWorker();
+  for (int waited = 0; waited < 200 && probes.load() == 0; ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  c.Expect(probes.load() > 0, "the worker is in its wait for a network that is not there");
+
+  const auto start = std::chrono::steady_clock::now();
+  console.Restore(entry_id);
+  const ipc::RestoreState done = console.AwaitRestore(entry_id);
+  c.Expect(done.phase == ipc::RestorePhase::kDone,
+           std::string("the restore runs while the worker waits for the network: ") +
+               ipc::ToString(done.phase));
+  c.Expect(std::chrono::steady_clock::now() - start < std::chrono::seconds{5},
+           "and does not wait out the two-minute boot budget");
+  c.Expect(done.report.outcome == conflicts::RestoreOutcome::kRestored,
+           std::string("and it restored: ") + conflicts::ToString(done.report.outcome) + " -- " +
+               done.report.message);
+  c.ExpectEq(console.sandbox.Read(harness::SavePath("game.srm")), std::string(kRestorePrevious),
+             "the bytes are back on the card");
+}
+
+/// M9-6 (#209): a restore that takes as long as the card does holds no IPC
+/// call for that long.
+///
+/// `RestoreBackup` used to copy the save on the IPC thread before it answered,
+/// so the overlay's draw thread -- waiting in `serviceDispatchOut` -- was held
+/// for the whole copy, and so was every other command the sysmodule would have
+/// answered in the meantime. Now the command starts the restore on the worker
+/// and answers at once, and `GetRestoreState` is what the overlay polls.
+///
+/// The card is held *inside* the restore, so every assertion below is made
+/// while the copy is demonstrably still running.
+void RestoreIsPolled(checks::Checks& c) {
+  Console console(c, "engine-restore-polled");
+  const std::string previous = kRestorePrevious;
+  const std::string server_copy = kRestoreServerCopy;
+  const std::string save = harness::SavePath("game.srm");
+  const std::int64_t entry_id = SeedRestorable(c, console);
+
+  SlowCard card(rommsync::host::MakeNativeFileSystem(console.sandbox.root().string()));
+  console.Boot();
+  console.engine.UseCard(&card);
+  console.engine.StartWorker();
+
+  card.Arm();
+  const auto start = std::chrono::steady_clock::now();
+  ipc::Error answered = ipc::Error::kInternal;
+  const ipc::RestoreState taken = console.Restore(entry_id, &answered);
+  const auto took = std::chrono::steady_clock::now() - start;
+  c.Expect(answered == ipc::Error::kOk, "RestoreBackup is answered");
+  c.Expect(taken.phase == ipc::RestorePhase::kRunning && taken.entry_id == entry_id,
+           std::string("with the restore taken and running, not finished: ") +
+               ipc::ToString(taken.phase));
+  c.Expect(card.AwaitHeld(), "the restore is on the worker, held inside the copy");
+  c.Expect(took < std::chrono::seconds{1},
+           "and the command came back without waiting for the card");
+
+  // **The IPC thread is free while the copy runs.** Every command the overlay
+  // polls is answered -- the status screen's, and the conflicts screen's own.
+  const auto polled = std::chrono::steady_clock::now();
+  (void)console.Status();
+  const ipc::RestoreState running = console.RestoreState();
+  c.Expect(std::chrono::steady_clock::now() - polled < std::chrono::seconds{1},
+           "GetStatus and GetRestoreState are answered while the save is copying");
+  c.Expect(running.phase == ipc::RestorePhase::kRunning && running.entry_id == entry_id,
+           "and the poll says it is still running");
+
+  // A second press while one is running starts nothing: it is answered with the
+  // restore that is already out, which is what lets a screen tell "mine" from
+  // "someone else's".
+  const ipc::RestoreState again = console.Restore(entry_id + 100);
+  c.Expect(again.phase == ipc::RestorePhase::kRunning && again.entry_id == entry_id,
+           "a press during a restore is answered with the one already running");
+  c.ExpectEq(console.sandbox.Read(save), server_copy, "nothing is written while it is held");
+
+  card.Release();
+  const ipc::RestoreState done = console.AwaitRestore(entry_id);
+  c.Expect(done.phase == ipc::RestorePhase::kDone, "the restore finishes once the card answers");
+  c.Expect(done.report.outcome == conflicts::RestoreOutcome::kRestored,
+           std::string("and it restored: ") + conflicts::ToString(done.report.outcome) + " -- " +
+               done.report.message);
+  c.ExpectEq(console.sandbox.Read(save), previous, "the bytes are back on the card");
+  c.Expect(!done.report.backup_sd_path.empty() &&
+               console.sandbox.Read(done.report.backup_sd_path) == server_copy,
+           "and what they replaced was backed up first (hard rule 2)");
+  c.Expect(console.RestoreState().phase == ipc::RestorePhase::kDone,
+           "the outcome stays readable until the next restore");
 }
 
 // --- M9-4 (#208): the console goes to sleep ----------------------------------
@@ -1866,6 +2404,75 @@ int LogsTransportFailures(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// Sync switched off for this console in RomM, seen from the overlay (#235).
+///
+/// The acceptance's own words: the overlay shows "sync disabled on server" for
+/// the 400. What crosses IPC is `SyncResult::kServerDisabled` with the server
+/// counted as reached -- `overlay.status` holds the sentence it renders to --
+/// and the log still names it under `sync.refused`, where
+/// docs/TROUBLESHOOTING.md's section for it lives. A real device whose switch is
+/// really off, so the 400 is RomM's and not the proxy's.
+int ServerDisabled(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string device_id =
+      harness::CreateSyncDisabledDevice(c, client, base, fixture, "engine-server-disabled");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  rommsync::log::Reset();
+  Console console(c, "engine-server-disabled");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\n"),
+           "the console points at the rig");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "with a pairing to the switched-off device on the card");
+
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+
+  ipc::Status status = console.Status();
+  for (int waited = 0; waited < 400 && status.last_sync_result == ipc::SyncResult::kNever;
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    status = console.Status();
+  }
+  c.Expect(status.last_sync_result == ipc::SyncResult::kServerDisabled,
+           std::string("the status says the server switched sync off, not that it failed: ") +
+               ipc::ToString(status.last_sync_result));
+  c.Expect(status.online, "the server was reached, so the screen does not say offline");
+  c.Expect(status.auth == ipc::AuthState::kPaired, "and the pairing stands");
+
+  const ipc::LogTail tail = console.Log();
+  c.Expect(Logged(tail, "sync.refused"),
+           "the log names it where the guide looks for it:" + Rendered(tail));
+  bool said = false;
+  for (const std::string& line : tail.lines) {
+    said = said || line.find("server_disabled") != std::string::npos;
+  }
+  c.Expect(said, "and the tick ends as server_disabled:" + Rendered(tail));
+
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 void Commands(checks::Checks& c) {
   Console console(c, "engine-commands");
   console.Boot();
@@ -1877,8 +2484,8 @@ void Commands(checks::Checks& c) {
   std::string response;
   // `Unpair` came off this list in M1-4 (#8): it discards `token.dat` and the
   // verdict beside it, which is the half of "re-pairing recovers" the engine
-  // owns. Starting the device-code flow afterwards is `StartPair`'s and is not
-  // built.
+  // owns. Starting the device-code flow afterwards is `StartPair`'s, which
+  // M1-6 (#123) built (`engine.pairs`).
   // `StartPair` never reaches the engine on this console: `ServiceCore` refuses
   // first, because there is no `server.url` to pair with -- which is the right
   // answer and a different sentence from "not built yet".
@@ -1887,9 +2494,10 @@ void Commands(checks::Checks& c) {
            "StartPair is refused for want of a server before the engine is asked at all");
 
   // M1-6 built the engine half. What is left on this list is the *transport*:
-  // `core/` reaches a server through `http::HttpClient` and the console has no
-  // implementation of one yet, so a build with a server to pair with and nothing
-  // to reach it through answers `kUnavailable` -- "this build has no engine
+  // `core/` reaches a server through `http::HttpClient`, which the console has
+  // had since M1-7 (#126) and installs at boot (`main.cpp`), but a build that
+  // wires none -- this harness, here -- has a server to pair with and nothing to
+  // reach it through. It answers `kUnavailable` -- "this build has no engine
   // behind that command" -- rather than a plausible refusal about the server or
   // the card (`ipc.hpp`).
   Console configured(c, "engine-commands-2");
@@ -2367,6 +2975,23 @@ int DrainPreempted(http::HttpClient& client, const std::string& base) {
              "the worker picks the transfer back up once the tick is done, and finishes it");
   c.Expect(console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
            "so the rom still arrives");
+
+  // The finished rom asks for a tick of its own, to bring its save (#241).
+  // Waited out, so the card is not taken away from under it.
+  const auto ticks_logged = [&console]() {
+    int logged = 0;
+    for (const std::string& line : console.Log().lines) {
+      logged += line.find("sync.tick") != std::string::npos ? 1 : 0;
+    }
+    return logged;
+  };
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((ticks_logged() < 2 || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks_logged(), 2, "and the download's own tick ran after the press's");
   return c.failures();
 }
 
@@ -2741,6 +3366,2089 @@ int SleepDownload(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M10-2 (#228): the engine reads which RomM it is talking to before it asks
+/// that RomM anything, refuses one below the floor without a negotiate, and
+/// says so on the status screen and in the log.
+///
+/// Two halves. The fixture runs a RomM the floor accepts, so the first raises
+/// the floor past it, which is the only way to see a refusal from a real
+/// server: every request the console made is recorded, and none of them may be
+/// a negotiate. The second runs at the build's own floor and holds the answer
+/// to the fixture's version -- the full capability set on 5.4.0, and a refusal
+/// if a fixture below the floor is ever started -- which is the one place the
+/// real floor meets a real server.
+int RommVersion(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  rig::DisarmFault(client, base);
+  const rommsync::server::Probe asked = rommsync::server::ReadServer(client, base);
+  c.Expect(asked.ok() && asked.capabilities.known,
+           "the fixture says which RomM it is: " + asked.message);
+  const std::string fixture_version = asked.capabilities.version;
+
+  struct Run {
+    std::string name;
+    rommsync::server::Version floor;
+  };
+  const Run runs[] = {
+      {"above", rommsync::server::Version{99, 0, 0}},
+      {"floor", rommsync::server::kMinimumVersion},
+  };
+  for (const Run& run : runs) {
+    rommsync::log::Reset();
+    Console console(c, "engine-romm-" + run.name);
+    console.engine.UseMinimumServerVersion(run.floor);
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + base +
+                                       "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\n"),
+             run.name + ": the console points at the rig");
+    auth::StoredToken token;
+    token.server_url = base;
+    token.access_token = fixture.token;
+    token.device_id = fixture.device_id;
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             run.name + ": with the fixture pairing on the card");
+
+    // Every request recorded, none slowed.
+    Throttled recorded(client, std::chrono::milliseconds{0});
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    c.ExpectEq(console.Status().server_version, std::string(),
+               run.name + ": before a tick nothing has been asked");
+    console.engine.UseServer(&recorded, token.access_token);
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    const auto tick = [&console, &c, &run](int number) {
+      const std::int64_t before = console.Status().last_sync_at;
+      c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+               run.name + ": tick " + std::to_string(number) + " is asked for");
+      ipc::Status status = console.Status();
+      for (int waited = 0;
+           waited < 400 && (status.sync_in_progress ||
+                            status.last_sync_result == ipc::SyncResult::kNever ||
+                            (number > 1 && status.last_sync_at == before && waited < 80));
+           ++waited) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+        status = console.Status();
+      }
+      return status;
+    };
+    const auto count = [&recorded](std::string_view path) {
+      int n = 0;
+      for (const Throttled::Sent& sent : recorded.sent()) {
+        n += sent.url.find(path) != std::string::npos ? 1 : 0;
+      }
+      return n;
+    };
+
+    const ipc::Status first = tick(1);
+    const ipc::LogTail tail = console.Log();
+    const bool refused = run.floor > rommsync::server::ParseVersion(fixture_version).value_or(
+                                         rommsync::server::Version{});
+    c.ExpectEq(first.server_version, fixture_version,
+               run.name + ": the status names the fixture's version");
+    if (refused) {
+      c.Expect(!first.server_supported, run.name + ": and says it is too old");
+      c.Expect(first.last_sync_result == ipc::SyncResult::kFailed,
+               run.name + ": the tick is a failed one");
+      c.Expect(first.online, run.name + ": the server was reached, so it is not offline");
+      c.ExpectEq(count("/api/sync/negotiate"), 0,
+                 run.name + ": and no negotiate call was made");
+      c.ExpectEq(count("/api/roms"), 0, run.name + ": nor was the library asked for");
+      c.Expect(Logged(tail, "server.unsupported"),
+               run.name + ": the refusal is a named event:" + Rendered(tail));
+      bool summarised = false;
+      for (const std::string& line : tail.lines) {
+        summarised = summarised || line.find("sync.tick outcome=unsupported") != std::string::npos;
+      }
+      c.Expect(summarised, run.name + ": and the tick ends saying so:" + Rendered(tail));
+      c.ExpectEq(rommsync::overlay::Render(first, 0).headline,
+                 std::string("RomM is too old to sync with"),
+                 run.name + ": which is the overlay's headline");
+    } else {
+      c.Expect(first.server_supported, run.name + ": a supported server is not refused");
+      c.Expect(count("/api/sync/negotiate") > 0, run.name + ": and is negotiated with");
+      c.Expect(Logged(tail, "server.version"),
+               run.name + ": the version read is on the record:" + Rendered(tail));
+    }
+    c.ExpectEq(count("/api/heartbeat"), 1, run.name + ": the first tick asked once");
+
+    // The second tick: a supported server is not asked again this boot; a
+    // refused one is, so an upgrade is noticed without a reboot.
+    const ipc::Status second = tick(2);
+    c.ExpectEq(count("/api/heartbeat"), refused ? 2 : 1,
+               run.name + (refused ? ": a refused server is asked again on the next tick"
+                                   : ": a supported server is asked once a boot"));
+    c.ExpectEq(second.server_supported, !refused, run.name + ": and the answer stands");
+  }
+  return c.failures();
+}
+
+/// A server whose heartbeat is held until the test lets it answer, and which
+/// counts heartbeats and negotiations. Everything else answers as an empty
+/// library, and a negotiation as a dropped connection.
+class HeldHeartbeat final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      ++heartbeats_;
+      arrived_.notify_all();
+      released_.wait(lock, [this] { return heartbeats_ < held_; });
+      result.response.status = 200;
+      result.response.body = R"({"SYSTEM":{"VERSION":"5.4.0"}})";
+      return result;
+    }
+    if (request.url.find("/api/roms") != std::string::npos) {
+      result.response.status = 200;
+      result.response.body = R"({"total":0,"limit":64,"offset":0,"items":[]})";
+      return result;
+    }
+    if (request.url.find("/api/sync/negotiate") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++negotiations_;
+    }
+    result.error = http::Error::kConnectFailed;
+    result.message = "nothing behind this test server";
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    return Send({});
+  }
+
+  /// Hold heartbeat number `n` and every one after it.
+  void HoldFrom(int n) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    held_ = n;
+  }
+
+  bool AwaitHeartbeat(int n) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return arrived_.wait_for(lock, std::chrono::seconds{10}, [this, n] { return heartbeats_ >= n; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      held_ = 1 << 30;
+    }
+    released_.notify_all();
+  }
+
+  int heartbeats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return heartbeats_;
+  }
+  int negotiations() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return negotiations_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable arrived_;
+  std::condition_variable released_;
+  int heartbeats_ = 0;
+  int held_ = 1 << 30;
+  int negotiations_ = 0;
+};
+
+/// M10-2 (#228): an answer about the server that was asked for **before** the
+/// engine was told to forget it must not stand for what came after.
+///
+/// The heartbeat is held, and while it is in flight the floor moves past what
+/// the server will answer -- the same "ask again" a `server.url` change or a
+/// pairing sets. When the old question's answer lands it was judged against the
+/// old floor, and a tick that recorded it would mark the server read: the next
+/// tick would then skip the heartbeat and negotiate with a server the new floor
+/// refuses.
+void RommForgotten(checks::Checks& c) {
+  Console console(c, "engine-romm-forgotten");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n\n[sync]\n"
+                                 "enabled = true\ninterval_min = 0\non_boot = false\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-romm-forgotten";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one");
+  console.engine.UseMinimumServerVersion(rommsync::server::kMinimumVersion);
+  HeldHeartbeat server;
+  server.HoldFrom(1);
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  const auto settle = [&console](std::int64_t after) {
+    ipc::Status status = console.Status();
+    for (int waited = 0; waited < 400 && (status.sync_in_progress || status.last_sync_at == after);
+         ++waited) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      status = console.Status();
+    }
+    return status;
+  };
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "the first tick is asked for");
+  c.Expect(server.AwaitHeartbeat(1), "and it is asking the server which RomM it is");
+  console.engine.UseMinimumServerVersion(rommsync::server::Version{99, 0, 0});
+  server.Release();
+  const ipc::Status first = settle(0);
+  c.Expect(first.last_sync_result != ipc::SyncResult::kNever, "the first tick settled");
+  const int negotiated = server.negotiations();
+  c.Expect(negotiated > 0, "and negotiated, under the floor it asked with");
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a second tick is asked for");
+  // A refused tick returns before `last_sync_at` moves, so the wait is on the
+  // tick being over rather than on the clock.
+  ipc::Status second = console.Status();
+  for (int waited = 0; waited < 400 && (second.sync_in_progress || server.heartbeats() < 2 ||
+                                        second.server_supported);
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    second = console.Status();
+  }
+  c.ExpectEq(server.heartbeats(), 2,
+             "the second tick asks again: the first answer predates the forgetting");
+  c.Expect(!second.server_supported, "and the new floor refuses the server");
+  c.ExpectEq(server.negotiations(), negotiated, "so the second tick negotiated nothing");
+}
+
+/// #231: a card where Tico 0.8 keeps saves for two accounts and `config.ini`
+/// names neither. The scan syncs no Tico save there (`scan.tico`); what this adds
+/// is that the settings screen -- `GetConfig`, which is where a user goes to pick
+/// one -- names both accounts after a tick, as a warning on `[tico] account`.
+int TicoAccounts(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  rlog::Reset();
+  Console console(c, "engine-tico-accounts");
+  if (!Downloadable(console, c, base, fixture, true)) {
+    return c.failures();
+  }
+  const std::string kAccounts[] = {"0123456789abcdef0123456789abcdef",
+                                   "fedcba9876543210fedcba9876543210"};
+  for (const std::string& uid : kAccounts) {
+    console.sandbox.MakeDirs("/tico/saves/users/" + uid + "/snes");
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+
+  const auto warned = [&console, &kAccounts] {
+    for (const config::Diagnostic& note : console.Configured().diagnostics) {
+      if (note.section == "tico" && note.key == "account" &&
+          note.severity == config::Severity::kWarning &&
+          note.message.find(kAccounts[0]) != std::string::npos &&
+          note.message.find(kAccounts[1]) != std::string::npos) {
+        return true;
+      }
+    }
+    return false;
+  };
+  c.Expect(!warned(), "nothing is said before the card has been read");
+
+  console.engine.StartWorker();
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  const ipc::Status ticked = Until(
+      console,
+      [](const ipc::Status& status) { return status.last_sync_result != ipc::SyncResult::kNever; },
+      std::chrono::seconds{120});
+  c.Expect(ticked.last_sync_result != ipc::SyncResult::kNever, "and it ran");
+  c.Expect(warned(), "the settings screen names both accounts and asks for one");
+  return c.failures();
+}
+
+/// Every save row RomM holds for `rom_id`, by id.
+std::vector<std::int64_t> SaveIdsFor(http::HttpClient& client, const std::string& base,
+                                     const harness::Fixture& fixture, std::int64_t rom_id) {
+  const http::Result listed = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom_id), fixture));
+  const rommsync::json::ParseResult parsed = rommsync::json::Parse(listed.response.body);
+  std::vector<std::int64_t> ids;
+  if (listed.successful() && parsed.ok() && parsed.value.is_array()) {
+    for (const rommsync::json::Value& save : parsed.value.elements()) {
+      ids.push_back(harness::Number(save, "id"));
+    }
+  }
+  return ids;
+}
+
+/// Saves other consoles left on another rom, more of them than the log's tail
+/// holds lines. Deleted again when this goes.
+///
+/// **A library is never empty of other people's saves**, and a console new to
+/// RomM is offered every one of them on its first tick. Before #237 placed them
+/// under a name the scan reads back, each landed under RomM's tagged name and
+/// was a `scan.skipped` line on every tick after -- so a tick wrote more lines
+/// than `log::kTailLines`, and the tail no longer held the tick before it. That
+/// is what main's long-lived fixture did to `engine.foreground` and
+/// `engine.server_deleted` with twenty-two rows `sched.*` had left behind. How
+/// many lines such a tick writes since #236 and #237 has not been re-measured,
+/// which is the reason this stays: a scenario that counts ticks has to count
+/// them on a server like that one, not only on a fresh fixture.
+class OtherConsolesSaves {
+ public:
+  OtherConsolesSaves(rig::Checks& c, http::HttpClient& client, const std::string& base,
+                     const harness::Fixture& fixture)
+      : client_(client), base_(base), fixture_(fixture), staging_(c, "engine-other-consoles") {
+    harness::Rom rom;
+    c.Expect(harness::FindRom(client, base, fixture, "gb240p.gb", &rom),
+             "the fixture library has gb240p.gb, for other consoles' saves");
+    if (rom.id == 0) {
+      return;
+    }
+    const std::string staged = staging_.Host("/another-console.srm");
+    rig::WriteFile(staged, "a save another console uploaded\n");
+    for (std::size_t i = 0; i <= rlog::kTailLines; ++i) {
+      // A name of its own each, so no two rows can share RomM's datetime tag.
+      const std::string name = "another-console-" + std::to_string(i) + ".srm";
+      harness::Save save;
+      if (harness::UploadSave(client, base, fixture, rom.id,
+                              harness::UniqueSlot("engine-other-console"), "engine-other",
+                              staged, name, /*with_device=*/false, &save)) {
+        ids_.push_back(save.id);
+      }
+    }
+    c.ExpectEq(ids_.size(), rlog::kTailLines + 1,
+               "RomM holds more saves from other consoles than the log's tail has lines");
+  }
+
+  ~OtherConsolesSaves() {
+    for (const std::int64_t id : ids_) {
+      harness::DeleteSave(client_, base_, fixture_, id);
+    }
+  }
+
+  OtherConsolesSaves(const OtherConsolesSaves&) = delete;
+  OtherConsolesSaves& operator=(const OtherConsolesSaves&) = delete;
+
+ private:
+  http::HttpClient& client_;
+  const std::string& base_;
+  const harness::Fixture& fixture_;
+  harness::Sandbox staging_;
+  std::vector<std::int64_t> ids_;
+};
+
+/// How many `sync.tick` lines the log has written since this was installed:
+/// one per tick that ran, whatever ended it (`LogTickEnd`). Installed before
+/// the console it counts, so it outlives the worker that writes to it.
+///
+/// **Counted at the sink, not off `GetLog`.** The tail is the last
+/// `log::kTailLines` lines, and one tick on a console whose library holds
+/// other consoles' saves writes more than that by itself
+/// (`OtherConsolesSaves`). A count of the tail is then a count of the ticks
+/// that still fit in it, which is how main's fixture made both scenarios
+/// below come up one tick short of ticks that had run. The sink sees every
+/// line; `test_heap_steady`'s `TickCounter` counts the same way.
+class TickLines final : public rlog::Sink {
+ public:
+  TickLines() : previous_(rlog::GetSink()) { rlog::SetSink(this); }
+  ~TickLines() override { rlog::SetSink(previous_); }
+
+  void Write(rlog::Level, std::string_view line) override {
+    if (line.find(" sync.tick ") != std::string_view::npos) {
+      ticks_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  int ticks() const { return ticks_.load(std::memory_order_relaxed); }
+
+ private:
+  rlog::Sink* previous_;
+  std::atomic<int> ticks_{0};
+};
+
+/// The real client, with a game that starts the moment the armed tick asks for
+/// the library -- the one request a tick makes before it touches a save.
+///
+/// What it stands for is a user launching a game while a tick is under way: the
+/// probe said no when the tick started, and says yes before the first save is
+/// placed. Also records every URL, for "nothing more went out".
+class LaunchesMidTick final : public http::HttpClient {
+ public:
+  LaunchesMidTick(http::HttpClient& inner, std::atomic<bool>& running)
+      : inner_(inner), running_(running) {}
+
+  http::Result Send(const http::Request& request) override {
+    Record(request.url);
+    if (request.url.find("/api/roms") != std::string::npos && armed_.exchange(false)) {
+      running_ = true;
+    }
+    return inner_.Send(request);
+  }
+
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    Record(request.url);
+    return inner_.Download(request, target);
+  }
+
+  void Arm() { armed_ = true; }
+
+  std::vector<std::string> urls() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return urls_;
+  }
+
+ private:
+  void Record(const std::string& url) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    urls_.push_back(url);
+  }
+
+  http::HttpClient& inner_;
+  std::atomic<bool>& running_;
+  std::atomic<bool> armed_{false};
+  mutable std::mutex mutex_;
+  std::vector<std::string> urls_;
+};
+
+/// How many of `urls` from `from` on asked RomM to plan a sync.
+std::size_t Negotiations(const std::vector<std::string>& urls, std::size_t from) {
+  std::size_t asked = 0;
+  for (std::size_t i = from; i < urls.size(); ++i) {
+    asked += urls[i].find("/api/sync/negotiate") != std::string::npos ? 1 : 0;
+  }
+  return asked;
+}
+
+/// M10-16 (#242): nothing is downloaded, placed or uploaded while a game runs,
+/// and **one** tick runs once it closes.
+///
+/// Against the real RomM, on a device of its own with no history, so the tick
+/// that finally runs has something real to do: the save on the card is not on
+/// the server, and negotiate plans its upload. That is what makes "nothing was
+/// uploaded while the game ran" a claim about a tick that *would* have, rather
+/// than about one with nothing to send. The game is a fake foreground probe --
+/// `pm:dmnt` is the console's half and no host can reach it. The library holds
+/// other consoles' saves too (`OtherConsolesSaves`), as a real one does.
+///
+/// Two ticks fall due under the game -- the boot tick and two presses -- and one
+/// runs after it, which is #37's coalescing doing what it already did for a
+/// suspend.
+int Foreground(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-foreground");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+  const OtherConsolesSaves others(c, client, base, fixture);
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-foreground");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     // The boot tick is the scheduled one, and it
+                                     // falls due the instant the worker starts --
+                                     // under the game.
+                                     "on_boot = true\nstates = false\n"),
+           "the console points at the rig");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "paired, as a device RomM has never seen sync");
+
+  // Tico's layout rather than RetroArch's: what is under test is the hold, not
+  // which folder a save is found in.
+  const std::string save = "/tico/saves/nes/nova.srm";
+  console.sandbox.MakeDirs("/tico/saves/nes");
+  const std::string played = "what the game had on the card when it started\n";
+  c.Expect(console.sandbox.Write(save, played), "a save on the card the server does not have");
+
+  std::atomic<bool> running{true};
+  LaunchesMidTick counted(client, running);
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseForegroundProbe([&running] { return running.load(); },
+                                    std::chrono::milliseconds{50});
+  console.engine.UseServer(&counted, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kDeferred,
+           "Sync now under the game is taken, and says it waits for the game");
+  std::this_thread::sleep_for(std::chrono::milliseconds{500});
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kDeferred,
+           "and a second press is the same held tick, not a tick already running");
+  // Twenty of the worker's re-polls, and every one of them finds the game.
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+
+  c.ExpectEq(counted.urls().size(), std::size_t{0},
+             "nothing reached the server while the game ran: no heartbeat -- this is the "
+             "boot's first tick, so one was due (#228) -- no library, no negotiate (where "
+             "#235's 'sync is disabled' would come from), no upload, no download");
+  const std::vector<std::int64_t> during = SaveIdsFor(client, base, fixture, rom.id);
+  c.ExpectEq(during.size(), before.size(), "so RomM holds no new save for the rom");
+  c.ExpectEq(console.sandbox.Read(save), played, "and the save on the card is untouched");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/state.db"),
+           "no tick recorded a baseline, because no tick ran");
+  c.Expect(!console.sandbox.Exists("/config/rommsync/play.db"),
+           "and none stamped the play window: a held tick did not look at the saves, so "
+           "the session the game is in is not cut in half (#39)");
+  const ipc::Status held = console.Status();
+  c.Expect(!held.sync_in_progress, "the status screen does not draw a held tick as syncing");
+  c.Expect(held.last_sync_result == ipc::SyncResult::kNever, "nor as one that ran");
+  const ipc::LogTail held_log = console.Log();
+  c.ExpectEq(ticks.ticks(), 0, "the log has no tick in it:" + Rendered(held_log));
+  c.Expect(Logged(held_log, "sync.held"), "and says why:" + Rendered(held_log));
+
+  // The game closes.
+  running = false;
+  const ipc::Status after = Until(
+      console,
+      [](const ipc::Status& status) {
+        return status.last_sync_result != ipc::SyncResult::kNever && !status.sync_in_progress;
+      },
+      std::chrono::seconds{60});
+  c.Expect(after.last_sync_result == ipc::SyncResult::kOk ||
+               after.last_sync_result == ipc::SyncResult::kPartial,
+           std::string("a tick runs once it has, and reaches the server: ") +
+               ipc::ToString(after.last_sync_result));
+  // Long enough for a second tick to show itself if the held ones had been
+  // queued rather than coalesced.
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  const ipc::LogTail done_log = console.Log();
+  c.ExpectEq(ticks.ticks(), 1,
+             "exactly one: the boot tick and both presses were the same tick" +
+                 Rendered(done_log));
+
+  std::vector<std::int64_t> uploaded;
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+    if (std::find(before.begin(), before.end(), id) == before.end()) {
+      uploaded.push_back(id);
+    }
+  }
+  c.ExpectEq(uploaded.size(), std::size_t{1}, "and that tick uploaded the save, once");
+  c.ExpectEq(console.sandbox.Read(save), played, "which it read and did not rewrite");
+
+  // **A game launched while a tick is under way.** The probe said no when the
+  // tick started; the game starts as the tick fetches the library, before any
+  // save is planned. The tick has to notice before it places or sends one --
+  // the game has just read the save a download would replace.
+  harness::Rom other;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee.nes", &other),
+           "the fixture library has 240pee.nes");
+  const std::vector<std::int64_t> other_before = SaveIdsFor(client, base, fixture, other.id);
+  const std::string second = "/tico/saves/nes/240pee.srm";
+  c.Expect(console.sandbox.Write(second, "a second save, new since the last tick\n"),
+           "a second save the server does not have");
+  const std::size_t asked_before = counted.urls().size();
+  counted.Arm();
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+           "with no game running, Sync now starts a tick");
+  const std::chrono::steady_clock::time_point launched_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{30};
+  while (!running.load() && std::chrono::steady_clock::now() < launched_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.Expect(running.load(), "the game starts while that tick fetches the library");
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  c.ExpectEq(Negotiations(counted.urls(), asked_before), std::size_t{0},
+             "the tick stops before it asks for a plan: nothing is placed or sent under the "
+             "game it now finds");
+  c.ExpectEq(SaveIdsFor(client, base, fixture, other.id).size(), other_before.size(),
+             "so the second save is not on the server yet");
+  c.ExpectEq(ticks.ticks(), 1, "and that tick did not end as one that ran");
+  c.Expect(!console.Status().sync_in_progress, "nor is it drawn as still running");
+
+  running = false;
+  const std::chrono::steady_clock::time_point ticked_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 2 && std::chrono::steady_clock::now() < ticked_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  std::this_thread::sleep_for(std::chrono::seconds{1});
+  c.ExpectEq(ticks.ticks(), 2,
+             "the press it was is held, and runs once the game closes -- once");
+  std::vector<std::int64_t> other_uploaded;
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, other.id)) {
+    if (std::find(other_before.begin(), other_before.end(), id) == other_before.end()) {
+      other_uploaded.push_back(id);
+    }
+  }
+  c.ExpectEq(other_uploaded.size(), std::size_t{1}, "and uploads the second save, once");
+  std::size_t heartbeats = 0;
+  for (const std::string& url : counted.urls()) {
+    heartbeats += url.find("/api/heartbeat") != std::string::npos ? 1 : 0;
+  }
+  c.ExpectEq(heartbeats, std::size_t{1},
+             "one heartbeat in the whole run: the tick that ran after the first game read "
+             "it, the held ticks never did, and the second tick reused the answer (#228)");
+
+  for (const std::int64_t id : uploaded) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
+  for (const std::int64_t id : other_uploaded) {
+    harness::DeleteSave(client, base, fixture, id);
+  }
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// M10-7 (#233): a save deleted in RomM, met by the whole engine -- the setting
+/// read from `config.ini`, the tick, the log line, the conflicts screen and the
+/// status counts -- once per value of `[sync] on_server_delete`.
+///
+/// `keep` is the run that proves the setting reaches the tick, because removing
+/// is also what a tick does with no setting at all. Each run is a device of its
+/// own, so the first tick's upload is the only thing negotiate plans for
+/// nova.nes -- beside the other consoles' saves on another rom
+/// (`OtherConsolesSaves`) that a console new to RomM is offered as well.
+int ServerDeleted(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const OtherConsolesSaves others(c, client, base, fixture);
+
+  for (const bool keep : {false, true}) {
+    const std::string what = keep ? "keep" : "remove";
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-deleted-" + what);
+    if (device_id.empty()) {
+      return c.failures();
+    }
+    const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-deleted-" + what);
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + base +
+                                       "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\nstates = false\non_server_delete = " +
+                                       what + "\n"),
+             what + ": the console points at the rig");
+    auth::StoredToken token;
+    token.server_url = base;
+    token.access_token = fixture.token;
+    token.device_id = device_id;
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             what + ": paired");
+    const std::string save = "/tico/saves/nes/nova.srm";
+    console.sandbox.MakeDirs("/tico/saves/nes");
+    const std::string bytes = "the save that is about to be deleted in RomM (" + what + ")\n";
+    console.sandbox.SeedSave(save, bytes);
+
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    console.engine.UseServer(&client, token.access_token);
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    const auto tick = [&console, &c, &what, &ticks](int n) {
+      c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, what + ": a tick is asked for");
+      const std::chrono::steady_clock::time_point by =
+          std::chrono::steady_clock::now() + std::chrono::seconds{60};
+      while (ticks.ticks() < n && std::chrono::steady_clock::now() < by) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      }
+      c.ExpectEq(ticks.ticks(), n, what + ": and it ran");
+    };
+
+    tick(1);
+    std::vector<std::int64_t> uploaded;
+    for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+      if (std::find(before.begin(), before.end(), id) == before.end()) {
+        uploaded.push_back(id);
+      }
+    }
+    c.ExpectEq(uploaded.size(), std::size_t{1}, what + ": the first tick uploads the save");
+    for (const std::int64_t id : uploaded) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+
+    tick(2);
+    const ipc::LogTail log = console.Log();
+    c.Expect(Logged(log, "save.deleted"), what + ": the log says RomM deleted it:" + Rendered(log));
+    const ipc::Status status = console.Status();
+    c.ExpectEq(status.conflicts, std::int64_t{0},
+               what + ": a deletion is not counted as a conflict");
+    ipc::ConflictQuery query;
+    std::string response;
+    console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(query), &response);
+    const ipc::ConflictPage page = ipc::DecodeConflictPage(response).value;
+    if (keep) {
+      c.ExpectEq(console.sandbox.Read(save), bytes, "keep: the save is still on the card");
+      c.Expect(page.entries.empty(), "keep: and nothing was replaced, so nothing is listed");
+    } else {
+      c.Expect(!console.sandbox.Exists(save), "remove: the save is off the card");
+      c.Expect(console.sandbox.HasBackupOf(bytes), "remove: and its bytes are under .backup/");
+      c.Expect(page.entries.size() == 1 &&
+                   page.entries[0].entry.event == conflicts::Event::kDeleted &&
+                   page.entries[0].backup_present,
+               "remove: the conflicts screen lists it, with its backup there to restore");
+    }
+
+    // ...and the tick after that sends nothing back up.
+    tick(3);
+    std::size_t after = 0;
+    for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+      after += std::find(before.begin(), before.end(), id) == before.end() ? 1 : 0;
+    }
+    c.ExpectEq(after, std::size_t{0}, what + ": nothing was uploaded again");
+
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+  return c.failures();
+}
+
+// --- the shared slot (#236) ----------------------------------------------------
+
+/// A request as RetroArch's Cloud Sync makes it: WebDAV under
+/// `/api/sync/retroarch/`, as the fixture user over Basic auth (#226 R2).
+http::Result AsRetroArch(http::HttpClient& client, const std::string& base, http::Method method,
+                         const std::string& path, const std::string& body = std::string()) {
+  http::Request request;
+  request.method = method;
+  request.url = base + "/api/sync/retroarch/" + path;
+  request.headers.push_back(
+      {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
+  if (method == http::Method::kPut) {
+    request.headers.push_back({"Content-Type", "application/octet-stream"});
+    request.body = body;
+  }
+  return client.Send(request);
+}
+
+/// One save row RomM holds for a rom.
+struct ServerRow {
+  std::int64_t id = 0;
+  std::string slot;
+  std::string emulator;
+  std::string file_name;
+  std::string content_hash;
+};
+
+std::vector<ServerRow> RowsFor(http::HttpClient& client, const std::string& base,
+                               const harness::Fixture& fixture, std::int64_t rom_id,
+                               const std::string& slot) {
+  const http::Result listed = client.Send(harness::Authed(
+      http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom_id), fixture));
+  const rommsync::json::ParseResult parsed = rommsync::json::Parse(listed.response.body);
+  std::vector<ServerRow> rows;
+  if (!listed.successful() || !parsed.ok() || !parsed.value.is_array()) {
+    return rows;
+  }
+  for (const rommsync::json::Value& save : parsed.value.elements()) {
+    ServerRow row;
+    row.id = harness::Number(save, "id");
+    row.slot = harness::Field(save, "slot");
+    row.emulator = harness::Field(save, "emulator");
+    row.file_name = harness::Field(save, "file_name");
+    row.content_hash = harness::Field(save, "content_hash");
+    if (row.slot == slot) {
+      rows.push_back(std::move(row));
+    }
+  }
+  return rows;
+}
+
+/// Delete what the shared and the old slot hold for `rom_id`, so a scenario
+/// starts from a slot it knows. Rig tests run serially; what is there is an
+/// earlier run's leftovers.
+void ClearSlots(http::HttpClient& client, const std::string& base, const harness::Fixture& fixture,
+                std::int64_t rom_id) {
+  for (const char* slot : {"autosave", "tico-srm"}) {
+    for (const ServerRow& row : RowsFor(client, base, fixture, rom_id, slot)) {
+      harness::DeleteSave(client, base, fixture, row.id);
+    }
+  }
+}
+
+/// A console on its own device, configured for the rig with no tick of its own:
+/// each one is a press, run to its end.
+bool PointAtTheRig(Console& console, rig::Checks& c, const std::string& base,
+                   const harness::Fixture& fixture, const std::string& device_id) {
+  if (!console.sandbox.Write("/config/rommsync/config.ini",
+                             "[server]\nurl = " + base +
+                                 "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                 "on_boot = false\nstates = false\n")) {
+    c.Expect(false, "the console points at the rig");
+    return false;
+  }
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  if (!auth::SaveToken(console.directory + auth::kTokenFileName, token).ok()) {
+    c.Expect(false, "and is paired as its own device");
+    return false;
+  }
+  return true;
+}
+
+/// Press Sync now and wait for that tick to end.
+bool TickOnce(Console& console, const TickLines& ticks, rig::Checks& c, const std::string& what) {
+  const int before = ticks.ticks();
+  if (console.SyncNow() != ipc::SyncOutcome::kAccepted) {
+    c.Expect(false, what + ": Sync now starts a tick");
+    return false;
+  }
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((ticks.ticks() <= before || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  const ipc::Status status = console.Status();
+  const bool ran = ticks.ticks() > before && !status.sync_in_progress;
+  c.Expect(ran && status.last_sync_result == ipc::SyncResult::kOk,
+           what + ": the tick ran clean -- " + ipc::ToString(status.last_sync_result) +
+               Rendered(console.Log()));
+  return ran;
+}
+
+/// #236's interop acceptance, through the real engine: RetroArch's Cloud Sync
+/// writes `saves/mGBA/<rom>.srm` and the console's Tico folder gets it as
+/// `<rom>.srm`; the console's next save is what RetroArch is then served.
+int Interop(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee_mb.gba", &rom),
+           "the fixture library has 240pee_mb.gba");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-interop");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  // Unique bytes per run: RomM remembers what a slot lost, and a client holding
+  // a deleted version's bytes is told `delete`.
+  const std::string stamp = harness::UniqueSlot("interop");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-interop");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::string save = "/tico/saves/gba/240pee_mb.srm";
+  console.sandbox.MakeDirs("/tico/saves/gba");
+  const std::string older = "the switch's save, before RetroArch played " + stamp + "\n";
+  console.sandbox.SeedSave(save, older);
+
+  harness::PassASecond();
+  const std::string retroarch = "RetroArch's progress, synced by Cloud Sync " + stamp + "\n";
+  const http::Result put =
+      AsRetroArch(client, base, http::Method::kPut, "saves/mGBA/240pee_mb.srm", retroarch);
+  c.Expect(put.successful(), "RetroArch's Cloud Sync stores its save: HTTP " +
+                                 std::to_string(put.response.status));
+
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.Boot();
+  console.engine.UseServer(&client, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  // RetroArch -> Switch.
+  TickOnce(console, ticks, c, "RetroArch to Switch");
+  c.ExpectEq(console.sandbox.Read(save), retroarch,
+             "RetroArch's save is in Tico's gba folder, under Tico's own name");
+  c.Expect(console.sandbox.HasBackupOf(older), "with the Switch's own bytes under .backup/");
+  const std::vector<ServerRow> after_download = RowsFor(client, base, fixture, rom.id, "autosave");
+  c.ExpectEq(after_download.size(), std::size_t{1},
+             "and nothing was uploaded: the autosave slot holds RetroArch's save alone");
+
+  // Switch -> RetroArch.
+  harness::PassASecond();
+  const std::string played = "the switch played on from there " + stamp + "\n";
+  console.sandbox.Reseed(save, played);
+  TickOnce(console, ticks, c, "Switch to RetroArch");
+  const http::Result served =
+      AsRetroArch(client, base, http::Method::kGet, "saves/mGBA/240pee_mb.srm");
+  c.Expect(served.successful() && served.response.body == played,
+           "RetroArch is served the Switch's save at its own path: HTTP " +
+               std::to_string(served.response.status) + " -- " + served.response.body);
+  bool uploaded = false;
+  for (const ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+    if (row.content_hash == crypto::Md5Hex(played)) {
+      uploaded = true;
+      c.ExpectEq(row.emulator, std::string("mgba"), "uploaded under mGBA's core id");
+      c.Expect(row.file_name.rfind("240pee_mb [", 0) == 0 &&
+                   row.file_name.size() > 4 &&
+                   row.file_name.compare(row.file_name.size() - 4, 4, ".srm") == 0,
+               "under the rom's own stem: " + row.file_name);
+    }
+  }
+  c.Expect(uploaded, "the Switch's save is a version in the autosave slot");
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// `POST /api/saves` as rc1 sent one: its own `tico-srm` slot, `emulator=tico`,
+/// this device's sync row written.
+bool UploadAsRc1(http::HttpClient& client, const std::string& base,
+                 const harness::Fixture& fixture, const std::string& device_id,
+                 std::int64_t rom_id, const std::string& host_path, const std::string& name) {
+  http::Request request = harness::Authed(
+      http::Method::kPost,
+      base + "/api/saves?rom_id=" + std::to_string(rom_id) +
+          "&emulator=tico&slot=tico-srm&overwrite=true&device_id=" + device_id,
+      fixture);
+  http::FormPart part;
+  part.name = "saveFile";
+  part.file_path = host_path;
+  part.file_name = name;
+  part.content_type = "application/octet-stream";
+  request.form.push_back(part);
+  return client.Send(request).successful();
+}
+
+/// True when conflicts.db has a conflict row for `rom_id`.
+bool ConflictRecorded(const Console& console, std::int64_t rom_id) {
+  const std::string text = console.sandbox.Read("/config/rommsync/conflicts.db");
+  const std::string rom = "\"rom_id\":" + std::to_string(rom_id) + ",";
+  std::size_t at = 0;
+  while (at < text.size()) {
+    const std::size_t end = text.find('\n', at);
+    const std::string line = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    if (line.find(rom) != std::string::npos && line.find("\"event\":\"conflict\"") != std::string::npos) {
+      return true;
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    at = end + 1;
+  }
+  return false;
+}
+
+/// #236's upgrade acceptance: a console rc1 synced, with rc1's own `state.db`
+/// (version 2, rows in `tico-srm`) and rc1's uploads on the server, runs its
+/// first ticks on this build. Three roms, the three ways the shared slot can be:
+///
+///   - nova.nes: empty, so the save is uploaded into it -- once;
+///   - 240pee.nes: holding RetroArch's progress, newer than the card's, which is
+///     downloaded over it with the card's bytes backed up first;
+///   - gb240p.gb: holding RetroArch's progress, *older* than the card's: the
+///     upload is refused by the slot guard (this device never synced that slot),
+///     and the 409 is a conflict -- RetroArch's copy on the card, the Switch's
+///     under `.backup/` and still on the server in `tico-srm`, and an entry on
+///     the conflicts screen. Not silently a download: see `AdoptLegacySaves`.
+///
+/// No data is lost (every byte the card held is on the card, under `.backup/` or
+/// on the server), rc1's rows stay where they are, and the second tick uploads
+/// nothing.
+int Upgrade(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  struct Game {
+    const char* rom_file;
+    const char* folder;
+    const char* core_folder;
+    std::int64_t rom_id = 0;
+    std::string save;
+    std::string bytes;
+    std::string retroarch;
+  };
+  Game games[] = {{"nova.nes", "/tico/saves/nes", nullptr, 0, {}, {}, {}},
+                  {"240pee.nes", "/tico/saves/nes", "FCEUmm", 0, {}, {}, {}},
+                  {"gb240p.gb", "/tico/saves/gb", "Gambatte", 0, {}, {}, {}}};
+  Game& empty = games[0];
+  Game& newer = games[1];
+  Game& older = games[2];
+  for (Game& game : games) {
+    harness::Rom rom;
+    c.Expect(harness::FindRom(client, base, fixture, game.rom_file, &rom),
+             std::string("the fixture library has ") + game.rom_file);
+    if (rom.id == 0) {
+      return c.failures();
+    }
+    game.rom_id = rom.id;
+    ClearSlots(client, base, fixture, rom.id);
+    const std::string stem(game.rom_file, std::string_view(game.rom_file).find('.'));
+    game.save = std::string(game.folder) + "/" + stem + ".srm";
+  }
+  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-upgrade");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::string stamp = harness::UniqueSlot("upgrade");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-upgrade");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  console.sandbox.MakeDirs("/tico/saves/nes");
+  console.sandbox.MakeDirs("/tico/saves/gb");
+
+  // RetroArch played gb240p before the Switch last did.
+  older.retroarch = "RetroArch's gb240p, older than the Switch's " + stamp + "\n";
+  c.Expect(AsRetroArch(client, base, http::Method::kPut, "saves/Gambatte/gb240p.srm",
+                       older.retroarch)
+               .successful(),
+           "RetroArch's gb240p is in the shared slot");
+  harness::PassASecond();
+
+  // rc1's sync: every save on the card, uploaded into rc1's own slot.
+  for (Game& game : games) {
+    game.bytes = std::string("rc1 synced ") + game.rom_file + " " + stamp + "\n";
+    console.sandbox.SeedSave(game.save, game.bytes);
+    c.Expect(UploadAsRc1(client, base, fixture, device_id, game.rom_id,
+                         console.sandbox.Host(game.save), game.save.substr(game.save.rfind('/') + 1)),
+             std::string("rc1 uploaded ") + game.rom_file + " into tico-srm");
+  }
+
+  // RetroArch played 240pee after the Switch last did.
+  harness::PassASecond();
+  newer.retroarch = "RetroArch's 240pee, newer than the Switch's " + stamp + "\n";
+  c.Expect(AsRetroArch(client, base, http::Method::kPut, "saves/FCEUmm/240pee.srm",
+                       newer.retroarch)
+               .successful(),
+           "RetroArch's 240pee is in the shared slot");
+
+  // rc1's state.db, in rc1's format: each save's facts, as rc1 read them off the
+  // card, and rc1's upload's digest as the server's.
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  std::string v2 = "rommsync-state 2\n";
+  for (const Game& game : games) {
+    const fs::Listing listing = card->List(game.folder);
+    for (const fs::Entry& entry : listing.entries) {
+      if (game.save == std::string(game.folder) + "/" + entry.name) {
+        v2 += "{\"rom_id\":" + std::to_string(game.rom_id) +
+              ",\"slot\":\"tico-srm\",\"content_hash\":\"" + crypto::Md5Hex(game.bytes) +
+              "\",\"mtime\":" + std::to_string(entry.modified_unix) +
+              ",\"file_size_bytes\":" + std::to_string(entry.size_bytes) +
+              ",\"server_updated_at\":null,\"server_content_hash\":\"" +
+              crypto::Md5Hex(game.bytes) + "\"}\n";
+      }
+    }
+  }
+  c.Expect(console.sandbox.Write("/config/rommsync/state.db", v2), "rc1's state.db is on the card");
+
+  console.Boot();
+  console.engine.UseServer(&client, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  TickOnce(console, ticks, c, "the first tick after the upgrade");
+
+  const std::vector<ServerRow> empty_rows = RowsFor(client, base, fixture, empty.rom_id, "autosave");
+  c.Expect(empty_rows.size() == 1 && empty_rows[0].content_hash == crypto::Md5Hex(empty.bytes) &&
+               empty_rows[0].emulator == "fceumm",
+           "nova: an empty shared slot gets the save, once, under its core's id");
+  c.ExpectEq(console.sandbox.Read(empty.save), empty.bytes, "nova: and the card is untouched");
+
+  c.ExpectEq(console.sandbox.Read(newer.save), newer.retroarch,
+             "240pee: RetroArch's newer progress is on the card");
+  c.Expect(console.sandbox.HasBackupOf(newer.bytes), "240pee: the Switch's bytes under .backup/");
+  c.ExpectEq(RowsFor(client, base, fixture, newer.rom_id, "autosave").size(), std::size_t{1},
+             "240pee: and nothing was uploaded over it");
+  c.Expect(!ConflictRecorded(console, newer.rom_id), "240pee: a download, not a conflict");
+
+  c.ExpectEq(console.sandbox.Read(older.save), older.retroarch,
+             "gb240p: the server's head is on the card, as for any conflict");
+  c.Expect(console.sandbox.HasBackupOf(older.bytes),
+           "gb240p: the Switch's newer progress under .backup/");
+  c.ExpectEq(RowsFor(client, base, fixture, older.rom_id, "autosave").size(), std::size_t{1},
+             "gb240p: nothing was uploaded over RetroArch's save");
+  c.Expect(ConflictRecorded(console, older.rom_id),
+           "gb240p: and it is on the conflicts screen, restorable:\n" +
+               console.sandbox.Read("/config/rommsync/conflicts.db"));
+  // #240: the Switch's progress is on the server deliberately, not only by
+  // rc1's `tico-srm` row happening to hold it: an archival row, outside every
+  // slot, and the conflicts screen knows which.
+  const auto archived_copies = [&]() {
+    std::vector<harness::ArchivalRow> copies;
+    for (harness::ArchivalRow& row : harness::ArchivalRows(client, base, fixture, older.rom_id)) {
+      if (row.content_hash == crypto::Md5Hex(older.bytes)) {
+        copies.push_back(std::move(row));
+      }
+    }
+    return copies;
+  };
+  std::vector<harness::ArchivalRow> archived = archived_copies();
+  c.ExpectEq(archived.size(), std::size_t{1},
+             "gb240p: the Switch's progress is on the server as one archival row");
+  c.Expect(console.sandbox.Read("/config/rommsync/conflicts.db")
+                   .find("\"local_copy\":\"server\"") != std::string::npos,
+           "gb240p: and the conflicts screen says the server holds it");
+
+  for (const Game& game : games) {
+    const std::vector<ServerRow> old_rows = RowsFor(client, base, fixture, game.rom_id, "tico-srm");
+    c.Expect(old_rows.size() == 1 && old_rows[0].content_hash == crypto::Md5Hex(game.bytes),
+             std::string(game.rom_file) + ": rc1's row is still in tico-srm, as rc1 left it");
+  }
+  const std::string state_db = console.sandbox.Read("/config/rommsync/state.db");
+  c.Expect(state_db.rfind("rommsync-state 3\n", 0) == 0 &&
+               state_db.find("\"tico-srm\"") == std::string::npos,
+           "state.db is version 3, with nothing left under the old slot:\n" + state_db);
+
+  // The second tick: nothing to send.
+  TickOnce(console, ticks, c, "the second tick");
+  for (const Game& game : games) {
+    c.ExpectEq(RowsFor(client, base, fixture, game.rom_id, "autosave").size(), std::size_t{1},
+               std::string(game.rom_file) + ": no duplicate upload on the second tick");
+  }
+  c.ExpectEq(console.sandbox.Read(empty.save), empty.bytes, "nova: unchanged");
+  c.ExpectEq(console.sandbox.Read(newer.save), newer.retroarch, "240pee: unchanged");
+  c.ExpectEq(console.sandbox.Read(older.save), older.retroarch, "gb240p: unchanged");
+  archived = archived_copies();
+  c.ExpectEq(archived.size(), std::size_t{1}, "gb240p: and archived once, not once a tick");
+
+  for (const Game& game : games) {
+    ClearSlots(client, base, fixture, game.rom_id);
+  }
+  for (const harness::ArchivalRow& row : archived) {
+    harness::DeleteSave(client, base, fixture, row.id);
+  }
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// #237: a save this console has never held, restored by a real tick. It lands
+/// in Tico's folder for the system under the rom's own name -- not in
+/// `/retroarch/saves` under RomM's datetime-tagged one -- and the next tick
+/// reads it back as the save it came from, so nothing goes up again.
+int Placement(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-placement");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  // Another device's save, as it reaches RomM: the shared slot, FCEUmm's id,
+  // and the datetime tag RomM stamps on the stored name. Unique bytes per run:
+  // RomM remembers what a slot lost.
+  const std::string server_bytes =
+      "nova's save, from another device " + harness::UniqueSlot("placement") + "\n";
+  harness::Save server;
+  {
+    harness::Sandbox staging(c, "engine-placement-upload");
+    const std::string staged = staging.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, server_bytes);
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "fceumm", staged,
+                                 "nova.srm", /*with_device=*/false, &server),
+             "another device's save is on the server");
+  }
+  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-placement");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  // Counted at the sink (`TickLines`). Partial is a tick that reached the
+  // server too: whatever else the shared fixture offers is not this test's.
+  const auto tick = [&console, &ticks, &c](int number) {
+    const int before_tick = ticks.ticks();
+    c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+    const std::chrono::steady_clock::time_point by =
+        std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    while ((ticks.ticks() <= before_tick || console.Status().sync_in_progress) &&
+           std::chrono::steady_clock::now() < by) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    const ipc::Status status = console.Status();
+    c.Expect(ticks.ticks() > before_tick &&
+                 (status.last_sync_result == ipc::SyncResult::kOk ||
+                  status.last_sync_result == ipc::SyncResult::kPartial),
+             "tick " + std::to_string(number) + " ran and reached the server: " +
+                 ipc::ToString(status.last_sync_result));
+  };
+
+  // Not while the card does not hold the game (#241): negotiate names only the
+  // roms on the card, so the save is not offered, let alone placed.
+  const std::string placed = "/tico/saves/nes/nova.srm";
+  tick(1);
+  c.Expect(!console.sandbox.Exists(placed),
+           "no save is placed for a rom the card does not hold" + Rendered(console.Log()));
+
+  console.sandbox.Write("/tico/roms/nes/nova.nes", "nova's rom\n");
+  tick(2);
+  c.ExpectEq(console.sandbox.Read(placed), server_bytes,
+             "the save is in Tico's nes folder under the rom's name" + Rendered(console.Log()));
+  for (const char* folder : {"/retroarch/saves", "/retroarch/cores/savefiles"}) {
+    std::error_code error;
+    const std::filesystem::path real = console.sandbox.Host(folder);
+    bool empty = true;
+    for (auto it = std::filesystem::recursive_directory_iterator(real, error);
+         !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+      empty = empty && !it->is_regular_file();
+    }
+    c.Expect(empty, std::string("and nothing was written under ") + folder);
+  }
+  c.Expect(!console.sandbox.Exists("/tico/saves/nes/" + server.file_name),
+           "nor under the server's tagged name");
+
+  // The next tick reads it back as the save it came from: nothing to upload.
+  tick(3);
+  c.ExpectEq(SaveIdsFor(client, base, fixture, rom.id).size(), before.size(),
+             "the placed save is the server's own, so no tick sends it back as another");
+  c.ExpectEq(console.sandbox.Read(placed), server_bytes, "and it is left as it is");
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// #241's acceptance, through the real engine: the server holds a save, the
+/// console downloads the rom, and the save is in the folder the emulator reads
+/// before the next scheduled tick -- of which there is none: `interval_min = 0`
+/// and no boot tick, so the only tick that can run is the one the download asks
+/// for.
+int DownloadRestores(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-download-restores");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  const std::string server_bytes =
+      "nova's save, waiting for the rom " + harness::UniqueSlot("restores") + "\n";
+  {
+    harness::Sandbox staging(c, "engine-download-restores-upload");
+    const std::string staged = staging.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, server_bytes);
+    harness::Save server;
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "fceumm", staged,
+                                 "nova.srm", /*with_device=*/false, &server),
+             "another device's save is on the server");
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-download-restores");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  // Nothing is on the card, and nothing ticks on its own.
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  c.ExpectEq(ticks.ticks(), 0, "a console with no schedule does not tick by itself");
+
+  std::int32_t position = 0;
+  c.Expect(console.Enqueue(rom.id, &position) == ipc::Error::kOk, "the overlay queues the rom");
+  const std::string placed = "/tico/saves/nes/nova.srm";
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while (console.sandbox.Read(placed) != server_bytes && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes"), "the rom was downloaded");
+  c.ExpectEq(console.sandbox.Read(placed), server_bytes,
+             "and its save is in Tico's nes folder, under the rom's name, with no tick asked "
+             "for" + Rendered(console.Log()));
+  // The tick says so as it ends, which is after the save is placed. Settled
+  // before the cleanup, too, so the tick is not cut off half way.
+  while ((ticks.ticks() < 1 || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks.ticks(), 1, "brought by the one tick the download asked for");
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// #245's acceptance: a rom queued for this console in RomM's web UI is
+/// claimed on a tick, downloaded through the queue, and reported done.
+///
+/// A device of its own, paired for real: the install endpoints answer only to
+/// the token bound to the device, and the fixture's device is every rig
+/// process's.
+int RemoteInstall(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  const std::string name = "engine-remote-install";
+  const auth::StoredToken token = harness::PairDevice(c, client, base, name);
+  if (rom.id == 0 || token.device_id.empty()) {
+    return c.failures();
+  }
+  // A re-run adopts its row: end whatever an earlier one left taken, and
+  // withdraw the capability, so the first tick is what registers it.
+  for (const install::Request& left : install::Claim(client, base, token).page.requests) {
+    install::Report(client, base, token, left.id, {install::Outcome::kFailed, "an earlier run"});
+  }
+  install::Register(client, base, token, false);
+  const auto queue_in_browser = [&] {
+    return rig::AsTheUser(client, base, "/api/devices/" + token.device_id + "/installs",
+                          "{\"rom_id\":" + std::to_string(rom.id) + "}");
+  };
+  c.ExpectEq(queue_in_browser().response.status, 400,
+             "before the console has ticked, the web UI cannot queue for it");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, name);
+  if (!console.sandbox.Write("/config/rommsync/config.ini",
+                             "[server]\nurl = " + base +
+                                 "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                 "on_boot = false\nstates = false\n") ||
+      !auth::SaveToken(console.directory + auth::kTokenFileName, token).ok()) {
+    c.Expect(false, "the console is configured and paired as its own device");
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  // Where RomM records what a device reported: the request itself is gone
+  // the moment it ends. Only what is newer than this run's start counts: an
+  // earlier run left its own, and RomM's cap of 200 evicts the oldest, so a
+  // before-and-after count can miss the one this run added (`rig::LatestNotificationId`).
+  const std::int64_t started = rig::LatestNotificationId(client, base);
+  const auto notices = [&](const std::string& status) {
+    return rig::InstallNoticesSince(client, base, started, "rommsync-nx " + name, status);
+  };
+
+  TickOnce(console, ticks, c, "the first tick");
+  const http::Result queued = queue_in_browser();
+  c.ExpectEq(queued.response.status, 201,
+             "after it, the console accepts remote installs and the web UI queues nova: " +
+                 queued.response.body.substr(0, 200));
+
+  // Claimed by the next tick, then downloaded by the queue, then reported.
+  TickOnce(console, ticks, c, "the tick that claims");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  const auto open = [&] {
+    // The device's own claim takes nothing new -- the console already took it
+    // -- and lists what is still taken, which a report ends.
+    return install::Claim(client, base, token).page.requests.size();
+  };
+  while ((!console.sandbox.Exists("/tico/roms/nes/nova.nes") || open() != 0) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes"),
+           "the rom the browser queued is on the card" + Rendered(console.Log()));
+  c.ExpectEq(open(), std::size_t{0}, "and the request is ended, not left taken");
+
+  c.ExpectEq(notices("done"), std::size_t{1},
+             "RomM was told it is done, and told the user so");
+  c.Expect(Logged(console.Log(), "download.remote"), "the console's log says so too");
+
+  // The download asks for a tick of its own (#241); let it end before teardown.
+  while ((ticks.ticks() < 3 || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+
+  // Downloads switched off with a request outstanding: nothing here will fetch
+  // it, so the browser is told so rather than left waiting out its expiry, and
+  // stops offering the console.
+  c.ExpectEq(queue_in_browser().response.status, 201, "the web UI queues nova again");
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "and downloads are switched off on the console");
+  TickOnce(console, ticks, c, "the tick after downloads went off");
+  c.ExpectEq(open(), std::size_t{0}, "that request is ended too");
+  c.ExpectEq(notices("failed"), std::size_t{1}, "as failed, which the user is told");
+  c.ExpectEq(queue_in_browser().response.status, 400,
+             "and the web UI no longer offers this console");
+  harness::DeleteDevice(client, base, fixture, token.device_id);
+  return c.failures();
+}
+
+/// The real client with a hook in front of it, which may answer a request
+/// itself, and a record of every request that went past.
+///
+/// For the answers a healthy RomM will not give on demand, aimed at exactly one
+/// endpoint: a 401 on the negotiate alone, a link that is down for one call, a
+/// claim refused once. The fault proxy matches a path too, but counts its uses
+/// across every client of the rig; this belongs to the one console it wraps.
+class Intercepting final : public http::HttpClient {
+ public:
+  using Hook = std::function<std::optional<http::Result>(const http::Request&)>;
+
+  explicit Intercepting(http::HttpClient& inner) : inner_(inner) {}
+
+  void Use(Hook hook) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    hook_ = std::move(hook);
+  }
+
+  http::Result Send(const http::Request& request) override {
+    if (std::optional<http::Result> answered = Note(request)) {
+      return *answered;
+    }
+    return inner_.Send(request);
+  }
+
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    if (std::optional<http::Result> answered = Note(request)) {
+      return *answered;
+    }
+    return inner_.Download(request, target);
+  }
+
+  /// The URLs asked so far with `method`, containing `fragment`, in order.
+  std::vector<std::string> Asked(http::Method method, std::string_view fragment) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> out;
+    for (const auto& [asked_with, url] : seen_) {
+      if (asked_with == method && url.find(fragment) != std::string::npos) {
+        out.push_back(url);
+      }
+    }
+    return out;
+  }
+
+  std::size_t Count(http::Method method, std::string_view fragment) const {
+    return Asked(method, fragment).size();
+  }
+
+ private:
+  std::optional<http::Result> Note(const http::Request& request) {
+    Hook hook;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      seen_.emplace_back(request.method, request.url);
+      hook = hook_;
+    }
+    return hook ? hook(request) : std::nullopt;
+  }
+
+  http::HttpClient& inner_;
+  mutable std::mutex mutex_;
+  Hook hook_;
+  std::vector<std::pair<http::Method, std::string>> seen_;
+};
+
+/// A status from "the server", with a body that is none of RomM's shapes.
+http::Result Answered(int status) {
+  http::Result result;
+  result.response.status = status;
+  result.response.body = "{\"detail\":\"answered by the test\"}";
+  return result;
+}
+
+/// No response at all.
+http::Result Unreachable() {
+  http::Result result;
+  result.error = http::Error::kConnectFailed;
+  result.message = "the test took the link down for this request";
+  return result;
+}
+
+bool Asks(const http::Request& request, http::Method method, std::string_view fragment) {
+  return request.method == method && request.url.find(fragment) != std::string::npos;
+}
+
+/// Press Sync now and wait for that tick to end, however it ends.
+bool TickEnds(Console& console, const TickLines& ticks, rig::Checks& c, const std::string& what) {
+  const int before = ticks.ticks();
+  if (console.SyncNow() != ipc::SyncOutcome::kAccepted) {
+    c.Expect(false, what + ": Sync now starts a tick");
+    return false;
+  }
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((ticks.ticks() <= before || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  const bool ended = ticks.ticks() > before && !console.Status().sync_in_progress;
+  c.Expect(ended, what + ": the tick ended" + Rendered(console.Log()));
+  return ended;
+}
+
+/// The states half of a tick, held to what the saves half found (review of
+/// #242, #235, #36): it does not run under a game that started during the saves
+/// half, nor after a saves half the server refused or never answered -- and a
+/// 401 it meets itself counts towards `auth::Gate`'s verdict like any other.
+///
+/// Each case is its own console and its own device: the gate remembers.
+int StatesGuarded(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+
+  // States on, and a rom on the card, so the saves half has a negotiate to
+  // make (#241 scopes it to the roms the card holds).
+  const auto set_up = [&](Console& console, const std::string& device_id) {
+    auth::StoredToken token;
+    token.server_url = base;
+    token.access_token = fixture.token;
+    token.device_id = device_id;
+    token.scopes = {"roms.read"};
+    const bool ok = console.sandbox.Write("/config/rommsync/config.ini",
+                                          "[server]\nurl = " + base +
+                                              "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                              "on_boot = false\nstates = true\n") &&
+                    auth::SaveToken(console.directory + auth::kTokenFileName, token).ok() &&
+                    console.sandbox.Write("/tico/roms/nes/nova.nes", "nova's rom\n");
+    c.Expect(ok, console.directory + ": configured, paired, and holding nova");
+    return ok;
+  };
+
+  // **A game launched while the saves half runs.** The worker asked before the
+  // tick and the tick asked again after the library; the game starts as the
+  // saves are negotiated. The states half is a second round of transfers, and
+  // it asks again before it starts.
+  {
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-states-held");
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-states-held");
+    const std::unique_ptr<fs::FileSystem> card = Card(console);
+    if (device_id.empty() || !set_up(console, device_id)) {
+      return c.failures();
+    }
+    Intercepting wire(client);
+    std::atomic<bool> running{false};
+    std::atomic<bool> armed{true};
+    wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+      if (Asks(request, http::Method::kPost, "/api/sync/negotiate") && armed.exchange(false)) {
+        running = true;
+      }
+      return std::nullopt;
+    });
+    console.Boot();
+    console.engine.UseForegroundProbe([&running] { return running.load(); },
+                                      std::chrono::milliseconds{50});
+    console.engine.UseServer(&wire, std::string());
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    TickEnds(console, ticks, c, "held: the tick the game starts under");
+    c.Expect(running.load(), "held: the game started as the saves were negotiated");
+    c.ExpectEq(wire.Count(http::Method::kGet, "/api/states"), std::size_t{0},
+               "held: the states half did not run under it -- no state listed, none sent "
+               "or placed" + Rendered(console.Log()));
+    c.Expect(Logged(console.Log(), "sync.held"),
+             "held: and the log says why" + Rendered(console.Log()));
+    std::this_thread::sleep_for(std::chrono::milliseconds{500});
+    c.ExpectEq(ticks.ticks(), 1, "held: nothing more runs while the game is up");
+
+    running = false;
+    const std::chrono::steady_clock::time_point by =
+        std::chrono::steady_clock::now() + std::chrono::seconds{60};
+    while ((ticks.ticks() < 2 || console.Status().sync_in_progress) &&
+           std::chrono::steady_clock::now() < by) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    c.Expect(wire.Count(http::Method::kGet, "/api/states") > 0,
+             "held: once it closes, a tick runs by itself and syncs the states" +
+                 Rendered(console.Log()));
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+
+  // **A saves half the server refused, or never answered.** States have no
+  // negotiate of their own: a 401 there is the same token, and a link that is
+  // down is down for `/api/states` too.
+  {
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-states-refused");
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-states-refused");
+    const std::unique_ptr<fs::FileSystem> card = Card(console);
+    if (device_id.empty() || !set_up(console, device_id)) {
+      return c.failures();
+    }
+    Intercepting wire(client);
+    std::atomic<int> negotiate{401};
+    wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+      if (!Asks(request, http::Method::kPost, "/api/sync/negotiate")) {
+        return std::nullopt;
+      }
+      return negotiate.load() == 0 ? Unreachable() : Answered(negotiate.load());
+    });
+    console.Boot();
+    console.engine.UseServer(&wire, std::string());
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    TickEnds(console, ticks, c, "refused: a negotiate answered 401");
+    c.ExpectEq(wire.Count(http::Method::kGet, "/api/states"), std::size_t{0},
+               "refused: the states half is not asked with a token the server just refused" +
+                   Rendered(console.Log()));
+    negotiate = 0;
+    TickEnds(console, ticks, c, "offline: a negotiate that never answered");
+    c.ExpectEq(wire.Count(http::Method::kGet, "/api/states"), std::size_t{0},
+               "offline: nor after a negotiate the link never carried" +
+                   Rendered(console.Log()));
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+
+  // **A 401 the states half meets itself.** The token is revoked between the
+  // saves and the states: the listing is the first request to hear it, and it
+  // is a rejection like the library's. Three in a row is the gate's budget
+  // (`auth::GateConfig`), so the console stops on the third tick's -- not on a
+  // fourth, as it would if the states half's were not heard.
+  {
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-states-revoked");
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-states-revoked");
+    const std::unique_ptr<fs::FileSystem> card = Card(console);
+    if (device_id.empty() || !set_up(console, device_id)) {
+      return c.failures();
+    }
+    Intercepting wire(client);
+    std::atomic<bool> revoked{false};
+    wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+      if (Asks(request, http::Method::kGet, "/api/states")) {
+        revoked = true;
+      }
+      // The heartbeat is unauthenticated, and tells the gate nothing.
+      if (revoked.load() && request.url.find("/api/heartbeat") == std::string::npos) {
+        return Answered(401);
+      }
+      return std::nullopt;
+    });
+    console.Boot();
+    console.engine.UseServer(&wire, std::string());
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    TickEnds(console, ticks, c, "revoked: the tick whose states are refused");
+    c.Expect(revoked.load(), "revoked: the states half asked, and was refused");
+    c.Expect(console.Status().auth != ipc::AuthState::kUnauthenticated,
+             "revoked: one rejection is not a verdict");
+    TickEnds(console, ticks, c, "revoked: the second rejected tick");
+    TickEnds(console, ticks, c, "revoked: the third");
+    c.Expect(console.Status().auth == ipc::AuthState::kUnauthenticated,
+             "revoked: the third rejection in a row is the verdict -- the states half's "
+             "counted as the first" + Rendered(console.Log()));
+    c.Expect(console.sandbox.Exists("/config/rommsync/auth.json"),
+             "revoked: and it is on the card");
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  return c.failures();
+}
+
+/// A console paired as its own device for the remote-install endpoints, which
+/// answer only to the token bound to the device, with whatever an earlier run
+/// left taken ended and the capability withdrawn -- so the first tick is the
+/// one that registers. Shared by the review's install scenarios.
+struct InstallConsole {
+  auth::StoredToken token;
+  std::int64_t nova = 0;
+  std::int64_t other = 0;
+};
+
+bool AdoptInstallDevice(rig::Checks& c, http::HttpClient& client, const std::string& base,
+                        const harness::Fixture& fixture, const std::string& name,
+                        InstallConsole* out) {
+  harness::Rom nova;
+  harness::Rom other;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &nova),
+           "the fixture library has nova.nes");
+  c.Expect(harness::FindRom(client, base, fixture, "240pee.nes", &other),
+           "and 240pee.nes");
+  out->token = harness::PairDevice(c, client, base, name);
+  out->nova = nova.id;
+  out->other = other.id;
+  if (nova.id == 0 || other.id == 0 || out->token.device_id.empty()) {
+    return false;
+  }
+  for (const install::Request& left : install::Claim(client, base, out->token).page.requests) {
+    install::Report(client, base, out->token, left.id,
+                    {install::Outcome::kFailed, "an earlier run"});
+  }
+  install::Register(client, base, out->token, false);
+  return true;
+}
+
+bool ConfigureInstallConsole(rig::Checks& c, Console& console, const std::string& base,
+                             const auth::StoredToken& token) {
+  const bool ok = console.sandbox.Write("/config/rommsync/config.ini",
+                                        "[server]\nurl = " + base +
+                                            "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                            "on_boot = false\nstates = false\n") &&
+                  auth::SaveToken(console.directory + auth::kTokenFileName, token).ok();
+  c.Expect(ok, "the console is configured and paired as its own device");
+  return ok;
+}
+
+/// Wait until `wire` has asked nothing new matching `fragment` for `quiet`,
+/// and no tick is running -- the end of whatever passes were under way.
+void UntilQuiet(Console& console, const Intercepting& wire, http::Method method,
+                std::string_view fragment, std::chrono::milliseconds quiet) {
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  std::size_t seen = wire.Count(method, fragment);
+  std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    const std::size_t now = wire.Count(method, fragment);
+    if (now != seen || console.Status().sync_in_progress) {
+      seen = now;
+      since = std::chrono::steady_clock::now();
+    } else if (std::chrono::steady_clock::now() - since >= quiet) {
+      return;
+    }
+  }
+}
+
+/// The reports a console owes RomM's web UI, over a link that will not carry
+/// them (review of #245). One report's link failure is every report's: the
+/// pass stops at the first rather than spending each held claim's retries on
+/// the worker, and the rest are reported once the link carries them.
+int InstallSettle(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string name = "engine-install-settle";
+  InstallConsole device;
+  if (!AdoptInstallDevice(c, client, base, fixture, name, &device)) {
+    return c.failures();
+  }
+  const auth::StoredToken& token = device.token;
+  const auto queue_in_browser = [&](std::int64_t rom_id) {
+    return rig::AsTheUser(client, base, "/api/devices/" + token.device_id + "/installs",
+                          "{\"rom_id\":" + std::to_string(rom_id) + "}");
+  };
+  const auto open = [&] { return install::Claim(client, base, token).page.requests.size(); };
+  const auto notices = [&](std::int64_t after, const std::string& status) {
+    return rig::InstallNoticesSince(client, base, after, "rommsync-nx " + name, status);
+  };
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, name);
+  if (!ConfigureInstallConsole(c, console, base, token)) {
+    return c.failures();
+  }
+  Intercepting wire(client);
+  std::atomic<bool> down{false};
+  wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+    if (down.load() && Asks(request, http::Method::kPut, "/installs/")) {
+      return Unreachable();
+    }
+    return std::nullopt;
+  });
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&wire, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  TickOnce(console, ticks, c, "the first tick");
+  c.ExpectEq(queue_in_browser(device.nova).response.status, 201, "the web UI queues nova");
+  c.ExpectEq(queue_in_browser(device.other).response.status, 201, "and 240pee");
+
+  // **The link stops carrying reports**, and nothing else: the claim, the
+  // downloads and the ticks all go through.
+  const std::int64_t started = rig::LatestNotificationId(client, base);
+  down = true;
+  TickOnce(console, ticks, c, "the tick that claims both");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((!console.sandbox.Exists("/tico/roms/nes/nova.nes") ||
+          !console.sandbox.Exists("/tico/roms/nes/240pee.nes")) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes") &&
+               console.sandbox.Exists("/tico/roms/nes/240pee.nes"),
+           "both roms the browser queued are on the card" + Rendered(console.Log()));
+  // The settle after the drain, and the one in the tick the download asks for
+  // (#241), each spend their retries.
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  const std::vector<std::string> tried = wire.Asked(http::Method::kPut, "/installs/");
+  const std::set<std::string> reports(tried.begin(), tried.end());
+  c.Expect(!tried.empty(), "a report was tried");
+  c.ExpectEq(reports.size(), std::size_t{1},
+             "and only the first: the link that did not carry it would not carry the "
+             "next, so each pass stops there rather than spending every claim's retries" +
+                 Rendered(console.Log()));
+  c.ExpectEq(open(), std::size_t{2}, "both stay taken on the server");
+
+  // The link comes back: the next pass reports both.
+  down = false;
+  TickOnce(console, ticks, c, "the tick after the link comes back");
+  c.ExpectEq(open(), std::size_t{0}, "both requests are ended");
+  c.ExpectEq(notices(started, "done"), std::size_t{2},
+             "both reported done -- the one the pass stopped at and the one it kept");
+  c.ExpectEq(notices(started, "failed"), std::size_t{0}, "and neither failed");
+
+  // The download asks for a tick of its own (#241); let it end.
+  UntilQuiet(console, wire, http::Method::kPost, "/api/sync/negotiate", std::chrono::seconds{1});
+
+  // **Downloads switched off with a report still owed.** nova is queued again,
+  // claimed, and settled from the card -- it is already there -- but the report
+  // does not go. Then downloads go off: what this console holds is told to the
+  // browser for what it is, not as a download that will never happen.
+  const std::int64_t before_off = rig::LatestNotificationId(client, base);
+  c.ExpectEq(queue_in_browser(device.nova).response.status, 201, "the web UI queues nova again");
+  down = true;
+  TickOnce(console, ticks, c, "the tick that claims it again");
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  c.ExpectEq(open(), std::size_t{1}, "its report did not go, so it is still taken");
+  down = false;
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "and downloads are switched off on the console");
+  TickOnce(console, ticks, c, "the tick after downloads went off");
+  c.ExpectEq(open(), std::size_t{0}, "the request is ended");
+  c.ExpectEq(notices(before_off, "failed"), std::size_t{0},
+             "and not as failed: the rom is on the card, settled before downloads went off" +
+                 Rendered(console.Log()));
+  c.ExpectEq(notices(before_off, "already_installed"), std::size_t{1},
+             "but as what its row says: already installed");
+
+  // **And downloads switched off while the link still will not carry it.** The
+  // switch is told once, so a report it could not make must not be dropped
+  // with the claims: the next tick tells the browser what this one could not.
+  c.Expect(console.Set(Edit("downloads", "enabled", "true")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads are switched back on");
+  TickOnce(console, ticks, c, "the tick that offers the console again");
+  const std::int64_t before_down = rig::LatestNotificationId(client, base);
+  c.ExpectEq(queue_in_browser(device.other).response.status, 201,
+             "the web UI queues 240pee again");
+  down = true;
+  TickOnce(console, ticks, c, "the tick that claims 240pee");
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  c.ExpectEq(open(), std::size_t{1}, "settled from the card, and its report did not go");
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads go off with the link still down");
+  TickOnce(console, ticks, c, "the tick after downloads went off, offline for reports");
+  down = false;
+  TickOnce(console, ticks, c, "the tick after the link comes back");
+  c.ExpectEq(open(), std::size_t{0},
+             "the request is ended once the link carries it" + Rendered(console.Log()));
+  c.ExpectEq(notices(before_down, "failed"), std::size_t{0}, "not as failed");
+  c.ExpectEq(notices(before_down, "already_installed"), std::size_t{1},
+             "but as already installed");
+
+  // **A request downloads-off fails, whose failure the link does not carry.**
+  // Queued in the browser and never claimed by a tick that wanted it, so the
+  // downloads-off claim is the first to take it, and its report is the only
+  // word the browser gets: the switch is not told until that report went.
+  c.Expect(console.Set(Edit("downloads", "enabled", "true")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads are switched on once more");
+  TickOnce(console, ticks, c, "the tick that offers the console once more");
+  const std::int64_t before_unsaid = rig::LatestNotificationId(client, base);
+  c.ExpectEq(queue_in_browser(device.nova).response.status, 201,
+             "the web UI queues nova, and no tick claims it yet");
+  down = true;
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads go off before it is claimed");
+  TickOnce(console, ticks, c, "the tick that claims nova to fail it, offline for reports");
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  down = false;
+  TickOnce(console, ticks, c, "the tick after the link carries reports again");
+  c.ExpectEq(notices(before_unsaid, "failed"), std::size_t{1},
+             "the browser is told nova failed once the link carries it" +
+                 Rendered(console.Log()));
+  c.ExpectEq(open(), std::size_t{0}, "and nothing is left taken");
+
+  install::Register(client, base, token, false);
+  harness::DeleteDevice(client, base, fixture, token.device_id);
+  return c.failures();
+}
+
+/// Remote install asked again after a wake (review of #245). A Switch mostly
+/// sleeps rather than reboots, so "until the server is read again" cannot mean
+/// "until the next boot": a claim refused once -- the feature off for a moment,
+/// as RomM answers a claim 404 then -- has to be asked again when the console
+/// wakes, and so does a heartbeat that said the feature was off.
+int InstallWake(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string name = "engine-install-wake";
+  InstallConsole device;
+  if (!AdoptInstallDevice(c, client, base, fixture, name, &device)) {
+    return c.failures();
+  }
+  const auth::StoredToken& token = device.token;
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, name);
+  if (!ConfigureInstallConsole(c, console, base, token)) {
+    return c.failures();
+  }
+  Intercepting wire(client);
+  std::atomic<bool> refuse{true};
+  wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+    if (refuse.load() && Asks(request, http::Method::kPost, "/installs/claim")) {
+      return Answered(404);
+    }
+    return std::nullopt;
+  });
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&wire, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  const auto claims = [&] { return wire.Count(http::Method::kPost, "/installs/claim"); };
+  TickOnce(console, ticks, c, "the tick whose claim is refused");
+  c.ExpectEq(claims(), std::size_t{1}, "the claim was asked, and answered 404");
+
+  // The server is fine again, and the user queues a rom for this console.
+  refuse = false;
+  const std::int64_t started = rig::LatestNotificationId(client, base);
+  c.ExpectEq(rig::AsTheUser(client, base, "/api/devices/" + token.device_id + "/installs",
+                            "{\"rom_id\":" + std::to_string(device.nova) + "}")
+                 .response.status,
+             201, "the web UI queues nova for it");
+  TickOnce(console, ticks, c, "a tick on the same boot");
+  c.ExpectEq(claims(), std::size_t{1},
+             "the refusal stands while the console stays awake: no claim every tick");
+
+  // Asleep, and awake again -- the console's ordinary day.
+  const std::size_t heartbeats = wire.Count(http::Method::kGet, "/api/heartbeat");
+  console.engine.Quiesce();
+  console.engine.Resume();
+  TickOnce(console, ticks, c, "the first tick after the wake");
+  c.Expect(wire.Count(http::Method::kGet, "/api/heartbeat") > heartbeats,
+           "the wake reads the server again: what it says of remote install may have changed");
+  c.ExpectEq(claims(), std::size_t{2}, "and claims again" + Rendered(console.Log()));
+
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  const auto open = [&] { return install::Claim(client, base, token).page.requests.size(); };
+  while ((!console.sandbox.Exists("/tico/roms/nes/nova.nes") || open() != 0) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes"),
+           "the rom the browser queued is on the card" + Rendered(console.Log()));
+  c.ExpectEq(rig::InstallNoticesSince(client, base, started, "rommsync-nx " + name, "done"),
+             std::size_t{1}, "and reported done");
+
+  // The download asks for a tick of its own (#241); let it end before teardown.
+  UntilQuiet(console, wire, http::Method::kPost, "/api/sync/negotiate", std::chrono::seconds{1});
+  install::Register(client, base, token, false);
+  harness::DeleteDevice(client, base, fixture, token.device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -2754,7 +5462,9 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"pairs", Pairs},
       {"nonblocking", NonBlocking},
       {"repairs", Repairs},
+      {"pair_commit", PairCommit},
       {"log_faults", LogsTransportFailures},
+      {"server_disabled", ServerDisabled},
       {"drains", Drains},
       {"downloading", DrainProgress},
       {"preempts", DrainPreempted},
@@ -2762,6 +5472,18 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"repoints", DrainRepointed},
       {"shutdown", DrainShutdown},
       {"sleep_download", SleepDownload},
+      {"romm_version", RommVersion},
+      {"foreground", Foreground},
+      {"tico_accounts", TicoAccounts},
+      {"download_restores", DownloadRestores},
+      {"server_deleted", ServerDeleted},
+      {"interop", Interop},
+      {"upgrade", Upgrade},
+      {"placement", Placement},
+      {"remote_install", RemoteInstall},
+      {"states_guard", StatesGuarded},
+      {"install_settle", InstallSettle},
+      {"install_wake", InstallWake},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -2781,6 +5503,8 @@ int main(int argc, char** argv) {
     Queue(checks);
   } else if (scenario == "unauthenticated") {
     Unauthenticated(checks);
+  } else if (scenario == "newer") {
+    NewerFiles(checks);
   } else if (scenario == "persists") {
     Persists(checks);
   } else if (scenario == "rollback") {
@@ -2805,6 +5529,10 @@ int main(int argc, char** argv) {
     Sleeps(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
+  } else if (scenario == "restore_polled") {
+    RestoreIsPolled(checks);
+  } else if (scenario == "restore_boot_wait") {
+    RestoreDuringBootWait(checks);
   } else if (scenario == "syncnow") {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {
@@ -2813,6 +5541,8 @@ int main(int argc, char** argv) {
     StaleActiveOnBoot(checks);
   } else if (scenario == "log") {
     LogsMisconfiguration(checks);
+  } else if (scenario == "romm_forgotten") {
+    RommForgotten(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {
     // The scenarios that need the fixture RomM. `server` pins that a *live*
     // credential stops being on the card, and the M1-6 three drive a real

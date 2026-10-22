@@ -8,6 +8,8 @@
 #include <string>
 #include <string_view>
 
+#include "rommsync/disk.hpp"
+
 namespace rommsync::io {
 namespace {
 
@@ -15,17 +17,6 @@ namespace {
 /// atomic so that a late call cannot race the first write rather than because
 /// swapping it mid-write is supported.
 std::atomic<FileSync> g_file_sync{nullptr};
-
-/// Put the closed file at `path` on the card, if the platform said how.
-///
-/// Called after the handle is closed and before the rename that publishes the
-/// file: flushing and closing move the bytes from stdio to the OS, and this is
-/// what moves them from the OS to the card. With no hook installed the answer is
-/// "yes" and the promise stays the weaker one.
-bool Synced(const std::string& path) {
-  const FileSync hook = g_file_sync.load(std::memory_order_relaxed);
-  return hook == nullptr || hook(path);
-}
 
 /// The directory `path` is in, or empty when the path names no directory.
 ///
@@ -51,6 +42,20 @@ std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
 }
 
+/// "could not be written completely", and what the card said when it was the
+/// card that refused -- "the card is full" is the half of the sentence a user
+/// can act on (#202). `written` is false when the write or the flush failed,
+/// which is when `refused` holds the `errno` they left; a close or a sync that
+/// failed after them says nothing `errno` can be trusted for.
+std::string Incomplete(bool written, int refused) {
+  std::string sentence = "could not be written completely";
+  if (!written) {
+    sentence += ": ";
+    sentence += Explain(RefusalOf(refused));
+  }
+  return sentence;
+}
+
 /// Overwrite whatever is at `path` with zeroes, then unlink it.
 ///
 /// Best-effort, and `Shred` says how little that is worth: without an `fsync`
@@ -58,7 +63,7 @@ std::string Describe(const std::string& path, std::string_view what) {
 /// all, since a filesystem is free to drop dirty pages belonging to an inode
 /// that is about to be unlinked. The unlink is the part that does the work.
 bool ShredOne(const std::string& path) {
-  std::FILE* file = std::fopen(path.c_str(), "r+b");
+  std::FILE* file = OpenForWriting(path, "r+b");
   if (file != nullptr) {
     long size = 0;
     if (std::fseek(file, 0, SEEK_END) == 0) {
@@ -70,7 +75,7 @@ bool ShredOne(const std::string& path) {
         const long chunk = size - written < static_cast<long>(sizeof(zeroes))
                                ? size - written
                                : static_cast<long>(sizeof(zeroes));
-        if (std::fwrite(zeroes, 1, static_cast<std::size_t>(chunk), file) !=
+        if (Write(file, zeroes, static_cast<std::size_t>(chunk)) !=
             static_cast<std::size_t>(chunk)) {
           break;
         }
@@ -80,7 +85,7 @@ bool ShredOne(const std::string& path) {
     }
     std::fclose(file);
   }
-  std::remove(path.c_str());
+  Remove(path);
   return !Exists(path);
 }
 
@@ -142,68 +147,107 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
     // move aside, though: a `.old` left by an interrupted commit is the only
     // copy of the record when `path` is missing, and removing it before the new
     // one is committed would turn a recoverable interruption into a loss.
-    std::remove(previous.c_str());
-    if (std::rename(path.c_str(), previous.c_str()) != 0) {
-      std::remove(staged.c_str());
+    Remove(previous);
+    if (Rename(path, previous) != 0) {
+      Remove(staged);
       return {WriteError::kCommitFailed, Describe(path, "could not be moved aside to " + previous)};
     }
   }
-  if (std::rename(staged.c_str(), path.c_str()) != 0) {
+  if (Rename(staged, path) != 0) {
     std::string detail = "could not be replaced by " + staged;
     // Putting the previous record back is the whole reason a caller can treat a
     // failed write as costing only the new record. When even *that* fails the
     // destination is gone, and saying so is the difference between a caller
     // reading `.old` deliberately and one wondering why its file vanished.
-    if (replacing && std::rename(previous.c_str(), path.c_str()) != 0) {
+    if (replacing && Rename(previous, path) != 0) {
       detail += ", and the previous record could not be put back -- it is at " + previous;
     }
-    std::remove(staged.c_str());
+    Remove(staged);
     return {WriteError::kCommitFailed, Describe(path, detail)};
   }
-  std::remove(previous.c_str());
+  Remove(previous);
 
-  // Best effort, and after the fact on purpose: the rename has happened, so
-  // reporting a failure here would describe a commit that did not occur. What it
-  // buys is the *name* being as durable as the bytes already are -- see
-  // `DirectoryOf`. A platform whose hook commits the whole device (Horizon's
-  // does) has already done this and pays for it twice, which is cheaper than the
-  // alternative of a second hook nobody would remember to call.
+  // After the fact on purpose: the rename has happened, so reporting a failure
+  // here would describe a commit that did not occur. What it buys is the *name*
+  // being as durable as the bytes already are -- see `DirectoryOf`. A platform
+  // whose hook commits the whole device (Horizon's does) has already done this
+  // and pays for it twice, which is cheaper than the alternative of a second
+  // hook nobody would remember to call.
+  //
+  // Not ignored, though. It used to be, and the crash replay found what that
+  // cost: a backup whose directory the card would not confirm was counted as a
+  // backup, and the save overwrite in *another* directory could survive a power
+  // cut that the backup's name did not (#203). So the answer goes back to the
+  // caller, and the one that depends on it -- `sync::BackUpFirst` -- reads it.
+  WriteResult committed;
   const std::string directory = DirectoryOf(path);
   if (!directory.empty()) {
-    Synced(directory);
+    committed.name_durable = Sync(directory);
   }
-  return {};
+  return committed;
 }
 
-WriteResult WriteAtomically(const std::string& path, std::string_view contents) {
+namespace {
+
+/// The body of both writers: `write` puts the whole record into the temp file
+/// and says whether every byte went, and the rest -- flush, close, sync, commit
+/// -- is the same whether the record came in one piece or many.
+WriteResult WriteStaged(const std::string& path, const std::function<bool(std::FILE*)>& write) {
   const std::string temp = TempPathFor(path);
 
-  std::FILE* file = std::fopen(temp.c_str(), "wb");
+  std::FILE* file = OpenForWriting(temp, "wb");
   if (file == nullptr) {
     return {WriteError::kOpenFailed,
             Describe(temp, "could not be created (does the directory exist?)")};
   }
 
-  const std::size_t written = std::fwrite(contents.data(), 1, contents.size(), file);
+  errno = 0;
+  const bool written = write(file);
   // The flush has to happen while the handle is still open: fclose reports a
   // failed flush too, but by then there is nothing left to distinguish "the
   // bytes never left the buffer" from "the close itself failed". The sync comes
   // after the close, by path, because that is the contract both platforms can
   // hold (`FileSync`).
-  const bool flushed = written == contents.size() && std::fflush(file) == 0;
+  const bool flushed = written && std::fflush(file) == 0;
+  // Read before `fclose` can overwrite it: what the card said, if it said no.
+  const int refused = flushed ? 0 : errno;
   const bool closed = std::fclose(file) == 0;
   // After the close and before the commit below, which is the only ordering
   // that means anything: the bytes have to be on the card before the rename
   // publishes them.
-  const bool synced = flushed && closed && Synced(temp);
+  const bool synced = flushed && closed && Sync(temp);
   if (!flushed || !closed || !synced) {
-    std::remove(temp.c_str());
-    return {WriteError::kWriteFailed, Describe(temp, "could not be written completely")};
+    Remove(temp);
+    return {WriteError::kWriteFailed, Describe(temp, Incomplete(flushed, refused))};
   }
 
   // Everything above touched only the temp file, so a failure up to this point
   // leaves whatever `path` already held exactly as it was.
   return CommitStaged(temp, path);
+}
+
+}  // namespace
+
+WriteResult WriteAtomically(const std::string& path, std::string_view contents) {
+  return WriteStaged(path, [contents](std::FILE* file) {
+    return Write(file, contents.data(), contents.size()) == contents.size();
+  });
+}
+
+WriteResult WriteAtomically(const std::string& path,
+                            const std::function<bool(std::string* piece)>& next) {
+  return WriteStaged(path, [&next](std::FILE* file) {
+    std::string piece;
+    for (;;) {
+      piece.clear();
+      if (!next(&piece)) {
+        return true;
+      }
+      if (Write(file, piece.data(), piece.size()) != piece.size()) {
+        return false;
+      }
+    }
+  });
 }
 
 const char* ToString(CopyError error) {
@@ -241,7 +285,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   }
 
   const std::string temp = TempPathFor(to);
-  std::FILE* destination = std::fopen(temp.c_str(), "wb");
+  std::FILE* destination = OpenForWriting(temp, "wb");
   if (destination == nullptr) {
     std::fclose(source);
     result.error = CopyError::kOpenFailed;
@@ -249,27 +293,34 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
     return result;
   }
 
-  // 4 KiB, the convention in this directory: the main thread gets a 16 KiB
-  // stack on the console, so a buffer sized for a desktop compiles here and
-  // overflows there (core/AGENTS.md).
+  // 4 KiB, the convention in this directory: the main thread gets a 32 KiB
+  // stack on the console, half of it the deepest parse's, so a buffer sized
+  // for a desktop compiles here and overflows there (core/AGENTS.md).
   char buffer[4096];
   std::uint64_t copied = 0;
   bool short_write = false;
+  int refused = 0;
   std::size_t got = 0;
   while ((got = std::fread(buffer, 1, sizeof(buffer), source)) > 0) {
-    if (std::fwrite(buffer, 1, got, destination) != got) {
+    errno = 0;
+    if (Write(destination, buffer, got) != got) {
       short_write = true;
+      refused = errno;
       break;
     }
     copied += got;
   }
   const bool read_failed = std::ferror(source) != 0;
   std::fclose(source);
+  errno = 0;
   const bool flushed = std::fflush(destination) == 0;
+  if (!short_write && !flushed) {
+    refused = errno;
+  }
   const bool closed = std::fclose(destination) == 0;
 
   if (read_failed) {
-    std::remove(temp.c_str());
+    Remove(temp);
     result.error = CopyError::kSourceUnreadable;
     result.message = Describe(from, "could not be read to the end");
     return result;
@@ -278,11 +329,11 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
   // -- which is the whole point of this copy: the previous bytes have to be on
   // the card before the save they came from is overwritten. Syncing a temp file
   // that is about to be deleted would just be a slow way to fail.
-  const bool synced = !short_write && flushed && closed && Synced(temp);
+  const bool synced = !short_write && flushed && closed && Sync(temp);
   if (short_write || !flushed || !closed || !synced) {
-    std::remove(temp.c_str());
+    Remove(temp);
     result.error = CopyError::kWriteFailed;
-    result.message = Describe(temp, "could not be written completely");
+    result.message = Describe(temp, Incomplete(!short_write && flushed, refused));
     return result;
   }
 
@@ -294,6 +345,7 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
     return result;
   }
   result.bytes_copied = copied;
+  result.name_durable = committed.name_durable;
   return result;
 }
 
@@ -389,7 +441,7 @@ bool Shred(const std::string& path) {
 
 StagedFile::~StagedFile() {
   if (!path_.empty()) {
-    std::remove(path_.c_str());
+    Remove(path_);
   }
 }
 

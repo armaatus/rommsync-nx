@@ -28,6 +28,14 @@ Five phases, one CTest entry each so a red run names what broke:
   structure the sections #38 lists, in order; the hardware note naming M8-1 and
             M8-2; the log's path and cap as log.hpp states them; and a link to
             the guide from README.md and from docs/INSTALL.md.
+  sections  every failure section quotes at least one log line -- a section a
+            user cannot find by searching the file for their line is one they
+            never reach -- and every quoted `scan.skipped` line names a skip
+            reason the scanner spells (`ToString(SkipReason)`), the word a user
+            searches for.
+  limits    the limits section gives the bounds the code stops at (saves,
+            states, roms in the index, a plan's saves), and shows the line that
+            names a rom left out for having too many saves on the server.
 """
 import argparse
 import os
@@ -47,6 +55,10 @@ SECTIONS = [
     "The SD card is full",
     "`config.ini` complaints",
     "The server refused the sync",
+    # M10-2 (#228). `server.unsupported` is a tag the code writes, and the remedy
+    # is on the server rather than on the console, so it has a section of its own
+    # rather than a paragraph under "refused".
+    "RomM is too old",
     # M9-5 (#197). Not one of #38's twelve: that issue was written when nothing
     # in the sysmodule drained the download queue, so "a rom never arrives" had
     # no failure mode to describe. It has one now, and `download.drain` is a tag
@@ -59,6 +71,22 @@ SECTIONS = [
     # meet, and it needs a section saying that a single one is the client
     # working rather than a fault to report.
     "The console slept mid-sync",
+    # M10-16 (#242). `sync.held` is a tag the code writes, and "my save did not
+    # sync" while a game is open is the one thing a user will see of it.
+    "Nothing syncs while a game is open",
+    # M10-7 (#233). `save.deleted` is the one line that explains a save leaving
+    # the card, and the remedy -- the Conflicts screen -- is not where a user
+    # would look for a deletion.
+    "A save disappeared from the card",
+    # M10-17 (#243): what a user meets once a second device shares the slot --
+    # RomM's 409, a Tico account the client will not guess, a platform RomM
+    # spells differently -- and the bounds a big card or library reaches. Each
+    # quotes the line it is found by (`sections`), and the bounds are the code's
+    # (`limits`).
+    "Another device's save got there first (409)",
+    "Tico saves from the wrong account, or none",
+    "RomM calls a platform something else",
+    "Some saves are left out: the limits",
     "What to attach to a bug report",
     "What this page cannot tell you yet",
 ]
@@ -231,6 +259,18 @@ def phase_events(args) -> int:
 
 # --- emitted ------------------------------------------------------------------
 
+# One pass, left to right, so whichever of a string, a character literal, a
+# line comment or a block comment starts first is the one that is read: a `/*`
+# inside `// services/*.c` or `"Accept: */*"` is text, not an opener.
+_TOKEN = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/',
+                    re.DOTALL)
+
+
+def strip_comments(text: str) -> str:
+    """`text` with its comments removed and its literals kept."""
+    return _TOKEN.sub(lambda m: " " if m.group(0).startswith("/") else m.group(0), text)
+
+
 def phase_emitted(args) -> int:
     repo = args.repo
     known = events(repo)
@@ -254,9 +294,20 @@ def phase_emitted(args) -> int:
     # the raw text would stay green after somebody deleted a call and left the
     # paragraph above it -- exactly the rot this phase exists to catch. `///`
     # doc comments are covered by the line rule.
-    body = "\n".join(read(path) for path in sources)
-    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.DOTALL)
-    body = re.sub(r"//[^\n]*", "", body)
+    # The stripper is held to the two shapes that once hid a real call site
+    # (PR #252's host-tests): a `/*` inside a line comment (`services/*.c`) and
+    # one inside a string (`"Accept: */*"`). Read as openers, each swallowed
+    # everything to the next `*/` -- in whichever file `os.walk` listed next, so
+    # it failed on Linux's order and passed on macOS's.
+    tricky = ('// services/*.c\nWarn(Event::kA);\n'
+              'const char* h = "Accept: */*";\nInfo(Event::kB); /* c */ Info(Event::kC);\n')
+    kept = strip_comments(tricky)
+    for name in ("kA", "kB", "kC"):
+        if f"Event::{name}" not in kept:
+            return fail(f"the comment stripper swallowed Event::{name}: a `/*` in a line "
+                        "comment or a string was read as a block comment")
+
+    body = "\n".join(strip_comments(read(path)) for path in sorted(sources))
 
     # A *call*, not a mention: one of the five entry points, an open paren, and
     # the event within the same statement. The level argument in between may be a
@@ -430,7 +481,138 @@ def phase_structure(args) -> int:
     return 0
 
 
+# --- sections -----------------------------------------------------------------
+
+def section_bodies(text: str) -> dict:
+    """`{heading: body}` for every `## ` section."""
+    bodies = {}
+    matches = list(re.finditer(r"^##\s+(.*?)\s*$", text, re.MULTILINE))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        bodies[m.group(1).strip()] = text[m.end():end]
+    return bodies
+
+
+def skip_reasons(repo: str) -> list:
+    """The scanner's skip reasons, read off `ToString(SkipReason)`."""
+    source = read(os.path.join(repo, "core", "src", "save_scan.cpp"))
+    body = re.search(r"const char\* ToString\(SkipReason reason\) \{(.*?)\n\}", source, re.DOTALL)
+    if not body:
+        raise SystemExit(fail("cannot find `ToString(SkipReason)` in core/src/save_scan.cpp"))
+    return [r for r in re.findall(r'return "([^"]+)";', body.group(1)) if r != "unknown"]
+
+
+def phase_sections(args) -> int:
+    repo = args.repo
+    text = read(guide_path(repo))
+    bodies = section_bodies(text)
+
+    # The failure sections: everything between reading the log and the bug report.
+    failures = SECTIONS[1: SECTIONS.index("What to attach to a bug report")]
+    for heading in failures:
+        if not quoted_lines(bodies.get(heading, "")):
+            return fail(f"the section {heading!r} quotes no log line. A user finds a section "
+                        "of this page by the line in their file; one with no line is a "
+                        "section nobody reaches.")
+
+    reasons = skip_reasons(repo)
+    checked = 0
+    for match in quoted_lines(text):
+        if match.group(3) != "scan.skipped":
+            continue
+        detail = match.group(4) or ""
+        # The scan's own lines start with the reason; the engine's line about a
+        # rom folder past the listing bound starts with the folder.
+        if detail.startswith("/") or any(detail.startswith(r + " ") for r in reasons):
+            checked += 1
+            continue
+        return fail("the guide quotes a scan.skipped line that starts with no skip reason "
+                    f"the scanner writes:\n  {match.group(0)}\nthe reasons are "
+                    f"{', '.join(reasons)}")
+
+    # `config::Diagnostic::Describe` writes `[section] key: message`, and with no
+    # key `[section] message` -- never `[section]:`. A line quoted with that colon
+    # is one the client cannot write, and a user searching for it finds nothing.
+    for match in quoted_lines(text):
+        if match.group(3) == "config.diagnostic" and re.search(r"\[[^\] ]+\]:",
+                                                               match.group(4) or ""):
+            return fail("the guide quotes a config.diagnostic line with `]:`, which "
+                        "Diagnostic::Describe never writes (core/src/config.cpp):\n  "
+                        + match.group(0))
+
+    print(f"{len(failures)} failure sections each quote a line; {checked} scan.skipped lines "
+          "name a reason the scanner spells")
+    return 0
+
+
+# --- limits -------------------------------------------------------------------
+
+LIMITS = "Some saves are left out: the limits"
+
+
+def header_constant(repo: str, name: str, seen=()) -> int:
+    """An integer `inline constexpr` from core/'s headers, its expression resolved
+    (`kMaxStates` is `state::kMaxRecords / 4`, not a number). A copy of
+    tests/test_docs_install.py's `constant`, kept beside it for the reason `slug`
+    is copied above; named apart because `constant` here reads log.hpp.
+
+    A qualifier is dropped when resolving, so two headers defining one name would
+    resolve to the first; today each bound is defined once."""
+    folder = os.path.join(repo, "core", "include", "rommsync")
+    headers = "\n".join(read(os.path.join(folder, n)) for n in sorted(os.listdir(folder))
+                        if n.endswith(".hpp"))
+    m = re.search(rf"inline constexpr [\w:<>]+ {name} = ([^;]+);", headers)
+    if not m:
+        raise SystemExit(fail(f"cannot find `{name}` in core/include/rommsync"))
+    expression = m.group(1)
+    for qualified in set(re.findall(r"(?:\w+::)*(k\w+)", expression)):
+        if qualified in seen:
+            raise SystemExit(fail(f"`{name}` is defined in terms of itself"))
+        expression = re.sub(rf"(?:\w+::)*\b{qualified}\b",
+                            str(header_constant(repo, qualified, seen + (name,))), expression)
+    if not re.fullmatch(r"[\d\s+\-*/()]+", expression):
+        raise SystemExit(fail(f"`{name}` is `{m.group(1)}`, which this test cannot evaluate"))
+    return int(eval(expression.replace("/", "//")))  # digits and operators only
+
+
+def phase_limits(args) -> int:
+    repo = args.repo
+    text = read(guide_path(repo))
+    body = section_bodies(text).get(LIMITS)
+    if body is None:
+        return fail(f"docs/TROUBLESHOOTING.md has no {LIMITS!r} section")
+
+    # A list, not a dict: the scan's bound and a plan's are both 128 saves today,
+    # and each is checked under its own name.
+    wanted = [
+        (f"{header_constant(repo, 'kMaxSaves'):,} saves", "scan::kMaxSaves"),
+        (f"{header_constant(repo, 'kMaxPlanOperations'):,} saves", "sync::kMaxPlanOperations"),
+        (f"{header_constant(repo, 'kMaxStates'):,} states", "scan::kMaxStates"),
+        (f"{header_constant(repo, 'kMaxIndexRoms'):,} roms", "roms::kMaxIndexRoms"),
+    ]
+    phrases = sorted({phrase for phrase, _ in wanted})
+    for phrase, source in wanted:
+        if phrase not in body:
+            return fail(f"the limits section does not say {phrase!r} ({source})")
+    for number, noun in re.findall(r"\b(\d[\d,]*) (saves|states|roms)\b", body):
+        if f"{number} {noun}" not in phrases:
+            return fail(f"the limits section says {number} {noun}, which is no bound the code "
+                        "has; the bounds are " + ", ".join(phrases))
+
+    # The rom left out for holding too many saves is named in a sync.refused
+    # line (sysmodule/source/engine.cpp, #246): show that line here.
+    if not any(m.group(3) == "sync.refused" for m in quoted_lines(body)):
+        return fail("the limits section does not show the sync.refused line that names a "
+                    "rom left out for holding more saves than one plan carries")
+
+    print("the limits section gives " + ", ".join(phrases) +
+          " and shows the oversized rom's line")
+    return 0
+
+
 PHASES = {
+    "sections": phase_sections,
+    "limits": phase_limits,
     "events": phase_events,
     "emitted": phase_emitted,
     "links": phase_links,

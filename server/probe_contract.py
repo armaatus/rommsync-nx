@@ -294,9 +294,9 @@ def register_device(s, base, cap, name="probe device", capture_as="devices-creat
     return dev.get("device_id") or dev.get("id"), dev
 
 
-def negotiate(s, base, cap, device_id, saves, capture_as=None):
+def negotiate(s, base, cap, device_id, saves, capture_as=None, **fields):
     r = s.post(f"{base}/api/sync/negotiate",
-               json={"device_id": device_id, "saves": saves}, timeout=60)
+               json={"device_id": device_id, "saves": saves, **fields}, timeout=60)
     r.raise_for_status()
     body = r.json()
     if capture_as:
@@ -319,6 +319,33 @@ def expect_action(plan, action, slot):
         sys.exit(1)
 
 
+def version_tuple(text):
+    """`5.4.0` as (5, 4, 0). Anything unparseable reads as the newest RomM."""
+    try:
+        return tuple(int(part) for part in text.split("-")[0].split("."))
+    except ValueError:
+        return (999,)
+
+
+def upload_save(s, base, rom_id, slot, device, content, emulator="probe-emulator", **params):
+    """`POST /api/saves` as the client sends it, response unchecked."""
+    return s.post(f"{base}/api/saves",
+                  params={"rom_id": rom_id, "emulator": emulator, "slot": slot,
+                          "device_id": device, **params},
+                  files={"saveFile": ("probe.srm", content, "application/octet-stream")},
+                  timeout=60)
+
+
+def expect_status(r, status, what):
+    """Fail loudly when a call that is captured for its refusal is not refused."""
+    if r.status_code != status:
+        print(f"!! {what} answered {r.status_code}, not {status}: {r.text[:200]}. "
+              f"docs/API_CONTRACT.md is describing a server that changed.",
+              file=sys.stderr)
+        sys.exit(1)
+    return r.json()
+
+
 def client_save(rom_id, file_name, slot, emulator, content, updated_at):
     """One ClientSaveState entry, as the sysmodule will build it.
 
@@ -337,7 +364,7 @@ def client_save(rom_id, file_name, slot, emulator, content, updated_at):
     }
 
 
-def sync_scenarios(s, base, cap, rom_id):
+def sync_scenarios(s, base, cap, rom_id, version):
     """Put real saves on the server so all four negotiate actions can be captured.
 
     A negotiate with an empty save list -- the read-only mode above -- returns an
@@ -364,9 +391,11 @@ def sync_scenarios(s, base, cap, rom_id):
               f"the captures will include operations for them too.")
 
     def cleanup(devices_too=False):
-        if created:
-            s.post(f"{base}/api/saves/delete", json={"saves": created}, timeout=60)
-            created.clear()
+        # One id per call: a delete naming a save that is already gone fails
+        # whole, and on 5.4 the slot cap prunes rows this list still names.
+        for save_id in created:
+            s.post(f"{base}/api/saves/delete", json={"saves": [save_id]}, timeout=60)
+        created.clear()
         # Every scenario device is a new row -- that is the point, they must have
         # no sync history -- so without this the fixture accretes four per run,
         # and this runs on every `ctest`.
@@ -510,8 +539,8 @@ def sync_scenarios(s, base, cap, rom_id):
         # RomM plans this upload and then refuses to accept it: with a device_id
         # and a slot, add_save wants a sync row at least as new as the save it is
         # replacing, and a device that has never synced has none. Capture the
-        # refusal -- a client executing the server's own plan has to send
-        # overwrite=true, and this is the error it gets when it forgets.
+        # refusal: it is RomM's slot guard, which the client keeps on purpose
+        # (overwrite=false) and resolves against the server's head (#232).
         refused = s.post(f"{base}/api/saves",
                          params={"rom_id": rom_id, "emulator": "probe-emulator",
                                  "slot": slot, "device_id": newcomer,
@@ -609,12 +638,238 @@ def sync_scenarios(s, base, cap, rom_id):
         listed.raise_for_status()
         cap.record("states-list", listed.json())
         show_shape(listed.json(), "GET /api/states")
+        cleanup()
+
+        if version >= (5, 4):
+            sync_scenarios_5_4(s, base, cap, rom_id, run, created, devices)
     finally:
         if states:
             s.post(f"{base}/api/states/delete", json={"states": states}, timeout=60)
             states.clear()
         cleanup(devices_too=True)
         print("\n  scenario saves, states and devices deleted; the fixture is as it was found.")
+
+
+def sync_scenarios_5_4(s, base, cap, rom_id, run, created, devices):
+    """What RomM 5.4.0 does that 5.2.0 did not (#227, the R1 list in #226).
+
+    Each scenario below is one row of docs/API_CONTRACT.md's "5.2.0 -> 5.4.0"
+    section, and each is checked rather than merely captured: a capture named
+    for a behaviour the server no longer has would be worse than a red run.
+    Saves and devices go into the caller's `created` and `devices`, so its
+    cleanup removes them however this leaves.
+    """
+    v1 = b"rommsync probe save v1\n"
+
+    def device(name):
+        device_id, _ = register_device(s, base, cap, f"probe-{run}-{name}", capture_as=None)
+        devices.append(device_id)
+        return device_id
+
+    def uploaded(slot, device_id, content, **params):
+        """An upload that must succeed, remembered for the caller's cleanup."""
+        r = upload_save(s, base, rom_id, slot, device_id, content, **params)
+        r.raise_for_status()
+        created.append(r.json()["id"])
+        return r.json()
+
+    def slot_versions(slot):
+        listed = s.get(f"{base}/api/saves", params={"rom_id": rom_id, "slot": slot},
+                       timeout=30)
+        listed.raise_for_status()
+        return listed.json()
+
+    # --- versions, identical bytes, and the slot cap ------------------------
+    hr("5.4: every slotted upload is a new version")
+    slot = f"probe-{run}-versions"
+    owner = device("versions")
+    first = uploaded(slot, owner, v1)
+    second = cap.record("saves-post-new-version",
+                        uploaded(slot, owner, b"rommsync probe save v2\n"))
+    if second["id"] == first["id"]:
+        print(f"!! a second upload to slot {slot!r} replaced row {first['id']} in place. "
+              f"5.4.0 keeps every slotted upload as a version of its own.", file=sys.stderr)
+        sys.exit(1)
+
+    hr("5.4: the same bytes again promote the old version, and create nothing")
+    again = cap.record("saves-post-identical", uploaded(slot, owner, v1))
+    if again["id"] != first["id"]:
+        print(f"!! re-uploading the bytes of row {first['id']} created row {again['id']}. "
+              f"5.4.0 promotes the existing version to head instead.", file=sys.stderr)
+        sys.exit(1)
+    listed = slot_versions(slot)
+    if sorted(save["id"] for save in listed) != sorted([first["id"], second["id"]]):
+        print(f"!! slot {slot!r} holds {[x['id'] for x in listed]} after the promotion, "
+              f"not the two versions {first['id']} and {second['id']}", file=sys.stderr)
+        sys.exit(1)
+    cap.record("saves-list-slot", listed)
+
+    hr("5.4: a slot keeps MAX_SAVES_PER_SLOT versions")
+    # Eleven distinct versions on top of the two above. The fixture pins the cap
+    # at 10 (server/testing/docker-compose.yml), and anything that keeps all
+    # thirteen is not pruning.
+    for n in range(3, 14):
+        uploaded(slot, owner, f"rommsync probe save v{n}\n".encode())
+    kept = slot_versions(slot)
+    if len(kept) > 10:
+        print(f"!! slot {slot!r} kept {len(kept)} versions of 13; the fixture's "
+              f"MAX_SAVES_PER_SLOT is 10.", file=sys.stderr)
+        sys.exit(1)
+    print(f"  13 uploaded, {len(kept)} kept")
+    # The pruned rows are gone already, and a delete naming one fails whole.
+    # Nothing else is in `created` yet: the caller cleaned up before this ran.
+    created[:] = [save["id"] for save in kept]
+
+    # --- delete -------------------------------------------------------------
+    hr("5.4: a slot emptied on the server negotiates as `delete`")
+    slot = f"probe-{run}-delete"
+    holder = device("delete")
+    held = upload_save(s, base, rom_id, slot, holder, v1)
+    held.raise_for_status()
+    held = held.json()
+    s.post(f"{base}/api/saves/delete", json={"saves": [held["id"]]},
+           timeout=60).raise_for_status()
+    gone = negotiate(s, base, cap, holder, [
+        client_save(rom_id, "probe.srm", slot, "probe-emulator", v1, "2026-01-01T00:00:00Z"),
+    ])
+    expect_action(gone, "delete", slot)
+    cap.record("sync-negotiate-delete", gone)
+    print(json.dumps(gone, indent=2)[:600])
+
+    # --- another device's version, and baselines ----------------------------
+    hr("5.4: another device's upload is a new head this device has no history with")
+    # Sync records are per (device, save row), and negotiate only reads the
+    # ones against each slot's newest row. Once `b` uploads, the head is a row
+    # `a` has never synced, so `a` falls back to comparing timestamps -- its
+    # baseline is on the row `b` superseded and is never consulted.
+    slot = f"probe-{run}-other-version"
+    a, b = device("version-a"), device("version-b")
+    uploaded(slot, a, v1, content_hash=hashlib.md5(v1).hexdigest())
+    # Negotiate picks a slot's head by `updated_at`, strictly newer wins, at
+    # whole seconds. Two versions in one second tie, the older row stays head,
+    # and this comes back `no_op` against a's own row -- #85's same-second
+    # rows, now between versions of one slot.
+    time.sleep(1.1)
+    uploaded(slot, b, b"server v2\n", overwrite="true")
+    behind = negotiate(s, base, cap, a, [
+        client_save(rom_id, "probe.srm", slot, "probe-emulator", v1, "2099-01-01T00:00:00Z"),
+    ])
+    expect_action(behind, "upload", slot)
+    cap.record("sync-negotiate-other-device-version", behind)
+    print(json.dumps(behind, indent=2)[:600])
+
+    hr("5.4: a content_hash baseline turns an mtime-only change into a download")
+    # The same story on one row: `b` moves the row `a` synced (PUT), and `a`
+    # comes back with the same bytes under a newer mtime. With no baseline both
+    # sides "changed since the last sync" and 5.2.0 says conflict; the hash `a`
+    # uploaded with proves its side did not.
+    slot = f"probe-{run}-baseline"
+    a, b = device("baseline-a"), device("baseline-b")
+    row = uploaded(slot, a, v1, content_hash=hashlib.md5(v1).hexdigest())["id"]
+    time.sleep(1.1)  # second-granular timestamps; see the conflict scenario
+    s.put(f"{base}/api/saves/{row}", params={"device_id": b},
+          files={"saveFile": ("probe.srm", b"server v2\n", "application/octet-stream")},
+          timeout=60).raise_for_status()
+    moved = negotiate(s, base, cap, a, [
+        client_save(rom_id, "probe.srm", slot, "probe-emulator", v1, "2099-01-01T00:00:00Z"),
+    ])
+    expect_action(moved, "download", slot)
+    cap.record("sync-negotiate-baseline-download", moved)
+    print(json.dumps(moved, indent=2)[:600])
+
+    # --- pairing across emulators, and the `emulators` filter ---------------
+    hr("5.4: saves pair on (rom_id, slot) whatever the emulator")
+    slot = f"probe-{run}-emulators"
+    other, mine_device = device("emu-x"), device("emu-y")
+    uploaded(slot, other, v1, emulator="probe-emulator-x")
+    entry = client_save(rom_id, "probe.srm", slot, "probe-emulator-y", v1,
+                        "2026-01-01T00:00:00Z")
+    paired = negotiate(s, base, cap, mine_device, [entry])
+    expect_action(paired, "no_op", slot)
+    cap.record("sync-negotiate-pairs-across-emulators", paired)
+    print(json.dumps(paired, indent=2)[:600])
+
+    hr("5.4: `emulators` narrows what the server pairs and offers")
+    narrowed = negotiate(s, base, cap, mine_device, [entry], emulators=["probe-emulator-y"])
+    expect_action(narrowed, "upload", slot)
+    cap.record("sync-negotiate-emulators-filter", narrowed)
+    print(json.dumps(narrowed, indent=2)[:600])
+
+    # --- rom_ids --------------------------------------------------------------
+    hr("5.3+: `rom_ids` scopes negotiate, and GET /api/saves")
+    roms = s.get(f"{base}/api/roms", params={"limit": 2}, timeout=30)
+    roms.raise_for_status()
+    others = [rom["id"] for rom in roms.json()["items"] if rom["id"] != rom_id]
+    if not others:
+        print("!! the library holds one rom, so a scope that leaves it out cannot be shown",
+              file=sys.stderr)
+        sys.exit(1)
+    # Every save above is on `rom_id`, and a device with no history is offered
+    # all of them -- unless the scope leaves their rom out.
+    scoped_device = device("rom-ids")
+    scoped = negotiate(s, base, cap, scoped_device, [], rom_ids=others[:1])
+    leaked = [op for op in scoped["operations"] if op["rom_id"] == rom_id]
+    if leaked:
+        print(f"!! negotiate scoped to rom {others[0]} still offered {len(leaked)} "
+              f"operation(s) for rom {rom_id}", file=sys.stderr)
+        sys.exit(1)
+    cap.record("sync-negotiate-rom-ids-scope", scoped)
+    listed = s.get(f"{base}/api/saves", params={"rom_ids": [rom_id, others[0]]}, timeout=30)
+    listed.raise_for_status()
+    if not listed.json() or {save["rom_id"] for save in listed.json()} - {rom_id, others[0]}:
+        print(f"!! GET /api/saves?rom_ids= answered saves for "
+              f"{sorted({x['rom_id'] for x in listed.json()})}", file=sys.stderr)
+        sys.exit(1)
+    cap.record("saves-list-rom-ids", listed.json()[:1])
+
+    # --- sessions -----------------------------------------------------------
+    hr("5.4: a second negotiate leaves the first session completable")
+    sessions = device("sessions")
+    earlier = negotiate(s, base, cap, sessions, [])
+    negotiate(s, base, cap, sessions, [])
+    done = s.post(f"{base}/api/sync/sessions/{earlier['session_id']}/complete",
+                  json={"operations_completed": 0, "operations_failed": 0,
+                        "play_sessions": []}, timeout=60)
+    cap.record("sync-complete-earlier-session",
+               expect_status(done, 200, "completing a session negotiated before another"))
+
+    hr("5.4: negotiate refuses a device whose sync is disabled")
+    disabled = device("disabled")
+    s.put(f"{base}/api/devices/{disabled}", json={"sync_enabled": False},
+          timeout=30).raise_for_status()
+    refused = s.post(f"{base}/api/sync/negotiate",
+                     json={"device_id": disabled, "saves": []}, timeout=60)
+    cap.record("sync-negotiate-400-sync-disabled",
+               expect_status(refused, 400, "negotiate for a sync-disabled device"))
+
+    # --- emulator validation ------------------------------------------------
+    hr("5.4: `emulator` is at most 50 characters and a folder name verbatim")
+    slot = f"probe-{run}-invalid"
+    validator = device("invalid")
+    cap.record("saves-post-422-emulator-too-long", expect_status(
+        upload_save(s, base, rom_id, slot, validator, v1, emulator="e" * 51),
+        422, "an upload with a 51-character emulator"))
+    cap.record("saves-post-400-emulator-not-a-folder-name", expect_status(
+        upload_save(s, base, rom_id, slot, validator, v1, emulator="probe/emulator"),
+        400, "an upload whose emulator is not one folder name"))
+
+    states_refused = s.post(f"{base}/api/states",
+                            params={"rom_id": rom_id, "emulator": "probe/emulator"},
+                            files={"stateFile": (f"probe-{run}.state", v1,
+                                                 "application/octet-stream")},
+                            timeout=60)
+    cap.record("states-post-400-emulator-not-a-folder-name", expect_status(
+        states_refused, 400, "a state upload whose emulator is not one folder name"))
+
+    # --- auth ---------------------------------------------------------------
+    hr("5.4: a malformed bearer token is a 401")
+    # Not `rmm_`-prefixed on purpose: 5.2.0 already answered 401 to a client
+    # token it did not know, and 500 to anything else -- which it then tried to
+    # decode as a JWT. That second path is the one 5.4.0 fixed.
+    bogus = requests.get(f"{base}/api/devices", timeout=30,
+                         headers={"Authorization": "Bearer not-a-token"})
+    cap.record("auth-401-malformed-token",
+               expect_status(bogus, 401, "a request with a malformed bearer token"))
 
 
 def main():
@@ -634,6 +889,8 @@ def main():
                          "can be captured (WRITES to the library; implies --negotiate)")
     ap.add_argument("--i-know-this-is-disposable", action="store_true",
                     help="allow a writing mode against a non-loopback URL")
+    ap.add_argument("--openapi", metavar="FILE",
+                    help="write /openapi.json to FILE exactly as the server sent it")
     args = ap.parse_args()
     base = args.url.rstrip("/")
     s = requests.Session()
@@ -651,8 +908,25 @@ def main():
             return 2
 
     hr("server version")
-    spec = s.get(f"{base}/openapi.json", timeout=30).json()
+    spec_r = s.get(f"{base}/openapi.json", timeout=30)
+    spec_r.raise_for_status()
+    spec = spec_r.json()
+    version = version_tuple(spec["info"]["version"])
     print("RomM", spec["info"]["version"], "| paths:", len(spec["paths"]))
+    if args.openapi:
+        # The bytes, not a re-serialisation: romm-openapi-5.2.0.json is what
+        # 5.2.0 sent, and a snapshot is only comparable to the next if both are.
+        with open(args.openapi, "wb") as fh:
+            fh.write(spec_r.content)
+        print(f"  wrote {args.openapi}")
+
+    # The unauthenticated version check a client can make before it has a
+    # token. 5.4.0 has no capability flags, so features are inferred from this.
+    # SYSTEM only: the rest is the server's whole configuration, which churns
+    # release to release and is no part of what this client reads.
+    heartbeat = s.get(f"{base}/api/heartbeat", timeout=30)
+    heartbeat.raise_for_status()
+    cap.record("heartbeat-system", {"SYSTEM": heartbeat.json().get("SYSTEM")})
 
     # sanity: the endpoints we depend on exist
     hr("required endpoints present")
@@ -700,6 +974,19 @@ def main():
 
     token, paired_device_id = device_auth(s, base, cap, approver)
     s.headers["Authorization"] = f"Bearer {token}"
+
+    if version >= (5, 4):
+        # 5.4.0 made (user, client_device_identifier) unique, so pairing again
+        # as the same console is the same device -- the reason a re-pair after a
+        # wiped token.dat does not leave a second row behind. Its own session
+        # and no captures: the shapes are the ones just recorded.
+        hr("5.4: pairing again as the same console reuses the device")
+        _, again = device_auth(requests.Session(), base, Captures(None), approver)
+        if again != paired_device_id:
+            print(f"!! a second pairing as the same client_device_identifier made device "
+                  f"{again} beside {paired_device_id}", file=sys.stderr)
+            sys.exit(1)
+        print(f"  same device: {again}")
 
     hr("the device pairing registered (DeviceSchema)")
     paired = paired_device(s, base, cap, paired_device_id)
@@ -772,7 +1059,7 @@ def main():
                 print("\n!! the library is empty, so no save can be attached to a rom.",
                       file=sys.stderr)
                 return 1
-            sync_scenarios(s, base, cap, rom_id)
+            sync_scenarios(s, base, cap, rom_id, version)
     finally:
         for probe_device in probe_devices:
             s.delete(f"{base}/api/devices/{probe_device}", timeout=30)

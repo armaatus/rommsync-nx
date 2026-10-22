@@ -38,11 +38,13 @@
 #
 #   flags/boot2.flag   its presence is what makes Atmosphere launch the
 #                      sysmodule at boot, and the sysmodule ships DISABLED
-#                      (#33, and the first step of the install guide). Nor the
-#                      `flags/` directory around it: ovl-sysmodules creates that
-#                      itself before it writes the flag (`mkdir` in its
-#                      gui_main.cpp), so a zip -- which cannot hold an empty
-#                      directory anyway -- has nothing to contribute.
+#                      (#33, and the first step of the install guide). The
+#                      `flags/` directory around it DOES ship, empty, as a zip
+#                      directory entry (#211): current ovl-sysmodules `mkdir`s
+#                      it before writing the flag, but only since its #6
+#                      ("autostart can't be enabled if the flags folder doesn't
+#                      exist"), and builds without that fix are still in the
+#                      wild. An empty directory enables nothing.
 #   config.ini         only config.ini.example. An upgrade is this same zip
 #                      unpacked over the top, and replacing a user's settings
 #                      is not something a release may do.
@@ -147,7 +149,10 @@ NSP_ENTRY="atmosphere/contents/$TITLE_ID/exefs.nsp"
 TOOLBOX_ENTRY="atmosphere/contents/$TITLE_ID/toolbox.json"
 OVL_ENTRY="switch/.overlays/ovl-rommsync.ovl"
 CONFIG_ENTRY="config/rommsync/config.ini.example"
-ENTRIES=("README.txt" "LICENSE" "$NSP_ENTRY" "$TOOLBOX_ENTRY" "$CONFIG_ENTRY" "$OVL_ENTRY")
+# The trailing slash is what makes it a directory entry, to zip and to unzip.
+FLAGS_ENTRY="atmosphere/contents/$TITLE_ID/flags/"
+ENTRIES=("README.txt" "LICENSE" "$NSP_ENTRY" "$TOOLBOX_ENTRY" "$FLAGS_ENTRY"
+         "$CONFIG_ENTRY" "$OVL_ENTRY")
 
 if [ "$LIST_ONLY" -eq 1 ]; then
   printf '%s\n' "${ENTRIES[@]}"
@@ -200,7 +205,7 @@ STAGE="$(mktemp -d)"
 cleanup() { rm -rf "$STAGE"; }
 trap cleanup EXIT
 
-mkdir -p "$STAGE/$(dirname "$NSP_ENTRY")" \
+mkdir -p "$STAGE/$FLAGS_ENTRY" \
          "$STAGE/$(dirname "$OVL_ENTRY")" \
          "$STAGE/$(dirname "$CONFIG_ENTRY")"
 
@@ -226,14 +231,27 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
 # Determinism, part two: the mode and the mtime are recorded in the archive, and
 # both would otherwise come from whatever the build left behind. Applied to
 # every entry, including the ones copied out of the worktree.
-( cd "$STAGE" && chmod 644 "${ENTRIES[@]}" && touch -t "$FIXED_TIMESTAMP" "${ENTRIES[@]}" )
+# 755 on the directory, which a 644 would leave untraversable on the way out.
+( cd "$STAGE" && chmod 644 "${ENTRIES[@]}" && chmod 755 "$FLAGS_ENTRY" &&
+  touch -t "$FIXED_TIMESTAMP" "${ENTRIES[@]}" )
 
 # -X drops the extra fields (unix uid/gid, the high-resolution timestamp) that
-# would otherwise differ between two runs; -D writes no directory entries, so
-# there is nothing in the archive but the six files named above; and the file
-# list is given explicitly, so the order is the one above rather than whatever
-# the filesystem hands back.
-( cd "$STAGE" && zip -X -D -q "$ZIP" "${ENTRIES[@]}" )
+# would otherwise differ between two runs; the list is given explicitly and
+# without -r, so the archive holds exactly the entries named above -- no
+# implicit parent directories, nothing a recursion could pick up -- in the order
+# above rather than whatever the filesystem hands back.
+( cd "$STAGE" && zip -X -q "$ZIP" "${ENTRIES[@]}" )
+
+# ...and that is checked on the archive itself, because it is the promise
+# everything downstream relies on: a `__MACOSX/`, a `._exefs.nsp` or an
+# implicit directory entry is an archive this script would otherwise hand a
+# release job without a word (#211). A refusal takes the archive with it.
+listed="$(unzip -Z1 "$ZIP")" || { rm -f "$ZIP"; die "cannot list $ZIP"; }
+[ "$listed" = "$(printf '%s\n' "${ENTRIES[@]}")" ] || {
+  rm -f "$ZIP"
+  die "the archive holds something other than its entries:
+$listed"
+}
 
 # The manifest. docs/INSTALL.md (#35) is checked against these paths rather than
 # against a copy of them, so a renamed artifact or a moved title id is a red

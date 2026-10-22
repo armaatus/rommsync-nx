@@ -198,6 +198,12 @@ struct SyncActionsView {
 /// nothing about how the sync then goes.
 ipc::SyncOutcome PredictSyncNow(const ipc::Status& status);
 
+/// Whether `outcome` is a press that promised a tick: `kAccepted`, or
+/// `kDeferred`, the same promise made for when the game closes (#242). Its
+/// notice goes once that tick is seen running. One place, because the screen
+/// records the transition and this header decides what it means.
+bool PromisesTick(ipc::SyncOutcome outcome);
+
 /// The sentence for each `SyncOutcome`, and how it should read.
 ///
 /// Published because the screen refuses a press locally rather than sending a

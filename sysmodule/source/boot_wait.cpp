@@ -1,7 +1,8 @@
 // See boot_wait.hpp for why the boot policy is here rather than in main.cpp.
 #include "boot_wait.hpp"
 
-#include <cstdio>
+#include <algorithm>
+#include <charconv>
 #include <cstring>
 
 namespace rommsync::sysmodule::boot {
@@ -37,16 +38,35 @@ char* Claim(Journal& journal) {
 
 }  // namespace
 
+std::size_t Append(char* line, std::size_t capacity, std::size_t at, std::string_view text) {
+  if (capacity == 0) return 0;
+  at = std::min(at, capacity - 1);
+  const std::size_t taken = std::min(text.size(), capacity - 1 - at);
+  std::memcpy(line + at, text.data(), taken);
+  line[at + taken] = '\0';
+  return at + taken;
+}
+
+std::size_t AppendNumber(char* line, std::size_t capacity, std::size_t at,
+                         std::uint64_t value, int base) {
+  char digits[20];
+  const std::to_chars_result written = std::to_chars(digits, digits + sizeof(digits), value, base);
+  return Append(line, capacity, at,
+                std::string_view(digits, static_cast<std::size_t>(written.ptr - digits)));
+}
+
 void Note(Journal& journal, const char* what) {
   char* line = Claim(journal);
   if (line == nullptr) return;
-  std::snprintf(line, kMaxNoteBytes, "%s", what);
+  Append(line, kMaxNoteBytes, 0, what);
 }
 
 void Note(Journal& journal, const char* what, std::uint32_t code) {
   char* line = Claim(journal);
   if (line == nullptr) return;
-  std::snprintf(line, kMaxNoteBytes, "%s: 0x%x", what, static_cast<unsigned>(code));
+  std::size_t at = Append(line, kMaxNoteBytes, 0, what);
+  at = Append(line, kMaxNoteBytes, at, ": 0x");
+  AppendNumber(line, kMaxNoteBytes, at, code, 16);
 }
 
 const char* NoteAt(const Journal& journal, std::size_t index) {

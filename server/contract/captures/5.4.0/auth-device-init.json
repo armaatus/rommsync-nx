@@ -1,0 +1,8 @@
+{
+  "device_code": "<device_code>",
+  "user_code": "<user_code>",
+  "verification_path": "/pair/device",
+  "verification_path_complete": "/pair/device?user_code=<user_code>",
+  "expires_in": 600,
+  "interval": 5
+}

@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "rommsync/config_text.hpp"
+#include "rommsync/save_source.hpp"
 
 namespace rommsync::config {
 namespace {
@@ -309,7 +310,7 @@ void AppendSection(Document* doc, const std::string& section,
 
 // --- what a value is allowed to be --------------------------------------------
 
-enum class ValueKind { kUnknown, kBool, kMinutes, kUrl, kPathList };
+enum class ValueKind { kUnknown, kBool, kMinutes, kUrl, kPathList, kEmulator };
 
 const bool* BoolField(const Config& config, const std::string& section, const std::string& key);
 
@@ -321,6 +322,9 @@ ValueKind KindOf(const std::string& section, const std::string& key) {
     return ValueKind::kMinutes;
   }
   if (section.rfind("platform.", 0) == 0) {
+    if (key == "emulator") {
+      return ValueKind::kEmulator;
+    }
     return key == "roms" || key == "saves" || key == "states" ? ValueKind::kPathList
                                                               : ValueKind::kUnknown;
   }
@@ -345,6 +349,7 @@ const bool* BoolField(const Config& config, const std::string& section,
     if (key == "on_boot") return &config.sync.on_boot;
     if (key == "saves") return &config.sync.saves;
     if (key == "states") return &config.sync.states;
+    if (key == "map_state_slots") return &config.sync.map_state_slots;
     if (key == "conflict_show") return &config.sync.conflict_show;
     return nullptr;
   }
@@ -509,6 +514,18 @@ bool NormalizeValue(const Resolved& target, std::string_view raw, std::string* o
       *out = Join(paths);
       return true;
     }
+    case ValueKind::kEmulator: {
+      const std::string_view id = Trim(raw);
+      std::string why;
+      // Empty is a value here, the way `roms =` is: it takes the override out.
+      if (!id.empty() && !scan::ValidEmulatorId(id, &why)) {
+        Complain(diagnostics, Severity::kError, target.section, target.key,
+                 "'" + Redact(id) + "' " + why);
+        return false;
+      }
+      *out = std::string(id);
+      return true;
+    }
     case ValueKind::kUnknown:
       break;
   }
@@ -528,17 +545,23 @@ bool ReadsBackAs(const Config& config, const Resolved& target) {
     }
     case ValueKind::kPathList:
       return Join(PathField(config, target.section, target.key)) == target.value;
+    case ValueKind::kEmulator:
+      return config.EmulatorOverride(std::string_view(target.section)
+                                         .substr(std::string_view("platform.").size())) ==
+             target.value;
     case ValueKind::kUnknown:
       break;
   }
   return false;
 }
 
-/// The lines a section that did not exist starts life with.
+/// The lines a section that did not exist starts life with -- or a section that
+/// sets no folder yet, which is an `emulator`-only one.
 ///
-/// For anything but a platform that is the one assignment. For a platform this
-/// build maps by default it is the **whole built-in mapping with the assignment
-/// applied on top**, and that is not tidiness: a `[platform.x]` section replaces
+/// For anything but a platform folder that is the one assignment. For a folder
+/// of a platform that maps any, it is the **whole mapping in force with the
+/// assignment applied on top** -- the built-in one, for a section that is not
+/// there or sets only `emulator` -- and that is not tidiness: a `[platform.x]` section replaces
 /// that platform's defaults rather than adding to them (docs/CONFIG.md), so a
 /// section created to point `saves` somewhere would otherwise unmap the
 /// platform's `roms` folder as a side effect of one edit. Precedence is
@@ -549,17 +572,19 @@ bool ReadsBackAs(const Config& config, const Resolved& target) {
 /// platform nowhere; that is an assignment with an empty value and reaches here
 /// as one.
 std::vector<std::pair<std::string, std::string>> NewSectionBody(
-    const Resolved& target, const std::vector<Resolved>& edit, bool* carried) {
+    const Resolved& target, const std::vector<Resolved>& edit, const Config& in_force,
+    bool* carried) {
   std::vector<std::pair<std::string, std::string>> body;
-  const auto found = target.kind == ValueKind::kPathList
-                         ? DefaultPlatforms().find(
-                               target.section.substr(std::string_view("platform.").size()))
-                         : DefaultPlatforms().end();
-  if (found == DefaultPlatforms().end()) {
+  const PlatformFolders* mapped =
+      target.kind == ValueKind::kPathList
+          ? in_force.Platform(
+                std::string_view(target.section).substr(std::string_view("platform.").size()))
+          : nullptr;
+  if (mapped == nullptr) {
     body.push_back({target.key, target.value});
     return body;
   }
-  const PlatformFolders& folders = found->second;
+  const PlatformFolders& folders = *mapped;
   const std::pair<const char*, const std::vector<std::string>*> keys[] = {
       {"roms", &folders.roms}, {"saves", &folders.saves}, {"states", &folders.states}};
   for (const auto& [name, paths] : keys) {
@@ -606,6 +631,16 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
     Complain(diagnostics, Severity::kError, "", "",
              "the configuration on the card is larger than the " +
                  std::to_string(kMaxConfigBytes) + " bytes one can be; it was not edited");
+    return false;
+  }
+  // A file written for a later release is one this build cannot read, so it
+  // cannot rewrite it either without turning a downgrade into lost settings.
+  // The parser's own sentence goes back, since it already says what to update.
+  LoadResult before = ParseConfig(current_text);
+  if (before.newer()) {
+    diagnostics->insert(diagnostics->end(), before.diagnostics.begin(), before.diagnostics.end());
+    Complain(diagnostics, Severity::kError, "", "",
+             "config.ini is from a newer release, so it was not edited");
     return false;
   }
 
@@ -667,7 +702,15 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
   }
 
   // --- apply ---
-  Document doc = Split(current_text);
+  // What the file maps before the edit, which is what a new folder line lands
+  // on: the built-in entry for a platform with no section, or with a section
+  // that sets only `emulator`.
+  const Config in_force = std::move(before.value);
+  // A file this build creates says which format it is in from its first line,
+  // so the one a later release meets is never "no version, presumably 1". A
+  // file that exists keeps whatever it says: an edit is one line, not a rewrite.
+  const std::string created = "version = " + std::to_string(kConfigVersion) + "\n";
+  Document doc = Split(current_text.empty() ? std::string_view(created) : current_text);
   for (const Resolved& target : resolved) {
     const std::vector<std::size_t> hits = AssignmentLines(doc, target.section, target.key);
     if (target.remove) {
@@ -686,14 +729,23 @@ bool ApplyEdit(std::string_view current_text, const Edit& edit, std::string* out
       continue;
     }
     std::size_t at = 0;
-    if (InsertPoint(doc, target.section, &at)) {
-      Insert(&doc, at, NewAssignment(target.key, target.value));
-      continue;
-    }
     bool carried = false;
-    const std::vector<std::pair<std::string, std::string>> body =
-        NewSectionBody(target, resolved, &carried);
-    AppendSection(&doc, target.section, body);
+    if (InsertPoint(doc, target.section, &at)) {
+      const bool sets_folders = !AssignmentLines(doc, target.section, "roms").empty() ||
+                                !AssignmentLines(doc, target.section, "saves").empty() ||
+                                !AssignmentLines(doc, target.section, "states").empty();
+      if (target.kind != ValueKind::kPathList || sets_folders) {
+        Insert(&doc, at, NewAssignment(target.key, target.value));
+        continue;
+      }
+      // The section's first folder line makes it a folder map, which replaces
+      // what it had been leaving alone -- so it carries that, like a new one.
+      for (const auto& [key, value] : NewSectionBody(target, resolved, in_force, &carried)) {
+        Insert(&doc, at++, NewAssignment(key, value));
+      }
+    } else {
+      AppendSection(&doc, target.section, NewSectionBody(target, resolved, in_force, &carried));
+    }
     if (carried) {
       Complain(diagnostics, Severity::kNotice, target.section, target.key,
                "a platform section replaces this build's default folders for that platform, so "

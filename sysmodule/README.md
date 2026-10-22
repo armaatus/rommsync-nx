@@ -1,10 +1,11 @@
 # sys-rommsync (sysmodule)
 
 The background engine. It registers the `rommsync` IPC service and answers it;
-everything behind that service is still arriving milestone by milestone, so the
-commands whose machinery does not exist yet answer `ipc::Error::kUnavailable`
-rather than a plausible refusal (see `source/engine.hpp`). Build on a devkitPro
-dev machine, never on the RomM server.
+every command now has its machinery behind it, and `ipc::Error::kUnavailable` --
+which a command answered while its machinery did not exist, rather than a
+plausible refusal -- is left only for `StartPairing` in a build that wires no
+transport (see `source/engine.hpp`). Build on a devkitPro dev machine, never on
+the RomM server.
 
 ```bash
 make -C sysmodule            # -> sysmodule/sys-rommsync.nsp
@@ -53,9 +54,10 @@ found two (#196), both now declared:
 | `svcReturnFromException` (0x28) | libnx's exception entry | It is the last thing the handler does. Undeclared, the process dies at the exact moment something else has already gone wrong, and the crash that would have been reported is replaced by one that cannot be. |
 | `svcUnmapTransferMemory` (0x52) | `socketExit` → `bsdExit` → `_bsdCleanup` → `tmemClose` | `NetworkExit` calls `socketExit`, so this path runs. Whether the SVC is *issued* rests on libnx leaving `TransferMemory::map_addr` NULL for the bsd transfer memory — an internal of libnx's bsd client, not ours to guarantee. There is no structural way to drop it either: `_bsdCleanup` also runs on `bsdInitialize`'s own failure path. `svcCreateTransferMemory` (0x15) is already granted for the same object. |
 
-The other direction — 18 SVCs are declared that nothing in the image calls — is
-reported and not failed. Narrowing that set is M9-11's, and the script prints
-the list it starts from.
+The other direction — 16 SVCs are declared that nothing in the image calls — is
+reported and not failed. M9-11 (#210) narrowed the filesystem mask, the handle
+table and the address space (below) and left this set alone; nothing owns
+narrowing it yet, and the script prints the list to start from.
 
 ## The two switches
 
@@ -139,35 +141,89 @@ without a console.
 The **M8-1** gate is still what confirms any of this on a console. Two of the
 three items that used to be listed here as "wrong to guess at now" stopped being
 guesses with M1-7 (#126), which gave this process a transport and so made its
-heap and its capabilities things somebody had to add up. The third is still a
+heap and its capabilities things somebody had to add up. M9-11 (#210) settled
+the three fields devkitPro's template had chosen. The title id is still a
 guess, and is still wrong to make now.
 
 - **Title id `0x4200000000524D53`.** The `0x42…` range is where homebrew
   sysmodules live by convention (ldn_mitm, sys-ftpd, sys-con); the low bytes
   spell `RMS`. Nothing verifies it is unused. Confirm it against the installed
   set before anything is loaded on real hardware.
-- **Filesystem access.** `filesystem_access.permissions` is
-  `0xffffffffffffffff` — everything — which is devkitPro's template default and
-  not a decision. It deserves the same treatment `service_access` gets below:
-  narrowed to what the engine actually opens. It is also the capability with the
-  most reach in a project whose second hard rule is about not destroying a
-  player's save.
-- **Heap and capabilities, settled.** `kInnerHeapSize` is `0x150000` (1.3 MiB)
+- **Filesystem access: `SdCard` and nothing else** (`0x0000000000200000`,
+  M9-11, #210). It was `0xffffffffffffffff`, devkitPro's template, which grants
+  `FormatSdCard`, `CorruptSaveData`, `BisAllRaw`, `FillBis` and
+  `FullPermission` — the last of which satisfies every check fs makes. What the
+  code does is `sdmc:` through libnx's fsdev and nothing more: no
+  `fsOpen_SaveData`, no `fsdevMountSaveData`, no BIS, no gamecard. A right the
+  process was never granted is one a bug cannot reach, which in a project whose
+  second hard rule is not destroying a save is the point.
+
+  `fs` checks a mount against this mask, so a facility that needs another bit
+  fails with a permission result until the bit is added here — add it with its
+  row, and the narrowest one that answers. The names and the checks they
+  satisfy are Atmosphere's reimplementation of fssrv
+  (`fssrv_access_control_bits.hpp`), where any one of a check's bits is enough; `npdm-check.py --print` names the bits of
+  a built NPDM.
+
+  | Facility | Bit | Granted |
+  |---|---|---|
+  | `sdmc:` — `fsOpenSdCardFileSystem`, under fsdev | `SdCard` (21) | **yes**: every file this process reads or writes |
+  | A user's game save — `fsOpen_SaveData`, `fsdevMountSaveData` (fs's `CanMountOthersSaveData*`) | `SaveDataBackUp` (5) | no; it also needs `acc:u0` in `service_access` for the `AccountUid` |
+  | This process's own system save — `fsOpen_SystemSaveData` (`CanMountSystemSaveData*`) | `SystemSaveData` (3) | no |
+  | A BIS partition — `fsOpenBisFileSystem` | `BisFileSystem` (15) | no |
+  | Never: format, corrupt, raw or debug access | `FormatSdCard` (26), `CorruptSaveData` (24), `BisAllRaw` (7), `FillBis` (23), `GameCardRaw` (8), `SaveDataForDebug` (25), `Debug` (62), `FullPermission` (63) | **no, and not for any facility this project plans** |
+
+  `npdmtool` writes the one `permissions` value into both the ACID and ACI0, and
+  fs ANDs the two; Atmosphere does not check the ACID signature for a module
+  under `/atmosphere/contents`, so the template's mask survived and did nothing
+  but grant. `npdm.grants` holds the config to `SdCard` on every push and
+  `npdm.svcs` holds both halves of the built NPDM to it.
+- **Handle table: 64, twice the 29 handles this process holds at once**
+  (#210). The count is term by term in
+  [`source/handle_budget.hpp`](source/handle_budget.hpp), read out of libnx's
+  own service code: four threads, the `sm` session, one `fsp-srv` session,
+  `time:s` with its five sub-sessions and shared memory, `psc:m` and its event,
+  `nifm:u`, `bsd:u`'s two sessions plus monitor and transfer memory, `ssl`'s two
+  sessions, the `rommsync` port with three overlay sessions, two `sfdnsres`
+  lookups in flight, and since #242 the `pm:dmnt` session the foreground probe
+  polls. Open files, `SslConnection`s and the `PmModule` are domain
+  objects and cost nothing here; **a socket is not a handle at all**, so the
+  `errno == ENOENT` descriptor question in `ssl_http_client.cpp` is a bsd limit
+  and not this one. A `static_assert` holds the table to exactly twice the
+  count, rounded up to a power of two, so it cannot be widened by editing the
+  number. Not the 1023 sys-con and sys-ftpd declare: sessions are drawn
+  from the resource limit every system module shares, and a table sized for a
+  leak lets the leak spend it, where 64 fails the leaking call here first.
+- **Address space: type 3, 39-bit** (#210). It is the 64-bit layout the kernel
+  has offered since 2.0.0, and what sys-clk, sys-botbase and sys-ftpd declare;
+  type 1 is the 36-bit layout 1.0.0 shipped, which switchbrew lists as
+  deprecated and later kernels keep for compatibility. Nothing here
+  needs either one's range — the heap is a `.bss` array (`kInnerHeapSize`) and
+  libnx reads the regions from the kernel — so the choice is the layout that is
+  not deprecated rather than the one the template copied. sys-con ships 1, so
+  neither is a risk; this is a decision rather than an inheritance.
+- **Heap and capabilities, settled.** `kInnerHeapSize` is `0x180000` (1.5 MiB)
   and is derived term by term in the table above the constant in
   `source/main.cpp`, where a `static_assert` fails the build rather than the
   console if a term outgrows it and `ctest -R heap` fails when the table, the
-  constants and the prose stop agreeing (M9-2, #207). The dominant term is the
+  constants and the prose stop agreeing (M9-2, #207; raised by M9-10, #201). The dominant term is the
   bsd transfer memory, which `socketInitialize` takes out of that heap: the config in
   `source/http/ssl_http_client.hpp` needs **116 KiB**, and libnx's default needs
   **2.25 MiB** and cannot fit at all — so `socketInitializeDefault()` is the one
-  call this process must never make. Add one in-flight transfer buffer to that;
-  roms stream to file and never sit in RAM whole.
+  call this process must never make. Add the transfer buffers to that -- a
+  download's 64 KiB, the receive window's worth, beside an API call's 16 KiB.
+  Roms stream to file and never sit in RAM whole.
 
   `main_thread_stack_size` went from the template's `0x4000` to `0x8000` for a
   reason that is not the transport: the main thread is where `SdEngine::Load`
-  parses `config.ini`, `queue.json` and `auth.json`, and `json::kMaxDepth` is 64
-  — so a document a card left behind can recurse further than 16 KiB of stack
-  allows, and the failure that causes has no console to report it on.
+  parses `config.ini`, `queue.json` and `auth.json`, and the IPC loop decodes
+  every payload the overlay sends — and a JSON document recurses once per level,
+  so the failure a deep one causes has no console to report it on. 0x8000 was
+  itself not enough while `json::kMaxDepth` was 64: the deepest parse measured
+  ~33 KiB. M9-18 (#216) lowered the limit to 16 rather than raising the stack —
+  RomM's deepest response nests 7 deep — and `source/stack_budget.hpp` holds the
+  deepest parse to half the stack, with `stack.fit`, `stack.measured` and
+  `stack.contract` holding the npdm, the frames and the limit to it.
 
   `service_access` is what is used and nothing more — `fsp-srv`, `set:sys`,
   `ssl`, `bsd:u`, `sfdnsres`, `nifm:u`, `time:s`. M1-7 (#126) dropped `time:s`
@@ -176,7 +232,13 @@ guess, and is still wrong to make now.
   back with the `timeInitialize` beside `fsInitialize`, because the scheduler is
   what makes `std::chrono::system_clock` matter — `core/`'s sync and download
   paths call it, and a save stamped from an uninitialised clock is one
-  docs/SYNC_PROTOCOL.md refuses as an epoch `updated_at`.
+  docs/SYNC_PROTOCOL.md refuses as an epoch `updated_at`. M9-4 (#208) added
+  `psc:m` for sleep, and M10-16 (#242) `pm:dmnt`: the engine holds every sync
+  tick while a game is in the foreground, and `pmdmntGetApplicationProcessId`
+  is how it knows. It is polled, and only while a tick is held — the
+  application-launch hook `pm:dmnt` also offers is the single one
+  `dmnt:cht` holds, and pm does not start a hooked application until its hooker
+  says so, so taking it would make every game launch wait on this process.
 
 ## Where the work is
 
@@ -192,8 +254,8 @@ docker, never a mock) before any of it runs on a Switch — see
   overlay has something to open. None of it has run: it is exercised in Ryujinx
   as a manually-launched build first, never as an auto-boot sysmodule and never
   on hardware before the M8-1 gate.
-- **M1 onward** — auth, sync and downloads, in `core/` first. Each one replaces
-  its `kUnavailable` in `source/engine.cpp`; the last one to go is what says the
-  engine is finished.
+- **M1 onward** — auth, sync and downloads, in `core/` first. Each one replaced
+  its `kUnavailable` in `source/engine.cpp`; what is left of it is `StartPairing`
+  on a build with no transport, which a console never is (M1-7, #126).
 
 See milestone M0 in [`../ISSUES.md`](../ISSUES.md).

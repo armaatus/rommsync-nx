@@ -62,20 +62,69 @@ json::Error ReadName(const json::Value& item, const char* key, std::string* out)
   return {};
 }
 
+/// `items[index]`, onto the end of `roms`, or the field that was wrong with it.
+json::Error ReadRom(const json::Value& item, std::size_t index, std::vector<Rom>* roms) {
+  const std::string where = "items[" + std::to_string(index) + "].";
+  json::Reader reader(item, "rom");
+  Rom rom;
+  reader.Required("id", &rom.id);
+  reader.Required("platform_fs_slug", &rom.platform_fs_slug);
+  reader.Required("has_multiple_files", &rom.has_multiple_files);
+  // The two match keys are read leniently, because `json::Reader::Required`
+  // refuses an empty string and these two can legitimately be one: RomM
+  // derives `fs_name_no_tags` by stripping `(...)` and `[...]`, so a rom
+  // whose whole filename is a tag -- `(USA).nes` -- reduces to nothing. Read
+  // strictly, that single oddly named file fails the page, aborts the fetch,
+  // and leaves an empty index in which *every* save on the card is
+  // unmatched, on every tick. An empty key simply matches no base name, which
+  // costs that one rom and nothing else.
+  if (!reader.ok()) {
+    json::Error error = reader.error();
+    error.field = where + error.field;
+    return error;
+  }
+  for (const auto& [key, out] : {std::pair{"fs_name_no_ext", &rom.fs_name_no_ext},
+                                 std::pair{"fs_name_no_tags", &rom.fs_name_no_tags}}) {
+    if (json::Error error = ReadName(item, key, out); !error.ok()) {
+      error.field = where + error.field;
+      return error;
+    }
+  }
+  if (rom.id <= 0) {
+    return Fail(where + "id", "must be a positive rom id");
+  }
+  roms->push_back(std::move(rom));
+  return {};
+}
+
 }  // namespace
 
 json::Error ParsePage(std::string_view body, Page* out) {
-  const json::ParseResult document = json::Parse(body);
+  // A row at a time, never the page (`json::ParseEach`): a parsed row weighs
+  // ~11x its text, and a page held as one document is a multiple of the
+  // sysmodule's whole heap (M9-19, #217).
+  //
+  // And of a row only what is read (#248): a rom RomM identified carries ~12 KiB
+  // of metadata nothing here looks at, ~190 KiB as a document.
+  static constexpr std::string_view kRead[] = {
+      "id",    "platform_fs_slug", "has_multiple_files", "fs_name_no_ext", "fs_name_no_tags",
+      "total", "limit",            "offset"};
+  Page page;
+  const json::ParseResult document = json::ParseEach(
+      body, "items", kRead,
+      [&page](const json::Value& item, std::size_t index) {
+        return ReadRom(item, index, &page.roms);
+      },
+      "rom list");
   if (!document.ok()) {
     return document.error;
   }
 
-  // The envelope first. A body that is a bare array -- which is what the
-  // endpoint *looks* like it should answer -- fails here by name rather than
-  // by producing an empty page, because an empty page reads as "the library
-  // ended" and every save after it is unmatched.
+  // The envelope. A body that is a bare array -- which is what the endpoint
+  // *looks* like it should answer -- fails here by name rather than by
+  // producing an empty page, because an empty page reads as "the library ended"
+  // and every save after it is unmatched.
   json::Reader envelope(document.value, "rom list");
-  Page page;
   envelope.Required("total", &page.total);
   envelope.Required("limit", &page.limit);
   envelope.Required("offset", &page.offset);
@@ -86,42 +135,6 @@ json::Error ParsePage(std::string_view body, Page* out) {
   const json::Value* items = document.value.Find("items");
   if (items == nullptr || !items->is_array()) {
     return Fail("items", "expected an array of roms");
-  }
-
-  page.roms.reserve(items->size());
-  std::size_t index = 0;
-  for (const json::Value& item : items->elements()) {
-    const std::string where = "items[" + std::to_string(index++) + "].";
-    json::Reader reader(item, "rom");
-    Rom rom;
-    reader.Required("id", &rom.id);
-    reader.Required("platform_fs_slug", &rom.platform_fs_slug);
-    reader.Required("has_multiple_files", &rom.has_multiple_files);
-    // The two match keys are read leniently, because `json::Reader::Required`
-    // refuses an empty string and these two can legitimately be one: RomM
-    // derives `fs_name_no_tags` by stripping `(...)` and `[...]`, so a rom
-    // whose whole filename is a tag -- `(USA).nes` -- reduces to nothing. Read
-    // strictly, that single oddly named file fails the page, aborts the fetch,
-    // and leaves an empty index in which *every* save on the card is
-    // unmatched, on every tick. An empty key simply matches no base name, which
-    // costs that one rom and nothing else.
-    if (!reader.ok()) {
-      json::Error error = reader.error();
-      error.field = where + error.field;
-      return error;
-    }
-    for (const auto& [key, out] :
-         {std::pair{"fs_name_no_ext", &rom.fs_name_no_ext},
-          std::pair{"fs_name_no_tags", &rom.fs_name_no_tags}}) {
-      if (json::Error error = ReadName(item, key, out); !error.ok()) {
-        error.field = where + error.field;
-        return error;
-      }
-    }
-    if (rom.id <= 0) {
-      return Fail(where + "id", "must be a positive rom id");
-    }
-    page.roms.push_back(std::move(rom));
   }
 
   *out = std::move(page);
@@ -240,15 +253,59 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
     return result;
   }
 
-  // A server that answers a page of one would otherwise take twenty thousand
-  // round trips to read a library this client already refuses to hold. The cap
-  // is on *requests*, so a pathological page size ends the fetch with a
-  // truncated index rather than with a tick that never finishes.
+  // A server that answers a page of one would otherwise take a round trip per
+  // rom, up to the whole of `kMaxIndexRoms`, every tick. The cap is on
+  // *requests*, so a pathological page size ends the fetch with a truncated
+  // index rather than with a tick that never finishes: this many pages that came
+  // back, and apart from them this many refused as too large -- at most twice
+  // it in all. Apart, because a refusal halving its way down to a wide rom is
+  // not a page of the library, and counted together they cut it short.
   constexpr int kMaxPages = 256;
-  const int page_size = std::clamp(options.page_size, 1, 500);
+  // No larger than the default, because the default is a heap term rather than
+  // a preference (`kDefaultPageSize`): a caller asking for more would be asking
+  // for a page the heap was not sized for.
+  //
+  // And smaller again when a page comes back past the transport's ceiling
+  // (`http::kMaxResponseBytes`, #248): a rom RomM identified is ~12 KiB of row,
+  // so 64 of them are ~750 KiB. The page is asked for again at half the rows.
+  //
+  // **And larger again after**, because what was too wide may be one rom: kept
+  // at the size that fit around it, a library of 1,024 behind a rom that halved
+  // the page to one row is a request a rom, and the cap above ends it a quarter
+  // of the way through, every tick. Past a rom left out the page is back at
+  // `largest`; otherwise it doubles after `wait` pages that came back. `wait`
+  // doubles each time a doubled page is refused, so a library that is wide
+  // everywhere -- every rom on IGDB -- pays a probe now and then rather than one
+  // a page. Nor is there a backoff between them: the server answered, and the
+  // same request is the same size however long it waits.
+  const int largest = std::clamp(options.page_size, 1, kDefaultPageSize);
+  int page_size = largest;
+  int wait = 1;
+  int streak = 0;
+  bool probing = false;
 
   std::int64_t offset = 0;
-  for (int page_number = 0; page_number < kMaxPages; ++page_number) {
+  std::size_t room = 0;
+  bool reserved = false;
+  // The roms left out, counted, and the first named by where it was: a count
+  // and not a list, so a library of them costs nothing that grows with it.
+  std::int64_t first_left_out = -1;
+  std::int64_t left_out = 0;
+  const auto finished = [&result, &first_left_out, &left_out]() -> FetchResult {
+    if (left_out > 0) {
+      const std::string where = "at offset " + std::to_string(first_left_out);
+      result.message += std::string(result.message.empty() ? "" : "; ") +
+                        (left_out == 1 ? "the rom " + where + " is"
+                                       : std::to_string(left_out) + " roms, the first " + where +
+                                             ", are") +
+                        " larger than the " + std::to_string(http::kMaxResponseBytes / 1024) +
+                        " KiB this client reads in one answer, and not matched";
+    }
+    return std::move(result);
+  };
+  int pages = 0;
+  int refused = 0;
+  while (pages < kMaxPages && refused < kMaxPages) {
     http::Request request;
     // Three things about this URL are not decoration.
     //
@@ -274,24 +331,50 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
     }
 
     const http::Result sent = client.Send(request);
+    if (http::AnsweredTooLarge(sent)) {
+      ++refused;
+      streak = 0;
+      if (probing) {
+        // Past a fetch's pages the next probe never comes, which is the end of
+        // doubling and of `int` overflow both.
+        wait = std::min(wait * 2, kMaxPages);
+      }
+      probing = false;
+      if (page_size > 1) {
+        page_size /= 2;
+        continue;
+      }
+      // One rom whose row alone is past the ceiling: left out, and the index
+      // says it is not whole -- the same as a library cut at its bound, which is
+      // what it is to that rom's saves.
+      result.index.set_truncated(true);
+      if (left_out++ == 0) {
+        first_left_out = offset;
+      }
+      ++offset;
+      page_size = largest;
+      wait = 1;
+      continue;
+    }
+    ++pages;
     if (!sent.ok()) {
       result.transport = sent.error;
       result.message = std::string("the rom index could not be fetched: ") +
                        http::ToString(sent.error) + " (" + sent.message + ")";
-      return result;
+      return finished();
     }
     if (!sent.successful()) {
       result.status = sent.response.status;
       result.message =
           "the rom index was refused with status " + std::to_string(sent.response.status);
-      return result;
+      return finished();
     }
 
     Page page;
     if (const json::Error error = ParsePage(sent.response.body, &page); !error.ok()) {
       result.shape = error;
       result.message = "the rom index is not the shape this client reads: " + error.Describe();
-      return result;
+      return finished();
     }
 
     if (page.roms.empty()) {
@@ -306,28 +389,60 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
                          std::to_string(page.total) +
                          " roms; the library changed mid-fetch and the rest are not matched";
       }
-      return result;
+      return finished();
+    }
+    if (probing) {
+      wait = 1;
+      probing = false;
+    }
+    if (page_size < largest && ++streak >= wait) {
+      page_size = std::min(page_size * 2, largest);
+      streak = 0;
+      probing = true;
+    }
+    // Reserved once, from the first page's `total`, because the index is held
+    // for the whole tick and is a heap term at its bound (sysmodule/source/
+    // main.cpp): grown by doubling, a library of 1,025 roms would hold room for
+    // 2,048 -- and both buffers while it moved. A server that does not say how
+    // many there are gets the bound.
+    if (!reserved) {
+      reserved = true;
+      room = page.total > 0
+                 ? std::min(static_cast<std::size_t>(page.total), options.max_roms)
+                 : options.max_roms;
+      result.index.Reserve(room);
     }
     for (Rom& rom : page.roms) {
       if (result.index.size() >= options.max_roms) {
         result.index.set_truncated(true);
         result.message = "the library is larger than the " + std::to_string(options.max_roms) +
                          " roms this client indexes; the rest are not matched";
-        return result;
+        return finished();
+      }
+      if (result.index.size() >= room) {
+        // More roms than `total` said when the fetch began: some were added
+        // while it ran. Growing past the reservation is the doubling it exists
+        // to avoid, so the index stops at what the library was, says so the way
+        // a library that shrank mid-fetch does, and the next tick reads the rest.
+        result.index.set_truncated(true);
+        result.message = "the library grew past " + std::to_string(room) +
+                         " roms while it was being read; the roms added since are matched "
+                         "from the next tick";
+        return finished();
       }
       result.index.Add(std::move(rom));
     }
 
     offset += static_cast<std::int64_t>(page.roms.size());
     if (page.total > 0 && offset >= page.total) {
-      return result;
+      return finished();
     }
   }
 
   result.index.set_truncated(true);
-  result.message = "the rom index stopped after " + std::to_string(kMaxPages) +
-                   " pages; the rest of the library is not matched";
-  return result;
+  result.message = "the rom index stopped after " + std::to_string(pages + refused) +
+                   " requests; the rest of the library is not matched";
+  return finished();
 }
 
 auth::Answer AnswerOf(const FetchResult& fetched) {

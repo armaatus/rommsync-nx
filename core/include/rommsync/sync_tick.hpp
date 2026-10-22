@@ -44,6 +44,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -51,10 +54,12 @@
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
+#include "rommsync/server_capabilities.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/sync_execute.hpp"
 #include "rommsync/sync_finish.hpp"
+#include "rommsync/sync_resolve.hpp"
 
 namespace rommsync::sync {
 
@@ -62,7 +67,7 @@ namespace rommsync::sync {
 ///
 /// The same bound `state::kMaxDiagnostics` draws and for the same reason: a card
 /// that will not delete anything must cost a bounded amount of memory on a
-/// 1.3 MiB heap, not one string per file (core/AGENTS.md). The counts stay honest
+/// 1.5 MiB heap, not one string per file (core/AGENTS.md). The counts stay honest
 /// past it.
 inline constexpr std::size_t kMaxRecoveryWarnings = 16;
 
@@ -164,9 +169,20 @@ enum class TickOutcome {
   kOffline,
 
   /// The server answered, and the answer does not change on a second attempt: a
-  /// device deleted in the web UI, sync switched off for it, a body it refused.
-  /// Backing off harder than usual is the polite response; re-pairing is not.
+  /// device deleted in the web UI, a body it refused. Backing off harder than
+  /// usual is the polite response; re-pairing is not.
   kRefused,
+
+  /// Negotiate answered `400 "Sync is disabled for this device"`: the user
+  /// switched sync off for this console in RomM. **Nothing was written.**
+  ///
+  /// Apart from `kRefused` because it is not a failure. It is a setting, the
+  /// user's own, and a console that reported it as "last sync failed" and
+  /// backed off on the failure curve would send them looking for a fault and
+  /// then take an hour to notice the switch turned back on (#235). So the
+  /// schedule treats it as a tick that ran -- the interval, not the backoff --
+  /// and the status screen names the switch.
+  kServerDisabled,
 
   /// The server stopped accepting the token, or refused a scope. `answer` is
   /// what `auth::Gate` needs; the tick did not decide anything about the
@@ -220,6 +236,18 @@ enum class TickOutcome {
   /// tick, which is harmless, and it only ever happens after a crash mid-commit.
   /// A caller that sweeps *before* it scans never sees this.
   kRescanNeeded,
+
+  /// The server is older than `server::kMinimumVersion` (M10-2, #228). **Nothing
+  /// was negotiated** and no save was offered to it: what a 5.2 or a 5.3 lacks
+  /// is what keeps one device's upload from silently superseding another's, so
+  /// syncing with one is worse than not syncing (#226 D1).
+  ///
+  /// The sweep has run, because it is local and it is what puts back a save an
+  /// interrupted commit parked -- a server being too old is no reason to leave a
+  /// player's save stranded as `.old`. Nothing after it does. The scheduler
+  /// treats it as `kRefused`: it does not change by asking again soon, and it
+  /// does change the day the server is upgraded, which the next tick notices.
+  kUnsupported,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -228,7 +256,7 @@ const char* ToString(TickOutcome outcome);
 /// What one tick is allowed to touch, and how hard each stage tries.
 ///
 /// The per-call retry is not re-implemented here: `NegotiateOptions` and
-/// `CompleteOptions` are `CallPolicy`, which already times out, retries and
+/// `CompleteOptions` are a `CallPolicy`, which already times out, retries and
 /// backs off, and widening `ShouldRetry` is explicitly not this module's to do.
 struct TickOptions {
   /// `config::SyncConfig::enabled`, and the whole of what a false one costs:
@@ -272,9 +300,81 @@ struct TickOptions {
   /// half its work does it.
   bool create_backup_dir = true;
 
+  /// What the server can do, as `server::ReadServer` read it (M10-2, #228).
+  ///
+  /// The one struct every version-dependent behaviour in a tick asks, so it is
+  /// carried in here rather than re-derived per stage. One that is not
+  /// `supported` ends the tick `TickOutcome::kUnsupported` before negotiate --
+  /// decided **here** and not only by the caller that read it, for the reason
+  /// `enabled` is: a second caller that forgot to ask must not sync with a 5.2.
+  ///
+  /// It defaults to the floor, which has every flag set: a caller with no
+  /// server to have asked -- every unit test of one stage -- is not talking to
+  /// an old one. The engine always passes what it read.
+  server::ServerCapabilities server = server::CapabilitiesFor(server::kMinimumVersion);
+
   NegotiateOptions negotiate;
   ExecuteOptions execute;
   FinishOptions finish;
+
+  /// The roms on the card (`FindRomsOnCard`), which every negotiation is then
+  /// scoped to with `rom_ids` -- together with the roms of the saves it reports
+  /// -- in chunks of `kMaxNegotiateRomIds` (#241, rom_scope.hpp). A server save
+  /// of a rom the card does not hold is then not offered, so nothing is placed
+  /// beside a game that is not there.
+  ///
+  /// **Each chunk's plan is carried out on its own, one after another** (M9-20,
+  /// #246): negotiated, executed, resolved, written into the baseline and its
+  /// session completed, and freed before the next chunk is asked. A plan is
+  /// held for the length of its run, and `kMaxPlanOperations` is what the heap
+  /// holds of one (`sysmodule/source/main.cpp`), so several merged would be
+  /// a plan the heap was never sized for. Each run starts from the baseline the
+  /// one before it wrote. The first chunk's completion is
+  /// `TickResult::finished` and carries the play sessions; the rest are
+  /// `TickResult::other_sessions`.
+  ///
+  /// **A chunk whose plan is past `kMaxPlanOperations` is split in half and
+  /// asked again**, its saves going with their roms, down to a single rom. A
+  /// rom whose own plan is still past it is left out of this tick -- its saves
+  /// are not offered, so nothing of it is touched -- and named in
+  /// `TickResult::oversized_roms`, which makes the tick `kPartial`.
+  ///
+  /// A chunk that fails to negotiate for any other reason ends the tick there.
+  /// Before any plan ran that is the tick's failure, as a single negotiation's
+  /// would be, and nothing is written; after one, what ran stands and the tick
+  /// is `kPartial` (`kUnauthorized` and `kCanceled` stay themselves). The roms
+  /// no plan covered are `TickResult::unasked_roms`.
+  ///
+  /// Nullopt -- and any server without `rom_ids` -- is the one unscoped
+  /// negotiation. The engine always sets it.
+  std::optional<std::vector<std::int64_t>> rom_scope;
+
+  /// Roms downloaded since the last tick that negotiated (#241). Each is asked
+  /// about in a negotiation of its own with `restore_unlisted`, so a save this
+  /// device synced before the rom was deleted comes back with it -- and nothing
+  /// else this device deleted does. Only with `rom_scope` set, and only on a
+  /// server with `restore_unlisted`; otherwise they are ordinary roms.
+  std::vector<std::int64_t> restore_roms;
+
+  /// Asked again wherever the tick would start more work after its first plan
+  /// ran: before each later chunk (`rom_scope`), and before a 409 is resolved
+  /// (#232). True holds that work -- no request, no transfer -- for the next
+  /// tick: the chunks held are `TickResult::unasked_roms` and make the tick
+  /// `kPartial`, and a held resolution leaves the refused uploads as they are.
+  /// The engine passes "a game is running" (#242): its own check sits before
+  /// the first plan, and a game launched while one ran has already read the
+  /// saves the next would replace. Not asked before the first chunk. Null never
+  /// holds.
+  std::function<bool()> hold;
+
+  /// Called once for every plan the tick carried out, in order, after it was
+  /// executed, resolved and finished and before it is freed (#246). The plan and
+  /// its report pair by position, as `TickResult`'s do.
+  ///
+  /// The way to see every operation of a tick that ran several plans:
+  /// `TickResult::negotiated` and `executed` hold only the last one, because
+  /// holding them all is what the per-chunk run exists to avoid. Null is fine.
+  std::function<void(const SyncPlan& plan, const ExecutionReport& executed)> on_plan;
 
   /// Optional, not owned; must outlive the call.
   ///
@@ -296,9 +396,57 @@ struct TickOptions {
 /// the one-line answer for the scheduler and `answer` the one for `auth::Gate`.
 struct TickResult {
   RecoveryReport recovered;
+
+  /// The plan, as executed. **An upload the slot guard refused (#232) is
+  /// replaced here by what the tick resolved it to** -- a download of the
+  /// server's head, or a conflict -- and its result in `executed` with it, so
+  /// the two still pair by position and say what happened to the save
+  /// (sync_resolve.hpp). `resolved` says whether that happened.
   Negotiation negotiated;
   ExecutionReport executed;
+
+  /// The second negotiation each plan may make, for the uploads RomM's slot
+  /// guard answered with a 409 -- every plan's, folded (`Accumulate`): counts
+  /// summed, the first failure kept. Empty when none was.
+  ResolveReport resolved;
+
   TickCompletion finished;
+
+  /// The completion of every session after the first, when `rom_scope` made
+  /// more than one negotiation (#241). Best-effort, like
+  /// `ResolveReport::second_session`: the baseline and the first session's
+  /// accounting are `finished`, and one of these failing costs a row in a
+  /// history.
+  std::vector<Completion> other_sessions;
+
+  /// What every plan the tick ran did, summed (#246). With one plan these are
+  /// `executed`'s and `finished`'s; with several, `negotiated` and `executed`
+  /// are the last plan's alone (`TickOptions::on_plan`) and these are the
+  /// tick's. The operations, results and warnings of a plan are let go of
+  /// when the next chunk is asked about (#248) -- they have been handed to
+  /// `on_plan` by then -- so after a later chunk that ran no plan, they are
+  /// empty.
+  struct Totals {
+    std::size_t plans = 0;
+    int completed = 0;
+    int failed = 0;
+    /// Every run's baseline reached the card.
+    bool stored = true;
+  };
+  Totals totals;
+
+  /// Roms whose own plan was past `kMaxPlanOperations`, left out of this tick
+  /// (#246). Ascending. Any makes the tick `kPartial`.
+  std::vector<std::int64_t> oversized_roms;
+
+  /// Every rom of the scope no plan covered this tick: the oversized ones, and
+  /// those of chunks a failure or a hold stopped the tick before. Ascending.
+  std::vector<std::int64_t> unasked_roms;
+
+  /// `TickOptions::hold` stopped the chunks after a plan (#242): the rest wait
+  /// for the game to close, which is the caller's to ask for soon rather than
+  /// an interval later.
+  bool held = false;
 
   TickOutcome outcome = TickOutcome::kCompleted;
 
@@ -308,7 +456,8 @@ struct TickResult {
   auth::Answer answer = auth::Answer::kSilent;
 
   /// The completion call was told the session is not this tick's to close:
-  /// already completed, cancelled by a later negotiation, or unknown.
+  /// already completed, closed by something else (CANCELLED, FAILED), or
+  /// unknown.
   ///
   /// **Never a reason to re-run the plan.** `kAlreadyCompleted` means the
   /// accounting succeeded -- a retry landing after the first attempt got through
@@ -329,6 +478,10 @@ struct TickResult {
 /// `(rom_id, slot)` -- the first is what the server arbitrates on, the second is
 /// where the files are. `previous` is the baseline `state::LoadBaseline` read,
 /// taken by value so a caller can `std::move` it in.
+///
+/// One save in `reported` is not offered: one whose `previous` row is marked
+/// `deleted_on_server` and still holds its digest -- a save RomM deleted that
+/// `[sync] on_server_delete = keep` left on the card (#233).
 ///
 /// **A failed negotiation returns before anything is written.** That is the
 /// offline case and it is the common one: no request that follows would work, no

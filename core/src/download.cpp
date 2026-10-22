@@ -14,11 +14,13 @@
 
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/overlay_status_view.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/sha1.hpp"
 #include "rommsync/sync.hpp"
@@ -95,8 +97,12 @@ bool Usable(const QueueEntry& entry, std::string* why) {
   return true;
 }
 
-std::string SerializeEntry(const QueueEntry& entry) {
-  std::string out("{\"rom_id\":");
+/// One entry's JSON, appended to `*out` rather than built beside it: the file
+/// is written an entry at a time, and a second string per entry was one more
+/// entry's text on every write (#247).
+void AppendEntry(const QueueEntry& entry, std::string* out_text) {
+  std::string& out = *out_text;
+  out += "{\"rom_id\":";
   out += std::to_string(entry.rom_id);
   out += ",\"platform_fs_slug\":";
   out += json::Quote(entry.platform_fs_slug);
@@ -108,7 +114,11 @@ std::string SerializeEntry(const QueueEntry& entry) {
   // no hash for this rom" is an answer, and a reader that could not tell it from
   // a missing field would have to guess which one it was looking at.
   out += ",\"sha1_hash\":";
-  out += entry.sha1_hash.empty() ? std::string("null") : json::Quote(entry.sha1_hash);
+  if (entry.sha1_hash.empty()) {
+    out += "null";
+  } else {
+    out += json::Quote(entry.sha1_hash);
+  }
   out += ",\"destination\":";
   out += json::Quote(entry.destination);
   out += ",\"state\":";
@@ -122,7 +132,6 @@ std::string SerializeEntry(const QueueEntry& entry) {
   out += ",\"queued_at\":";
   out += std::to_string(entry.queued_at);
   out += "}";
-  return out;
 }
 
 /// A `string | null` field read straight off the object.
@@ -264,7 +273,7 @@ std::int64_t PartialBytes(const std::string& staging) {
 /// orphan beside a rom that never arrived is bytes the card does not get back
 /// until a human finds it, on a console with no file manager.
 void DiscardPartial(const std::string& staging) {
-  std::remove(http::PartialPathFor(staging).c_str());
+  io::Remove(http::PartialPathFor(staging));
 }
 
 /// ASCII lowercase, for comparing a digest this client computed against one the
@@ -411,14 +420,32 @@ std::vector<QueueEntry>::iterator Queue::FindLocked(std::int64_t rom_id) {
 }
 
 Queue::Undo Queue::TakeUndoLocked() const {
-  return {entries_, live_rom_id_, live_bytes_per_second_, last_finished_rom_id_};
+  Undo undo;
+  undo.live_rom_id = live_rom_id_;
+  undo.live_bytes_per_second = live_bytes_per_second_;
+  undo.last_finished_rom_id = last_finished_rom_id_;
+  return undo;
 }
 
-void Queue::RestoreLocked(const Undo& undo) {
+void Queue::RestoreLocked(Undo undo) {
+  // The change in reverse: the row it appended off the end, then the row it
+  // took out back at its index, or the row it wrote over back in place. The
+  // lock has been held since the change, so every index still means what it
+  // did (`Undo`).
+  if (undo.appended && !entries_.empty()) {
+    entries_.pop_back();
+  }
+  if (undo.row.has_value()) {
+    if (undo.replaced) {
+      entries_[undo.at] = std::move(*undo.row);
+    } else {
+      entries_.insert(entries_.begin() + static_cast<std::ptrdiff_t>(undo.at),
+                      std::move(*undo.row));
+    }
+  }
   // Exactly as it was, the two off-row fields included: a rollback that put the
   // rows back and left `live_rom_id_` pointing at a transfer the change had
   // cleared would quote a rate against a bar that is not moving.
-  entries_ = undo.entries;
   live_rom_id_ = undo.live_rom_id;
   live_bytes_per_second_ = undo.live_bytes_per_second;
   last_finished_rom_id_ = undo.last_finished_rom_id;
@@ -429,7 +456,7 @@ ipc::Error Queue::Enqueue(std::int64_t rom_id, std::int32_t* position) {
   return EnqueueLocked(rom_id, position);
 }
 
-ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
+ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position, Undo* undo) {
   if (rom_id <= 0) {
     // There is no such rom, and saying so here means every caller is held to it
     // -- `EnqueueRom` checks the library, and a `sysmodule` engine that skipped
@@ -444,6 +471,10 @@ ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
     // "Try again" -- see the header. Erased and re-added rather than reset in
     // place, so a rom re-queued after a failure goes behind the entries that
     // were already waiting rather than ahead of them.
+    if (undo != nullptr) {
+      undo->at = static_cast<std::size_t>(existing - entries_.begin());
+      undo->row = std::move(*existing);
+    }
     entries_.erase(existing);
   } else if (entries_.size() >= kMaxQueueEntries) {
     // The file is full. A finished row is history the queue screen shows and
@@ -454,6 +485,10 @@ ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
     if (oldest == entries_.end()) {
       return ipc::Error::kQueueFull;
     }
+    if (undo != nullptr) {
+      undo->at = static_cast<std::size_t>(oldest - entries_.begin());
+      undo->row = std::move(*oldest);
+    }
     entries_.erase(oldest);
   }
 
@@ -461,6 +496,9 @@ ipc::Error Queue::EnqueueLocked(std::int64_t rom_id, std::int32_t* position) {
   entry.rom_id = rom_id;
   entry.queued_at = NowSeconds();
   entries_.push_back(std::move(entry));
+  if (undo != nullptr) {
+    undo->appended = true;
+  }
 
   std::int32_t pending = 0;
   for (const QueueEntry& row : entries_) {
@@ -475,13 +513,17 @@ ipc::Error Queue::Remove(std::int64_t rom_id) {
   return RemoveLocked(rom_id, nullptr);
 }
 
-ipc::Error Queue::RemoveLocked(std::int64_t rom_id, QueueEntry* removed) {
+ipc::Error Queue::RemoveLocked(std::int64_t rom_id, QueueEntry* removed, Undo* undo) {
   const auto found = FindLocked(rom_id);
   if (found == entries_.end()) {
     return ipc::Error::kNotQueued;
   }
   if (removed != nullptr) {
     *removed = *found;
+  }
+  if (undo != nullptr) {
+    undo->at = static_cast<std::size_t>(found - entries_.begin());
+    undo->row = std::move(*found);
   }
   entries_.erase(found);
   if (rom_id == last_finished_rom_id_) {
@@ -507,6 +549,11 @@ std::vector<QueueEntry> Queue::Snapshot() const {
   return entries_;
 }
 
+void Queue::Visit(const std::function<void(const std::vector<QueueEntry>&)>& visit) const {
+  std::lock_guard<std::mutex> held(mutex_);
+  visit(entries_);
+}
+
 QueueEntry Queue::Find(std::int64_t rom_id) const {
   std::lock_guard<std::mutex> held(mutex_);
   for (const QueueEntry& entry : entries_) {
@@ -523,6 +570,7 @@ void Queue::Reset(std::vector<QueueEntry> entries) {
   }
   std::lock_guard<std::mutex> held(mutex_);
   entries_ = std::move(entries);
+  entries_.reserve(kMaxQueueEntries);
   // These entries are not the ones the rate was measured over, nor the ones
   // anything finished -- this is a load, or the rollback of a write that failed.
   last_finished_rom_id_ = 0;
@@ -680,10 +728,15 @@ bool Queue::Update(const QueueEntry& entry) {
   return UpdateLocked(entry);
 }
 
-bool Queue::UpdateLocked(const QueueEntry& entry) {
+bool Queue::UpdateLocked(const QueueEntry& entry, Undo* undo) {
   const auto found = FindLocked(entry.rom_id);
   if (found == entries_.end()) {
     return false;
+  }
+  if (undo != nullptr) {
+    undo->at = static_cast<std::size_t>(found - entries_.begin());
+    undo->row = std::move(*found);
+    undo->replaced = true;
   }
   *found = entry;
   if (Terminal(entry.state)) {
@@ -746,19 +799,40 @@ const char* ToString(StoreError error) {
   return "none";
 }
 
-std::string SerializeQueue(const std::vector<QueueEntry>& entries) {
-  std::string out("{\"format\":");
-  out += json::Quote(kFormatMagic);
-  out += ",\"version\":";
-  out += std::to_string(kFormatVersion);
-  out += ",\"entries\":[";
-  for (std::size_t at = 0; at < entries.size(); ++at) {
-    if (at != 0) {
-      out += ",";
+namespace {
+
+/// How many pieces `AppendPiece` makes of `entries`: the opening, one an entry,
+/// and the closing.
+std::size_t PieceCount(const std::vector<QueueEntry>& entries) { return entries.size() + 2; }
+
+/// Piece `piece` of the file's text, appended to `out`: the opening, then one
+/// entry each, then the closing -- `PieceCount` of them. The file is
+/// written a piece at a time (`SaveQueue`), so what a write holds is the largest
+/// piece rather than the whole text beside the queue it came from (#247).
+void AppendPiece(const std::vector<QueueEntry>& entries, std::size_t piece, std::string* out) {
+  if (piece == 0) {
+    *out += "{\"format\":";
+    *out += json::Quote(kFormatMagic);
+    *out += ",\"version\":";
+    *out += std::to_string(kFormatVersion);
+    *out += ",\"entries\":[";
+  } else if (piece <= entries.size()) {
+    if (piece != 1) {
+      *out += ",";
     }
-    out += SerializeEntry(entries[at]);
+    AppendEntry(entries[piece - 1], out);
+  } else {
+    *out += "]}\n";
   }
-  out += "]}\n";
+}
+
+}  // namespace
+
+std::string SerializeQueue(const std::vector<QueueEntry>& entries) {
+  std::string out;
+  for (std::size_t piece = 0; piece < PieceCount(entries); ++piece) {
+    AppendPiece(entries, piece, &out);
+  }
   return out;
 }
 
@@ -772,11 +846,55 @@ LoadedQueue ParseQueue(std::string_view text) {
   // not the standard's.
   LoadedQueue loaded;
 
-  const json::ParseResult document = json::Parse(text);
+  // An entry at a time (`json::ParseEach`), checked as it comes: a full queue at
+  // its widest held as one document peaked at 413 KiB on aarch64, at boot
+  // (M9-20, #246). What an entry says is only kept once the format below is
+  // known to be this one's, so reading it first changes no answer.
+  std::vector<QueueEntry> rows;
+  std::vector<std::string> complaints;
+  bool crowded = false;
+  const json::ParseResult document = json::ParseEach(
+      text, "entries",
+      [&rows, &complaints, &crowded](const json::Value& element, std::size_t at) {
+        if (at >= kMaxQueueEntries) {
+          crowded = true;
+          json::Error stop;
+          stop.field = "entries";
+          stop.message = "more than a queue may have";
+          return stop;
+        }
+        QueueEntry entry;
+        std::string why;
+        if (!ParseEntry(element, &entry, &why)) {
+          Add(&complaints,
+              std::string(kQueueFileName) + " entry " + std::to_string(at + 1) + ": " + why);
+          return json::Error{};
+        }
+        const bool duplicate = std::any_of(
+            rows.begin(), rows.end(),
+            [&entry](const QueueEntry& row) { return row.rom_id == entry.rom_id; });
+        if (duplicate) {
+          Add(&complaints, std::string(kQueueFileName) + " entry " + std::to_string(at + 1) +
+                               ": a second entry for the same rom");
+          return json::Error{};
+        }
+        rows.push_back(std::move(entry));
+        return json::Error{};
+      },
+      "download queue");
+  if (crowded) {
+    Add(&loaded.diagnostics, std::string(kQueueFileName) + " holds more than the " +
+                                 std::to_string(kMaxQueueEntries) +
+                                 " entries a queue may have; it is discarded");
+    loaded.discarded = true;
+    return loaded;
+  }
   if (!document.ok()) {
     // Naming the complaint rather than quoting the text: the bytes may be
-    // anything a corrupt card region holds.
-    Add(&loaded.diagnostics, std::string(kQueueFileName) + " is not readable JSON (" +
+    // anything a corrupt card region holds. Not "readable JSON" any more: a file
+    // whose shape `ParseEach` refused -- the whole of it, or its `entries` -- is
+    // JSON, and the complaint itself says which it was.
+    Add(&loaded.diagnostics, std::string(kQueueFileName) + " could not be read as a queue (" +
                                  document.error.Describe() + "); the queue is discarded");
     loaded.discarded = true;
     return loaded;
@@ -801,40 +919,11 @@ LoadedQueue ParseQueue(std::string_view text) {
     return loaded;
   }
 
-  const json::Value* entries = document.value.Find("entries");
-  if (entries == nullptr || !entries->is_array()) {
+  if (document.value.Find("entries") == nullptr) {
     Add(&loaded.diagnostics,
-        std::string(kQueueFileName) + ": field entries: expected an array; the queue is discarded");
+        std::string(kQueueFileName) + ": field entries: is missing; the queue is discarded");
     loaded.discarded = true;
     return loaded;
-  }
-  if (entries->elements().size() > kMaxQueueEntries) {
-    Add(&loaded.diagnostics, std::string(kQueueFileName) + " holds more than the " +
-                                 std::to_string(kMaxQueueEntries) +
-                                 " entries a queue may have; it is discarded");
-    loaded.discarded = true;
-    return loaded;
-  }
-
-  std::vector<QueueEntry> rows;
-  std::vector<std::string> complaints;
-  for (std::size_t at = 0; at < entries->elements().size(); ++at) {
-    QueueEntry entry;
-    std::string why;
-    if (!ParseEntry(entries->elements()[at], &entry, &why)) {
-      Add(&complaints,
-          std::string(kQueueFileName) + " entry " + std::to_string(at + 1) + ": " + why);
-      continue;
-    }
-    const bool duplicate = std::any_of(
-        rows.begin(), rows.end(),
-        [&entry](const QueueEntry& row) { return row.rom_id == entry.rom_id; });
-    if (duplicate) {
-      Add(&complaints, std::string(kQueueFileName) + " entry " + std::to_string(at + 1) +
-                           ": a second entry for the same rom");
-      continue;
-    }
-    rows.push_back(std::move(entry));
   }
 
   if (!complaints.empty()) {
@@ -952,16 +1041,34 @@ StoreResult SaveQueue(const std::string& path, const std::vector<QueueEntry>& en
     }
   }
 
-  const std::string contents = SerializeQueue(entries);
-  if (contents.size() > kMaxQueueBytes) {
+  // Sized first and then written, a piece at a time both times: the text whole
+  // was the queue a second time over, and this runs from the IPC thread beside
+  // whatever the worker holds (#247). Serialising twice is ~64 short strings.
+  std::size_t size = 0;
+  std::string piece;
+  for (std::size_t at = 0; at < PieceCount(entries); ++at) {
+    piece.clear();
+    AppendPiece(entries, at, &piece);
+    size += piece.size();
+  }
+  if (size > kMaxQueueBytes) {
     result.error = StoreError::kTooLarge;
     result.message =
-        Describe(path, "would be " + std::to_string(contents.size()) + " bytes; " +
+        Describe(path, "would be " + std::to_string(size) + " bytes; " +
                            std::to_string(kMaxQueueBytes) + " is the most a queue may take");
     return result;
   }
+  std::string().swap(piece);
 
-  const io::WriteResult written = io::WriteAtomically(path, contents);
+  std::size_t next = 0;
+  const io::WriteResult written =
+      io::WriteAtomically(path, [&entries, &next](std::string* out) {
+        if (next == PieceCount(entries)) {
+          return false;
+        }
+        AppendPiece(entries, next++, out);
+        return true;
+      });
   switch (written.error) {
     case io::WriteError::kNone:
       break;
@@ -1004,7 +1111,33 @@ std::string ContentUrl(std::string_view base_url, std::int64_t rom_id, std::stri
 }
 
 json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
-  const json::ParseResult document = json::Parse(body);
+  // What is read, and nothing else (#248). A rom's detail is its list row and
+  // more -- every metadata source RomM holds for it, and a row per file -- so a
+  // rom RomM identified is ~12 KiB of text before its files, and parsed whole was
+  // ~16 times that in flight on the worker. `files` is streamed a file at a time,
+  // and two names are all that are kept: the worker asks whether there is
+  // exactly one (`file_names`).
+  static constexpr std::string_view kRead[] = {
+      "id",          "fs_name",       "platform_fs_slug", "fs_size_bytes", "has_multiple_files",
+      "has_nested_single_file", "missing_from_fs", "sha1_hash", "md5_hash", "file_name"};
+  constexpr std::size_t kNamesKept = 2;
+  std::vector<std::string> file_names;
+  const json::ParseResult document = json::ParseEach(
+      body, "files", kRead,
+      [&file_names](const json::Value& file, std::size_t) {
+        const json::Value* name = file.is_object() ? file.Find("file_name") : nullptr;
+        if (name == nullptr || !name->is_string()) {
+          json::Error error;
+          error.field = "files";
+          error.message = "expected every entry to carry a file_name string";
+          return error;
+        }
+        if (file_names.size() < kNamesKept) {
+          file_names.push_back(name->string());
+        }
+        return json::Error{};
+      },
+      "rom detail");
   if (!document.ok()) {
     return document.error;
   }
@@ -1050,18 +1183,10 @@ json::Error ParseRomDetail(std::string_view body, RomDetail* out) {
   // shape serves them all, and the next rom out of it is the nested one whose
   // name this decides. A caller reading `file_names.front()` must be reading a
   // name the server actually sent, not the survivor of a list with a hole in it.
-  if (const json::Value* files = document.value.Find("files"); files != nullptr) {
-    if (!files->is_array()) {
-      return refuse("files", "expected an array");
-    }
-    for (const json::Value& file : files->elements()) {
-      const json::Value* name = file.is_object() ? file.Find("file_name") : nullptr;
-      if (name == nullptr || !name->is_string()) {
-        return refuse("files", "expected every entry to carry a file_name string");
-      }
-      detail.file_names.push_back(name->string());
-    }
-  }
+  //
+  // Read as it streamed past (above); `ParseEach` refused a `files` that is not
+  // an array by name.
+  detail.file_names = std::move(file_names);
 
   // The two digests are `string | null` and the only fields here allowed to have
   // no value: an unscanned library leaves both null, and a download with nothing
@@ -1184,11 +1309,29 @@ Verdict Judge(const http::Result& result, Reason* why) {
         say("the download was stopped");
         return Verdict::kCanceled;
       case http::Error::kInvalidRequest:
-      case http::Error::kWriteFailed:
-        // Neither gets better by trying again: one is this client building a
-        // request wrong, the other is the card refusing the write -- a mapped
-        // folder that does not exist is the ordinary way to reach it.
+        // This client building a request wrong, which trying again repeats.
         say(std::string("the transfer could not be made: ") + http::ToString(result.error));
+        return Verdict::kFatal;
+      // The card's refusals. None gets better by asking the server again, and
+      // each is a different thing for a user to do, so each is its own sentence
+      // -- "could not write the destination file" was true of all three and
+      // useful for none (#202). Fatal discards the partial, which for a full
+      // card is also the space the next attempt needs.
+      case http::Error::kDiskFull:
+        say("the card is full; free some space on it and queue this rom again");
+        return Verdict::kFatal;
+      case http::Error::kFileTooLarge:
+        say("this rom is larger than one file on this card can be; on FAT32 that is 4 GiB");
+        return Verdict::kFatal;
+      // Only `Send`'s: the rom's detail past the transport's ceiling (#248). The
+      // same server answers the same body, so asking again buys nothing.
+      case http::Error::kTooLarge:
+        say("the server's description of this rom is larger than this console reads");
+        return Verdict::kFatal;
+      case http::Error::kWriteFailed:
+        // A mapped folder that does not exist is the ordinary way to reach it;
+        // a failing card, or one half out of its slot, is the other.
+        say("the card refused the write; check the card and queue this rom again");
         return Verdict::kFatal;
       default:
         say(std::string("the transfer did not complete: ") + http::ToString(result.error));
@@ -1399,6 +1542,7 @@ class Drainer {
     }
 
     result.downloaded = downloaded_;
+    result.done = done_;
     result.skipped = skipped_;
     result.failed = failed_;
     result.attempts = requests_;
@@ -1493,6 +1637,13 @@ class Drainer {
     switch (state) {
       case QueueState::kDone:
         ++downloaded_;
+        // A rom that was already on the card is not one that just arrived: the
+        // card has held it, so a save missing beside it may be one the user
+        // deleted, and `done` is what asks for a save with `restore_unlisted`
+        // (#241).
+        if (entry.message != kAlreadyOnCardMessage) {
+          done_.push_back(entry.rom_id);
+        }
         break;
       case QueueState::kSkipped:
         ++skipped_;
@@ -1655,7 +1806,16 @@ class Drainer {
       return *present;
     }
 
-    // 6. The bytes.
+    // 6. Can the card hold it? Asked before the first byte moves, because the
+    // two answers that say no -- past the format's per-file ceiling, past the
+    // space left -- are otherwise learned at the end of the transfer they make
+    // pointless (#202).
+    const std::optional<Step> room = RoomOnTheCard(&entry);
+    if (room.has_value()) {
+      return *room;
+    }
+
+    // 7. The bytes.
     return Transfer(std::move(entry), detail);
   }
 
@@ -1759,7 +1919,7 @@ class Drainer {
       // skip returns before `Transfer`, which is what usually tidies them, and a
       // 120 MiB orphan beside a rom that is already there is space the card does
       // not get back on a console with no file manager.
-      std::remove(staging_.c_str());
+      io::Remove(staging_);
       DiscardPartial(staging_);
       // Where it actually is, which is not always where it would have been
       // written: a rom found in the platform's second `roms` folder belongs in
@@ -1767,10 +1927,63 @@ class Drainer {
       // go and look at.
       entry->destination = candidate;
       entry->bytes_done = detail.size_bytes;
-      return Settle(std::move(*entry), QueueState::kDone,
-                    "already on the card, with the bytes the server's hash describes");
+      return Settle(std::move(*entry), QueueState::kDone, kAlreadyOnCardMessage);
     }
     return std::nullopt;
+  }
+
+  /// Nothing when the card can take this rom, so the caller carries on.
+  ///
+  /// An answer the backend does not have refuses nothing (`fs::Volume`), and
+  /// neither does a rom whose size the server does not know: a refusal built on
+  /// a guess would block a download that works. What an earlier attempt already
+  /// put on the card counts as space, since it is built on or deleted before the
+  /// transfer writes -- so a resume onto a nearly full card is not refused.
+  ///
+  /// A refusal is `kFailed`, terminal, and takes the earlier attempt's bytes with
+  /// it -- `Judge`'s answer for a card that filled mid-transfer, for the same
+  /// reasons: retrying cannot change it, and those bytes are space the user has
+  /// to find before queueing the rom again.
+  std::optional<Step> RoomOnTheCard(QueueEntry* entry) {
+    if (entry->size_bytes <= 0) {
+      return std::nullopt;
+    }
+    std::string directory;
+    std::string leaf;
+    if (!fs::SplitPath(entry->destination, &directory, &leaf)) {
+      return std::nullopt;
+    }
+    const fs::Volume volume = filesystem_.VolumeOf(directory);
+    const auto size = static_cast<std::uint64_t>(entry->size_bytes);
+
+    std::string why;
+    if (volume.max_file_bytes != 0 && size > volume.max_file_bytes) {
+      why = "this rom is " + overlay::FormatBytes(entry->size_bytes);
+      // FAT32's sentence for an unknown card held to its ceiling too: on the
+      // console that is the only reason the ceiling is there (`card.cpp`).
+      const bool fat = volume.format == fs::Format::kFat32 ||
+                       volume.max_file_bytes == fs::kFat32MaxFileBytes;
+      why += fat ? ", and a file on a FAT32 card stops at 4 GiB"
+                 : ", and one file on this card can be at most " +
+                       overlay::FormatBytes(static_cast<std::int64_t>(volume.max_file_bytes));
+    } else if (volume.free_bytes >= 0) {
+      // What an earlier attempt left -- the staged body and the in-flight
+      // file -- is either built on or deleted before the transfer writes, so
+      // it is space this rom can use either way.
+      const std::int64_t reusable = FileSizeBytes(staging_) + PartialBytes(staging_);
+      if (entry->size_bytes > volume.free_bytes + reusable) {
+        why = "the card has " + overlay::FormatBytes(volume.free_bytes + reusable) +
+              " free, and this rom needs " + overlay::FormatBytes(entry->size_bytes) +
+              "; free some space and queue it again";
+      }
+    }
+    if (why.empty()) {
+      return std::nullopt;
+    }
+    io::Remove(staging_);
+    DiscardPartial(staging_);
+    entry->bytes_done = 0;
+    return Settle(std::move(*entry), QueueState::kFailed, std::move(why));
   }
 
   Verdict FetchDetail(QueueEntry* entry, RomDetail* out, Reason* why) {
@@ -1848,7 +2061,7 @@ class Drainer {
     // spliced, the digest catches it, and the retry below fetches it clean.
     const std::string in_flight = http::PartialPathFor(staging_);
     if (target.resume && entry.size_bytes > 0 && FileSizeBytes(in_flight) > entry.size_bytes) {
-      std::remove(in_flight.c_str());
+      io::Remove(in_flight);
     }
 
     // A staging file is a *complete* body nothing verified -- left by a power cut
@@ -1869,7 +2082,7 @@ class Drainer {
     // Whatever is left is bytes nothing will build on -- and it is also a
     // destination the backend's own rename would have to replace, which
     // Horizon's refuses (atomic_file.hpp).
-    std::remove(staging_.c_str());
+    io::Remove(staging_);
 
     for (;;) {
       // Bytes this attempt did not fetch. A body built on them and then failing
@@ -1986,7 +2199,7 @@ class Drainer {
       // The user dequeued it, or the queue could not be written. Either way
       // nothing will record this download, and a complete body under a name no
       // entry mentions is an orphan the console has no file manager to find.
-      std::remove(staging_.c_str());
+      io::Remove(staging_);
       return step;
     }
 
@@ -1995,7 +2208,7 @@ class Drainer {
       // Both files go. Bytes that are not this rom's are not a prefix of it
       // either, so keeping them for a resume would buy a cheaper way to produce
       // the same wrong file.
-      std::remove(staging_.c_str());
+      io::Remove(staging_);
       DiscardPartial(staging_);
       entry->bytes_done = 0;
       if (inherited) {
@@ -2066,6 +2279,7 @@ class Drainer {
   std::chrono::milliseconds waited_{0};
   int requests_ = 0;
   int downloaded_ = 0;
+  std::vector<std::int64_t> done_;
   int skipped_ = 0;
   int failed_ = 0;
 };

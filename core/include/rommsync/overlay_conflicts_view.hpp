@@ -17,12 +17,18 @@
 //   Command command = model.Next();     // kNone: nothing to do this frame
 //   ... send it ...
 //   model.OnPage(page);                 // ListConflicts answered
-//   model.OnRestored(report);           // RestoreBackup answered
+//   model.OnRestoreState(state);        // RestoreBackup or GetRestoreState answered
 //   model.OnRefused(error);             // the sysmodule refused it
 //   model.OnUnreachable(link);          // the transport, or the handshake
 //
 // One command per frame and one in flight at a time, which is what the overlay
 // can do: it draws on one thread and a `cmif` call from it is synchronous.
+//
+// **A restore is two commands, not one** (M9-6, #209). `RestoreBackup` answers
+// the moment the sysmodule has taken it, and `Next()` then hands out
+// `kRestoreState` once a frame until the answer says it is done. A copy of a
+// large save takes as long as the card does, and the screen draws "Restoring"
+// for it rather than holding a frame.
 //
 // ## What it never does
 //
@@ -221,7 +227,7 @@ class ConflictsModel {
  public:
   /// The one command the screen should send this frame.
   struct Command {
-    enum class Kind { kNone, kListConflicts, kRestore };
+    enum class Kind { kNone, kListConflicts, kRestore, kRestoreState };
 
     Kind kind = Kind::kNone;
 
@@ -249,26 +255,39 @@ class ConflictsModel {
   /// place would leave a hole in the list rather than a short one.
   void OnPage(const ipc::ConflictPage& page);
 
-  /// `RestoreBackup` answered. The screen stays on the entry and says what
-  /// happened.
+  /// `RestoreBackup` or `GetRestoreState` answered.
+  ///
+  /// `kRunning` for the restore this screen asked for is "keep asking". `kDone`
+  /// for it is the outcome, and the screen -- if it is still on that entry --
+  /// says what happened. `kRunning` for a *different* entry, in answer to the
+  /// press, is somebody else's restore: this one started nothing, and says so.
+  /// Anything else while waiting -- `kIdle`, or another entry's -- is a
+  /// sysmodule that restarted and forgot, and the screen says it lost track
+  /// rather than waiting for ever or inventing an outcome.
   ///
   /// **The loaded pages are not re-read.** A restore rewrites nothing in the
   /// history and deletes nothing from `.backup/`, so every row is as true as it
   /// was; and a refetch would start at offset 0, which for a restore below the
   /// first page would replace the rows under the open detail. See the
   /// definition.
-  void OnRestored(const conflicts::RestoreReport& report);
+  void OnRestoreState(const ipc::RestoreState& state);
 
   /// The sysmodule refused the command `Next()` handed out.
   void OnRefused(ipc::Error error);
 
   /// The command did not reach the sysmodule, or its answer could not be read.
   /// `link` must not be `kOk`; it is `ScreenFrame::Diagnose`'s verdict.
+  ///
+  /// `kNotResponding` is the one that keeps everything (#209): the session was
+  /// never dropped, so only the command that ran out of budget is in doubt. A
+  /// page is asked for again, and a restore is asked *about* rather than sent
+  /// twice.
   void OnUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 
-  /// The link came back. Everything loaded is dropped and the list is read
-  /// again from the start: a page from before the outage is not a page this
-  /// session would answer with.
+  /// The link came back. After an outage that dropped the session, everything
+  /// loaded is dropped too and the list is read again from the start: a page
+  /// from before it is not a page this session would answer with. After a
+  /// sysmodule that was merely slow, nothing is.
   void OnLinkRestored();
 
   /// Move the selection by `delta` rows, clamped at both ends. Also what asks
@@ -303,6 +322,9 @@ class ConflictsModel {
 
   /// Everything loaded, dropped. The next `Next()` asks for the first page.
   void Reset();
+
+  /// The restore of `restoring_` is over, with `report`.
+  void FinishRestore(const conflicts::RestoreReport& report);
 
   std::vector<ipc::ConflictRow> rows_;
 
@@ -343,6 +365,14 @@ class ConflictsModel {
   /// The restore that is out, so its answer lands on the right entry.
   std::int64_t restoring_ = 0;
 
+  /// The sysmodule took `restoring_` and has not finished it, so `Next()`
+  /// polls rather than pages (#209).
+  bool awaiting_ = false;
+
+  /// A restore the sysmodule stopped knowing about, by entry id, so its detail
+  /// can say so. Zero when there is none.
+  std::int64_t lost_ = 0;
+
   /// What the last restore produced, and whether there is one to draw.
   bool restored_ = false;
   conflicts::RestoreReport last_restore_;
@@ -351,6 +381,10 @@ class ConflictsModel {
   Command::Kind issued_ = Command::Kind::kNone;
 
   Link link_ = Link::kOk;
+
+  /// An outage since the last `Reset` dropped the session, so what is loaded
+  /// came from a sysmodule that may since have been replaced.
+  bool stale_ = false;
 
   /// What `GetInterfaceVersion` last answered, for `kIncompatible`'s hint.
   std::uint32_t sysmodule_interface_ = 0;

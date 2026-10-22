@@ -105,11 +105,17 @@ and a log is not worth it. A save is never in that position; see
 | `download.drain` | how one pass at the download queue ended — how many roms came down, and what stopped it | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.failed` | play time could not be recorded — no save is at risk | [The SD card is full](#the-sd-card-is-full) |
 | `power.sleep` | the console went to sleep while this client was still busy | [The console slept mid-sync](#the-console-slept-mid-sync) |
+| `server.version` | which RomM release the server says it runs — once a boot and once a pairing | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
+| `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
+| `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
+| `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
+| `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 
-The overlay does not show the log yet. `sys-rommsync` serves it over IPC —
-`GetLog`, command 16 in [DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so a
-screen can be added without an SD reader, and until one is, the card is how you
-read it.
+The overlay shows the end of the log under **Settings → Log**, read off the
+sysmodule over IPC — `GetLog`, command 16 in
+[DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so the lines above can be
+read without an SD reader. It is the last lines the sysmodule kept in memory;
+the whole log is the file on the card.
 
 ---
 
@@ -171,7 +177,7 @@ was working and then stopped, all at once, without the network changing.
 **What is happening.** RomM answered **401**. The client stops there rather than
 spending a whole plan's worth of requests on credentials that are gone — and it
 never reads a 401 as "the server has no saves", which would be a plan to upload
-everything over the server's copies. RomM 5.2.0 issues tokens with no expiry to
+everything over the server's copies. RomM issues tokens with no expiry to
 refresh, so nothing here comes back on its own
 ([AUTH.md](AUTH.md#re-pairing--revocation)).
 
@@ -283,7 +289,7 @@ nothing obviously different about them.
 **Log line.**
 
 ```
-5 warn scan.skipped unmatched /retroarch/saves/Game (USA).srm: no rom is named "Game (USA)"
+5 warn scan.skipped unmatched /retroarch/saves/Game (USA).srm: no rom named "Game (USA)"
 6 warn scan.skipped ambiguous /retroarch/saves/Game.srm: "Game" matches 2 roms (gb, gba)
 ```
 
@@ -308,6 +314,15 @@ Two folder layouts behave differently here, and it matters:
 - `ambiguous` — move the save into a per-platform folder and map that folder for
   that platform in `config.ini` ([CONFIG.md](CONFIG.md#defaults--the-folder-map)).
   A folder that belongs to one platform is what resolves it.
+- `save folder` — a PSP save. PPSSPP keeps each game's save as a folder, and
+  PSP saves are not synced yet; nothing to fix
+  ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#formats-only-one-emulator-reads)).
+
+A PS1, N64, Dreamcast, NDS or Saturn save that **is** matched can still be
+refused at the download, with `other_emulator` in a `save.failed` line: the
+server's copy came from RetroArch, whose format for that system Tico's module
+does not read, so it is never written over the card. It syncs with the same
+module on another Switch only.
 
 ---
 
@@ -385,6 +400,14 @@ part is what *did not* happen as a result:
   complete body that may not be the right one, with no backup beside it, and
   nothing after the fact can tell — so it costs one re-fetch to say no.
 
+- **A rom that will not fit is refused before it starts.** Before the first
+  byte of a download moves, the sysmodule asks the card how much space is left;
+  a rom bigger than that fails at once, and the queue screen says how much is
+  free and how much the rom needs. A card that fills up *during* a download
+  anyway fails the rom with "the card is full" and deletes the partial file, so
+  the space it took comes back. The rom already on the card under that name, if
+  there is one, is not touched.
+
 A full card also stops the client's own records being written, and one of those
 has a line of its own:
 
@@ -447,14 +470,16 @@ setting quietly not applying rather than as a failure.
 ## The server refused the sync
 
 **Symptom.** The console reaches RomM, and the sync fails the same way every
-time no matter how long you wait.
+time no matter how long you wait — or the status screen says **Sync disabled on
+server**.
 
 **Log line.**
 
 ```
 3 warn sync.refused GET /api/roms: the rom index is not the shape this client reads: at offset 8: expected ':' after an object key
 7 warn sync.refused no such device: the device was deleted in RomM's web UI
-7 warn sync.refused sync disabled: sync is disabled for this device
+7 warn sync.refused sync_disabled: sync is turned off for this device in RomM; turn it back on there
+7 info sync.tick outcome=server_disabled completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
 ```
 
 The first of those is a truncated or non-RomM body, and it is the one that reads
@@ -466,7 +491,12 @@ next time — which is why this is not `net.offline`. Three real causes:
 
 1. **The device was deleted in RomM's web UI.** The token still works; the
    device it was bound to is gone.
-2. **Sync is switched off for this device**, in RomM, by you.
+2. **Sync is switched off for this device**, in RomM, by you. This one is not
+   a failure, and the client does not treat it as one: the status screen says
+   **Sync disabled on server**, the tick ends `outcome=server_disabled`, save
+   states are left alone too, and the console keeps asking once per interval
+   rather than backing off — so it starts syncing again within one interval of
+   the switch going back on.
 3. **The answer was not the shape this client reads.** A truncated body, a
    reverse proxy's error page, or a login portal's HTML where a rom index was
    expected — the URL reaches *something*, and that something is not RomM.
@@ -474,6 +504,43 @@ next time — which is why this is not `net.offline`. Three real causes:
 **The fix.** For 1 and 2, open RomM's device list and either re-enable sync for
 this console or pair it again. For 3, open `[server] url` in a browser and check
 that RomM itself answers there rather than a proxy, a portal or a redirect.
+
+---
+
+## RomM is too old
+
+**Symptom.** The overlay's status screen says **RomM is too old to sync with**,
+its `RomM` row names the version with "(too old)" after it, and nothing syncs.
+
+**Log line.** One on every sync attempt, until the server is upgraded:
+
+```
+4 error server.unsupported RomM 5.2.0 is older than 5.4.0, the oldest this build syncs with; nothing is synced until it is upgraded
+5 info sync.tick outcome=unsupported completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
+```
+
+**What is happening.** Before a sync asks the server anything, `sys-rommsync`
+reads which RomM release it is — RomM says so, unauthenticated, at
+`/api/heartbeat`. Below **5.4.0** it stops there: no save is offered to the
+server and none is downloaded from it. That is deliberate, not a missing
+feature. A RomM before 5.4 cannot tell this console that a save was deleted on
+the server, cannot keep two devices' saves of one game apart, and cannot record
+which version each device last synced — so syncing with one is how a save from
+another device gets silently replaced. Downloading roms is not affected.
+
+**The fix.** Upgrade RomM to 5.4.0 or later. Nothing needs doing on the console:
+it asks again on every sync attempt while the server is too old, so the next
+sync after the upgrade runs normally — no reboot and no re-pairing — and says
+which release it found:
+
+```
+9 info server.version RomM 5.4.0
+```
+
+The first
+start of RomM 5.4 after an upgrade runs its database migrations, which RomM's
+release notes put at 15–20 minutes on a large library; the console reads that
+time as the server being unreachable and retries.
 
 ---
 
@@ -493,7 +560,7 @@ screen shows it waiting, and it never turns into a file.
 **What is happening.** The sysmodule drains the queue on the same thread that
 runs the sync tick, and it does it **last** — a sync that is due and a list page
 the overlay is waiting for both go first. So a rom that is not moving is usually
-one of five things, and the queue screen names which:
+one of seven things, and the queue screen names which:
 
 1. **`[downloads] enabled = false`.** Nothing is opened and nothing is lost;
    switching it back on resumes exactly what was there.
@@ -511,9 +578,48 @@ one of five things, and the queue screen names which:
    stands. The bytes already on the card are kept as a `.part`, so the next
    attempt resumes rather than starting over — that is the `stopped` line.
 
+6. **The card cannot hold it.** A rom bigger than the space left on the card,
+   or over **4 GiB** -- the largest file FAT32 holds, and the card is held to
+   that limit unless the console can tell it is not FAT32, which it usually
+   cannot -- fails before it starts, and the row says which. A card that refused
+   a write part way through says "the card refused the write"; that one is worth
+   checking the card for. All three are failed rather than retried, because
+   trying again changes nothing until you do: free space (or check the card) and
+   queue the rom again. This version does not split a file over 4 GiB into the
+   pieces Horizon can store; a rom that size has to reach the card some other way.
+7. **RomM describes the rom at more length than the console reads.** Before a
+   download the sysmodule asks RomM about the rom, and reads at most **200 KiB**
+   of answer. RomM's answer carries every user's saves, states, screenshots and
+   notes for that rom, and its RetroAchievements, so it grows as the rom is
+   used. Past that the row says "the server's description of this rom is larger
+   than this console reads" and the rom is failed rather than retried, because
+   the same answer comes back. This version has no way past it; deleting old
+   saves, states and screenshots of that rom in RomM's web UI shrinks the answer.
+
 **The fix.** Read the row on the overlay's queue screen first; it carries the
 reason for that rom. For 3, the drain is already retrying and nothing needs
 doing. For 1 and 2, the settings and pairing screens are where both are fixed.
+
+**Queued from RomM's web UI instead.** "Install on device" in RomM 5.4 puts the
+rom in this same queue, so everything above applies once it is there. Getting
+it there takes a sync tick: the console asks RomM for new requests once a tick
+rather than holding a connection open, so a rom queued in the browser starts at
+the next scheduled sync, or at once on **Sync now**. With sync switched off, no
+tick runs and nothing is fetched. When the rom is done, failed or taken out of
+the queue on the console, RomM is told and shows it.
+
+```
+12 info download.remote RomM's web UI can install roms on this console
+13 info download.remote rom 42 queued from RomM's web UI
+13 info download.remote rom 42 from RomM's web UI: reported done
+```
+
+The console is not offered in the browser at all while `[downloads] enabled =
+false` (it says `RomM's web UI will not offer this console`, and any request it
+had taken is reported failed so the browser is not left waiting), or when the
+server has `DEVICE_INSTALL_ENABLED` off. A `warn download.remote` line is an
+exchange that did not work; the next tick tries again, and sync carries on
+either way.
 
 ---
 
@@ -551,9 +657,258 @@ there is nothing to turn off.
 
 ---
 
+## Nothing syncs while a game is open
+
+**Symptom.** You pressed "Sync now" from the overlay during a game and it said
+*Syncs when the game closes*, or the log shows a sync waiting and nothing after it:
+
+```
+21 info sync.held a game is running; the interval tick waits until it closes
+```
+
+**What it means, and why it is not a bug.** While a game — a retail game, Tico,
+or RetroArch launched over a title — is open, `sys-rommsync` downloads, places
+and uploads no save. A game keeps its save in memory and writes it when it
+closes, so a newer save downloaded under it would be overwritten with the old
+one the moment you quit, and a save uploaded under it would be the one from
+before you started playing. Tico's library screen counts as a game too: it is
+the same application its emulators run in.
+
+**What happens next.** One sync runs within a few seconds of the game closing,
+however many fell due while it was open, and ends with the usual `sync.tick`
+line. A "Sync now" pressed during the game is that same sync. A game started
+while a sync was already moving saves leaves that sync to finish its saves,
+and its save states wait instead —
+`sync.held a game started during this sync; its save states wait until it closes`,
+and the status screen says *partial* — for the sync that runs once the game
+closes. Downloads from
+the queue are not held — a rom is not a save — so a rom queued from the overlay
+mid-game still comes down.
+
+**When to report it.** If a `sync.held` line is never followed by a `sync.tick`
+after you have closed the game and gone back to the HOME Menu, attach the log
+([What to attach to a bug report](#what-to-attach-to-a-bug-report)). RetroArch
+started from the album rather than over a title is not seen as a game, which is
+a known gap rather than this failing.
+
+---
+
+## A save disappeared from the card
+
+**Symptom.** A save that was on the console is gone after a sync, or a save you
+deleted in RomM is still on the console.
+
+**Log line.**
+
+```
+22 info save.deleted delete rom 4, slot autosave: deleted on the server; removed /tico/saves/nes/nova.srm after backing it up to /config/rommsync/.backup/4-autosave-1757000901.srm
+22 info save.deleted delete rom 4, slot autosave: deleted on the server; /tico/saves/nes/nova.srm stays on the card ([sync] on_server_delete = keep), and these bytes are not offered to RomM again
+```
+
+**What is happening.** The save was deleted in RomM — in its web UI, or by
+another device; RetroArch deleting a `.srm` removes every version RomM holds for
+it — and RomM 5.4 told this console not to upload its copy again. With
+`[sync] on_server_delete = remove`, the default, the file is copied under
+`/config/rommsync/.backup/` **first** and only then removed: the server is the
+source of truth, and the backup is what makes obeying it safe. With `keep`, the
+file stays exactly as it was and is not offered to RomM again while it holds the
+bytes RomM deleted — one `save.deleted` line, then silence; play it and the new
+progress syncs as usual ([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)).
+
+**Fix.** To have the save back, open the overlay's **Conflicts** screen: a
+removed save is listed as *deleted on RomM*, and restoring it puts the file back
+where it was. The next sync then offers it to RomM as new progress. If a save
+you did not delete disappeared, check RomM's own history for who deleted it; the
+backup is on the card either way.
+
+**When to report it.** A save gone from the card with no `save.deleted` line
+for it, or a `save.deleted ... removed` line whose backup is not under
+`/config/rommsync/.backup/`.
+
+---
+
+## Another device's save got there first (409)
+
+**Symptom.** A save comes back to the console as a different version than the
+one you played, or a conflict appears on the **Conflicts** screen with *Slot has
+a newer save since your last sync* as what the server said — or one sync ends
+partly finished with a line like:
+
+```
+14 error save.failed upload rom 4, slot autosave: the upload was refused: HTTP 409; the slot holds a newer save than this device last synced, so nothing was uploaded over it
+15 info sync.tick outcome=partial completed=2 failed=1 states_completed=0 states_failed=0 baseline=stored
+```
+
+**What is happening.** Another device — RetroArch's Cloud Sync, RomM's web
+player, another Switch — saved this game to RomM since this console last synced
+it. RomM refuses to let the console's upload replace that save (HTTP **409**),
+and that refusal is what stops a save made elsewhere from being silently
+overwritten. The same sync then asks RomM about that save once more
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#the-slot-guard-and-the-409-232)):
+
+- if the card's copy has not changed since this console last synced it, the
+  newer save is downloaded over it, after a backup;
+- if it has, both changed, and it is a **conflict**: the server's copy goes on
+  the card, and the card's bytes are kept under `/config/rommsync/.backup/` and
+  on RomM as an extra save named `<game> [switch-conflict <time>]` plus the
+  save's extension
+  ([INTEROP.md](INTEROP.md#when-two-devices-disagree)).
+
+Either way the line above does not stay. It is left — and the sync reads partly
+finished — only when that second question could not settle it:
+
+- a game was open, and this client touches no save while one is
+  ([Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open));
+- the server did not answer it;
+- more than four uploads were refused at once: four are settled at a time
+  (`sync::kMaxResolvedUploads`, per round of a sync), and the rest keep the line
+  until a later sync reaches them;
+- or the save went from the server between the two questions, so the answer
+  named nothing to compare.
+
+The next sync settles it.
+
+**The fix.** Usually nothing. To keep the card's version after a conflict,
+restore it from the **Conflicts** screen; the next sync decides again, and will
+most likely offer it to RomM as new progress. If the same 409 line comes back on every sync with no game open,
+attach the log ([What to attach to a bug report](#what-to-attach-to-a-bug-report)).
+
+---
+
+## Tico saves from the wrong account, or none
+
+**Symptom.** RetroArch's saves sync and Tico's never do, or the Tico saves that
+sync are another Switch user's.
+
+**Log line.**
+
+```
+3 warn config.diagnostic [tico] account: Tico keeps saves for 2 accounts in /tico/saves/users and [tico] account does not say whose to sync, so none of them is synced -- set it to one of 0123456789abcdef0123456789abcdef, fedcba9876543210fedcba9876543210
+6 warn scan.skipped tico account /tico/saves/users: Tico keeps saves for 2 accounts in /tico/saves/users and [tico] account does not say whose to sync, so none of them is synced
+3 warn config.diagnostic [tico] account: names an account with no folder in /tico/saves/users, so no Tico save there is synced -- the accounts there are 0123456789abcdef0123456789abcdef
+3 info config.diagnostic [tico] account: Tico keeps saves per account in /tico/saves/users; the only one there, 0123456789abcdef0123456789abcdef, is synced
+6 warn scan.skipped outside layout /tico/saves/snes/Game.srm: Tico 0.8 keeps saves in /tico/saves/users/0123456789abcdef0123456789abcdef/snes now and does not read this one; a module installed before 0.8.0 writes here until it is reinstalled
+```
+
+The `config.diagnostic` lines are also on the overlay's settings screen, and are
+written to the log when they change rather than on every sync.
+
+**What is happening.** Tico 0.8 keeps each Switch user's saves apart, in
+`/tico/saves/users/<account>/` ([CONFIG.md](CONFIG.md#tico-per-account-saves)).
+With one account there the client syncs it, and says whose. With **several**
+it syncs none of them: it cannot tell which are yours, and guessing would sync
+one user's save over another's through the server. An `account` naming a folder
+that is not there syncs nothing from that root. And a file still in the folder
+from before 0.8 is *outside layout*: Tico 0.8 does not read it, though a module
+installed before 0.8.0 keeps writing there until it is reinstalled.
+
+"The wrong account" is usually the first case's cousin: the only account with a
+folder is not the one you play as — you have never saved under yours yet — so
+that one is synced.
+
+**The fix.** Name the account in `config.ini`, using an id from the settings
+screen's list:
+
+```ini
+[tico]
+account = 0123456789abcdef0123456789abcdef
+```
+
+`account = legacy` reads the layout from before 0.8 even when `users/` exists.
+For *outside layout* files, reinstall the Tico module from Tico 0.8 so it writes
+the new layout, and move a save you still need into your account's folder.
+
+---
+
+## RomM calls a platform something else
+
+**Symptom.** One system's roms never download — the queue screen says no folder
+is mapped for its platform — and its saves never sync, while every other system
+works.
+
+**Log line.**
+
+```
+6 warn scan.skipped unmatched /tico/saves/genesis/Sonic the Hedgehog (USA, Europe).srm: no rom named "Sonic the Hedgehog (USA, Europe)" on platform genesis
+1 info config.diagnostic line 14 [platform.megadrive] is not a platform this build maps by default; it is used as written -- check it matches the folder name under RomM's library/roms/, because a slug that matches nothing maps nothing
+```
+
+**What is happening.** The folder map is keyed by RomM's `platform_fs_slug`:
+the name of the platform's folder under RomM's `library/roms/`
+([CONFIG.md](CONFIG.md#defaults--the-folder-map)). The built-in map knows the
+usual names — both spellings where two are common (`dc` and `dreamcast`,
+`arcade` and `fbneo`), and Tico's own folder name where it differs (`sms` is
+Tico's `master-system`). A library whose folder has another name — `megadrive`
+for Genesis, say — gets none of that: its roms have nowhere to land, and a save
+in Tico's `genesis` folder is looked for among `genesis` roms, of which RomM has
+none. That is the first line. The second is what a `[platform.…]` section for a
+name this build does not know says: a reminder, not a fault — check the name
+against RomM's folder, because a slug that matches nothing maps nothing.
+
+**The fix.** A section under RomM's name, pointing at Tico's folders and saying
+which emulator writes them and plays them:
+
+```ini
+[platform.megadrive]
+roms      = /tico/roms/genesis
+saves     = /tico/saves/genesis
+states    = /tico/states/genesis
+emulator  = genesis_plus_gx
+play_with = tico
+```
+
+`emulator` and `play_with` are needed because both defaults are keyed by the
+spelling this build knows: without the first, the saves go to RomM with no
+emulator and meet nobody else's
+([INTEROP.md](INTEROP.md#which-systems-sync-with-what) has the ids); without the
+second, a save the console has never had is not placed. The name is
+case-sensitive, because it is a folder name on the server.
+
+---
+
+## Some saves are left out: the limits
+
+**Symptom.** Most saves sync and a few never do, or a game you have saves for
+on the server never gets one on the console. The status screen may say the last
+sync **partly finished** every time.
+
+**Log line.**
+
+```
+7 warn scan.skipped too many saves /tico/saves/snes/Zelda (USA).srm: the scan stopped at 128 saves; the rest of this card was not read
+7 warn scan.skipped unmatched /tico/saves/gba/Golden Sun (USA).srm: no rom named "Golden Sun (USA)" on platform gba; the rom index is incomplete, so this may be a rom that was never read rather than one you do not have
+9 warn sync.refused Tetris (World) (rom 812): the server holds more saves for it than the 128 one plan can carry, so it was left out of this sync
+```
+
+**What is happening.** The sysmodule runs in a fixed, small amount of memory,
+so a sync holds a bounded amount of everything
+([INTEROP.md](INTEROP.md#known-limits)):
+
+- **128 saves per console.** The scan reads RetroArch's folders first, then the
+  folder map, each folder's files in name order, and stops at the 128th save.
+  The rest of the card is not read that sync — nothing of it is uploaded, and
+  nothing is written over it — and the status screen reads partly finished.
+- **32 states**, when states are on, sharing those records with the saves.
+- **1,024 roms** in the library index a sync holds, the ones with the lowest
+  RomM ids. A save of any other game is *unmatched*, with the index named as
+  the likely reason.
+- **A game with more than 128 saves on the server** — one plan's worth — is
+  left out of the sync whole: none of its saves is offered and nothing of it is
+  touched. The `sync.refused` line names it on every sync, and the sync reads
+  partly finished.
+
+**The fix.** Fewer saves in the folders the client reads: move old saves of
+games you no longer play out of them, or switch a platform's saves off in the
+folder map ([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-defaults)).
+For a game with too many saves on the server, delete old versions in RomM's web
+UI. For a library past the index, nothing on the console helps yet; the roms
+with the lowest ids are the ones matched.
+
+---
+
 ## What to attach to a bug report
 
-Four things, and the log has three of them:
+Five things, and the log has four of them:
 
 1. **The version.** The first line of the log, and also on the overlay's status
    screen:
@@ -574,13 +929,21 @@ Four things, and the log has three of them:
    called `token` is one the redactor blanks, and blanking it would lose the one
    thing this line is for — whether this console has credentials at all.
 
-3. **The last tick.** What the sync did, or did not:
+3. **The server's version**, written once a boot and again after a pairing —
+   the first question about any sync problem is which RomM answered it. It is
+   also the `RomM` row on the overlay's status screen:
+
+   ```
+   5 info server.version RomM 5.4.0
+   ```
+
+4. **The last tick.** What the sync did, or did not:
 
    ```
    14 info sync.tick outcome=partial completed=3 failed=1 states_completed=0 states_failed=0 baseline=stored
    ```
 
-4. **The log tail.** The last twenty or thirty lines of
+5. **The log tail.** The last twenty or thirty lines of
    `sdmc:/config/rommsync/rommsync.log`, and `rommsync.log.old` beside it if the
    failure is older than the current file.
 

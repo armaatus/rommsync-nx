@@ -7,9 +7,10 @@
 // suggests. Nothing is committed here. The uploads and downloads already landed
 // on the server while the plan was executing, and RomM has already written the
 // sync rows the next negotiation arbitrates against. This writes a history row
-// a user reads and closes the session so the next negotiate does not have to
-// cancel it. A `complete` that never lands costs a session RomM will show as
-// CANCELLED; it costs no save and no arbitration.
+// a user reads and closes the session. A `complete` that never lands costs a
+// session RomM shows as CANCELLED (5.2.0, at the next negotiate) or FAILED
+// (5.4.0, when its cleanup expires it after 24 hours); it costs no save and no
+// arbitration.
 //
 // Which is exactly why sync_finish.hpp persists the baseline *before* calling
 // this: the expensive thing to lose is the client's own record of what it
@@ -44,17 +45,23 @@ namespace {
 constexpr const char* kCompletedStatus = "COMPLETED";
 
 /// What RomM answers a 400 with when the session has already been accounted for
-/// -- verified against the live 5.2.0. It is what a retry that worked looks
-/// like: the first attempt reached the server, the connection died on the way
-/// back, and the second is refused because the first succeeded.
+/// -- verified against the live 5.2.0 and 5.4.0. It is what a retry that worked
+/// looks like: the first attempt reached the server, the connection died on the
+/// way back, and the second is refused because the first succeeded.
 constexpr const char* kAlreadyCompletedDetail = "Session is already COMPLETED";
 
-/// And what it answers when another negotiation already took the device --
-/// also verified against the live 5.2.0, and the *reachable* half of this 400:
-/// every negotiate cancels the device's previous IN_PROGRESS session, so a tick
-/// that gave up on one negotiation and made another lands here with the first
-/// id (docs/API_CONTRACT.md).
-constexpr const char* kSupersededDetail = "Session is already CANCELLED";
+/// And the same 400 for every other closed status: `Session is already
+/// {status}` is one f-string in RomM, so CANCELLED and FAILED arrive spelled
+/// alike. Matched as a prefix, after COMPLETED, rather than status by status --
+/// a status a later RomM adds is still a session closed by something other than
+/// this tick, and reading it as a refused body would call the tick unreported.
+///
+/// On 5.2.0 the reachable one was CANCELLED: every negotiate cancelled the
+/// device's previous IN_PROGRESS session. 5.4.0 cancels nothing and lets
+/// `complete` reopen a session its cleanup expired (#235), so what still lands
+/// here is a session closed on purpose -- cancelled by a 5.2.0 before the
+/// upgrade, or FAILED by whatever ran it (docs/API_CONTRACT.md).
+constexpr const char* kClosedDetailPrefix = "Session is already ";
 
 /// And what it answers a 404 with when the id names nothing -- `Sync session
 /// with ID {id} not found`.
@@ -115,15 +122,6 @@ std::optional<Completion> Refused(const http::Result& result) {
     return Refuse(CompleteError::kNoSuchSession,
                   "the completion was answered 404; RomM has no session with that id at all");
   }
-  if (status == 400 && result.response.body.find(kSupersededDetail) != std::string::npos) {
-    // Not a refusal of this body either, and not the same news as the branch
-    // below: this session was ended by another negotiation, so the counts it was
-    // carrying were never recorded and cannot be. The next tick negotiates its
-    // own session; there is nothing here to retry or to fix.
-    return Refuse(CompleteError::kSuperseded,
-                  "this sync session was cancelled by a later negotiation; its counts were not "
-                  "recorded, and the next tick opens a session of its own");
-  }
   if (status == 400 && result.response.body.find(kAlreadyCompletedDetail) != std::string::npos) {
     // Not a refusal of this body. The session has been accounted for -- almost
     // always by this client's own previous attempt, which reached RomM before
@@ -131,6 +129,15 @@ std::optional<Completion> Refused(const http::Result& result) {
     return Refuse(CompleteError::kAlreadyCompleted,
                   "this sync session was already completed; the counts it holds are the ones an "
                   "earlier attempt reported");
+  }
+  if (status == 400 && result.response.body.find(kClosedDetailPrefix) != std::string::npos) {
+    // Not a refusal of this body either, and not the same news as the branch
+    // above: this session was ended by something other than this tick, so the
+    // counts it was carrying were never recorded and cannot be. The next tick
+    // negotiates its own session; there is nothing here to retry or to fix.
+    return Refuse(CompleteError::kSuperseded,
+                  "this sync session was already closed on the server; its counts were not "
+                  "recorded, and the next tick opens a session of its own");
   }
   // The same three-way split `Refused` makes next door: a 429 or a 408 is the
   // server declining *now*, and letting either fall through to a non-retryable
@@ -474,9 +481,10 @@ auth::Parsed<SyncCompletion> ParseCompleteResponse(std::string_view body) {
   }
 
   if (completion.session.status != kCompletedStatus) {
-    // The expected way to see this is a session another negotiation already
-    // cancelled -- each negotiate cancels the device's previous IN_PROGRESS one
-    // (docs/API_CONTRACT.md). The counts in it are then RomM's, not this tick's.
+    // RomM answers a closed session with a 400 rather than with this, so a 2xx
+    // carrying another status is a server that changed its mind about that.
+    // An expired session is *not* this: 5.4.0 completes it and answers
+    // COMPLETED (#235). The counts in it are then RomM's, not this tick's.
     completion.warnings.push_back("the session came back \"" + completion.session.status +
                                   "\" rather than " + kCompletedStatus +
                                   "; its counts are not this tick's");

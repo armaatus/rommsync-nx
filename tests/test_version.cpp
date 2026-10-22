@@ -2,6 +2,7 @@
 // wiring itself works, so a red `ctest` always means something real.
 #include <cstring>
 #include <iostream>
+#include <string>
 
 #include "rommsync/core.hpp"
 
@@ -22,6 +23,14 @@ int main() {
   if (std::strcmp(rommsync::version(), ROMMSYNC_VERSION_EXPECTED) != 0) {
     std::cerr << "version() is " << rommsync::version() << ", VERSION says "
               << ROMMSYNC_VERSION_EXPECTED << "\n";
+    ++failures;
+  }
+
+  // The marker the shipped artifacts are searched for (#211): the prefix
+  // scripts/artifact-check.py looks for, then this build's version.
+  if (std::string(rommsync::kBuildMarker) !=
+      std::string("ROMMSYNC_NX_VERSION=") + ROMMSYNC_VERSION_EXPECTED) {
+    std::cerr << "kBuildMarker is " << rommsync::kBuildMarker << "\n";
     ++failures;
   }
 

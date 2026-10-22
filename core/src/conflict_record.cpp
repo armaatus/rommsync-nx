@@ -68,6 +68,11 @@ std::size_t RecordSaves(History* history, const sync::SyncPlan& plan,
       // A download with no backup replaced nothing -- the save was not on the
       // card at all -- so there is nothing for a player to want back.
       event = Event::kReplaced;
+    } else if (result.outcome == sync::OperationOutcome::kRemoved &&
+               !result.backup_sd_path.empty()) {
+      // A save RomM deleted, off the card (#233). With no backup it was already
+      // gone and there is nothing to put back; a kept one changed nothing.
+      event = Event::kDeleted;
     } else {
       continue;
     }
@@ -83,6 +88,14 @@ std::size_t RecordSaves(History* history, const sync::SyncPlan& plan,
     entry.server_content_hash = operation.server_content_hash;
     entry.server_updated_at = operation.server_updated_at.value_or(std::string());
     entry.backup_sd_path = result.backup_sd_path;
+    // Whether the losing bytes reached the server as well (#240). Only a
+    // keep-both asks; everything else stays `kUnrecorded`.
+    if (result.archive == sync::ArchiveOutcome::kKept) {
+      entry.local_copy = LocalCopy::kOnServer;
+      entry.archive_save_id = result.archive_save_id.value_or(0);
+    } else if (result.archive == sync::ArchiveOutcome::kFailed) {
+      entry.local_copy = LocalCopy::kCardOnly;
+    }
 
     // The local facts are the ones step 0 reported, not the ones on the card:
     // the card now holds the server's copy.
@@ -243,7 +256,7 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
   }
 
   // Streamed and staged: a save state is tens of megabytes and the sysmodule's
-  // inner heap is 1.3 MiB, and the two-rename commit is what makes an
+  // inner heap is 1.5 MiB, and the two-rename commit is what makes an
   // interruption leave the old bytes or the new ones and never a splice.
   const io::CopyResult copied = io::CopyAtomically(backup, destination);
   if (!copied.ok()) {

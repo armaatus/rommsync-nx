@@ -7,6 +7,14 @@ namespace rommsync {
 /// Project version, single-sourced from the VERSION file at the repo root.
 inline constexpr const char* kVersion = "@ROMMSYNC_VERSION@";
 
+/// The build, as one string `strings` finds in a shipped artifact -- so a file
+/// from a bug report says what it is (#211). `version()` returns the tail of
+/// this array rather than a literal of its own, which is what keeps it in every
+/// image that can report a version: --gc-sections cannot drop the one without
+/// the other. scripts/artifact-check.py reads it back, prefix and all.
+inline constexpr char kBuildMarkerPrefix[] = "ROMMSYNC_NX_VERSION=";
+inline constexpr char kBuildMarker[] = "ROMMSYNC_NX_VERSION=@ROMMSYNC_VERSION@";
+
 /// User agent sent on every request to RomM. RomM records the client string, so
 /// keeping it stable and identifiable matters for server-side debugging.
 inline constexpr const char* kUserAgent = "rommsync-nx/@ROMMSYNC_VERSION@";

@@ -157,6 +157,24 @@ void Rejects(checks::Checks& c) {
            "nesting just under the limit parses");
   c.Expect(!json::Parse(too_deep + std::string(json::kMaxDepth + 1, ']')).ok(),
            "nesting past the limit is refused");
+  // Exactly the limit parses and one more does not. sysmodule/source/
+  // stack_budget.hpp prices the worst case at kMaxDepth + 1 levels -- each one
+  // accepted, and the frame that refuses the next -- so the boundary is part of
+  // the main thread's stack budget, not only of this parser (#216).
+  c.Expect(json::Parse(std::string(json::kMaxDepth, '[') + std::string(json::kMaxDepth, ']'))
+               .ok(),
+           "nesting exactly at the limit parses");
+  c.Expect(!json::Parse(std::string(json::kMaxDepth, '[') + "1" +
+                        std::string(json::kMaxDepth, ']'))
+                .ok(),
+           "a value inside the deepest container the limit allows is one level too deep");
+  // ...and the limit is not one RomM reaches. A rom row's IGDB multiplayer mode
+  // names its platform seven levels down a page of roms, the deepest typed
+  // response either pinned OpenAPI snapshot describes (`stack.contract`).
+  c.Expect(json::Parse("{\"items\": [{\"igdb_metadata\": {\"multiplayer_modes\": "
+                       "[{\"platform\": {\"id\": 1, \"name\": \"Nintendo Switch\"}}]}}]}")
+               .ok(),
+           "RomM's deepest response shape parses");
 }
 
 void ReaderReportsTheField(checks::Checks& c) {
@@ -359,6 +377,166 @@ void QuotesWhatItIsGiven(checks::Checks& c) {
   }
 }
 
+/// `ParseEach`: one array handed over an element at a time (M9-19, #217). What
+/// it must keep is everything `Parse` promises -- the strictness, the rest of the
+/// document -- while never holding the array it streams.
+void StreamsOneArray(checks::Checks& c) {
+  std::vector<std::int64_t> seen;
+  std::vector<std::size_t> indices;
+  const json::EachElement collect = [&](const json::Value& element, std::size_t index) {
+    const json::Value* id = element.Find("id");
+    seen.push_back(id != nullptr ? id->integer() : -1);
+    indices.push_back(index);
+    return json::Error{};
+  };
+
+  const json::ParseResult page = json::ParseEach(
+      R"({"items":[{"id":1},{"id":2},{"id":3}],"total":3,"nested":{"items":[9]}})", "items",
+      collect);
+  c.Expect(page.ok(), "an envelope parses: " + page.error.Describe());
+  c.Expect(seen == std::vector<std::int64_t>{1, 2, 3}, "every element, in order");
+  c.Expect(indices == std::vector<std::size_t>{0, 1, 2}, "each with its index");
+  const json::Value* items = page.value.Find("items");
+  c.Expect(items != nullptr && items->is_array() && items->size() == 0,
+           "and the streamed array is left present and empty");
+  const json::Value* total = page.value.Find("total");
+  c.Expect(total != nullptr && total->integer() == 3, "the rest of the document is kept");
+  const json::Value* nested = page.value.Find("nested");
+  c.Expect(nested != nullptr && nested->Find("items") != nullptr &&
+               nested->Find("items")->size() == 1,
+           "and only the top-level member is streamed, not a nested one of the same name");
+
+  seen.clear();
+  const json::ParseResult bare = json::ParseEach(R"([{"id":7},{"id":8}])", "", collect);
+  c.Expect(bare.ok() && bare.value.is_array() && bare.value.size() == 0,
+           "an empty key streams the root array");
+  c.Expect(seen == std::vector<std::int64_t>{7, 8}, "element by element");
+
+  // The wrong shape is refused before it is parsed, by the name a caller's own
+  // shape check would have given it (M9-20, #246). Parsed first and refused
+  // after, a bare array where the envelope belongs cost ~11x its text on the way
+  // to a refusal that was always coming.
+  seen.clear();
+  const json::ParseResult object = json::ParseEach(R"({"items":{"id":1}})", "items", collect);
+  c.Expect(!object.ok() && seen.empty(), "something other than an array is not streamed");
+  c.ExpectEq(object.error.field, std::string("items"), "it is refused by the member's name");
+  c.ExpectEq(object.error.message, std::string("expected an array, got an object"),
+             "and says what it was instead");
+  const json::ParseResult missing = json::ParseEach(R"({"total":0})", "items", collect);
+  c.Expect(missing.ok() && missing.value.Find("items") == nullptr,
+           "a member that is not there is the caller's to refuse, as it always was");
+
+  const json::ParseResult bare_page =
+      json::ParseEach(R"([{"id":1},{"id":2}])", "items", collect, "rom list");
+  c.Expect(!bare_page.ok() && seen.empty(), "a bare array where an envelope belongs is refused");
+  c.ExpectEq(bare_page.error.message,
+             std::string("rom list is an array, not the object it must be"),
+             "in the sentence `Reader` would have used, naming what was being read");
+  const json::ParseResult enveloped =
+      json::ParseEach(R"({"items":[{"id":1}],"total":1})", "", collect, "platform list");
+  c.Expect(!enveloped.ok() && seen.empty(), "and an envelope where a bare array belongs");
+  c.ExpectEq(enveloped.error.message,
+             std::string("platform list is an object, not the array it must be"),
+             "the other way round");
+  const json::ParseResult unnamed = json::ParseEach("null", "items", collect);
+  c.ExpectEq(unnamed.error.message, std::string("the document is a null, not the object it must be"),
+             "with a context of its own when the caller gave none");
+  c.Expect(!json::ParseEach("", "items", collect).ok(), "an empty body is still refused");
+
+  // Strict exactly as `Parse` is, including past elements already handed over.
+  seen.clear();
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1},{"id":2,}]})", "items", collect).ok(),
+           "a malformed element fails the document");
+  c.ExpectEq(seen.size(), std::size_t{1}, "after the elements before it were handed over");
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1}],"items":[]})", "items", collect).ok(),
+           "a duplicate key is still refused");
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1}]} x)", "items", collect).ok(),
+           "and so is content after the document");
+  c.Expect(!json::ParseEach(R"({"items":[{"id":1})", "items", collect).ok(),
+           "and a body cut short");
+
+  // The caller's refusal stops the walk and is the error.
+  seen.clear();
+  const json::ParseResult refused =
+      json::ParseEach(R"([{"id":1},{"id":2},{"id":3}])", "",
+                      [&](const json::Value& element, std::size_t) {
+                        seen.push_back(element.Find("id")->integer());
+                        json::Error error;
+                        if (seen.size() == 2) {
+                          error.field = "[1].id";
+                          error.message = "not this one";
+                        }
+                        return error;
+                      });
+  c.Expect(!refused.ok(), "a refused element fails the parse");
+  c.ExpectEq(refused.error.field, std::string("[1].id"), "with the caller's own error");
+  c.ExpectEq(seen.size(), std::size_t{2}, "and nothing after it is read");
+}
+
+/// `ParseEach`'s keeping form (#248): what a reader names is built, at every
+/// depth, and the rest is read past as strictly and never built.
+void KeepsWhatIsNamed(checks::Checks& c) {
+  constexpr std::string_view kKeep[] = {"id", "name", "total", "file_name"};
+  std::vector<json::Value> seen;
+  const auto collect = [&seen](const json::Value& element, std::size_t) {
+    seen.push_back(element);
+    return json::Error{};
+  };
+  const json::ParseResult page = json::ParseEach(
+      R"({"items":[{"id":1,"name":"a","summary":"long \"text\" é","igdb":{"keywords":["x",)"
+      R"("y"],"id":9},"files":[{"file_name":"a.bin","size":1}]}],"total":1,"char_index":{"a":0}})",
+      "items", kKeep, collect, "rom list");
+  c.Expect(page.ok(), "a page parses keeping what is named: " + page.error.Describe());
+  c.ExpectEq(seen.size(), std::size_t{1}, "one element");
+  if (seen.size() == 1) {
+    c.ExpectEq(seen[0].size(), std::size_t{2}, "which holds only the two members named");
+    c.Expect(seen[0].Find("id") != nullptr && seen[0].Find("name") != nullptr &&
+                 seen[0].Find("summary") == nullptr && seen[0].Find("igdb") == nullptr &&
+                 seen[0].Find("files") == nullptr,
+             "id and name, and not what nothing reads");
+  }
+  c.Expect(page.value.Find("total") != nullptr && page.value.Find("char_index") == nullptr,
+           "the envelope keeps what is named and drops the rest");
+  c.Expect(page.value.Find("items") != nullptr && page.value.Find("items")->is_array(),
+           "and the streamed array is there, empty, whatever keep says");
+
+  // At any depth: a kept array's objects are filtered the same way.
+  seen.clear();
+  constexpr std::string_view kFiles[] = {"files", "file_name"};
+  const json::ParseResult nested = json::ParseEach(
+      R"([{"files":[{"file_name":"a.bin","crc":"00"},{"file_name":"b.bin","crc":"11"}],"x":1}])",
+      "", kFiles, collect);
+  c.Expect(nested.ok() && seen.size() == 1, "a nested array of objects parses");
+  if (seen.size() == 1 && seen[0].Find("files") != nullptr) {
+    const json::Value& files = *seen[0].Find("files");
+    c.Expect(files.size() == 2 && files.elements()[0].size() == 1 &&
+                 files.elements()[0].Find("file_name")->string() == "a.bin",
+             "its objects keep only the named member");
+  } else {
+    c.Expect(false, "the kept array is there");
+  }
+
+  // A skipped member is checked as strictly as a kept one.
+  for (const char* broken :
+       {R"([{"id":1,"skip":[1,2,]}])", R"([{"id":1,"skip":"\x"}])", R"([{"id":1,"skip":tru}])",
+        R"([{"id":1,"skip":{"a" 1}}])", R"([{"id":1,"skip":"\ud800"}])",
+        R"([{"id":1,"skip":01}])", R"([{"id":1,"skip":"a)"}) {
+    c.Expect(!json::ParseEach(broken, "", kKeep, collect).ok(),
+             std::string("a malformed skipped member fails the document: ") + broken);
+  }
+  std::string deep = R"([{"id":1,"skip":)";
+  for (int level = 0; level < json::kMaxDepth; ++level) deep += "[";
+  for (int level = 0; level < json::kMaxDepth; ++level) deep += "]";
+  deep += "}]";
+  c.Expect(!json::ParseEach(deep, "", kKeep, collect).ok(),
+           "and nested past kMaxDepth, it is refused");
+  // Two kept members of one name are still refused.
+  c.Expect(!json::ParseEach(R"([{"id":1,"id":2}])", "", kKeep, collect).ok(),
+           "a duplicated kept key is refused");
+  c.Expect(json::ParseEach(R"([{"id":1,"skip":1,"skip":2}])", "", kKeep, collect).ok(),
+           "a duplicated skipped key is not looked at");
+}
+
 }  // namespace
 
 int main() {
@@ -367,5 +545,7 @@ int main() {
   Rejects(c);
   ReaderReportsTheField(c);
   QuotesWhatItIsGiven(c);
+  StreamsOneArray(c);
+  KeepsWhatIsNamed(c);
   return c.failures() == 0 ? 0 : 1;
 }

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "rommsync/auth.hpp"
@@ -38,6 +39,9 @@ class FakeEngine : public ipc::Engine {
   std::vector<config::Diagnostic> apply_edit_notes;
   ipc::ConfigEdit last_edit;
 
+  /// What the last tick said about the emulators' folders (#230).
+  std::vector<config::Diagnostic> sources;
+
   bool sync_accepted = true;
   int sync_requests = 0;
 
@@ -59,6 +63,7 @@ class FakeEngine : public ipc::Engine {
 
   const config::Config& config() const override { return settings; }
   const std::vector<config::Diagnostic>& config_diagnostics() const override { return notes; }
+  std::vector<config::Diagnostic> source_notes() const override { return sources; }
   ipc::EngineSnapshot Snapshot() const override { return snapshot; }
   auth::PairingStatus pairing_status() const override { return pairing; }
 
@@ -80,6 +85,10 @@ class FakeEngine : public ipc::Engine {
     ++sync_requests;
     return sync_accepted;
   }
+
+  /// #242: an application in the foreground.
+  bool application_running_now = false;
+  bool application_running() const override { return application_running_now; }
 
   ipc::Error StartPairing() override { return start_pairing_error; }
   ipc::Error Unpair() override { return unpair_error; }
@@ -135,17 +144,57 @@ class FakeEngine : public ipc::Engine {
     return ipc::Error::kOk;
   }
 
-  ipc::Error RestoreBackup(std::int64_t entry_id, conflicts::RestoreReport* report) override {
+  /// Taken, and -- unless `restore_runs_inline` is off -- finished on the spot
+  /// with `restore_report`, which is what an engine with no worker does. With it
+  /// off the restore stays `kRunning` until the test calls `FinishRestore`: a
+  /// copy on a slow card, as far as anything on the wire can tell (#209).
+  ipc::RestoreState RequestRestore(std::int64_t entry_id) override {
+    std::lock_guard<std::mutex> lock(restore_mutex_);
     last_restore_id = entry_id;
-    *report = restore_report;
-    return restore_error;
+    ++restore_requests;
+    if (restore_.phase == ipc::RestorePhase::kRunning) {
+      return restore_;
+    }
+    restore_ = ipc::RestoreState{};
+    restore_.entry_id = entry_id;
+    restore_.phase = restore_runs_inline ? ipc::RestorePhase::kDone : ipc::RestorePhase::kRunning;
+    if (restore_runs_inline) {
+      restore_.report = restore_report;
+    }
+    return restore_;
+  }
+
+  ipc::RestoreState restore_state() const override {
+    std::lock_guard<std::mutex> lock(restore_mutex_);
+    return restore_;
+  }
+
+  /// The copy a test was holding has finished, with `restore_report`.
+  void FinishRestore() {
+    std::lock_guard<std::mutex> lock(restore_mutex_);
+    restore_.phase = ipc::RestorePhase::kDone;
+    restore_.report = restore_report;
+  }
+
+  /// The sysmodule restarted: whatever it was doing, it no longer knows.
+  void ForgetRestore() {
+    std::lock_guard<std::mutex> lock(restore_mutex_);
+    restore_ = ipc::RestoreState{};
   }
 
   std::vector<ipc::ConflictRow> conflicts_;
   ipc::ConflictQuery last_conflict_query;
   std::int64_t last_restore_id = 0;
+  int restore_requests = 0;
   conflicts::RestoreReport restore_report;
-  ipc::Error restore_error = ipc::Error::kOk;
+  bool restore_runs_inline = true;
+
+ private:
+  /// The overlay's suites reach this engine from `IpcClient`'s worker thread
+  /// while the test thread finishes the restore, so the one piece both touch is
+  /// guarded.
+  mutable std::mutex restore_mutex_;
+  ipc::RestoreState restore_;
 };
 
 }  // namespace fakes

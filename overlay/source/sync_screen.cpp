@@ -97,8 +97,8 @@ void SyncScreen::Poll() {
   // started" would come back when the sync ended. What to *do* about it is
   // still the view model's (`overlay_sync_actions.hpp`); this only records that
   // it happened.
-  if (last_.kind == LastCommand::Kind::kSyncNow &&
-      last_.sync == ipc::SyncOutcome::kAccepted && status_.sync_in_progress) {
+  if (last_.kind == LastCommand::Kind::kSyncNow && PromisesTick(last_.sync) &&
+      status_.sync_in_progress) {
     last_.sync_seen_running = true;
   }
   Refresh();

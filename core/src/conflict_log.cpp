@@ -41,6 +41,28 @@ bool SecondsUsable(std::int64_t seconds) {
   return seconds == 0 || (seconds >= kEarliest && seconds <= kLatest);
 }
 
+/// The version a `<magic> <version> ...` header names when it is above this
+/// build's, else zero -- which is also the answer for anything that is not this
+/// file's header at all, since those are corrupt rather than newer.
+int NewerVersion(std::string_view header) {
+  const std::string magic = std::string(kFormatMagic) + " ";
+  if (header.substr(0, magic.size()) != magic) {
+    return 0;
+  }
+  int version = 0;
+  std::size_t at = magic.size();
+  for (; at < header.size() && header[at] >= '0' && header[at] <= '9'; ++at) {
+    if (version > 100000) {
+      return 0;  // not a version anybody shipped; corrupt, and discarded as such
+    }
+    version = version * 10 + (header[at] - '0');
+  }
+  if (at == magic.size() || (at < header.size() && header[at] != ' ')) {
+    return 0;
+  }
+  return version > kFormatVersion ? version : 0;
+}
+
 std::string FormatHeader(std::int64_t next_id) {
   return std::string(kFormatMagic) + " " + std::to_string(kFormatVersion) + " " +
          std::to_string(next_id);
@@ -112,6 +134,8 @@ const char* EventText(Event event) {
       return "replaced";
     case Event::kKeptBoth:
       return "kept_both";
+    case Event::kDeleted:
+      return "deleted";
   }
   return "conflict";
 }
@@ -127,6 +151,10 @@ bool ReadEvent(std::string_view text, Event* out) {
   }
   if (text == "kept_both") {
     *out = Event::kKeptBoth;
+    return true;
+  }
+  if (text == "deleted") {
+    *out = Event::kDeleted;
     return true;
   }
   return false;
@@ -154,6 +182,16 @@ std::string SerializeEntry(const Entry& entry) {
   AppendOptionalText(&out, "server_updated_at", entry.server_updated_at);
   AppendInteger(&out, "server_size_bytes", entry.server_size_bytes);
   AppendOptionalText(&out, "backup_sd_path", entry.backup_sd_path);
+  // Last, the two keys a reader tolerates missing (`Entry::local_copy`), and
+  // written only when they say something: an entry with nothing recorded is
+  // the row rc1 wrote, byte for byte, which is what lets the format keep its
+  // version (`compat.fixtures`).
+  if (entry.local_copy != LocalCopy::kUnrecorded) {
+    AppendText(&out, "local_copy", ToString(entry.local_copy));
+  }
+  if (entry.archive_save_id > 0) {
+    AppendInteger(&out, "archive_save_id", entry.archive_save_id);
+  }
   out += "}";
   return out;
 }
@@ -220,15 +258,55 @@ bool ParseEntry(const json::Value& object, Entry* out, std::string* why) {
   entry.server_updated_at = server_updated_at.value_or(std::string());
   entry.backup_sd_path = backup.value_or(std::string());
 
+  // #240's two keys, read by hand because absent is an answer here: a row from
+  // before them is `kUnrecorded`, not a row to drop. Present, they are held to
+  // the same bar as the rest -- a value this build does not know is refused
+  // rather than read as "not recorded".
+  if (const json::Value* copy = object.Find("local_copy"); copy != nullptr && !copy->is_null()) {
+    if (!copy->is_string()) {
+      *why = "field local_copy: not a string";
+      return false;
+    }
+    if (copy->string() == ToString(LocalCopy::kOnServer)) {
+      entry.local_copy = LocalCopy::kOnServer;
+    } else if (copy->string() == ToString(LocalCopy::kCardOnly)) {
+      entry.local_copy = LocalCopy::kCardOnly;
+    } else {
+      *why = "field local_copy: " + copy->string() + " is not a copy this build records";
+      return false;
+    }
+  }
+  if (const json::Value* id = object.Find("archive_save_id"); id != nullptr && !id->is_null()) {
+    if (!id->is_integer() || id->integer() <= 0) {
+      *why = "field archive_save_id: not a save id";
+      return false;
+    }
+    entry.archive_save_id = id->integer();
+  }
+
   *out = std::move(entry);
   return true;
 }
 
 const char* ToString(EntryKind kind) { return KindText(kind); }
 
+const char* ToString(LocalCopy copy) {
+  switch (copy) {
+    case LocalCopy::kUnrecorded:
+      return "unrecorded";
+    case LocalCopy::kOnServer:
+      return "server";
+    case LocalCopy::kCardOnly:
+      return "card";
+  }
+  return "unrecorded";
+}
+
 const char* ToString(Event event) { return EventText(event); }
 
-bool Overwrote(Event event) { return event == Event::kConflict || event == Event::kReplaced; }
+bool Overwrote(Event event) {
+  return event == Event::kConflict || event == Event::kReplaced || event == Event::kDeleted;
+}
 
 const char* ToString(StoreError error) {
   switch (error) {
@@ -244,6 +322,8 @@ const char* ToString(StoreError error) {
       return "write_failed";
     case StoreError::kCommitFailed:
       return "commit_failed";
+    case StoreError::kNewerFormat:
+      return "newer_format";
   }
   return "none";
 }
@@ -304,6 +384,17 @@ LoadedHistory ParseHistory(std::string_view text) {
   // prefix match on the magic and the version is what says "these bytes are
   // this file"; the number after it is data.
   const std::string prefix = std::string(kFormatMagic) + " " + std::to_string(kFormatVersion) + " ";
+  const int newer = lines.empty() ? 0 : NewerVersion(lines.front());
+  if (newer > 0) {
+    loaded.newer_version = newer;
+    loaded.diagnostics.push_back(
+        "conflicts.db is version " + std::to_string(newer) +
+        ", written by a newer release than this sys-rommsync (which reads " +
+        std::to_string(kFormatVersion) +
+        "); it is not read and not written over, conflicts recorded now last until a reboot, "
+        "and the backups under .backup/ are untouched -- update sys-rommsync to see it again");
+    return loaded;
+  }
   if (lines.empty() || lines.front().size() <= prefix.size() ||
       lines.front().substr(0, prefix.size()) != prefix) {
     // Includes an empty file and a truncated first line. The expected header is
@@ -372,7 +463,7 @@ LoadedHistory LoadHistory(const std::string& path) {
   // **Bounded, not `ReadFile`.** `state::LoadBaseline`'s rule, and its reason:
   // this file sits on a FAT32 card that gets yanked mid-write, so a corrupt
   // directory entry claiming four gigabytes has to be a named refusal rather
-  // than a `bad_alloc` on a 1.3 MiB heap before the diagnostic exists.
+  // than a `bad_alloc` on a 1.5 MiB heap before the diagnostic exists.
   std::string contents;
   io::BoundedRead outcome = io::ReadBounded(path, kMaxHistoryBytes, &contents);
   if (outcome == io::BoundedRead::kMissing) {
@@ -400,12 +491,21 @@ LoadedHistory LoadHistory(const std::string& path) {
   return ParseHistory(contents);
 }
 
-History::History(std::string path) : path_(std::move(path)) {}
+History::History(std::string path) : path_(std::move(path)) {
+  // Room for one past the bound, once: an `Append` inserts before it trims, and
+  // a vector with no room left doubles -- both arrays live while it moves, in
+  // the tick's run phase (#248).
+  entries_.reserve(kMaxEntries + 1);
+}
 
 std::vector<std::string> History::Load() {
   LoadedHistory loaded = LoadHistory(path_);
-  entries_ = std::move(loaded.entries);
+  entries_.clear();
+  for (Entry& entry : loaded.entries) {
+    entries_.push_back(std::move(entry));
+  }
   next_id_ = loaded.next_id;
+  newer_version_ = loaded.newer_version;
   return std::move(loaded.diagnostics);
 }
 
@@ -420,18 +520,45 @@ const Entry* History::Find(std::int64_t id) const {
 
 StoreResult History::Persist() {
   StoreResult result;
-  const std::string text = SerializeHistory(entries_, next_id_);
-  if (text.size() > kMaxHistoryBytes) {
+  if (newer_version_ > 0) {
+    result.error = StoreError::kNewerFormat;
+    result.message = Describe(path_, "is version " + std::to_string(newer_version_) +
+                                         ", a newer release's, so this entry was kept in memory "
+                                         "and the file left as it is");
+    return result;
+  }
+  // Written an entry at a time, never as one string: `SerializeHistory`'s text
+  // is every entry again, doubled its way to `kMaxHistoryBytes`, and this runs
+  // from `TickOptions::on_plan`, beside the plan and its results (#248). Sized
+  // first, the same way, so a file the reader would discard is never begun.
+  std::size_t size = FormatHeader(next_id_).size() + 1;
+  for (const Entry& entry : entries_) {
+    size += SerializeEntry(entry).size() + 1;
+  }
+  if (size > kMaxHistoryBytes) {
     // Unreachable with `kMaxEntries` entries of bounded strings -- which is what
     // `conflicts.store` asserts -- so reaching it means a bound moved. Refuse
     // rather than write a file the reader would discard whole.
     result.error = StoreError::kTooLarge;
-    result.message = Describe(path_, "would be " + std::to_string(text.size()) +
+    result.message = Describe(path_, "would be " + std::to_string(size) +
                                          " bytes, more than a conflict history can be read back "
                                          "with; nothing was written");
     return result;
   }
-  const io::WriteResult written = io::WriteAtomically(path_, text);
+  std::size_t next = 0;
+  const io::WriteResult written =
+      io::WriteAtomically(path_, [this, &next](std::string* piece) {
+        if (next == 0) {
+          *piece = FormatHeader(next_id_);
+        } else if (next <= entries_.size()) {
+          *piece = SerializeEntry(entries_[next - 1]);
+        } else {
+          return false;
+        }
+        *piece += '\n';
+        ++next;
+        return true;
+      });
   switch (written.error) {
     case io::WriteError::kNone:
       break;

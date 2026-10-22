@@ -130,9 +130,10 @@ void Answers(checks::Checks& c) {
            "execute: bytes that were not the save judged nothing about the token");
 
   // States, held to exactly what every sibling above is held to. Untested until
-  // review caught it: nothing calls this yet -- there is no tick orchestrator --
-  // so a miswiring here, kNoPlacement or kCommitFailed answering something other
-  // than kSilent, would have gone unseen until the first caller trusted it.
+  // review caught it: nothing calls this yet -- the tick M7-2 (#37) built runs
+  // the states half (`sync::SyncStates`) and does not ask it -- so a miswiring
+  // here, kNoPlacement or kCommitFailed answering something other than
+  // kSilent, would have gone unseen until the first caller trusted it.
   c.Expect(sync::AnswerOf(sync::StateError::kUnauthorized) == Answer::kRejected,
            "states: a 401 is a rejection");
   c.Expect(sync::AnswerOf(sync::StateError::kForbidden) == Answer::kForbidden,

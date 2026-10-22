@@ -218,8 +218,35 @@ class Scheduler {
   /// the caller can say so.
   bool RequestNow();
 
-  /// Whether a request is waiting to be picked up by the next `Poll()`.
+  /// Something on the card changed that a tick should see now rather than at
+  /// the interval: a rom was downloaded, and its save belongs beside it before
+  /// the game is launched (#241). Polled as `kInterval`, ahead of the backoff,
+  /// the way a rescan is -- nobody pressed anything, so `requested()` stays
+  /// false -- and dropped while `enabled` is false.
+  void RunSoon();
+
+  /// Whether a request is waiting to be picked up by the next `Poll()` -- one
+  /// pressed, or one pressed and handed back by `Defer`.
   bool requested() const { return on_demand_; }
+
+  /// The tick `Poll()` just handed out did not start: an application is in the
+  /// foreground, and a tick under a running game is the one that loses a save
+  /// (#242). The next `Poll()` hands the same trigger out again.
+  ///
+  /// **The contract is poll, then exactly one of run-and-`Finished` or this.**
+  /// Nothing is recorded -- no backoff, no restamp -- because nothing ran.
+  ///
+  /// It exists because `Poll()` consumes what it hands out: the boot tick, a
+  /// press and a rescan are flags, and a worker that simply polled again later
+  /// would have lost all three. An interval tick does not need it -- the
+  /// interval is still elapsed -- and goes through it anyway, so the caller has
+  /// one rule rather than four. **The coalescing is the existing one**: however
+  /// many intervals pass while a tick is held, the elapsed check fires once, and
+  /// a press that lands meanwhile is the same tick (`Poll`).
+  ///
+  /// Who knows a game is running, and how often to ask again, is the caller's:
+  /// this object reads no platform and owns no thread.
+  void Defer(Trigger trigger);
 
   /// What to do now. Clears the on-demand flag when it answers `kOnDemand`, and
   /// marks the boot tick as taken when it answers `kBoot` -- so a caller that
@@ -250,6 +277,9 @@ class Scheduler {
   ///     off on the same curve, which is the "harder than usual" the outcome
   ///     asks for, because the alternative is asking a server that has said no
   ///     once every interval forever.
+  ///   - `kServerDisabled` -- sync is switched off for this console in RomM
+  ///     (#235). Not a failure: the backoff is cleared and the interval runs,
+  ///     which is how the switch turned back on is noticed within one.
   ///   - `kUnauthorized` -- **not backed off here.** `auth::Gate` owns what a
   ///     rejected call means and how long to wait for it, and the caller consults
   ///     `blocked()` before the next tick. The *schedule* is restamped anyway,
@@ -322,10 +352,14 @@ class Scheduler {
 
   bool on_demand_ = false;
 
-  /// The last tick answered `kRescanNeeded` and is to be run again at once. Kept
-  /// apart from `on_demand_` so a rescan cannot look like a user pressing a
-  /// button -- see `Trigger::kOnDemand`.
+  /// The last tick answered `kRescanNeeded`, or `RunSoon` was asked, and a tick
+  /// is to run at once. Kept apart from `on_demand_` so neither can look like a
+  /// user pressing a button -- see `Trigger::kOnDemand`.
   bool rerun_ = false;
+
+  /// The boot, rescan or interval trigger `Defer` handed back, or `kNone`. A
+  /// press handed back is `on_demand_` again instead, so it keeps reading as one.
+  Trigger held_ = Trigger::kNone;
 
   /// When the backoff is up. Meaningful only while `backoff_.failures() > 0`.
   Steady retry_at_{};

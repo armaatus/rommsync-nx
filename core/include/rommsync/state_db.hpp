@@ -27,7 +27,7 @@
 // `rommsync/` headers (core/AGENTS.md) so SQLite cannot be linked into the
 // portable engine at all, and because a sysmodule heap has no room for one.
 //
-//     rommsync-state 2
+//     rommsync-state 3
 //     {"rom_id":12,"slot":"autosave","content_hash":"...","mtime":1757000000,...}
 //     {"rom_id":12,"slot":null,...}
 //     {"kind":"state","rom_id":12,"file_name":"Game (USA).state",...}
@@ -57,6 +57,24 @@
 // one extra tick of hashing, once, on the boot after the upgrade. That is the
 // designed cost of the version line, not a migration anybody has to write.
 //
+// ## Version 3: the shared slot (#236)
+//
+// The rows did not change shape; what a save's slot *means* did. Version 2
+// derived it from the folder's source and the extension (`tico-srm`); version 3
+// syncs every save in the configured shared slot (`autosave`, `autosave-rtc`).
+// Version 2 is every card rc1 wrote, so it is **read, not discarded**: discarding
+// it would lose its states' rows -- which no rescan rebuilds, and without which a
+// state is kept on both sides forever -- and every save's digest. Its states and
+// archival rows are in force as they were; its slotted rows are held apart in
+// `LoadedBaseline::legacy_saves` and moved by `AdoptLegacySaves` to the slot
+// each file is synced in now. A newer file than this build's is discarded.
+//
+// rc1 wrote it at rc1's bounds, 512 rows and 128 KiB, four times this build's
+// (#246). So a v2 file is read at those -- streamed a line at a time past
+// `kMaxStateBytes`, its text never held whole -- and kept to `kMaxRecords`
+// rows: states and archival rows first, then slotted rows while there is
+// room. A slotted row let go costs its save one re-hash, and is said.
+//
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two
 // ways -- which the string can: this client writes `Z` and RomM writes `+00:00`
@@ -71,6 +89,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -88,7 +107,12 @@ inline constexpr const char* kStateFileName = "state.db";
 
 /// The first line of a well-formed file, `<magic> <version>`.
 inline constexpr const char* kFormatMagic = "rommsync-state";
-inline constexpr int kFormatVersion = 2;
+inline constexpr int kFormatVersion = 3;
+
+/// The version before #236 moved every save to the shared slot: the same rows,
+/// with slots derived as `<source>-<extension>`. Read, and migrated by
+/// `AdoptLegacySaves` -- see `LoadedBaseline::legacy_saves`.
+inline constexpr int kSourceSlotVersion = 2;
 
 /// The largest `state.db` that will be read, and the most rows it may hold.
 ///
@@ -100,23 +124,26 @@ inline constexpr int kFormatVersion = 2;
 /// A bound larger than the heap is not a bound -- it is a `bad_alloc` with a
 /// constant next to it. The arithmetic, from
 /// [docs/DEVELOPMENT.md](../../../docs/DEVELOPMENT.md#tls-in-a-sysmodule):
-/// `kInnerHeapSize` is `0x150000` (1.3 MiB) since M9-2 (#207) -- M1-7 (#126) made
-/// it a number somebody derived rather than devkitPro's template default, and
+/// `kInnerHeapSize` is `0x180000` (1.5 MiB) since M9-20 (#246) -- M1-7 (#126) made
+/// it a number somebody derived rather than devkitPro's template default,
 /// #207 re-derived it once the two thread stacks and the open-directory cache
-/// had terms -- and the trimmed socket transfer memory takes 116 KiB of it,
-/// leaving **~1.2 MiB** for everything else
-/// -- which is the download buffer *and* this. Loading a baseline costs the file's
-/// text and then the parsed `Baseline`, whose per-row `std::string`s each
-/// exceed the 15-character small-string buffer and land on the heap, so the map
-/// costs more than the text it came from. At ~214 bytes a row, `kMaxRecords`
-/// rows is ~110 KiB of text and ~130 KiB parsed: about 240 KiB at the peak,
-/// with room left for a transfer.
+/// had terms, #201 added the download's 64 KiB read chunk, and #246 the rows a
+/// tick holds for every save -- and the trimmed socket transfer memory takes
+/// 116 KiB of it. Loading a baseline costs the file's text and then the parsed
+/// `Baseline`, whose per-row `std::string`s each exceed the 15-character
+/// small-string buffer and land on the heap, so the map costs more than the text
+/// it came from. At ~214 bytes a row, `kMaxRecords` rows is ~27 KiB of text and
+/// ~33 KiB parsed: ~60 KiB at the peak, under the 64 KiB the heap table gives
+/// the two together (`kHeapStateBaseline`).
 ///
-/// **The heap grew and these did not**, which is the safe direction and is
-/// deliberate: this pair bounds the *file*, and how many saves a console may
-/// hold is a decision about a library rather than about a heap. What the extra
-/// headroom bought was the terms M1-7 added beside this one -- a buffered
-/// `/api/platforms` and two worker thread stacks -- not a bigger baseline.
+/// **128, and 32 KiB, since M9-20 (#246).** They were 512 and 128 KiB, sized
+/// against the baseline alone -- and a save costs a tick far more than its row
+/// here: the scan's record, what is reported and targeted, the plan's operation
+/// and what it did, ~1.7 KiB a save on aarch64 at the tick's worst moment, all
+/// held beside the baseline. At 512 that was more heap than the table had, so
+/// `kMaxRecords` is what the heap holds, and the trade -- ~140 KiB of resident
+/// `.bss` for each further 64 saves -- is `sysmodule/source/main.cpp`'s to make
+/// again, beside the rest of the table, rather than this constant's alone.
 ///
 /// `core.state_db` asserts the two agree -- a full baseline must serialize to
 /// less than the byte bound, or the writer would produce a file the reader
@@ -147,8 +174,13 @@ inline constexpr int kFormatVersion = 2;
 ///
 /// A card with more saves than this needs the sysmodule heap raised first.
 /// These two constants and `kInnerHeapSize` move together.
-inline constexpr std::size_t kMaxRecords = 512;
-inline constexpr std::size_t kMaxStateBytes = 128 * 1024;
+inline constexpr std::size_t kMaxRecords = 128;
+inline constexpr std::size_t kMaxStateBytes = 32 * 1024;
+
+// A plan names one operation per save, and a save this file cannot record is a
+// save no tick can finish: the two bounds are one number (M9-20, #246).
+static_assert(sync::kMaxPlanOperations == kMaxRecords,
+              "a negotiate plan may carry exactly as many operations as state.db records");
 
 /// How many diagnostics are kept before the rest are dropped. `config`'s
 /// reasoning: a corrupt file must not answer with fifty thousand strings.
@@ -195,6 +227,16 @@ struct SaveRecord {
   /// this field.
   std::optional<sync::Timestamp> server_updated_at;
   std::optional<std::string> server_content_hash;
+
+  /// RomM deleted this save and `[sync] on_server_delete = keep` left it on the
+  /// card (#233). While the file still holds `content_hash`, `sync::RunTick`
+  /// does not offer it to the server: RomM's own memory of the deletion is
+  /// bounded and does not cover the same bytes rewritten later, so the client
+  /// keeps the promise itself. New bytes are new progress and are offered.
+  ///
+  /// Written as `"deleted_on_server":true` only when set, so every other row is
+  /// byte-identical to the ones before it, and read as false when absent.
+  bool deleted_on_server = false;
 };
 
 /// What one save **state** looked like at the end of the last sync.
@@ -311,12 +353,40 @@ struct LoadedBaseline {
   /// produces exactly one, saying there is no file yet.
   std::vector<std::string> diagnostics;
 
+  /// The version the file was written in: `kFormatVersion`, or
+  /// `kSourceSlotVersion` for a file from before #236. Zero when nothing was
+  /// read -- no file, or one discarded.
+  int version = 0;
+
+  /// A `kSourceSlotVersion` file's slotted save rows, **not** in `value`.
+  ///
+  /// Their slots are `<source>-<extension>` (`tico-srm`), which no save is
+  /// synced in any more, so a row left under one would describe nothing and
+  /// cost a row of `kMaxRecords` until it was trimmed. Held apart rather than
+  /// discarded, because each is still the digest of a file that is on the card:
+  /// `AdoptLegacySaves` moves it to the slot that file is now synced in, and the
+  /// first tick after the upgrade hashes nothing it already knew. A caller that
+  /// never adopts them loses only that -- every save is hashed once.
+  ///
+  /// The v2 file's archival (null-slot) rows and its states are in `value` as
+  /// they were: neither key moved.
+  std::vector<SaveRecord> legacy_saves;
+
   /// One line per diagnostic, for a log. Empty when there are none.
   std::string DescribeDiagnostics() const;
 };
 
 /// The whole file, version line included, ending in a newline.
 std::string SerializeBaseline(const Baseline& baseline);
+
+/// The bytes `SerializeBaseline` would produce, without holding the text: a
+/// trim that has to bring a baseline inside `kMaxStateBytes` asks this once
+/// and subtracts a row's own size as it drops it, rather than building 32 KiB
+/// per row it tries.
+std::size_t SerializedSize(const Baseline& baseline);
+/// One row's line, newline included.
+std::size_t SerializedSize(const SaveRecord& record);
+std::size_t SerializedSize(const StateRecord& record);
 
 /// Parse the contents of a `state.db`.
 ///
@@ -327,6 +397,36 @@ std::string SerializeBaseline(const Baseline& baseline);
 /// no caller can reason about. Since dropping the lot costs only a tick of
 /// hashing, that is the cheaper mistake to make.
 LoadedBaseline ParseBaseline(std::string_view text);
+
+/// Move `loaded->legacy_saves` into `loaded->value`, each under the slot
+/// `slot_for` names for its old one -- `scan::MigratedSlot` under the
+/// configured slot (#236). Returns how many rows landed.
+///
+/// **Only the local half moves**: the digest, mtime and size of the file, which
+/// are what spare the scan a re-hash. The server half (`server_updated_at`,
+/// `server_content_hash`) described the *old* slot's row, and this device has
+/// never synced the new one -- carried across, the old digest would let #232's
+/// 409 rule read "unchanged since the last sync" against a slot whose head is
+/// some other device's progress, and download over a newer local save without a
+/// conflict. Left absent, the first meeting is what it is: no sync history.
+///
+/// **`deleted_on_server` moves with the row** (#233). It records that RomM
+/// deleted this save and the card kept it, which is about the save and not the
+/// slot: dropped, the next tick would offer the deleted bytes to the shared slot
+/// and resurrect there what the user deleted.
+///
+/// A row whose new key is already taken -- RetroArch's and Tico's `.srm` of one
+/// rom, both now `autosave` -- is dropped, the first in key order kept, which is
+/// RetroArch's: the copy the scan also reads first. So is one `slot_for` has no
+/// slot for. Either costs a re-hash -- and a dropped row's `deleted_on_server`
+/// mark goes with it, because the mark is held against that row's digest and
+/// cannot be put on the winner's, which names other bytes. That is the one
+/// place a mark is let go: the losing copy is read only once the winner's file
+/// is gone from the card, and then it is offered to the shared slot as any
+/// save with no history is.
+std::size_t AdoptLegacySaves(
+    LoadedBaseline* loaded,
+    const std::function<std::optional<std::string>(std::string_view old_slot)>& slot_for);
 
 /// Read `path` and parse it.
 ///

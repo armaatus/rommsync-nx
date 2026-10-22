@@ -49,6 +49,14 @@ enum class Link {
   /// and because command 0's encoding is frozen precisely so this is knowable
   /// before anything else is decoded (`ipc.hpp`).
   kIncompatible,
+
+  /// It is running and a call into it did not come back within the overlay's
+  /// budget (M9-6, #209). Not `kNotRunning`, whose sentence sends a user to
+  /// ovl-sysmodules to turn on something that is already on, and not
+  /// `kUnreadable`, which is an answer this build could not read: there was no
+  /// answer at all. The screen keeps drawing and the user keeps their buttons;
+  /// it clears by itself on the first call that is answered.
+  kNotResponding,
 };
 const char* ToString(Link link);
 
@@ -120,13 +128,19 @@ struct StatusView {
 /// `last_sync_at` -- a console whose clock moved, which is ordinary on a Switch
 /// that has been offline -- renders as "just now" rather than as a negative
 /// interval.
+///
+/// A `Status::build` that is not this overlay's `rommsync::kVersion` is two
+/// releases on one card (#205): the `Build` row turns to a warning, an `Overlay`
+/// row joins it, and the hint says to install both from one release unless a
+/// worse problem already holds the hint.
 StatusView Render(const ipc::Status& status, std::int64_t now_unix);
 
 /// The screen for a sysmodule that could not be asked, or could not be
 /// understood. `link` must not be `kOk`.
 ///
 /// `sysmodule_interface` is what `GetInterfaceVersion` answered, and is shown
-/// only for `kIncompatible`, where the two numbers are the whole diagnosis.
+/// only for `kIncompatible`, where the two numbers are the whole diagnosis --
+/// and where they also say which half to update: the one that is behind.
 StatusView RenderUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 
 /// What the SD card says about the two switches, for a console whose sysmodule

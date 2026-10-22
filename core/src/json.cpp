@@ -118,6 +118,20 @@ class Parser {
  public:
   explicit Parser(std::string_view text) : text_(text) {}
 
+  /// The parser `ParseEach` runs: the array at `each_key` -- the root when it is
+  /// empty -- goes to `each` an element at a time instead of into the result.
+  Parser(std::string_view text, std::string_view each_key, const EachElement& each,
+         std::string_view context, Keep keep = {})
+      : text_(text), each_key_(each_key), each_(&each), context_(context), keep_(keep) {}
+
+  /// The whole document. `kStreams` is `json::ParseEach`'s, and an instantiation
+  /// of its own for the reason `ParseObject` is one: `json::Parse` is on the
+  /// main thread's deepest chain (#216), and the dispatch below would cost it
+  /// frame for a branch it never takes. `kKeeps` is the keeping form's, an
+  /// instantiation of its own for the same reason: `json::Parse` and the plain
+  /// `ParseEach` -- `queue.json` is read on the main thread at boot -- never
+  /// reach the skipping recursion, so its frames are not on their chain.
+  template <bool kStreams, bool kKeeps = false>
   ParseResult Run() {
     ParseResult result;
     SkipWhitespace();
@@ -127,7 +141,27 @@ class Parser {
       return result;
     }
     Value root;
-    if (!ParseValue(0, &root)) {
+    bool parsed = false;
+    if constexpr (kStreams) {
+      // The streamed array is the root (an empty key) or a member of the root
+      // object. A root of the other shape is refused here, before a byte of it
+      // is parsed: a caller's shape check would refuse it anyway, and a bare
+      // array where an envelope belongs would otherwise be held whole on the way
+      // to that refusal -- ~11x its text (M9-20, #246). What is not a JSON value
+      // at all goes on to `ParseValue`, whose syntax error is the better answer.
+      const char wanted = each_key_.empty() ? '[' : '{';
+      if (text_[at_] != wanted && KindAt(at_) != nullptr) {
+        Fail(std::string(context_.empty() ? "the document" : context_) + " is " + KindAt(at_) +
+             ", not the " + (each_key_.empty() ? "array" : "object") + " it must be");
+        result.error = error_;
+        return result;
+      }
+      parsed = each_key_.empty() ? ParseEach<kKeeps>(0, &root)
+                                 : ParseObject<true, kKeeps>(0, &root);
+    } else {
+      parsed = ParseValue(0, &root);
+    }
+    if (!parsed) {
       result.error = error_;
       return result;
     }
@@ -150,6 +184,28 @@ class Parser {
     return false;
   }
 
+  /// What the value starting at `at` is, in `ToString`'s words, read off its
+  /// first byte and nothing else -- or nullptr when no JSON value starts there.
+  const char* KindAt(std::size_t at) const {
+    switch (text_[at]) {
+      case '{':
+        return ToString(Type::kObject);
+      case '[':
+        return ToString(Type::kArray);
+      case '"':
+        return ToString(Type::kString);
+      case 't':
+      case 'f':
+        return ToString(Type::kBool);
+      case 'n':
+        return ToString(Type::kNull);
+      default:
+        return text_[at] == '-' || (text_[at] >= '0' && text_[at] <= '9')
+                   ? ToString(Type::kNumber)
+                   : nullptr;
+    }
+  }
+
   void SkipWhitespace() {
     while (at_ < text_.size()) {
       const char c = text_[at_];
@@ -169,6 +225,7 @@ class Parser {
     return true;
   }
 
+  template <bool kKeeps = false>
   bool ParseValue(int depth, Value* out) {
     if (depth >= kMaxDepth) {
       return Fail("nested deeper than " + std::to_string(kMaxDepth) + " levels");
@@ -201,14 +258,15 @@ class Parser {
         out->type_ = Type::kString;
         return ParseString(&out->string_);
       case '[':
-        return ParseArray(depth, out);
+        return ParseArray<kKeeps>(depth, out);
       case '{':
-        return ParseObject(depth, out);
+        return ParseObject<false, kKeeps>(depth, out);
       default:
         return ParseNumber(out);
     }
   }
 
+  template <bool kKeeps = false>
   bool ParseArray(int depth, Value* out) {
     out->type_ = Type::kArray;
     ++at_;  // '['
@@ -220,7 +278,7 @@ class Parser {
     for (;;) {
       SkipWhitespace();
       Value element;
-      if (!ParseValue(depth + 1, &element)) {
+      if (!ParseValue<kKeeps>(depth + 1, &element)) {
         return false;
       }
       out->elements_.push_back(std::move(element));
@@ -240,6 +298,69 @@ class Parser {
     }
   }
 
+  /// `ParseArray` for the one array `ParseEach` streams: each element is parsed,
+  /// handed over and destroyed before the next is read, so `out` stays an empty
+  /// array. Any other value there is refused by the member's name before it is
+  /// parsed, for `Run`'s reason; what is no value at all is `ParseValue`'s.
+  template <bool kKeeps>
+  bool ParseEach(int depth, Value* out) {
+    if (depth >= kMaxDepth || at_ >= text_.size() || text_[at_] != '[') {
+      if (depth < kMaxDepth && at_ < text_.size() && KindAt(at_) != nullptr) {
+        if (error_.ok()) {
+          error_.offset = at_;
+          error_.field = std::string(each_key_);
+          error_.message = std::string("expected an array, got ") + KindAt(at_);
+        }
+        return false;
+      }
+      return ParseValue<kKeeps>(depth, out);
+    }
+    out->type_ = Type::kArray;
+    ++at_;  // '['
+    SkipWhitespace();
+    if (at_ < text_.size() && text_[at_] == ']') {
+      ++at_;
+      return true;
+    }
+    for (std::size_t index = 0;; ++index) {
+      SkipWhitespace();
+      {
+        Value element;
+        if (!ParseValue<kKeeps>(depth + 1, &element)) {
+          return false;
+        }
+        if (Error refused = (*each_)(element, index); !refused.ok()) {
+          error_ = std::move(refused);
+          return false;
+        }
+      }
+      SkipWhitespace();
+      if (at_ >= text_.size()) {
+        return Fail("unterminated array");
+      }
+      if (text_[at_] == ',') {
+        ++at_;
+        continue;
+      }
+      if (text_[at_] == ']') {
+        ++at_;
+        return true;
+      }
+      return Fail("expected ',' or ']' in an array");
+    }
+  }
+
+  /// An object. `kStreams` is the top-level object `ParseEach` was asked about,
+  /// and only `Run` asks for it: the member named `each_key_` goes to
+  /// `ParseEach`. A separate instantiation rather than a runtime test, so the
+  /// recursion `ParseValue` -> `ParseObject<false>` is the one #216 measured --
+  /// `stack.measured` counts every function on that cycle once per nesting
+  /// level, and `ParseEach` on it would cost the main thread 272 bytes a level
+  /// for a branch only depth 0 can take.
+  ///
+  /// `kKeeps` is `ParseEach`'s keeping form: a member `keep_` does not name is
+  /// read past (`SkipValue`) and never becomes one of `out`'s.
+  template <bool kStreams, bool kKeeps = false>
   bool ParseObject(int depth, Value* out) {
     out->type_ = Type::kObject;
     ++at_;  // '{'
@@ -272,10 +393,27 @@ class Parser {
       }
       ++at_;
       SkipWhitespace();
-      if (!ParseValue(depth + 1, &member.value)) {
-        return false;
+      bool kept = true;
+      if constexpr (kKeeps) {
+        kept = Kept(member.key) || (kStreams && member.key == each_key_);
       }
-      out->members_.push_back(std::move(member));
+      if (!kept) {
+        if (!SkipValue(depth + 1)) {
+          return false;
+        }
+      } else if constexpr (kStreams) {
+        if (!(member.key == each_key_ ? ParseEach<kKeeps>(depth + 1, &member.value)
+                                      : ParseValue<kKeeps>(depth + 1, &member.value))) {
+          return false;
+        }
+      } else {
+        if (!ParseValue<kKeeps>(depth + 1, &member.value)) {
+          return false;
+        }
+      }
+      if (kept) {
+        out->members_.push_back(std::move(member));
+      }
       SkipWhitespace();
       if (at_ >= text_.size()) {
         return Fail("unterminated object");
@@ -292,9 +430,92 @@ class Parser {
     }
   }
 
+  /// Whether the keeping form builds the member named `key`.
+  bool Kept(std::string_view key) const {
+    for (const std::string_view wanted : keep_) {
+      if (wanted == key) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// One value read to its end and dropped: every rule `ParseValue` holds a value
+  /// to, and no node, no string and no member built. The duplicate-key rule is
+  /// the one exception, and why is the keeping form's (json.hpp).
+  bool SkipValue(int depth) {
+    if (depth >= kMaxDepth) {
+      return Fail("nested deeper than " + std::to_string(kMaxDepth) + " levels");
+    }
+    if (at_ >= text_.size()) {
+      return Fail("value expected, body ended");
+    }
+    switch (text_[at_]) {
+      case 'n':
+        return Literal("null");
+      case 't':
+        return Literal("true");
+      case 'f':
+        return Literal("false");
+      case '"':
+        return ParseString(nullptr);
+      case '[':
+      case '{':
+        break;
+      default: {
+        Value number;
+        return ParseNumber(&number);
+      }
+    }
+    const bool object = text_[at_] == '{';
+    const char close = object ? '}' : ']';
+    ++at_;
+    SkipWhitespace();
+    if (at_ < text_.size() && text_[at_] == close) {
+      ++at_;
+      return true;
+    }
+    for (;;) {
+      SkipWhitespace();
+      if (object) {
+        if (at_ >= text_.size() || text_[at_] != '"') {
+          return Fail("expected a quoted key in an object");
+        }
+        if (!ParseString(nullptr)) {
+          return false;
+        }
+        SkipWhitespace();
+        if (at_ >= text_.size() || text_[at_] != ':') {
+          return Fail("expected ':' after an object key");
+        }
+        ++at_;
+        SkipWhitespace();
+      }
+      if (!SkipValue(depth + 1)) {
+        return false;
+      }
+      SkipWhitespace();
+      if (at_ >= text_.size()) {
+        return Fail(object ? "unterminated object" : "unterminated array");
+      }
+      if (text_[at_] == ',') {
+        ++at_;
+        continue;
+      }
+      if (text_[at_] == close) {
+        ++at_;
+        return true;
+      }
+      return Fail(object ? "expected ',' or '}' in an object" : "expected ',' or ']' in an array");
+    }
+  }
+
+  /// A string, into `out` -- or, when `out` is null, only checked (`SkipValue`).
   bool ParseString(std::string* out) {
     ++at_;  // '"'
-    out->clear();
+    if (out != nullptr) {
+      out->clear();
+    }
     for (;;) {
       if (at_ >= text_.size()) {
         return Fail("unterminated string");
@@ -308,7 +529,9 @@ class Parser {
         return Fail("unescaped control character in a string");
       }
       if (c != '\\') {
-        out->push_back(text_[at_]);
+        if (out != nullptr) {
+          out->push_back(text_[at_]);
+        }
         ++at_;
         continue;
       }
@@ -318,38 +541,38 @@ class Parser {
       }
       const char escape = text_[at_];
       ++at_;
+      char plain = 0;
       switch (escape) {
         case '"':
-          out->push_back('"');
-          break;
         case '\\':
-          out->push_back('\\');
-          break;
         case '/':
-          out->push_back('/');
+          plain = escape;
           break;
         case 'b':
-          out->push_back('\b');
+          plain = '\b';
           break;
         case 'f':
-          out->push_back('\f');
+          plain = '\f';
           break;
         case 'n':
-          out->push_back('\n');
+          plain = '\n';
           break;
         case 'r':
-          out->push_back('\r');
+          plain = '\r';
           break;
         case 't':
-          out->push_back('\t');
+          plain = '\t';
           break;
         case 'u':
           if (!ParseUnicodeEscape(out)) {
             return false;
           }
-          break;
+          continue;
         default:
           return Fail("unknown escape in a string");
+      }
+      if (out != nullptr) {
+        out->push_back(plain);
       }
     }
   }
@@ -401,7 +624,9 @@ class Parser {
     } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
       return Fail("lone low surrogate in a \\u escape");
     }
-    AppendUtf8(unit, out);
+    if (out != nullptr) {
+      AppendUtf8(unit, out);
+    }
     return true;
   }
 
@@ -476,13 +701,31 @@ class Parser {
   }
 
   std::string_view text_;
+  std::string_view each_key_;
+  const EachElement* each_ = nullptr;
+  /// What the document is called in a refusal of its shape: `Reader`'s context.
+  std::string_view context_;
+  /// What the keeping form builds (`json::ParseEach(..., Keep, ...)`).
+  Keep keep_;
   std::size_t at_ = 0;
   Error error_;
 };
 
 ParseResult Parse(std::string_view text) {
   Parser parser(text);
-  return parser.Run();
+  return parser.Run<false>();
+}
+
+ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each,
+                      std::string_view context) {
+  Parser parser(text, key, each, context);
+  return parser.Run<true>();
+}
+
+ParseResult ParseEach(std::string_view text, std::string_view key, Keep keep,
+                      const EachElement& each, std::string_view context) {
+  Parser parser(text, key, each, context, keep);
+  return parser.Run<true, true>();
 }
 
 std::string Quote(std::string_view value) {

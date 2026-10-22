@@ -10,9 +10,16 @@ browse-and-download; **rommsync-nx** adds the thing nothing on Switch does yet:
 save sync via RomM's device-sync protocol, running as a background **sysmodule**
 you control from an **Ultrahand / Tesla overlay**.
 
-> Status: **planning / server-side groundwork complete.** The Switch components
-> are specced and issue-tracked but not yet implemented. The RomM 5.2.0 API this
-> targets is captured and verified — see [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
+> Status: **built and tested off-console, not yet run on a Switch.** The
+> sysmodule and the overlay are written: pairing, the download queue, save sync
+> with backups and a conflicts screen, opt-in save states, and — on `main` since
+> the v1.0.0-rc1 pre-release — saves shared with RetroArch, RomM's web player,
+> Argosy and Grout ([`docs/INTEROP.md`](docs/INTEROP.md)). Sync, downloads and
+> pairing are tested against a real RomM and the overlay's screens on the host;
+> nothing has booted on a console yet, and the first
+> real-console run is M8-2. It needs RomM 5.4.0 or later and refuses to sync
+> with anything older; that API is captured and verified — see
+> [`docs/API_CONTRACT.md`](docs/API_CONTRACT.md).
 >
 > **Test-first, hardware-last.** No real Switch and no production RomM is touched
 > until a v1 is fully proven off-console — on a native host harness against a
@@ -52,6 +59,10 @@ sysmodule with ovl-sysmodules, pointing it at your RomM, and pairing without
 typing anything secret on the console. Nothing in it has been run on hardware
 yet — that is M8-2.
 
+To share saves with RetroArch on a PC, RomM's web player, Argosy or Grout,
+[`docs/INTEROP.md`](docs/INTEROP.md) is what to set on each of them, which
+systems sync with which emulators, and where the limits are.
+
 When a sync does not happen,
 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) is the page: every failure
 this client knows how to have, the line it writes in
@@ -62,7 +73,7 @@ this client knows how to have, the line it writes in
 ```
         Nintendo Switch (Atmosphère)                    Your server
  ┌───────────────────────────────────────┐      ┌───────────────────────┐
- │  ovl-rommsync (.ovl overlay)           │      │   RomM 5.2.0           │
+ │  ovl-rommsync (.ovl overlay)           │      │   RomM 5.4.0 or later  │
  │     │  IPC (tipc)                      │      │   (HTTPS, public URL)  │
  │     ▼                                  │ HTTPS│                        │
  │  sys-rommsync (sysmodule)  ────────────┼─────▶│  /api/auth/device/*    │
@@ -81,8 +92,8 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | Path | What |
 |------|------|
 | `docs/` | Architecture, the pinned RomM API contract, auth & sync protocol, config, security, dev environment |
-| `sysmodule/` | `sys-rommsync` — the background engine. Skeleton: builds and packages, does nothing yet |
-| `overlay/` | `ovl-rommsync` — the libultrahand overlay. Skeleton: builds and packages, draws nothing yet |
+| `sysmodule/` | `sys-rommsync` — the background engine: pairing, the download queue, the sync tick, IPC |
+| `overlay/` | `ovl-rommsync` — the libultrahand overlay: status, library, queue, conflicts, settings |
 | `switch.mk` | Shared devkitPro rules for both Switch targets |
 | `core/` | The portable engine — auth, sync, downloads, config, state. Builds and is tested natively. |
 | `server/` | API snapshot (source of truth), contract-probe script, and the docker RomM test fixture |
@@ -116,7 +127,7 @@ The two Switch targets are built separately, with devkitPro rather than CMake
 is ever run before the hardware gate in M8:
 
 ```bash
-docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:latest \
+docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
   bash -lc 'make -C sysmodule && make -C overlay'
 ```
 

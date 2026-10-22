@@ -117,6 +117,10 @@ class RomIndex {
     by_no_tags_.clear();
   }
 
+  /// Room for `roms` in one allocation. `FetchRomIndex` sizes the index from the
+  /// library's `total` before the first `Add`, so it is never doubled past it.
+  void Reserve(std::size_t roms) { roms_.reserve(roms); }
+
   const std::vector<Rom>& roms() const { return roms_; }
   std::size_t size() const { return roms_.size(); }
   bool empty() const { return roms_.empty(); }
@@ -160,13 +164,27 @@ class RomIndex {
 ///
 /// A bound for the same reason `config::kMaxConfigBytes` is one: this runs on a
 /// sysmodule heap, and "however many the server says" is a number a client does
-/// not get to choose. Five figures of roms is an order of magnitude past a
-/// curated Switch library, and the index says when it stopped rather than
-/// pretending the rest are not there.
-inline constexpr std::size_t kMaxIndexRoms = 20000;
+/// not get to choose. The index says when it stopped rather than pretending the
+/// rest are not there.
+///
+/// **1,024, because that is what the heap holds** (M9-19, #217). A rom costs
+/// ~248 bytes held for the whole tick -- a 112-byte `Rom` on aarch64, two lookup
+/// offsets, and the two match keys' heap strings -- and that is a row of the
+/// table in `sysmodule/source/main.cpp`, which derives this number and pins it.
+/// It was 20,000 until then: ~4.7 MiB at the bound, in a process whose whole
+/// heap is 1.5 MiB, chosen without reference to it. More roms are more heap,
+/// ~62 KiB a further 256, and that is a decision for that table, not for here.
+inline constexpr std::size_t kMaxIndexRoms = 1024;
 
 /// The page size asked for. RomM may answer with fewer.
-inline constexpr int kDefaultPageSize = 200;
+///
+/// **64**, the overlay's own `ipc::kMaxPageSize` (M9-19, #217). A page is held
+/// whole as text while it is read, so this is heap rather than a preference; at
+/// 64 it sits under the platforms list, the largest response the heap already
+/// budgets, and costs nothing of its own. 200 was 500 KiB of text, by a
+/// distance the largest term in the table, and bought only fewer requests: three
+/// where there was one, once a tick.
+inline constexpr int kDefaultPageSize = 64;
 
 struct FetchOptions {
   /// The origin, normalised -- `config::ServerConfig::url`.

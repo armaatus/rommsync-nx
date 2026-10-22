@@ -16,7 +16,8 @@ so they are fully testable natively.
 
 ## There is no mock RomM
 
-Tests run against a **real RomM 5.2.0** in Docker, not a hand-written mock. A
+Tests run against a **real RomM** in Docker — 5.4.0
+([choosing the version](#choosing-the-romm-version)) — not a hand-written mock. A
 mock only ever encodes what we *believe* RomM does; when a test passes against
 the real thing, the behaviour is real, and the whole class of "the mock drifted
 from the server" bugs cannot happen.
@@ -46,6 +47,24 @@ curl -XPOST "$PROXY_BASE_URL/__fault" \
 
 The proxy never synthesises a RomM response of its own — that is what keeps the
 fidelity while still making failure deterministic and repeatable in CI.
+
+### The other clients are their requests (#244)
+
+The same rule covers the clients a library is shared with. `interop.*`
+(`tests/test_interop.cpp`) runs the whole engine against three of them, each
+reduced to what it sends RomM rather than to a model of it: RetroArch's Cloud
+Sync (WebDAV under `/api/sync/retroarch/`, Basic auth as the fixture user), a
+Grout-like device (its own device row, negotiate, upload, download, confirm),
+and the web player as RomM 5.4's bundle syncs (a `client: "web"` device
+negotiating one rom with `restore_unlisted` and its core as the `emulators`
+filter). Each meets the Switch in five cells, one ctest each and named
+`interop.<client>.<cell>`: `from_switch`, `to_switch` (including "not while the
+rom is not on the card", #241), `conflict` (#240's archival copy), `delete`
+(both ways: a save gone from the card is no deletion signal; one deleted by the
+other client is removed with a backup, #233) and `states` (a PSX core's state
+and DuckStation's never meet, #238/#239, under the three ways `POST
+/api/states`' name-only key makes two states meet). The fixture has no SNES
+rom, so the web player plays FCEUmm rather than `snes9x`.
 
 ### One proxy, several clients
 
@@ -116,15 +135,20 @@ have quietly turned it into a no-op. It runs a real second process to do it, for
 the reason `RUN_SERIAL` cannot help either: nothing inside one invocation can see
 the other.
 
-**What this does not fix**, because it cannot be fixed from this side: RomM keeps
-one active sync session per device and cancels the existing one on every
-negotiate (`/backend/endpoints/sync.py` in 5.2.0), and every rig process
-negotiates as the fixture's single device. A second `ctest` therefore still ends
-this run's session the moment it reaches its own first negotiate. What #174
-closed is the *startup* door — a second run clears sessions before it has done
-anything else, which is the window it spends most of its life in, and the one
-`#156` was measured through. Closing the rest would mean a registered device per
-process, not a claim file.
+**What this did not fix on 5.2.0**, because it could not be fixed from this
+side: 5.2.0 keeps one active sync session per device and cancels the existing
+one on every negotiate (`/backend/endpoints/sync.py` in 5.2.0), and every rig
+process negotiates as the fixture's single device. A second `ctest` therefore
+still ended this run's session the moment it reached its own first negotiate.
+What #174 closed is the *startup* door — a second run clears sessions before it
+has done anything else, which is the window it spends most of its life in, and
+the one `#156` was measured through. **That residue is 5.2.0-only** (#235):
+5.4.0 cancels nothing on negotiate — a session belongs to the negotiation that
+opened it — so a second run's negotiate leaves this one's session alone, and
+only the cleanup above could end it, which the claim files already prevent.
+The `RUN_SERIAL` lines in `tests/CMakeLists.txt` that cite #76 still stand for
+the rest of the shared fixture — one library whose saves the rig tests upload
+and delete, and a per-IP rate limit — whatever RomM does with sessions.
 
 Two `ctest`s at once broke a second thing, on disk rather than on the wire, and
 for the same reason (#151). `ROMMSYNC_TEST_SCRATCH` is per build tree, so it kept
@@ -214,7 +238,7 @@ that demonstrates it. A box checked because someone believes it is not checked.
 | # | The claim | What demonstrates it |
 |---|---|---|
 | 1 | The engine builds on a laptop with warnings as errors, and the same `core/` sources still build for Horizon — compiled and linked, not just parsed. | `cmake --build build`; CI `switch-build` (a real devkitA64 build of both targets, checked to be a PFS0 and an `ULTR`-signed `.ovl`); `switch.builds`, `switch.ci_requires_artifacts` |
-| 2 | One command brings up a real RomM 5.2.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
+| 2 | One command brings up a real RomM 5.4.0 on a throwaway volume, isolated per worktree. | `scripts/orca/compose.sh up -d`; `rig.smoke`; `orca.env_*` |
 | 3 | That fixture is *usable*, not merely running: library scanned, collection created, client token minted with no human in the loop. | `rig.provisioned`; [`provision.py`](../server/testing/provision.py) |
 | 3b | ...and *stable*: it answers the ten-thousandth call the way it answered the first, rather than retiring a worker under a request in flight. | `rig.recycling`, `rig.recycling_live` |
 | 4 | The failure paths a healthy RomM will not produce on demand can be forced, deterministically, in CI. | `http.status`, `http.truncate`, `http.drop`, `http.stall`, `pair.stall`, `pair.drop`, and the whole `harness.*` set |
@@ -289,7 +313,7 @@ which were watched taking ~50s. Time the test yourself.
   in M1–M5 is written against `HttpClient`, so holding five milestones behind one
   emulator question would buy nothing. It is a gate — for **M8**.
 - **The engine edge cases in M0-5's wording.** Conflict, partial failure and
-  multi-file skip are behaviours of code M2 and M3 have not written yet. What M0
+  multi-file skip are behaviours of code M2 and M3 had not written yet. What M0
   owes is the *mechanism* that forces them and proof the mechanism works
   (`http.*`, `pair.*`, `harness.*`); each edge case is then covered by the
   milestone that implements the behaviour. M0-5 has since landed on exactly that
@@ -330,7 +354,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 - The fixture is [`server/testing/docker-compose.yml`](../server/testing/docker-compose.yml):
-  RomM 5.2.0 on a throwaway volume, with metadata providers disabled so runs are
+  RomM 5.4.0 on a throwaway volume, with metadata providers disabled so runs are
   deterministic and offline.
 - [`seed.sh`](../server/testing/seed.sh) populates the library from
   `roms.manifest` — **homebrew and freely redistributable ROMs only**,
@@ -342,7 +366,7 @@ ctest --test-dir build --output-on-failure
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) hard rule).
 - The `http.*` tests cover the native `HttpClient` backend end to end: `get`,
   `status`, `post_json`, `post_form`, `multipart`, `download`, `progress`,
-  `range`, `drop`, `resume`, `resume_no_range`, `resume_empty_body`,
+  `range`, `drop`, `disk`, `resume`, `resume_no_range`, `resume_empty_body`,
   `resume_stale_range`, `range_expected_size`, `not_found`, `truncate`, `stall`,
   `cancel`. One CTest entry each, so a red run names the behaviour rather than
   "the http tests". They run `RUN_SERIAL` because they share one RomM fixture,
@@ -388,7 +412,18 @@ ctest --test-dir build --output-on-failure
   `POST /api/auth/device/init` to **ten a minute, per IP**. A console
   pairs once; the suite opens a dozen codes from one address, so `pair.*` waits
   a rate-limited init out rather than failing on it. The wait is bounded, so an
-  init broken for any other reason still goes red.
+  init broken for any other reason still goes red. The address is the fault
+  proxy's, since every rig test goes through it, so the budget is the suite's.
+  It is a fixed Redis window (`AUTHORIZE_RATE_LIMIT`/`RATE_LIMIT_WINDOW_SECONDS`
+  in RomM's `backend/utils/device_auth.py`, 5.2.0 and 5.4.0 alike): constants
+  rather than settings, so the fixture cannot lift it, and the `429` carries no
+  `Retry-After`. The limiter also sits *behind* body validation, so a probe
+  with an empty body answers `422` and says nothing about it, while a valid one
+  spends budget. `http.post_json` / `wire.post_json` were the init callers that
+  did not wait, and failed whenever `pair.*`, `device.*` or `engine.*` had spent
+  the minute first (the 5.4.0 flake after #235). They now wait out one whole
+  window on a `429` and send once more; a second `429` is still red.
+  `http.post_json_spent` holds that by spending the window itself first.
 - The `device.*` tests cover registering the console (M1-3): `shapes`,
   `registered`, `repair`, `recovers`, `deleted`, `revoked`, `forbidden`,
   `sync_disabled`, `offline`, `impostor`, `never_post`. All but `shapes` need the rig, and they
@@ -404,7 +439,7 @@ ctest --test-dir build --output-on-failure
   that dies mid-body. They are `RUN_SERIAL` for the ten-inits-a-minute limit
   below, and because two of them at once would count each other's device rows.
 - `device.shapes` is the no-network half: `DeviceSchema` parsed out of
-  `captures/devices-get.json`, and the classification the sysmodule acts on —
+  `captures/5.4.0/devices-get.json`, and the classification the sysmodule acts on —
   registered / paired-but-not / unpaired, and whether a failure is worth
   retrying or worth a trip to the pairing screen. It never skips.
 - `core.token_store` covers `token.dat`: the atomic write, and specifically what
@@ -441,6 +476,17 @@ ctest --test-dir build --output-on-failure
   block-boundary lengths the padding gets wrong, and then the property that
   actually matters — the identifier is the *same* identifier across a restart, a
   re-pair, a different seed, an interrupted commit and a corrupt record.
+- `compat.fixtures` covers every record under `config/rommsync/` across releases
+  (#205): the files v1.0.0-rc1's own writers produced
+  (`tests/fixtures/v1.0.0-rc1/`) must read back to the values they were written
+  with, and — while a format's version is still rc1's — be written back byte for
+  byte, so a format cannot move without its version. Each is then bumped one
+  version past this build and must be refused or discarded by its policy
+  ([ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases)), never misread,
+  and the refused ones never rewritten. `engine.newer` is the same downgrade
+  through a booted engine: a later release's `config.ini` and `token.dat` are
+  two errors on the status screen, and an edit from the overlay leaves both on
+  the card as they were.
 - `core.md5` covers the digest RomM compares saves on (M2-3): RFC 1321's own
   vectors including the empty string, the padding boundaries (55/56/63/64/119/
   120/128 bytes) where the length field does and does not fit in the last block,
@@ -491,16 +537,17 @@ ctest --test-dir build --output-on-failure
   holds.
 - `sync.payload` pins the negotiate shapes to the committed OpenAPI snapshot
   rather than to a second copy of the field names: tables in the test are
-  checked against `server/contract/romm-openapi-5.2.0.json` — `ClientSaveState`
-  and `SyncNegotiatePayload` going out (M2-1), `SyncOperationSchema` and
-  `SyncNegotiateResponse` coming back (M2-4), plus the four `action` values the
-  schema enumerates — *and* `ClientSaveState` is checked again against a body
-  `EncodeNegotiateRequest` actually produced, so drift on either side is red.
+  checked against `server/contract/romm-openapi-5.4.0.json`, the floor's
+  snapshot — `ClientSaveState` and `SyncNegotiatePayload` going out (M2-1),
+  `SyncOperationSchema` and `SyncNegotiateResponse` coming back (M2-4), plus the
+  five `action` values the schema enumerates — *and* `ClientSaveState` is
+  checked again against a body `EncodeNegotiateRequest` actually produced, so
+  drift on either side is red.
 - `sync.plan` is the response half, read off the committed captures rather than
-  restated: every field of `SyncOperation` against the five negotiate captures,
-  including the `upload` one where `save_id`, `server_updated_at` and
-  `server_content_hash` are all null. Two things no capture can pin are checked
-  there too — the eight `reason` strings 5.2.0 can emit that no capture holds
+  restated: every field of `SyncOperation` against the negotiate captures in
+  `captures/5.4.0/`, including the `upload` one where `save_id`,
+  `server_updated_at` and `server_content_hash` are all null. Two things no capture can pin are checked
+  there too — the `reason` strings RomM can emit that no capture holds
   (against the table in [API_CONTRACT.md](API_CONTRACT.md), in both directions),
   and an `action` from a server newer than this client, which is downgraded to
   `no_op`, flagged and logged rather than guessed at. That last body is the only
@@ -681,9 +728,15 @@ ctest --test-dir build --output-on-failure
   Makefiles were missing. `switch.builds` runs the real devkitA64 build in the
   same `devkitpro/devkita64` image CI uses and checks that the `.nsp` is a PFS0
   archive, that the `.ovl` carries its `ULTR` signature, and that every `core/`
-  translation unit produced an aarch64 object. It skips when that image is not
-  pulled — including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does
-  not have it and the `switch-build` job is the enforcement there.
+  translation unit produced an aarch64 object, and reads out of the built files
+  what the console's loaders read: libnx's `LNY2` stamp, the overlay's NACP, and
+  the `ROMMSYNC_NX_VERSION=` marker (`scripts/artifact-check.py`, whose own
+  vectors are `artifacts.parser`). It skips when that image is not pulled —
+  including under `ROMMSYNC_REQUIRE_RIG`, since the host CI runner does not have
+  it. The `switch-build` job runs it instead, in the image, where a skip fails:
+  see [the toolchain's ctest entries](DEVELOPMENT.md#the-toolchains-ctest-entries)
+  (#211), and `switch.toolchain_suite`, which holds that job's list to the
+  `toolchain` label.
 - The `npdm.*` pair asks what the console half is actually *allowed* to do. An
   SVC the NPDM does not grant is refused by the kernel and kills the process,
   and the linked sysmodule issued two it never declared (M9-3, #196) —
@@ -693,14 +746,38 @@ ctest --test-dir build --output-on-failure
   linked ELF, and also asserts the program id the config asked for,
   `is_retail`, pool partition 2, ACI0/ACID coherence and that no
   `@PLACEHOLDER@` reached the artifact. It needs npdmtool, so it needs the
-  `devkitpro/devkita64` image, so it skips wherever `switch.builds` does — and
-  unlike that one it has *no* equivalent in CI yet: the `switch-build` job
-  builds the module without parsing what it built, which is M9-12's (#211) to
-  fix. `npdm.parser` is the same script's `--self-test` over vectors hand-built
-  from the NPDM and AArch64 formats; it reads no artifact, so it never skips,
-  and it is the only coverage the byte offsets get until #211 lands — the
-  fixtures are chosen so that a parser reading the wrong offset gets a wrong
-  answer rather than a lucky one.
+  `devkitpro/devkita64` image, so it skips wherever `switch.builds` does, and
+  runs in the `switch-build` job beside it (#211). `npdm.parser` is the same
+  script's `--self-test` over vectors hand-built from the NPDM and AArch64
+  formats; it reads no artifact, so it never skips — the fixtures are chosen so
+  that a parser reading the wrong offset gets a wrong answer rather than a lucky
+  one.
+- The `stack.*` group is the main thread's stack: the one the npdm sizes, and
+  the one that parses `queue.json` off the card at boot and every IPC payload
+  after it (M9-18, #216). `json::kMaxDepth` and `main_thread_stack_size` were
+  never held against each other, and a max-depth document cost ~33 KiB of a
+  32 KiB stack. `stack.fit` holds the npdm to `sysmodule/source/stack_budget.hpp`
+  and the deepest parse to half the stack; `stack.contract` holds `kMaxDepth`
+  to at least twice the deepest response shape a pinned RomM OpenAPI snapshot
+  describes; `stack.walk` is the call-graph arithmetic on hand-built graphs.
+  Those three read the tree and never skip. `stack.measured` cross-compiles the
+  sysmodule with `-fcallgraph-info=su`, walks the deepest chain from `main`, and
+  fails when a frame outgrows the header's ceilings; it needs the devkitPro
+  image, so it skips where `npdm.svcs` does and runs in the `switch-build` job
+  beside it, under the same `toolchain` label.
+- The `toolchain.*` group holds the two pins the Switch build rests on and
+  nothing here produces (M9-8, #199). `toolchain.pins` reads every file in the
+  tree: each one naming the devkitPro image names the dated tag
+  `scripts/toolchain.sh` pins, and the moving tag appears once, in the
+  `switch-build-canary` job, which is `continue-on-error` and needed by nothing.
+  `toolchain.submodule` holds the libultrahand gitlink to the tag commit
+  `.gitmodules` records beside it. `toolchain.floor` is the libnx version
+  comparison on literals, chosen so that a string compare — which reads 4.9 as
+  newer than 4.10 — fails it. Those three never skip. `toolchain.libnx` asks the
+  pinned image's package database for its libnx and requires 4.10.0 or later
+  (HOS 21.0.0's TLS ABI); it skips without the image, like `switch.builds`, and
+  the `switch-build` job runs it on every push, as a step and with the rest of
+  the `toolchain` label.
 - The `boot.*` group is the sysmodule's `__appInit`, which nothing off a console
   can execute -- which is how three separate bugs sat in twenty lines through
   every green run (M9-1, #195). Half of it reads: `boot.dns`, `boot.clock`,
@@ -721,7 +798,8 @@ ctest --test-dir build --output-on-failure
   process is told about a sleep early enough to matter. None of the
   eight needs Docker, a rig, or a resolver, so none of them ever skips.
 - The `overlay.card`, `overlay.wire`, `overlay.roundtrip`, `overlay.version`,
-  `overlay.errors`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
+  `overlay.errors`, `overlay.timeout`, `overlay.restore`, `overlay.cycles`,
+  `overlay.hidden`, `overlay.log`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
   compiled by a host compiler and run** (M9-7, #198). Everything else in the
   `overlay.*` group tests the view models in `core/` -- what a screen *says* --
   and greps the directory for what it must not contain; until #198 not one of
@@ -733,14 +811,26 @@ ctest --test-dir build --output-on-failure
   `ipc_client.cpp` (the whole client half of the wire),
   `screen_frame.cpp` (the version handshake, and *not running* versus
   *unreachable*), and `status_paint.cpp` (the status screen's layout, behind the
-  `DrawList` seam). The far side is the **real** `ipc::Dispatch` over a real
+  `DrawList` seam). M9-6 (#209) added three more: `conflicts_pump.cpp` (the
+  conflicts screen's IPC frame), `lifecycle.cpp` (start, show and the one
+  teardown) and `log_paint.cpp` (the log screen's layout). What those make
+  assertable: `overlay.timeout` holds the far side's answer and asserts the draw
+  thread gets `NotResponding` at the client's budget and is never held again
+  while the call is out; `overlay.restore` times every frame of the conflicts
+  screen while a restore is still copying; `overlay.cycles` drives every way the
+  pinned `tsl::loop` ends, eight times over, and balances sessions, worker
+  threads and -- through `count_new.hpp` -- the heap, after grepping
+  `tesla.hpp` for the loop's one tail; `overlay.hidden` pins that a poll is due
+  on the first frame of every showing, because `update()` does not run while
+  the overlay is hidden. The far side is the **real** `ipc::Dispatch` over a real
   `ipc::ServiceCore`, answering through the **real** `sysmodule::ToResult` --
   split into `sysmodule/source/ipc/result.cpp` so the overlay's `DecodeError` is
   held against the mapping that ships rather than against a copy of it. So an
   overlay/sysmodule contract mismatch is a red test rather than a first-boot
   surprise. `overlay.portable` is the odd one out and is a grep: it holds the
   portable half of `overlay/source/` -- `draw_list.hpp`, `prompts.hpp`,
-  `screen_frame.*`, `status_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
+  `screen_frame.*`, `status_paint.*`, `conflicts_pump.*`, `lifecycle.*`,
+  `log_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
   `libultrahand` or `arm_neon`, transitively through the headers they include,
   because the compile only covers the files this target happens to build and the
   *next* screen's painter is the one that would quietly leave the reach of every
@@ -748,7 +838,7 @@ ctest --test-dir build --output-on-failure
   `overlay/source/` calls `drawString` except `DrawBounded`**, the one function
   that refuses a `maxWidth` of `0` -- which libtesla reads as *no limit* while
   every screen's width arithmetic produces it to mean *no room*. None of the
-  seven needs Docker or a rig, so none of them skips.
+  twelve needs Docker or a rig, so none of them skips.
   What they do **not** reach, and why, is in the two limits below.
 - The `power.*` pair is the sleep contract without a console (M9-4, #208).
   `psc:m` is a service and cannot be reached from a laptop, but everything the
@@ -760,15 +850,115 @@ ctest --test-dir build --output-on-failure
   anyway. Neither needs Docker or a rig. The engine's half of the same contract
   is `engine.sleeps` (a save write in flight at `SleepReady`, no rig) and
   `engine.sleep_download` (a 120 MiB rom in flight, which needs one).
+- **A card that will not take the bytes** (M9-13, #202): full, refusing, gone,
+  or formatted so that one file stops at 4 GiB. Every write the engine makes --
+  `io::WriteAtomically`, `io::CopyAtomically`, `io::CommitStaged`, the download
+  worker, the save executor and both HTTP backends' `.part` sinks -- goes through
+  `io::Disk` (`core/include/rommsync/disk.hpp`), and `tests/faulty_disk.hpp` is a
+  decorator over it that refuses on cue: `ENOSPC` part way through a file (a
+  *short* write, as a full card does it), `EIO`, or a card that is gone for
+  every open, write, rename and remove until the decorator goes out of scope.
+  RomM stays real; only the card's answer is invented. Where each one runs:
+
+  | Test | What it holds | Runs |
+  |---|---|---|
+  | `card.resolve`, `card.list`, `card.bounded`, `card.mkdir`, `card.volume` | `sysmodule/source/card.cpp` itself, host-compiled and rooted at a scratch directory through `MakeSdCardAt`. Until #202 it was built only by devkitPro. | everywhere, no rig |
+  | `http.disk`, `wire.disk` | both backends name `ENOSPC` as `kDiskFull`, `EFBIG` as `kFileTooLarge`, anything else as `kWriteFailed`, and leave no file at the destination | everywhere the rig runs |
+  | `download.fullcard`, `download.cardgone` | a full card and a refusing one: the destination untouched, no `.part`/`.tmp`/`.old` left, the entry failed with a sentence that says which. A card gone for every write ends the drain `kStoreFailed`, loses nothing, and the next drain finishes the rom | everywhere the rig runs |
+  | `download.toolarge` | a rom past the volume's per-file ceiling, or past its free space, is refused before a single content request | everywhere the rig runs |
+  | `tick.download_full`, `tick.download_eio`, `tick.backup_full` | the save and the baseline survive a full card under the transfer or under the backup, and the next tick completes | everywhere the rig runs |
+  | `card.fat32` | **a real FAT32 image**, by `tests/test_fat_volume.sh`: the host backend reads it as FAT32, a byte that would make a file 4 GiB is `EFBIG`, filling it is `ENOSPC`, and a download onto it is `kDiskFull` -- the check that the decorator's errnos are the ones a card really produces. The image is 64 MiB (a sparse file on Linux), and the ceiling is reached with one seek and one byte, so nothing near 4 GiB is ever written | **macOS** (`hdiutil`, no privileges) always; **Linux** only with `dosfstools` installed and passwordless `sudo -n` for the loop mount, and **Skipped**, saying which was missing, otherwise. GitHub's runners allow `sudo -n`, but `ci.yml` does not install `dosfstools` today, so on CI this currently reports Skipped |
+
+  A Skipped `card.fat32` is a check that did not run, not one that passed.
+  What none of these reach is Horizon's own errno for a full card: whether
+  `fsdev` translates the filesystem's "not enough space" to `ENOSPC` is
+  unverified, and a console that reports it as anything else gets the generic
+  "the card refused the write" sentence rather than "full". The free-space check
+  before a download starts does not depend on it -- `statvfs` over `fsdev` reads
+  `fsFsGetFreeSpace` -- which is why it is there.
+- **A power cut at every call of an overwrite** (M9-14, #203). Hard rule 2 is
+  an ordering of *persistence* -- after a power cut at any instant, the save is
+  its old bytes or its new ones, and new bytes never stand without the old under
+  `.backup/` -- and a test of the order of *calls* does not prove it. The same
+  `io::Disk` seam carries `Sync`, the durability point, so
+  `tests/crash_disk.hpp`'s `crash::Recorder` logs every open, write, rename,
+  remove and sync an overwrite makes on real files. `crash::Replay` then cuts the
+  log at every call and enumerates what a card that does not journal may keep --
+  per directory, any prefix of the names changed since its last sync; per file,
+  the data since its last sync lost, truncated, torn, short, out of order or
+  complete -- writes each
+  distinct card to scratch, runs `sync::RecoverStaging` over it as the next boot
+  would, and judges it. `execute.crash` (a download), `states.crash` (a state)
+  and `conflicts.crash` (a restore) are the three paths the gate's census says
+  land on a save; `execute.crash` and `conflicts.crash` also run once with the
+  card refusing to confirm `.backup/`, which must stop the overwrite (the state
+  path shares `BackUpFirst`, so it shares that answer). `execute.crash_delete`
+  is 5.4.0's `delete` (#233), the one path that removes a save rather than
+  overwriting it, judged by `crash::OldOrGone` -- the save's old bytes or no
+  file, and no file only with the old bytes under `.backup/` -- once as the
+  executor removes, once with `.backup/` unconfirmed, and once as a removal with
+  no backup the replay must catch. `execute.placed` replays a first-time restore
+  (#237), which lands on no save and is judged by `crash::AbsentOrNew` instead:
+  no file or all of it, and every file already on the card untouched. Every
+  replay drives the
+  host backend; the Horizon one syncs its `.part` through the same `io::Sync`,
+  and only a console runs it (#44). `execute.crash_model` is the
+  replay's own check: an overwrite written in place, one with no backup, and a
+  rename of bytes nothing synced must each be caught, or a green run means
+  nothing. None needs privileges, and all run the same on a Mac and on Linux.
+
+  What the model does **not** cover is stated at the top of `crash_disk.hpp`: a
+  sync that returns true and persisted nothing, flying writes, metadata
+  reordered within one directory, and `fseek`/`ftruncate` (no save path reaches
+  them). A durability call made *beside* the seam is invisible to it, which is
+  how the host backend's descriptor `fsync` was found -- so a backend that makes
+  something durable does it through `io::Sync`. A kernel-level injector
+  ([lazyfs](https://github.com/dsrhaslab/lazyfs), Linux and FUSE) is the check
+  on the model's assumptions and is not part of this suite.
+- **What the sysmodule holds, measured** (M9-15, #204). The heap's table in
+  `sysmodule/source/main.cpp` is a bound added up from constants, and two things
+  measure what it describes. `scripts/image-budget.sh` reads the linked image --
+  the three NSO segments page-aligned, `.bss` against `kInnerHeapSize`, the
+  `.eh_frame` and `.text` ceilings -- and fails past a budget it states; the
+  `switch-build` job runs it on every push and `switch.builds` runs it here,
+  then shows the budget and the `.bss` tie each bite. And `test_heap_steady`
+  counts every `operator new` in the process (`tests/count_new.hpp`, after
+  llvm's `count_new.h`) while the sysmodule's own `SdEngine` ticks against the
+  fixture RomM: `alloc.steady` samples what is outstanding between sixteen ticks
+  after a warm-up and fails if it grows with the number of ticks, and
+  `soak.smoke` does the same for rounds of a tick and a rom download. The judge
+  (`alloc.judge`) compares the least reading of each half of the run, so a block
+  kept per tick and a vector that only ever reallocates are both caught, and
+  `alloc.counts` checks the counter sees every signature and that allocation
+  elision is off for the target. The first soak found the log ring's `std::deque`
+  stepping a 4 KiB chunk up and down as its window moved; `alloc.log_ring` holds
+  the fixed ring that replaced it.
+
+  The same scenario runs nightly for a thousand rounds
+  (`.github/workflows/soak.yml`), with its samples kept as an artifact. A
+  schedule GitHub can disable for inactivity is not trusted on its own: the
+  `soak-fresh` job turns main red when no *scheduled* soak has passed in three
+  days -- a hand-run one of four rounds does not reset the clock
+  (`scripts/soak-fresh.sh`; `soak.workflow` and `soak.fresh` hold both).
+
+  These are host numbers: the host's standard library, C++ allocations only
+  (libcurl's are the host transport's), and a fixture library of a few roms.
+  What carries to the console is the shape -- flat or growing -- and the order
+  of magnitude of a tick. Not done here: curl-style OOM injection (fail
+  allocation *N* on run *N*), and `libfaketime` to run the scheduler's own
+  clock fast -- the soak asks for each tick instead of waiting for one.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two
-  artifacts — four bytes of magic is all the script inspects — so they need no
-  toolchain and never skip. `package.builds` does the real cross-compile and
-  packages it *inside* the container, and skips on the same missing image
-  `switch.builds` does — and, like that one, it now has an equivalent in CI that
-  cannot skip: `switch-build` runs `scripts/package.sh` on every push and the
-  `release` job runs it again on a tag, both in that image (#34).
+  artifacts — four bytes of magic is all the script inspects — and
+  `package.toolbox` needs none, feeding `tests/toolbox_check.py` every
+  `toolbox.json` ovl-sysmodules would skip or abort on; none of them skips.
+  `package.builds` does the real cross-compile and packages it *inside* the
+  container, holds the archive to the same layout `package.layout` does and
+  `toolbox.json`'s `tid` to the built NPDM's program id, and skips on the same
+  missing image `switch.builds` does — and, like that one, runs in the
+  `switch-build` job, where it cannot skip (#211). The `release` job runs the
+  script again on a tag (#34).
 - The `release.*` group and `version.tag` cover what turns a `v*` tag into a
   downloadable release, and none of them needs Docker, a network or a tag:
   `version.tag` refuses a tag that disagrees with `VERSION` (it reads
@@ -838,11 +1028,63 @@ the whole period the next was false: the first throughout the entire period the
 library was empty, and the second throughout the period every full run had a
 one-in-a-few-hundred chance of a 502 from a retired worker (#155).
 
+### Choosing the RomM version
+
+The fixture runs whichever RomM `ROMM_VERSION` in `.env` names: `5.4.0` by
+default since #235, which is also the floor (D1 in #226) — every suite asserts
+5.4.0's behaviour. `scripts/orca/env.sh` writes it — from the environment when
+the variable is set there, else as `.env` already had it, so the regenerations
+`compose.sh` and `seed.sh` do on their own never move a worktree back.
+
+**That includes a `.env` written before #235**, which names `5.2.0` only because
+that was the default then: env.sh keeps it, and the stack keeps running 5.2.0
+until someone moves it. `rig.version_live` is what says so — it fails any
+`ROMM_VERSION` below env.sh's default, with these steps:
+
+```bash
+ROMM_VERSION=5.4.0 ./scripts/orca/env.sh
+./scripts/orca/compose.sh down -v      # empty the volumes first -- see below
+./scripts/orca/compose.sh up -d
+./.venv/bin/python server/testing/provision.py
+ctest --test-dir build --output-on-failure
+```
+
+The same four lines with another version are how a worktree moves to one for an
+experiment; nothing below 5.4.0 is expected to pass. `down -v` is not optional
+when going back. RomM migrates its database forward
+when it starts and never back, so a 5.2.0 started on a volume 5.4.0 has touched
+is a server nobody tested against. Going forward it is only slow: 5.4.0's
+release notes put its migrations at 15–20 minutes on a volume with a library in
+it, during which `/api/heartbeat` does not answer and `provision.py --wait`
+gives up. On the empty volume `down -v` leaves, the same migrations took 7
+seconds and the first heartbeat came 21 seconds after `up` (measured for #227),
+which is why neither CI nor `provision.py` needed a longer wait. The volumes are
+not split per version on purpose: `archive.sh` tears a stack down with `-p` and
+no `.env`, and a volume name built from `ROMM_VERSION` would make it remove the
+wrong ones.
+
+`rig.version_live` fails when the running image is not the one `ROMM_VERSION`
+names, so a stack nobody recreated cannot answer the suite for the wrong
+server; `ROMM_VERSION` in the environment of a `ctest` run overrides `.env`
+for that check and for `contract.captures`. `rig.slot_cap` holds the
+`MAX_SAVES_PER_SLOT: "10"` the compose file pins: 5.3+ prunes every slot to
+it, and a cap left to each release's default would make every pruning test
+depend on which RomM ran it.
+
+CI runs `host-tests` against 5.4.0 alone since #235, under the plain job name
+branch protection requires. The 5.2.0 leg was dropped with the flip, and with
+it the matrix: a matrix job whose `name:` holds no matrix expression reports as
+`host-tests (5.4.0)`, so the required `host-tests` check would never arrive.
+The next RomM beside it runs as a job of its own, so the required one stays
+plain `host-tests`; `agent.config` fails a `host-tests` that is a matrix, and
+any workflow job that pairs a fixed name with one.
+
 ### Keeping the captured contract honest
 
 `contract.captures` re-runs `probe_contract.py --auth --negotiate
 --sync-scenarios` against the fixture and compares the result with the committed
-`server/contract/captures/` — the responses [API_CONTRACT.md](API_CONTRACT.md),
+captures for the fixture's RomM — `server/contract/captures/5.4.0/` for 5.4.0,
+and `server/contract/captures/` for 5.2.0, kept as history — the responses [API_CONTRACT.md](API_CONTRACT.md),
 [AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote and that M1/M2
 are coded against. It compares field names, nesting and JSON types, plus the
 `action`/`reason` pairs each scenario is named for; ids, timestamps and the
@@ -987,7 +1229,7 @@ two cannot drift.
 | `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
 | `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol, and since M9-7 (#198) they prove it through the overlay's own `ipc_client.cpp` as well as through `ipc::Dispatch` -- `overlay.wire`, `overlay.roundtrip`, `overlay.errors`. What no test reaches is the libnx `cmif`/`hipc` glue: `sysmodule/source/ipc/server.cpp` and the message unpacking in `service.cpp`, verified with the rest of the Horizon glue at M8-2. |
 | `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
-| `backup` | Every save-overwrite path shown to back up first (SYNC_PROTOCOL hard rule) -- verified by tests. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `tick.backupdir`, `tick.durable` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
+| `backup` | Every save-overwrite path shown to back up first, durably (SYNC_PROTOCOL hard rule) -- verified by tests, a power cut replayed at every call. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `states.crash`, `conflicts.crash`, `tick.newer_download`, `tick.newer_conflict`, `tick.migrated`, `tick.backupdir`, `tick.durable` — **a crash-prefix replay** of each of the three paths that land on a save (`execute.crash`, `states.crash`, `conflicts.crash`; `tests/crash_disk.hpp`), and of the tick that resolves a 409 from RomM's slot guard by taking the server's head (`tick.newer_download`, `tick.newer_conflict`, #232), and of the first tick after an upgrade from rc1, whose migrated save takes the shared slot's newer head (`tick.migrated`, #236), which makes "first" an order of *persistence* rather than of calls: every point of the recorded overwrite is cut, every card a non-journalling FAT may keep is swept by the boot sweep, and each must hold the old bytes or the new, never the new without the old under `.backup/` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
 | `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
 | `media` | A known-good NAND/SD backup exists; testing will be on a spare/backup SD or emuMMC, not the daily driver. | **Nothing in a repository can attest to this**, and a checkbox that says otherwise is worse than none. See *what the first console decides*. |
 
@@ -1050,8 +1292,9 @@ them in full; in short:
   `SslStream::Wait` assumes, whether `sslConnectionSetIoTimeout` [16.0.0+] does
   anything, and **who owns the descriptor** when
   `socketSslConnectionSetSocketDescriptor` returns `-1` with `errno == ENOENT` —
-  if the service did not take it, every failed handshake leaks an fd against a
-  `handle_table_size` of 64, and closing it on a guess would be a double close.
+  if the service did not take it, every failed handshake leaks a socket against
+  bsd's own limit (a socket is not a kernel handle, so not against
+  `handle_table_size`; #210), and closing it on a guess would be a double close.
   The answers go in
   [DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision), beside
   the measurement they correct.

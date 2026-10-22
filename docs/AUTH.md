@@ -1,13 +1,18 @@
 # Authentication — device-code flow
 
-The Switch has no keyboard-friendly login. RomM 5.2.0 ships the OAuth 2.0 Device
-Authorization Grant, which is designed for exactly this: the device shows a short
-code, the human approves it once in a browser, the device gets a token.
+The Switch has no keyboard-friendly login. RomM ships the OAuth 2.0 Device
+Authorization Grant (since 5.2.0; this client requires 5.4.0), which is designed
+for exactly this: the device shows a short code, the human approves it once in a
+browser, the device gets a token.
 
-Every response below is real, captured from a live 5.2.0 by
-`server/probe_contract.py --auth --capture` and committed under
-`server/contract/captures/` (issue M0-4). `ctest -R contract` re-captures and
-compares, so a RomM upgrade that changes these shapes turns the suite red.
+Every response below is real, captured by `server/probe_contract.py --auth
+--capture`: first from a live 5.2.0 (issue M0-4, committed under
+`server/contract/captures/` and kept as history), then from a live 5.4.0 under
+`server/contract/captures/5.4.0/` -- the bodies `auth.shapes` and
+`device.shapes` pin. The pairing bodies are identical across the two but for
+ids and timestamps; `GET /api/devices/{id}` gained `capabilities` in 5.4.0.
+`ctest -R contract` re-captures against the fixture's RomM and compares, so a
+RomM upgrade that changes these shapes turns the suite red.
 
 The engine codes against [`core/include/rommsync/auth.hpp`](../core/include/rommsync/auth.hpp),
 whose structs carry exactly these fields with these types — no field is inferred
@@ -49,7 +54,7 @@ sys-rommsync                         RomM server                 you (browser)
 ## The responses, verbatim
 
 `POST /api/auth/device/init` → **`201 Created`**, not `200`
-([`captures/auth-device-init.json`](../server/contract/captures/auth-device-init.json)):
+([`captures/5.4.0/auth-device-init.json`](../server/contract/captures/5.4.0/auth-device-init.json)):
 
 ```json
 {
@@ -63,21 +68,21 @@ sys-rommsync                         RomM server                 you (browser)
 ```
 
 `POST /api/auth/device/token` → `200` once approved
-([`captures/auth-device-token.json`](../server/contract/captures/auth-device-token.json)):
+([`captures/5.4.0/auth-device-token.json`](../server/contract/captures/5.4.0/auth-device-token.json)):
 
 ```json
 {
   "access_token": "rmm_<64 lowercase hex characters>",
-  "device_id": "9fdce844-779b-4216-a6e2-597a2f3e7027",
+  "device_id": "<the device row's UUID>",
   "scopes": ["assets.read", "assets.write", "collections.read", "devices.read",
-             "devices.write", "me.read", "roms.read", "roms.user.read",
-             "roms.user.write"],
+             "devices.write", "me.read", "platforms.read", "roms.read",
+             "roms.user.read", "roms.user.write"],
   "expires_at": null
 }
 ```
 
 A poll that has not been approved yet
-([`captures/auth-device-token-pending.json`](../server/contract/captures/auth-device-token-pending.json)):
+([`captures/5.4.0/auth-device-token-pending.json`](../server/contract/captures/5.4.0/auth-device-token-pending.json)):
 
 ```json
 {
@@ -266,8 +271,9 @@ limiter answered.
 ## Where the OpenAPI snapshot and the running server disagree
 
 `server/contract/romm-openapi-5.2.0.json` is what RomM *declares*; the captures
-are what it *does*. Both were checked field by field against this worktree's
-fixture, and on the **response bodies they agree exactly**: no field the
+are what it *does*. Both were checked field by field against a 5.2.0 fixture
+(5.4.0's snapshot, `romm-openapi-5.4.0.json`, is the one `sync.payload` now
+pins), and on the **response bodies they agree exactly**: no field the
 snapshot declares is missing from a live response, and no live response carries
 a field the snapshot does not declare. Where they part company is everything the
 snapshot does not model.

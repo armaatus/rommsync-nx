@@ -30,7 +30,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -40,7 +42,16 @@ namespace rommsync::json {
 enum class Type { kNull, kBool, kNumber, kString, kArray, kObject };
 
 /// How deep a document may nest before it is refused.
-inline constexpr int kMaxDepth = 64;
+///
+/// **16, and it is a stack budget before it is a parsing rule.** The parser
+/// recurses once per level, and on the sysmodule the deepest document it
+/// accepts is the deepest stack the main thread can reach -- off the card at
+/// boot, or from the overlay over IPC. At 64 that was ~33 KiB of a 32 KiB stack
+/// (#216); at 16 it is ~12.5 KiB, and `sysmodule/source/stack_budget.hpp` holds
+/// it to half. The cost is nothing real: RomM's deepest typed response nests 7
+/// deep, and `stack.contract` fails if a pinned RomM snapshot ever promises
+/// more than half of this. Raising it is a question for that header first.
+inline constexpr int kMaxDepth = 16;
 
 class Value;
 
@@ -138,6 +149,60 @@ struct ParseResult {
 /// Parse a whole document. Trailing content other than whitespace is an error,
 /// so a truncated body followed by a second one cannot be read as the first.
 ParseResult Parse(std::string_view text);
+
+/// Called with each element of the array `ParseEach` streams, in order, fully
+/// parsed and valid only for the call. A non-ok return stops the parse and is
+/// its error.
+using EachElement = std::function<Error(const Value& element, std::size_t index)>;
+
+/// `Parse`, with one array handed over an element at a time instead of held.
+///
+/// A parsed `Value` weighs about eleven times the text it came from -- a node is
+/// ~100 bytes and a RomM row is ~100 nodes -- so a 64-row page held as one
+/// document is ~1.5 MiB, the whole of the sysmodule's 1.5 MiB heap (M9-19,
+/// #217). Streamed, the peak is the text and one element.
+///
+/// `key` names a member of the top-level object; empty means the top-level value
+/// is itself the array. In the result that array is present and **empty**, so a
+/// reader of the rest of the document still sees that it was an array. Every
+/// element is still parsed in full, so the strictness above is unchanged: a
+/// malformed element fails the document, even after earlier ones were handed
+/// over -- which is why a caller keeps what it reads only once this returns ok.
+///
+/// **The wrong shape is refused before it is parsed** (M9-20, #246): a root that
+/// is not the object holding `key` -- or, for an empty key, not the array -- as
+/// "`context` is an array, not the object it must be", `Reader`'s sentence; and
+/// anything but an array at `key` as that field, "expected an array, got an
+/// object". Parsed first, a bare array where the envelope belongs was held whole,
+/// at ~11x its text, on its way to a refusal that was always coming. `context`
+/// names the document as a caller's `Reader` would, and defaults to "the
+/// document". A missing `key` is still the caller's to refuse.
+ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each,
+                      std::string_view context = {});
+
+/// The member names a reader takes, for `ParseEach`'s keeping form.
+using Keep = std::span<const std::string_view>;
+
+/// `ParseEach`, building only the members `keep` names (#248).
+///
+/// A row is one element at a time, but each element was still parsed whole, and
+/// RomM's rows are as wide as the metadata it holds: a rom it identified on IGDB
+/// is ~12 KiB of text that no reader here looks at, and ~16 times that as a
+/// document -- ~190 KiB in flight on aarch64, beside the page, where the
+/// fixture's homebrew rows cost a tenth of it. So every **object** in the
+/// document -- the root and anything inside the streamed elements, at any depth
+/// -- holds only the members named in `keep`, and the root also `key`. The rest
+/// are read to the end of their value, as strictly as a kept one, and dropped
+/// without a node being built: a malformed skipped member still fails the
+/// document.
+///
+/// The one check a skipped member does not get is the duplicate-key rule (above):
+/// a key nothing reads cannot shadow anything that is read, and catching a
+/// duplicate needs the names held. Two kept members of one name are still
+/// refused. A reader must name every member it reads, at every depth -- one it
+/// forgets is simply absent, which its `Reader` then reports as missing.
+ParseResult ParseEach(std::string_view text, std::string_view key, Keep keep,
+                      const EachElement& each, std::string_view context = {});
 
 /// `value` as a JSON string literal, quotes included.
 ///

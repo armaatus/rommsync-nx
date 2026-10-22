@@ -3,9 +3,12 @@
 #include "rommsync/atomic_file.hpp"
 
 #include "rommsync/config_text.hpp"
+#include "rommsync/save_source.hpp"
 
 #include <cstddef>
+#include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -122,25 +125,36 @@ bool HasRealHost(std::string_view authority) {
 // --- the built-in folder map ------------------------------------------------
 
 PlatformFolders TicoAndRetroArch(const std::string& slug) {
+  // Tico's folder for the system, which is not always RomM's name for it:
+  // `sms` lives in `/tico/roms/master-system` (#226 R5). A rom downloaded under
+  // RomM's spelling is a rom Tico never lists.
+  const std::string tico = scan::TicoSlugFor(slug);
   PlatformFolders folders;
-  folders.roms = {"/tico/roms/" + slug};
-  folders.saves = {"/retroarch/saves", "/tico/saves/" + slug};
-  folders.states = {"/retroarch/states", "/tico/states/" + slug};
+  folders.roms = {"/tico/roms/" + tico};
+  folders.saves = {"/retroarch/saves", "/tico/saves/" + tico};
+  folders.states = {"/retroarch/states", "/tico/states/" + tico};
   return folders;
+}
+
+std::map<std::string, PlatformFolders, std::less<>> BuildPlatforms(
+    std::initializer_list<const char*> slugs) {
+  std::map<std::string, PlatformFolders, std::less<>> platforms;
+  for (const char* slug : slugs) {
+    platforms.emplace(slug, TicoAndRetroArch(slug));
+  }
+  return platforms;
 }
 
 std::map<std::string, PlatformFolders, std::less<>> BuildDefaultPlatforms() {
   // The systems a Switch has an emulator for, as RomM's `library/roms/` folder
-  // names conventionally spell them. Anything heavier (ps2, ps3, ps4, wii, ngc,
-  // 3ds) is deliberately absent: nothing on the console runs it, and a default
-  // mapping would only invite downloads that cannot be played.
-  const char* const kSlugs[] = {"nes",     "snes", "gb",  "gbc", "gba", "n64",
-                                "genesis", "psx",  "nds", "dreamcast", "psp"};
-  std::map<std::string, PlatformFolders, std::less<>> platforms;
-  for (const char* slug : kSlugs) {
-    platforms.emplace(slug, TicoAndRetroArch(slug));
-  }
-  return platforms;
+  // names conventionally spell them -- both spellings where two are common,
+  // since a key that matches none of the user's folders costs nothing and a
+  // missing one maps their whole platform to nowhere. Anything heavier (ps2,
+  // ps3, ps4) is deliberately absent: nothing on the console runs it, and a
+  // default mapping would only invite downloads that cannot be played.
+  return BuildPlatforms({"nes", "snes", "gb", "gbc", "gba", "n64", "genesis", "sms", "gamegear",
+                         "segacd", "psx", "nds", "dc", "dreamcast", "psp", "saturn", "fbneo",
+                         "arcade"});
 }
 
 // --- the file ---------------------------------------------------------------
@@ -158,7 +172,16 @@ io::BoundedRead ReadBounded(const std::string& path, std::string* out) {
 
 // --- the parse ---------------------------------------------------------------
 
-enum class SectionKind { kNone, kServer, kSync, kDownloads, kPlatform, kUnknown };
+enum class SectionKind {
+  kNone,
+  kServer,
+  kSync,
+  kDownloads,
+  kSources,
+  kTico,
+  kPlatform,
+  kUnknown,
+};
 
 /// The state one line of the file is read against.
 struct ParseState {
@@ -199,6 +222,32 @@ void ApplyServer(const ParseState& state, int line, std::string_view key, std::s
   }
 }
 
+}  // namespace
+
+bool ValidSlot(std::string_view slot, std::string* why) {
+  if (slot.empty()) {
+    *why = "a slot cannot be empty";
+    return false;
+  }
+  if (slot.size() > kMaxSlotLength) {
+    *why = "longer than " + std::to_string(kMaxSlotLength) + " characters";
+    return false;
+  }
+  for (const char character : slot) {
+    const bool keep = (character >= 'a' && character <= 'z') ||
+                      (character >= 'A' && character <= 'Z') ||
+                      (character >= '0' && character <= '9') || character == '-' ||
+                      character == '_';
+    if (!keep) {
+      *why = "a slot is letters, digits, '-' and '_' only";
+      return false;
+    }
+  }
+  return true;
+}
+
+namespace {
+
 void ApplySync(const ParseState& state, int line, std::string_view key, std::string_view value,
                Config* config, Diagnostics* diags) {
   const std::string quoted = "'" + std::string(value) + "'";
@@ -231,6 +280,34 @@ void ApplySync(const ParseState& state, int line, std::string_view key, std::str
     return;
   }
 
+  if (key == "on_server_delete") {
+    // Two words and nothing else: `true`/`false` would leave a reader guessing
+    // which of the two a save RomM deleted gets, and that is a save (#233).
+    const std::string lowered = LowerAscii(Trim(value));
+    if (lowered == "remove") {
+      config->sync.on_server_delete = OnServerDelete::kRemove;
+    } else if (lowered == "keep") {
+      config->sync.on_server_delete = OnServerDelete::kKeep;
+    } else {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected remove or keep, got " + quoted + "; keeping " +
+                     std::string(config->sync.on_server_delete == OnServerDelete::kKeep ? "keep"
+                                                                                       : "remove"));
+    }
+    return;
+  }
+
+  if (key == "slot") {
+    std::string why;
+    if (!ValidSlot(value, &why)) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 why + "; keeping '" + config->sync.slot + "'");
+      return;
+    }
+    config->sync.slot = std::string(value);
+    return;
+  }
+
   bool* target = nullptr;
   if (key == "enabled") {
     target = &config->sync.enabled;
@@ -240,6 +317,8 @@ void ApplySync(const ParseState& state, int line, std::string_view key, std::str
     target = &config->sync.saves;
   } else if (key == "states") {
     target = &config->sync.states;
+  } else if (key == "map_state_slots") {
+    target = &config->sync.map_state_slots;
   } else if (key == "conflict_show") {
     target = &config->sync.conflict_show;
   }
@@ -280,12 +359,120 @@ void ApplyDownloads(const ParseState& state, int line, std::string_view key,
   *target = flag;
 }
 
+/// `[sources]` (#230).
+void ApplySources(const ParseState& state, int line, std::string_view key, std::string_view value,
+                  Config* config, Diagnostics* diags) {
+  if (key == "retroarch") {
+    const std::string lowered = LowerAscii(Trim(value));
+    bool flag = false;
+    if (lowered == "auto") {
+      config->sources.retroarch = SourceMode::kAuto;
+    } else if (ParseBool(lowered, &flag)) {
+      config->sources.retroarch = flag ? SourceMode::kOn : SourceMode::kOff;
+    } else {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected auto, on or off, got '" + Redact(value) + "'; keeping auto");
+      config->sources.retroarch = SourceMode::kAuto;
+    }
+    return;
+  }
+  if (key == "retroarch_content_dir") {
+    bool flag = false;
+    if (!ParseBool(value, &flag)) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected true or false, got '" + Redact(value) + "'; keeping " +
+                     std::string(config->sources.retroarch_content_dir ? "true" : "false"));
+      return;
+    }
+    config->sources.retroarch_content_dir = flag;
+    return;
+  }
+  diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
+}
+
+/// `[platform.<slug>] emulator`. Checked against RomM's own rule here, at the
+/// line that wrote it, because an id RomM refuses is otherwise a 400 on every
+/// upload of that platform's saves -- reported per save, every tick, nowhere
+/// near the typo.
+void ApplyEmulator(const ParseState& state, int line, std::string_view key,
+                   std::string_view value, Config* config, Diagnostics* diags) {
+  if (value.empty()) {
+    // `emulator =` takes an override back out, the way `roms =` maps nowhere.
+    config->emulators.erase(state.slug);
+    return;
+  }
+  std::string why;
+  if (!scan::ValidEmulatorId(value, &why)) {
+    diags->Add(Severity::kWarning, line, state.section, key,
+               "'" + Redact(value) + "' " + why + "; this line is ignored and " + state.slug +
+                   " keeps its built-in emulator id");
+    return;
+  }
+  config->emulators[state.slug] = std::string(value);
+}
+
+/// `[tico]` (#231).
+void ApplyTico(const ParseState& state, int line, std::string_view key, std::string_view value,
+               Config* config, Diagnostics* diags) {
+  if (key != "account") {
+    diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
+    return;
+  }
+  const std::string lowered = LowerAscii(Trim(value));
+  TicoConfig tico;
+  if (lowered == "legacy") {
+    tico.account = TicoAccount::kLegacy;
+  } else if (IsTicoUid(lowered)) {
+    tico.account = TicoAccount::kNamed;
+    tico.uid = lowered;
+  } else if (lowered != "auto") {
+    // Checked here because the value becomes a folder name under `users/`, and
+    // anything but 32 hex digits is either a typo or a path.
+    diags->Add(Severity::kWarning, line, state.section, key,
+               "expected auto, legacy or an account's 32-digit id, got '" + Redact(value) +
+                   "'; keeping auto");
+  }
+  config->tico = std::move(tico);
+}
+
 /// `rejected` collects slugs whose section had a line the parser could not use,
 /// so the end-of-parse sweep can tell a platform emptied on purpose from one
 /// emptied by a typo.
 void ApplyPlatform(const ParseState& state, int line, std::string_view key,
                    std::string_view value, Config* config, Diagnostics* diags,
-                   std::set<std::string>* rejected) {
+                   std::set<std::string>* rejected, std::map<std::string, bool>* enabled) {
+  if (key == "emulator") {
+    ApplyEmulator(state, line, key, value, config, diags);
+    return;
+  }
+  if (key == "play_with") {
+    const std::string lowered = LowerAscii(Trim(value));
+    if (lowered.empty()) {
+      config->play_with.erase(state.slug);  // `play_with =` is the default again
+    } else if (lowered == "tico") {
+      config->play_with[state.slug] = PlayWith::kTico;
+    } else if (lowered == "retroarch") {
+      config->play_with[state.slug] = PlayWith::kRetroArch;
+    } else {
+      // Not guessed at: which emulator's folder a first restore lands in is the
+      // whole meaning of the line, and a typo that picked one would write saves
+      // where the user does not play.
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected tico or retroarch, got '" + Redact(value) + "'; this line is ignored");
+    }
+    return;
+  }
+  if (key == "enabled") {
+    bool flag = false;
+    if (!ParseBool(value, &flag)) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "expected true or false, got '" + Redact(value) + "', ignored");
+      rejected->insert(state.slug);
+      return;
+    }
+    (*enabled)[state.slug] = flag;
+    return;
+  }
   std::vector<std::string>* target = nullptr;
   PlatformFolders& folders = config->platforms[state.slug];
   if (key == "roms") {
@@ -618,6 +805,26 @@ const std::map<std::string, PlatformFolders, std::less<>>& DefaultPlatforms() {
   return kPlatforms;
 }
 
+const std::map<std::string, PlatformFolders, std::less<>>& OptionalPlatforms() {
+  // Tico 0.8 runs these, at a cost the console notices; off until asked for.
+  static const std::map<std::string, PlatformFolders, std::less<>> kPlatforms =
+      BuildPlatforms({"ngc", "wii", "3ds"});
+  return kPlatforms;
+}
+
+bool IsTicoUid(std::string_view text) {
+  if (text.size() != 32) {
+    return false;
+  }
+  for (const char c : text) {
+    const bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!hex) {
+      return false;
+    }
+  }
+  return true;
+}
+
 Config Defaults() {
   Config config;
   config.platforms = DefaultPlatforms();
@@ -629,6 +836,33 @@ Config Defaults() {
 const PlatformFolders* Config::Platform(std::string_view slug) const {
   const auto found = platforms.find(slug);
   return found == platforms.end() ? nullptr : &found->second;
+}
+
+std::string_view Config::EmulatorOverride(std::string_view slug) const {
+  const auto found = emulators.find(slug);
+  return found == emulators.end() ? std::string_view() : std::string_view(found->second);
+}
+
+const char* ToString(PlayWith play_with) {
+  switch (play_with) {
+    case PlayWith::kTico:
+      return "tico";
+    case PlayWith::kRetroArch:
+      return "retroarch";
+  }
+  return "tico";
+}
+
+std::optional<PlayWith> Config::PlayWithFor(std::string_view slug) const {
+  const auto found = play_with.find(slug);
+  if (found != play_with.end()) {
+    return found->second;
+  }
+  if (scan::TicoModuleFor(scan::TicoSlugFor(slug)) != nullptr ||
+      OptionalPlatforms().find(slug) != OptionalPlatforms().end()) {
+    return PlayWith::kTico;
+  }
+  return std::nullopt;
 }
 
 std::string Config::RomTarget(std::string_view slug) const {
@@ -751,6 +985,22 @@ std::vector<std::string> Config::StateScanDirs() const {
 
 // --- parsing ------------------------------------------------------------------
 
+namespace {
+
+/// The folders this build has for `slug`, on or off by default; nullptr when it
+/// has none.
+const PlatformFolders* BuiltInFolders(std::string_view slug) {
+  for (const auto* table : {&DefaultPlatforms(), &OptionalPlatforms()}) {
+    const auto found = table->find(slug);
+    if (found != table->end()) {
+      return &found->second;
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 LoadResult ParseConfig(std::string_view text) {
   LoadResult result;
   result.value = Defaults();
@@ -775,6 +1025,9 @@ LoadResult ParseConfig(std::string_view text) {
   std::set<std::string> sections_seen;       // canonical section names already opened
   std::set<std::string> platform_sections;   // which slugs the file has claimed
   std::set<std::string> platform_rejected;   // ...and which had a line that was dropped
+  std::set<std::string> platform_folders;    // ...which had a folder line
+  std::set<std::string> platform_emulators;  // ...and which had `emulator` or `play_with`
+  std::map<std::string, bool> platform_enabled;  // ...and what an `enabled` line said
   std::set<std::string> assigned;            // "section\x1fkey" pairs already set
   bool platform_cap_reported = false;
 
@@ -821,6 +1074,10 @@ LoadResult ParseConfig(std::string_view text) {
         state.kind = SectionKind::kSync;
       } else if (lowered == "downloads") {
         state.kind = SectionKind::kDownloads;
+      } else if (lowered == "sources") {
+        state.kind = SectionKind::kSources;
+      } else if (lowered == "tico") {
+        state.kind = SectionKind::kTico;
       } else if (lowered.rfind("platform.", 0) == 0) {
         // The slug keeps its case: it is RomM's `platform_fs_slug`, which is a
         // directory name on the server's filesystem, and lowercasing it would
@@ -849,7 +1106,7 @@ LoadResult ParseConfig(std::string_view text) {
             continue;
           }
           platform_sections.insert(state.slug);
-          if (DefaultPlatforms().find(state.slug) == DefaultPlatforms().end()) {
+          if (BuiltInFolders(state.slug) == nullptr) {
             diags.Add(Severity::kNotice, line_number, state.section, "",
                       "is not a platform this build maps by default; it is used as written -- "
                       "check it matches the folder name under RomM's library/roms/, because a "
@@ -894,6 +1151,46 @@ LoadResult ParseConfig(std::string_view text) {
                 "a line with no key before the '=', ignored");
       continue;
     }
+    if (state.kind == SectionKind::kNone && LowerAscii(key_text) == "version") {
+      // Above the first section because it is about the whole file, and so it
+      // is read before a single key it governs.
+      int version = 0;
+      if (!ParseInt(value, &version) && !value.empty() &&
+          value.find_first_not_of("0123456789") == std::string_view::npos) {
+        // Digits past what an `int` holds: no typo makes one, and reading the
+        // file as version 1 would be the misparse refusing exists to prevent.
+        version = std::numeric_limits<int>::max();
+      }
+      if (version < 1) {
+        diags.Add(Severity::kWarning, line_number, "", "version",
+                  "expected the whole number of the format this file is written in, got '" +
+                      Redact(value) + "'; it is read as version " +
+                      std::to_string(kConfigVersion));
+        continue;
+      }
+      if (version > kConfigVersion) {
+        // Refused whole, not read for the keys this build happens to know: a
+        // version moves only when a key's meaning does, so those are exactly
+        // the keys it would misread. Defaults and one error, which the overlay
+        // counts onto the status screen. The file itself is not touched here,
+        // and `ApplyEdit` will not touch it either.
+        LoadResult refused;
+        refused.value = Defaults();
+        refused.version = version;
+        Diagnostics only;
+        only.Add(Severity::kError, line_number, "", "version",
+                 "is " + std::string(value) +
+                     ": this config.ini was written by a newer release than this "
+                     "sys-rommsync, which reads version " +
+                     std::to_string(kConfigVersion) +
+                     ". None of it is in use and it is left as it is -- install sys-rommsync and "
+                     "the overlay from the release that wrote it");
+        refused.diagnostics = only.Take();
+        return refused;
+      }
+      result.version = version;
+      continue;
+    }
     if (state.kind == SectionKind::kNone) {
       diags.Add(Severity::kWarning, line_number, "", std::string(key_text),
                 "is above the first section header, so there is nothing it configures");
@@ -920,9 +1217,20 @@ LoadResult ParseConfig(std::string_view text) {
       case SectionKind::kDownloads:
         ApplyDownloads(state, line_number, key, value, &result.value, &diags);
         break;
+      case SectionKind::kSources:
+        ApplySources(state, line_number, key, value, &result.value, &diags);
+        break;
+      case SectionKind::kTico:
+        ApplyTico(state, line_number, key, value, &result.value, &diags);
+        break;
       case SectionKind::kPlatform:
+        if (key == "emulator" || key == "play_with") {
+          platform_emulators.insert(state.slug);
+        } else if (key != "enabled") {
+          platform_folders.insert(state.slug);
+        }
         ApplyPlatform(state, line_number, key, value, &result.value, &diags,
-                      &platform_rejected);
+                      &platform_rejected, &platform_enabled);
         break;
       case SectionKind::kNone:
       case SectionKind::kUnknown:
@@ -940,6 +1248,37 @@ LoadResult ParseConfig(std::string_view text) {
   // likely way a user stops their own saves from syncing.
   for (const std::string& slug : platform_sections) {
     const std::string section = "platform." + slug;
+    const auto defaults = DefaultPlatforms().find(slug);
+    const auto enabled = platform_enabled.find(slug);
+    if (enabled != platform_enabled.end() && !enabled->second) {
+      // Switched off in so many words, whatever else the section lists. Not
+      // worth a notice: unlike an emptied section, nobody writes this by accident.
+      result.value.platforms[slug] = PlatformFolders{};
+      continue;
+    }
+    const bool maps_folders = platform_folders.find(slug) != platform_folders.end();
+    if (!maps_folders && enabled != platform_enabled.end()) {
+      // `enabled = true` with no folder of its own: the built-in folders, the
+      // off-by-default ones included -- that is what turning `ngc` on means.
+      if (const PlatformFolders* built_in = BuiltInFolders(slug)) {
+        result.value.platforms[slug] = *built_in;
+      } else {
+        diags.Add(Severity::kWarning, 0, section, "enabled",
+                  "this build has no folders of its own for " + slug +
+                      ", so there is nothing to turn on -- list roms, saves and states instead");
+      }
+      continue;
+    }
+    if (!maps_folders && platform_emulators.find(slug) != platform_emulators.end() &&
+        defaults != DefaultPlatforms().end()) {
+      // A section that sets only `emulator` or `play_with` is not a folder map,
+      // so it does not replace one. "mGBA for GB" must not also mean "stop
+      // syncing GB", and nobody reading that one line could tell that it did --
+      // nor a refused or emptied `emulator` line. A section with no lines at
+      // all is still the documented way to unmap a platform.
+      result.value.platforms[slug] = defaults->second;
+      continue;
+    }
     const PlatformFolders& now = result.value.platforms[slug];
     if (now.empty()) {
       // Emptying a section on purpose is how a user removes a built-in mapping
@@ -955,7 +1294,6 @@ LoadResult ParseConfig(std::string_view text) {
                     : "maps no folders, so " + slug + " is skipped entirely");
       continue;
     }
-    const auto defaults = DefaultPlatforms().find(slug);
     if (defaults == DefaultPlatforms().end()) {
       continue;
     }

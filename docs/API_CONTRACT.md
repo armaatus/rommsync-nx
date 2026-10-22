@@ -1,4 +1,4 @@
-# RomM API contract (pinned to 5.2.0)
+# RomM API contract (5.2.0 body, 5.4.0 pinned beside it)
 
 Everything the Switch client talks to. **Verified against a live RomM `5.2.0`**:
 `server/contract/romm-openapi-5.2.0.json` is the full OpenAPI snapshot, and
@@ -6,6 +6,13 @@ Everything the Switch client talks to. **Verified against a live RomM `5.2.0`**:
 from the docker fixture by `server/probe_contract.py` (issue M0-4). If you
 upgrade RomM, re-capture and update this file — `ctest -R contract` fails when
 the captures stop matching the server.
+
+RomM **5.4.0** is pinned beside it the same way — `romm-openapi-5.4.0.json` and
+`captures/5.4.0/` — and [what changed](#520--540) is the last section of this
+page. The body of the page still describes 5.2.0, although 5.4.0 has been the
+fixture's default since #235 and the oldest RomM the client syncs with since
+#228 (D1 in #226: 5.4.0 is the minimum, 5.2.0 is dropped). Where the two differ,
+that section says so; the body has not been re-based.
 
 > The snapshot says what RomM *declares*; the captures say what it *does*. Where
 > this page marks something **verified**, it came from a captured response, not
@@ -328,13 +335,18 @@ ticked, so a 403 here is a scope missing from a pairing that otherwise works,
 and reporting it as a revocation sends the user looking for something that did
 not happen. Read `scopes` back off the token instead of meeting it here.
 
-**Verified — negotiating twice cancels the first session.** Each
-`POST /api/sync/negotiate` opens a session, and RomM cancels the device's
+**5.2.0 only — negotiating twice cancels the first session.** Each
+`POST /api/sync/negotiate` opens a session, and 5.2.0 cancels the device's
 previous `IN_PROGRESS` one when it does: two negotiations in a row leave the
 first `CANCELLED` with a `completed_at`, and exactly one row is ever in progress
-per device. So a retried negotiation — a stall the client gave up on, a tick that
-died before `complete` — does not accumulate open sessions, and only the last
-`session_id` is worth posting uploads and `complete` against.
+per device. **5.4.0 cancels nothing** (#235): a session belongs to the
+negotiation that opened it, several can be open at once, every one stays
+completable, and one nobody completes is failed by a scheduled cleanup after 24
+hours (`error_message` `"No completion was reported before this session
+expired"`) — and can *still* be completed after that. So on 5.4.0 a retried
+negotiation whose first response never arrived leaves that first session open
+until the cleanup fails it; the client never learned its id and cannot close
+it. The client completes the id its plan carried, which is right on both.
 
 **The `server_content_hash` is whatever some client uploaded.** RomM stores the
 digest it is given, so a save another tool put there can come back carrying a
@@ -364,6 +376,12 @@ by `ctest -R contract`. Treat an unlisted reason as a server that moved:
 | `no_op` | `No changes since last sync` | neither side moved past the sync record | |
 | `no_op` | `Saves appear identical` | no sync record, equal timestamps, hashes not comparable | |
 | `no_op` | `Save is untracked on this device` | the device's sync row is marked untracked |  |
+| `delete` | `Save was deleted on the server` | 5.4.0: the slot is empty and remembers losing the client's version, written no later than the removal (#233) | ✔ 5.4.0 |
+
+5.4.0 also emits `download` / `Client holds a version removed on the server`
+(`_held_since_removal`: the slot has a current save, and the client holds a
+version the slot lost). It is not in `sync::Reason` yet, so it arrives
+`kUnrecognized` with a warning; the `download` is obeyed regardless.
 
 An `action` or a `reason` that is not in the tables above is a server that moved.
 `ClassifyAction` pins the unknown action to `no_op` and reports it, because on a
@@ -422,15 +440,22 @@ land here — and it means the accounting succeeded, which is the opposite of wh
 a bare "the server refused the body" would say. `sync::CompleteError` therefore
 carries `kAlreadyCompleted` for it, separately from `kRejected`.
 
-**Verified — completing a session another negotiation cancelled is also a
-`400`, with a different detail: `{"detail":"Session is already CANCELLED"}`.**
-This is the *reachable* half of the pair. Each negotiate cancels the device's
-previous `IN_PROGRESS` session (above), so a tick that gave up on one
-negotiation and made another is completing a session RomM has already ended. It
-says the opposite of the `COMPLETED` detail about the accounting — those counts
-were never recorded and never will be — so `sync::CompleteError` carries
-`kSuperseded` for it, apart from both `kAlreadyCompleted` and `kRejected`.
-Nothing about the body is wrong; the answer is the next tick's own negotiation.
+**Verified — completing a session something else closed is also a `400`, with
+a different detail: `{"detail":"Session is already CANCELLED"}`.** It is one
+f-string in RomM — `Session is already {status}` — so `FAILED` arrives the same
+way. On 5.2.0 `CANCELLED` was the *reachable* one: each negotiate cancelled the
+device's previous session (above), so a tick that gave up on one negotiation and
+made another was completing a session RomM had already ended. On 5.4.0 nothing
+cancels a session and `complete` reopens one the cleanup expired, so what still
+answers this is a session closed on purpose — cancelled by a 5.2.0 before the
+upgrade, or `FAILED` by whatever ran it. Either way it says the opposite of the
+`COMPLETED` detail about the accounting — those counts were never recorded and
+never will be — so `sync::CompleteError` carries `kSuperseded` for every status
+but `COMPLETED` (matched as the detail's prefix, after `COMPLETED`), apart from
+both `kAlreadyCompleted` and `kRejected`. Nothing about the body is wrong; the
+answer is the next tick's own negotiation. `tick.complete_closed` forces both
+statuses through the proxy, since a healthy 5.4.0 will not produce either for a
+session this client opened.
 
 **Verified — an unknown session id is a `404`
 `{"detail":"Sync session with ID N not found"}`.** A session RomM *cancelled*
@@ -526,12 +551,12 @@ re-send its whole buffer forever.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/api/saves` | list; filter `rom_id, platform_id, device_id, slot` |
-| POST | `/api/saves` | upload; query `rom_id*, emulator, slot, device_id, session_id, overwrite, autocleanup, autocleanup_limit`; multipart field **`saveFile`** (+ optional `screenshotFile`) |
+| POST | `/api/saves` | upload; query `rom_id*, emulator, slot, device_id, content_hash, session_id, overwrite, autocleanup, autocleanup_limit`; multipart field **`saveFile`** (+ optional `screenshotFile`) |
 | PUT | `/api/saves/{id}` | replace one save's bytes in place; query `device_id` |
 | GET | `/api/saves/{id}` | one save → `SaveSchema`; query `device_id` — see `device_syncs` below |
 | GET | `/api/saves/{id}/content` | download raw save bytes; query `device_id`, `session_id` — **do not send them**, see below |
 | GET | `/api/saves/identifiers` | lightweight id/hash listing |
-| POST | `/api/saves/{id}/downloaded` | `{device_id}` — record that this device now holds this save |
+| POST | `/api/saves/{id}/downloaded` | `{device_id, content_hash}` — record that this device now holds this save; `content_hash` becomes the baseline when it equals the row's, or when the device's sync row already names the version it was served |
 | POST | `/api/saves/delete` | `{saves: [id, …]}` |
 | GET | `/api/states` | list; filter `rom_id, platform_id` — **no `device_id`, no `slot`** |
 | POST | `/api/states` | upload; query `rom_id*, emulator`; multipart field **`stateFile`** (+ optional `screenshotFile`) |
@@ -624,15 +649,18 @@ cleanly and early cannot be told from a complete one, because RomM's own
 `Content-Length` is what the shortening removed. That is the shape
 `server/testing/fault_proxy.py`'s `truncate` mode produces on purpose.
 
-**An upload needs `overwrite=true`, and the flag does exactly one thing.** With
-a `device_id` and a `slot`, `POST /api/saves` answers `409 {"detail": "Slot has a
+**`overwrite` does exactly one thing: it decides the slot guard's 409.** With a
+`device_id` and a `slot`, `POST /api/saves` answers `409 {"detail": "Slot has a
 newer save since your last sync"}` when this device has no sync row for the
-slot's current save — which is exactly the state negotiate calls `Client save is
-newer (no sync history)` and tells the client to upload. The flag clears that
-check and nothing else; it is read well before the row is looked up.
-`execute.occupied` arranges the state and asserts the 409 on the flagless
-request, then asserts the same upload succeeds with the flag. A previous
-revision said the flag did a *second* thing — see below; it does not.
+slot's current save, or an older one — which includes the state negotiate calls
+`Client save is newer (no sync history)` and tells the client to upload.
+`overwrite=true` clears that check and nothing else; it is read well before the
+row is looked up. The client sends `overwrite=false` and resolves the 409 against
+the server's head instead (#232, docs/SYNC_PROTOCOL.md#the-slot-guard-and-the-409-232);
+only a player's Keep local sends `true`. `execute.occupied` arranges the state
+and asserts the 409 on the client's own upload, then the same upload succeeding
+under Keep local. A previous revision said the flag did a *second* thing — see
+below; it does not.
 
 **Verified — whether an upload replaces a row or adds one is decided by the
 clock, not by the flag.** RomM stamps a slot upload with a second-granularity
@@ -890,6 +918,24 @@ itself needed no change:
 `genesis`, `nds`, `psp`, `dreamcast`). The client maps each to a Tico /
 RetroArch SD folder; default map + override scheme in [CONFIG.md](CONFIG.md).
 
+### Remote installs from the web UI
+
+RomM 5.4's "Install on device" (#245, `core/include/rommsync/remote_install.hpp`).
+Gated on `DEVICE_INSTALL.ENABLED` in the heartbeat, read beside `SYSTEM.VERSION`.
+Polled once a tick; the `/devices` Socket.IO namespace is not used. Checked live
+against the 5.4.0 fixture:
+
+| Call | What it does | Answers worth knowing |
+|---|---|---|
+| `PUT /api/devices/{id}` `{"capabilities":{"remote_install":true}}` | Lets the web UI queue for this device. Not `POST /api/devices`, which makes a second device ([above](#why-post-apidevices-is-the-wrong-call)). | Without it, `POST .../installs` is `400 "does not accept remote installs"`. |
+| `POST /api/devices/{id}/installs/claim` | Takes every pending request and answers **every request the device holds taken**, oldest first, as `InstallRequestSchema[]` (~260 bytes each). | Idempotent: a second claim returns the same taken requests. Needs the token **bound to that device**: another device's token is a 404 (the device is "not theirs"), an unbound one a 403. `DEVICE_INSTALL_ENABLED=false` is a 404 too. |
+| `PUT /api/devices/{id}/installs/{request_id}` `{"status":…,"reason":…}` | Ends a taken request as `done`, `already_installed` or `failed`, and notifies the user. | Any other status is a 422. A request already ended, cancelled in the web UI or expired is a 404. `reason` is at most 500 characters. |
+
+`file_ids` names the rom's game, update and DLC files; the client downloads the
+rom the way the overlay does and does not read it. Platforms in
+`EXCLUDED_PLATFORM_SLUGS` are refused by the server when queued, so the client
+does not read that list either.
+
 ## Resume & integrity
 
 - Range requests are supported on `content` endpoints (SwitchRomM already relies
@@ -907,3 +953,90 @@ RetroArch SD folder; default map + override scheme in [CONFIG.md](CONFIG.md).
   `DownloadTarget::expected_size` from `fs_size_bytes` (`download.truncate`).
 - Saves are matched to roms by `fs_name_no_ext` (exact) with `fs_name_no_tags`
   fallback, scoped by platform when known — see [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md).
+
+## 5.2.0 → 5.4.0
+
+Every difference #226 lists under R1, each with what proves it on the fixture
+(#227). "Capture" means a file under `server/contract/captures/5.4.0/`, written
+by `probe_contract.py --sync-scenarios` against a live 5.4.0 and re-checked by
+`contract.captures` on every `ctest` with `ROMM_VERSION=5.4.0`; the probe
+**asserts** each behaviour before it writes the file, so a capture cannot exist
+under a name its server stopped deserving. "Snapshot" means
+`romm-openapi-5.4.0.json` against `romm-openapi-5.2.0.json`. Where neither can
+prove a row, it says why and names the source line instead. The last column is
+the issue that acts on it.
+
+### Negotiate
+
+| Difference | Proof | Owner |
+|---|---|---|
+| New action **`delete`** and new count **`total_delete`**: the client holds a version of a slot that was emptied on the server, and must not upload it again. | Capture `sync-negotiate-delete.json`: a save uploaded, deleted through `POST /api/saves/delete`, then offered back with the same hash and an older mtime comes back `delete`, `"Save was deleted on the server"`, `save_id: null`. `total_delete` is in every negotiate capture; the snapshot's action enum gained `delete`. **Honoured** since #233: `sync.plan` reads this capture, and `tick.deleted` / `tick.deleted_keep` / `engine.server_deleted` drive it on the fixture ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#a-save-deleted-on-the-server)). | #233 |
+| Request fields `rom_ids` (5.3), `restore_unlisted`, `emulators`. | Snapshot `SyncNegotiatePayload`. `emulators` behaviour: capture `sync-negotiate-emulators-filter.json` — the save `sync-negotiate-pairs-across-emulators.json` paired is filtered out, and the same client entry becomes an `upload`. `rom_ids`: capture `sync-negotiate-rom-ids-scope.json` — a device with no history, scoped to another rom, is offered nothing for the rom every probe save is on (the probe asserts it). `restore_unlisted` is **not captured**: the probe never sends it (the `restore_unlisted` branch in `endpoints/sync/__init__.py`). | #241, #229 |
+| Saves pair on **`(rom_id, slot)` across emulators**, newest row per pair, unless `emulators` is sent. A `null` slot never pairs. | Capture `sync-negotiate-pairs-across-emulators.json`: a client entry with `emulator: probe-emulator-y` against a server save written as `probe-emulator-x` in the same slot is `no_op`, `"Content is identical"`, and the operation names the **server's** emulator. The `null`-slot rule is not captured (`get_saves(slot_not_null=True)`). | #229, #236 |
+| `download` and `conflict` carry the server's datetime-tagged `file_name`. | Capture `sync-negotiate-download.json` (`probe [YYYY-MM-DD_HH-MM-SS].srm`). **Not a difference**: 5.2.0's capture of the same call carries the same tag. | #237 |
+| **Baselines**: with `content_hash` on upload (query) and on `/downloaded` (body), the server records per-device `last_sync_hash`/`last_sync_server_hash` and stops reporting a conflict when only the mtime moved. | Capture `sync-negotiate-baseline-download.json`: device `a` uploads with its hash, `b` replaces that row's bytes (`PUT`), and `a` offers the same bytes under a 2099 mtime — `download`, `"Server save is newer than last sync"`, where without the baseline both sides changed and it would be `conflict`. Snapshot: `content_hash` joined `POST /api/saves`'s parameters and the `/downloaded` body. **Limit, found here:** a baseline belongs to a save *row*, and negotiate only reads syncs against each slot's newest row. Another device's upload is a new row, so the device that uploaded before it has no history at all against the head and falls back to timestamps: capture `sync-negotiate-other-device-version.json` is `upload`, `"Client save is newer (no sync history)"` — for bytes the server has already seen from this very device. | #234, #232 |
+| Negotiate **no longer cancels** earlier sessions for the device; unfinished ones are failed after 24 h; `complete` accepts an expired session and refuses a cancelled one with 400. | Capture `sync-complete-earlier-session.json`: negotiate twice, complete the first — `200`, `COMPLETED`. On 5.2.0 the same call is the 400 `complete.session` asserts. The 24-hour expiry is **not captured**: a fixture cannot age a session on demand (the comment above `complete_session`). | #235 |
+| Sync disabled for the device → negotiate **400**. | Capture `sync-negotiate-400-sync-disabled.json`, `"Sync is disabled for this device"`, after `PUT /api/devices/{id}` with `sync_enabled: false`. The snapshot still declares only 200 and 422. | #235 |
+
+### Saves
+
+| Difference | Proof | Owner |
+|---|---|---|
+| Every slotted upload is a **new version**. | Capture `saves-post-new-version.json`: a second upload to the slot by the device that wrote the first answers with a different `id`; `saves-list-slot.json` (`GET /api/saves?rom_id=&slot=`) lists both. | #236 |
+| Each slot is **pruned to `MAX_SAVES_PER_SLOT`** per lineage `(emulator, lower(extension))`, named slots included. | Asserted, not captured — ten rows are the shape of two: the probe uploads 13 versions and fails unless at most 10 remain (the fixture pins `MAX_SAVES_PER_SLOT: "10"`, `rig.slot_cap`). Lineage is from `prune_save_slot(..., lineage=SaveLineage.of(...))` in `endpoints/saves.py`. | #236 |
+| With `device_id` and `overwrite=false`, a slotted upload is **409** when the slot's latest save (any emulator) changed since this device last synced it — including a first upload to a slot another device filled. `overwrite=true` skips it. | Capture `saves-post-409-no-overwrite.json`, `"Slot has a newer save since your last sync"`. The scenario is a device with no history against a slot another filled, so it is the "including" case. The body is byte-identical to 5.2.0's. | #232 |
+| Identical bytes (same `content_hash`) create no version; the existing row is **promoted to head**. | Capture `saves-post-identical.json`: re-uploading the first version's bytes answers with the first version's `id`, and the slot still holds two rows. | #232, #236 |
+| `emulator` at most 50 characters and unchanged by filename sanitising, else 422 / 400. | Captures `saves-post-422-emulator-too-long.json` (51 characters, pydantic `string_too_long`) and `saves-post-400-emulator-not-a-folder-name.json` (`probe/emulator`, `"Invalid emulator name: probe/emulator"`). | #229 |
+| Uploading for a ROM the user cannot see is 404. | **Not captured**: the fixture has one user, who sees everything (`assert_rom_visible` in `add_save`). | — |
+| `content_hash` is MD5 of the bytes, **except a ZIP**, whose contents are hashed. | **Not captured**: no scenario uploads a zip (`hash_save_content`). The MD5 half is what every capture's `content_hash` already shows. The client reports the plain MD5 for a ZIP too (#234): the device's own digest is stored as `last_sync_hash` and only ever compared with that device's later reports (`compare_save_state`), so the mismatch loses a suppression and cannot invent one. | #234, #238 |
+| `AUTOSAVE_SLOT = "autosave"` is where a client with no slot of its own files progress. | **Not captured**: a constant, not a behaviour; the slot name is an ordinary string to the API. | #236 |
+| `GET /api/saves` and `GET /api/states` take a repeatable `rom_ids` (5.3). | Saves: capture `saves-list-rom-ids.json`, and the probe asserts every row is on one of the two roms it named. States: snapshot only. | #241 |
+| New `SaveSchema` fields `is_favorite`, `labels`. | Capture `saves-post.json` against 5.2.0's. | — |
+
+### States
+
+| Difference | Proof | Owner |
+|---|---|---|
+| Still no slot, no negotiate, no digest; a same-name upload replaces the row. | Captures `states-post.json`, `states-list.json`, and the probe's assertion that the second `POST` keeps the id — unchanged from 5.2.0. New fields `core`, `is_favorite`, `labels`. | #239 |
+| `emulator` validated as for saves. | Capture `states-post-400-emulator-not-a-folder-name.json` (`probe/emulator` → 400). | #229 |
+
+### Devices and auth
+
+| Difference | Proof | Owner |
+|---|---|---|
+| Device-code flow keeps its shape. | Captures `auth-device-*.json`: no field differs from 5.2.0's. | — |
+| `(user, client_device_identifier)` is unique, so re-pairing reuses the device. | Asserted, not captured — the shapes are `auth-device-token.json`'s: on 5.4+ the probe pairs a second time as the same `client_device_identifier` and fails unless the token names the same `device_id`. | #228 |
+| `capabilities` on `POST /api/devices` and on `DeviceSchema`. | Snapshot `DeviceCreatePayload`, `DeviceSchema` (required there); capture `devices-get.json`. | #228 |
+| Remote-install endpoints and a `/devices` Socket.IO namespace. | Snapshot: `/api/devices/{device_id}/installs` and its children, `/api/devices/online`. The namespace is not in OpenAPI. Checked live for #245: [Remote installs](#remote-installs-from-the-web-ui). | #245 |
+| Malformed or expired credentials → 401, not 500. | Capture `auth-401-malformed-token.json`: `Bearer not-a-token` → 401. On 5.2.0 the same header, a `Bearer a.b.c` or a garbled `Basic` is a bare `500 Internal Server Error`, checked live for #227; an unknown `rmm_…` client token was already 401 there. The expired half is **not captured**: fixture tokens do not expire. | #228 |
+
+### Play sessions, ROM list, version
+
+| Difference | Proof | Owner |
+|---|---|---|
+| `GET /api/play-sessions` no longer defaults `device_id` from the token. | **Not captured**: this client only POSTs (`core/src/play_sessions.cpp`). | — |
+| `sync_session_id` is gone from play-session responses. | Snapshot `PlaySessionSchema`. `play.carried` fails on it with 5.4.0. | #235 |
+| The `filters` object is gone from `GET /api/roms`. | **Not observed.** Neither 5.2.0's `roms-list.json` nor 5.4.0's has a `filters` key; both send `filter_values`, which gained `developers` and `publishers`. Rom items gained `has_file_on_disk`, `title_id`, `save_target`, `save_target_layout` and a dozen metadata ids (shape diff of the two captures). | — |
+| `RomFileSchema.last_modified` is nullable. | Snapshot. | — |
+| The web player tells `autosave` apart from named slots (5.3). | **Not captured**: a UI change, not an API one. | — |
+| Unauthenticated `GET /api/heartbeat` returns `SYSTEM.VERSION`. | Capture `heartbeat-system.json` (`SYSTEM` only — the rest is the server's configuration). 5.2.0 sends it too, verified live: `{"VERSION": "5.2.0", ...}`. There are still no capability flags — nothing in the 5.4.0 snapshot answers "which features" — so features follow from the version. Read by `server::ReadServer` (`core/src/server_capabilities.cpp`) at the top of a tick, walking the body to `SYSTEM` only. 5.4.0's heartbeat also carries `DEVICE_INSTALL` (`ENABLED`, `EXCLUDED_PLATFORM_SLUGS`), which #245 needs. | #228 |
+
+### Found on the way, not in R1
+
+- **Two versions in one second tie.** Negotiate takes a slot's head as the row
+  with the strictly newest `updated_at`, at whole seconds, so a version written
+  in the same second as the previous one does not become head — the older row
+  is compared and reported instead. The probe waits 1.1 s between versions for
+  this reason. It is #85's same-second rows, now between versions of one slot.
+- **The library scan refuses `playmatch_enabled`.** 5.4.0 validates the `scan`
+  socket payload with `extra="forbid"`; 5.2.0 defaults the option to *on*
+  unless named. `provision.py` sends it only to RomM older than 5.4.
+- **The web bundle is split.** `rig::DiscoverLargeAsset` took the
+  `index-*.js` RomM's page links as a file over 1 MB to test ranged reads on;
+  5.4.0's is 118 KB and no linked script is over 133 KB, so `http.range`,
+  `wire.range`, both `*_expected_size` and `scratch.concurrent` failed. Since
+  #235 it falls back to the files the index stylesheet links — the 1.3 MB icon
+  font on 5.4.0.
+- **First start on an empty volume is fast.** The 15–20 minutes of migrations
+  are an upgrade with data; an empty volume migrates in 7 s and answers
+  `/api/heartbeat` 21 s after `up` ([TESTING.md](TESTING.md#choosing-the-romm-version)).

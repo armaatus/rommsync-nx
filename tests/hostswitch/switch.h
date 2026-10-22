@@ -2,11 +2,13 @@
 // client half of the IPC wire compiles and runs on a host (M9-7, #198).
 //
 // **This is not a libnx emulator and must not grow into one.** Everything below
-// is here because `ipc_client.cpp` or `screen_frame.cpp` names it, with one
-// exception that is the seam's own and is marked as such: `Module_Kernel` /
+// is here because `ipc_client.cpp` or `screen_frame.cpp` names it, with two
+// exceptions that are the seam's own and are marked as such: `Module_Kernel` /
 // `KernelError_SessionClosed`, which is how a sysmodule exiting under a live
-// session is modelled. Anything else that wants adding is either a file that
-// does not belong on this seam or a sign the seam has moved -- say so in
+// session is modelled, and `hostswitch::OpenSessions`, which is how
+// `overlay.cycles` balances what an open/close cycle took (M9-6, #209).
+// Anything else that wants adding is either a file that does not belong on
+// this seam or a sign the seam has moved -- say so in
 // `overlay/AGENTS.md` rather than growing this header. `tesla.hpp` in particular
 // is deliberately absent: `tsl::gfx::Renderer` is `final` with non-virtual
 // inline methods and cannot be faked, which is why the screens are split at
@@ -58,12 +60,14 @@ using Result = std::uint32_t;
 /// Spelled as libnx spells them for the reason in the header note.
 enum { Module_Libnx = 345 };
 
-/// The kernel's, and the one failure of its this seam produces: a session whose
-/// far end is gone. It is what a call into a sysmodule that exited returns, and
-/// it is the case `ScreenFrame::Diagnose` exists for -- so the shim answers the
-/// real thing rather than inventing one in our own module, which the overlay
-/// would read as a refusal.
-enum { Module_Kernel = 1, KernelError_SessionClosed = 301 };
+/// The kernel's, and the two failures of its this seam names: a session whose
+/// far end is gone, and a wait that ran out. The first is what a call into a
+/// sysmodule that exited returns, and it is the case `ScreenFrame::Diagnose`
+/// exists for -- so the shim answers the real thing rather than inventing one in
+/// our own module, which the overlay would read as a refusal. The second the
+/// shim never produces: `IpcClient` answers it itself when a call outlives its
+/// budget (M9-6, #209), and it is here only because that file spells it.
+enum { Module_Kernel = 1, KernelError_TimedOut = 117, KernelError_SessionClosed = 301 };
 enum {
   LibnxError_NotInitialized = 8,
   LibnxError_NotFound = 9,
@@ -123,6 +127,12 @@ struct Dispatched {
 };
 const Dispatched& LastDispatched();
 
+/// How many sessions `smGetService` has handed out that `serviceClose` has not
+/// taken back. What `overlay.cycles` balances across repeated open/close
+/// cycles (#209): a session the overlay forgot to close is a handle leaked for
+/// the life of the console, because nx-ovlloader's process never exits.
+int OpenSessions();
+
 }  // namespace hostswitch
 
 /// A session, as far as this client uses one. `serviceIsActive` is the whole of
@@ -137,11 +147,7 @@ struct Service {
 };
 
 inline bool serviceIsActive(Service* s) { return s != nullptr && s->server != nullptr; }
-inline void serviceClose(Service* s) {
-  if (s != nullptr) {
-    s->server = nullptr;
-  }
-}
+void serviceClose(Service* s);
 
 Result smGetService(Service* out, const char* name);
 

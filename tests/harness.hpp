@@ -49,7 +49,10 @@
 #include "rig.hpp"
 #include "scratch.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/md5.hpp"
+#include "rommsync/pairing.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/token_store.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_execute.hpp"
 
@@ -394,6 +397,100 @@ inline http::Result PostJson(http::HttpClient& client, const std::string& url,
   return client.Send(request);
 }
 
+/// A second device of the fixture user's, with sync on -- a console with no
+/// history at all, so its first tick uploads what is on its card rather than
+/// negotiating against whatever the fixture device has done (#242).
+/// Empty, with a failed check, when RomM would not make one. The fixture token
+/// can do this because pairing granted `devices.write`. `DeleteDevice` removes it.
+inline std::string CreateDevice(rig::Checks& checks, http::HttpClient& client,
+                                const std::string& base, const Fixture& fixture,
+                                const std::string& name) {
+  const http::Result created =
+      PostJson(client, base + "/api/devices", fixture,
+               "{\"name\":" + json::Quote(name + "-" + std::to_string(getpid())) +
+                   ",\"allow_existing\":false}");
+  const std::string device_id = rig::JsonString(created.response.body, "device_id");
+  checks.Expect(created.successful() && !device_id.empty(),
+                "RomM registers a second device: HTTP " +
+                    std::to_string(created.response.status));
+  return device_id;
+}
+
+/// The same, with sync switched off for it in RomM -- the setting
+/// `400 "Sync is disabled for this device"` reports (#235).
+///
+/// Its own device rather than the fixture's switched off and back: every rig
+/// process negotiates as the fixture device, so turning *that* one off would
+/// fail whichever test was mid-tick on it.
+inline std::string CreateSyncDisabledDevice(rig::Checks& checks, http::HttpClient& client,
+                                            const std::string& base, const Fixture& fixture,
+                                            const std::string& name) {
+  const std::string device_id = CreateDevice(checks, client, base, fixture, name);
+  if (device_id.empty()) {
+    return {};
+  }
+  http::Request off = Authed(http::Method::kPut, base + "/api/devices/" + device_id, fixture);
+  off.headers.push_back({"Content-Type", "application/json"});
+  off.body = "{\"sync_enabled\":false}";
+  const http::Result switched = client.Send(off);
+  checks.Expect(switched.successful(), "and switches sync off for it: HTTP " +
+                                           std::to_string(switched.response.status));
+  return device_id;
+}
+
+inline void DeleteDevice(http::HttpClient& client, const std::string& base,
+                         const Fixture& fixture, const std::string& device_id) {
+  if (!device_id.empty()) {
+    client.Send(Authed(http::Method::kDelete, base + "/api/devices/" + device_id, fixture));
+  }
+}
+
+/// A device of its own, paired the way a console pairs it, and the token bound
+/// to it.
+///
+/// `CreateDevice` is not enough where RomM checks the binding: the install
+/// endpoints a device claims and reports on answer 404 to a token bound to some
+/// other device (#245), and the fixture's own device is every rig process's, so
+/// a request queued for it would be claimed by whichever scenario ticked first.
+/// `identifier` is fixed per scenario, so a re-run adopts its row rather than
+/// adding one. Empty, with a failed check, when the pairing did not complete.
+inline auth::StoredToken PairDevice(rig::Checks& checks, http::HttpClient& client,
+                                    const std::string& base, const std::string& identifier) {
+  using namespace std::chrono_literals;
+  auth::PairingConfig config;
+  config.server_url = base;
+  config.client_device_identifier = identifier;
+  config.device_name = "rommsync-nx " + identifier;
+  config.max_poll_backoff = 5s;
+  auth::PairingSession session(client, config);
+  // RomM allows ten device inits a minute per IP, and the suite is one IP.
+  const std::chrono::steady_clock::time_point give_up = std::chrono::steady_clock::now() + 90s;
+  auth::PairingState state = session.Begin();
+  while (state == auth::PairingState::kFailed &&
+         session.status().message.find("429") != std::string::npos &&
+         std::chrono::steady_clock::now() < give_up) {
+    std::this_thread::sleep_for(2s);
+    state = session.Begin();
+  }
+  if (state != auth::PairingState::kPending) {
+    checks.Expect(false, "pairing started: " + session.status().message);
+    return {};
+  }
+  const http::Result approved =
+      rig::ApproveDeviceCode(client, base, session.status().user_code, config.requested_scopes);
+  checks.Expect(approved.successful(),
+                "the code is approved: HTTP " + std::to_string(approved.response.status));
+  while (!auth::IsTerminal(state) && std::chrono::steady_clock::now() < give_up) {
+    state = session.Poll();
+    std::this_thread::sleep_for(100ms);
+  }
+  if (state != auth::PairingState::kApproved || session.token() == nullptr) {
+    checks.Expect(false, "the pairing was approved: " + session.status().message);
+    return {};
+  }
+  return auth::StoredTokenFrom(base, *session.token());
+}
+
 // --- reading a plan -----------------------------------------------------------
 
 /// The operation the server planned for `slot`, or nullptr.
@@ -667,6 +764,66 @@ inline void DeleteSave(http::HttpClient& client, const std::string& base, const 
   }
 }
 
+/// One archival (`null`-slot) row RomM holds for a rom: where a conflict's
+/// losing local copy goes (#240).
+struct ArchivalRow {
+  std::int64_t id = 0;
+  std::string file_name;
+  std::string emulator;
+  std::string content_hash;
+};
+
+/// Every archival row of `rom_id`. Other scenarios' rows are there too, so a
+/// caller picks its own out by digest.
+inline std::vector<ArchivalRow> ArchivalRows(http::HttpClient& client, const std::string& base,
+                                             const Fixture& fixture, std::int64_t rom_id) {
+  const http::Result listed = client.Send(
+      Authed(http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom_id), fixture));
+  const json::ParseResult parsed = json::Parse(listed.response.body);
+  std::vector<ArchivalRow> rows;
+  if (!listed.successful() || !parsed.ok() || !parsed.value.is_array()) {
+    return rows;
+  }
+  for (const json::Value& save : parsed.value.elements()) {
+    const json::Value* slot = save.Find("slot");
+    if (slot == nullptr || !slot->is_null()) {
+      continue;
+    }
+    ArchivalRow row;
+    row.id = Number(save, "id");
+    row.file_name = Field(save, "file_name");
+    row.emulator = Field(save, "emulator");
+    row.content_hash = Field(save, "content_hash");
+    rows.push_back(std::move(row));
+  }
+  return rows;
+}
+
+/// Delete every archival copy a conflict left for `rom_id` -- the rows
+/// `sync::ArchiveFileName` names. Every rig scenario that resolves a real
+/// conflict leaves one (#240), and a scenario's own cleanup deletes only the
+/// slot rows it planted, so a suite sweeps these once its scenario is done.
+inline void DeleteArchivalCopies(http::HttpClient& client, const std::string& base,
+                                 const Fixture& fixture, std::int64_t rom_id) {
+  for (const ArchivalRow& row : ArchivalRows(client, base, fixture, rom_id)) {
+    if (row.file_name.find(" [switch-conflict ") != std::string::npos) {
+      DeleteSave(client, base, fixture, row.id);
+    }
+  }
+}
+
+/// The archival row of `rom_id` holding `content_hash`, or one with id 0.
+inline ArchivalRow ArchivalWith(http::HttpClient& client, const std::string& base,
+                                const Fixture& fixture, std::int64_t rom_id,
+                                const std::string& content_hash) {
+  for (ArchivalRow& row : ArchivalRows(client, base, fixture, rom_id)) {
+    if (row.content_hash == content_hash) {
+      return row;
+    }
+  }
+  return {};
+}
+
 // --- save states --------------------------------------------------------------
 //
 // Deliberately thin, and deliberately not built on the save helpers above:
@@ -842,6 +999,12 @@ inline http::Result Negotiate(::checks::Checks& checks, http::HttpClient& client
 /// passing every time locally (issue #76). It was the only scenario that
 /// completed its session, so it was the only one that could notice.
 ///
+/// **That race is 5.2.0's.** 5.4.0 cancels nothing on negotiate -- a session
+/// belongs to the negotiation that opened it (#235) -- so a session left open
+/// stays open until RomM's 24-hour cleanup fails it, and races nothing. It is
+/// still closed here, so the fixture device's history does not fill with open
+/// sessions; the call sites that cite #76 describe the 5.2.0 reason.
+///
 /// Best effort by design: this is cleanup, and a scenario must not fail because
 /// tidying up did not work. Takes the negotiate response so a caller cannot
 /// close a session it did not open.
@@ -974,6 +1137,98 @@ inline sync::ClientSaveState LocalSave(std::int64_t rom_id, const std::string& f
 }
 
 // --- files --------------------------------------------------------------------
+
+/// Passes every request through, and holds each save upload and each download
+/// confirmation to #234's rule on the way: it carries a `content_hash`, and an
+/// upload's is the MD5 of the very bytes the request sends.
+///
+/// That last part is what makes a RomM 5.4 baseline safe to have. RomM treats a
+/// device's reported hash matching its baseline as *proof* that side did not
+/// change, so a digest of anything other than what went up would be a proof of
+/// something false. The file is read here as the request leaves, just before
+/// the transport streams it.
+///
+/// Decorates the real client rather than standing in for it, so a rig scenario
+/// can wrap its tick in one and still be talking to RomM.
+class BaselineAudit final : public http::HttpClient {
+ public:
+  explicit BaselineAudit(http::HttpClient& inner) : inner_(inner) {}
+
+  http::Result Send(const http::Request& request) override {
+    if (request.method == http::Method::kPost) {
+      if (request.url.find("/api/saves?") != std::string::npos) {
+        AuditUpload(request);
+      } else if (EndsWith(request.url, "/downloaded")) {
+        AuditConfirmation(request);
+      }
+    }
+    return inner_.Send(request);
+  }
+  http::Result Download(const http::Request& request, const http::DownloadTarget& into) override {
+    return inner_.Download(request, into);
+  }
+
+  /// The `content_hash` each upload and each confirmation carried, in order.
+  std::vector<std::string> uploaded;
+  std::vector<std::string> confirmed;
+
+  /// One line per request that broke the rule. Empty is the pass.
+  std::vector<std::string> violations;
+
+ private:
+  static bool EndsWith(const std::string& text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+  }
+
+  static bool IsMd5(const std::string& value) {
+    if (value.size() != 32) {
+      return false;
+    }
+    for (const char c : value) {
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void AuditUpload(const http::Request& request) {
+    const std::size_t at = request.url.find("&content_hash=");
+    if (at == std::string::npos) {
+      violations.push_back("an upload left without content_hash: " + request.url);
+      return;
+    }
+    const std::size_t from = at + std::string_view("&content_hash=").size();
+    const std::string sent = request.url.substr(from, request.url.find('&', from) - from);
+    uploaded.push_back(sent);
+    if (request.form.size() != 1 || request.form[0].file_path.empty()) {
+      violations.push_back("an upload whose bytes this audit cannot read: " + request.url);
+      return;
+    }
+    const std::string actual = rommsync::crypto::Md5Hex(rig::ReadFile(request.form[0].file_path));
+    if (sent != actual) {
+      violations.push_back("an upload claimed content_hash " + sent + " for bytes whose MD5 is " +
+                           actual);
+    }
+  }
+
+  void AuditConfirmation(const http::Request& request) {
+    const json::ParseResult body = json::Parse(request.body);
+    const json::Value* device = body.ok() ? body.value.Find("device_id") : nullptr;
+    const json::Value* hash = body.ok() ? body.value.Find("content_hash") : nullptr;
+    if (device == nullptr || !device->is_string() || device->string().empty()) {
+      violations.push_back("a download confirmation without device_id: " + request.body);
+    }
+    if (hash == nullptr || !hash->is_string() || !IsMd5(hash->string())) {
+      violations.push_back("a download confirmation without a content_hash: " + request.body);
+      return;
+    }
+    confirmed.push_back(hash->string());
+  }
+
+  http::HttpClient& inner_;
+};
 
 /// Byte-for-byte equality of two files, streamed rather than loaded.
 ///

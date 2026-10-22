@@ -1,0 +1,17 @@
+{
+  "access_token": "<access_token>",
+  "device_id": "c4ef65e7-a0bc-4edd-b264-ce9afdfc739c",
+  "scopes": [
+    "assets.read",
+    "assets.write",
+    "collections.read",
+    "devices.read",
+    "devices.write",
+    "me.read",
+    "platforms.read",
+    "roms.read",
+    "roms.user.read",
+    "roms.user.write"
+  ],
+  "expires_at": null
+}

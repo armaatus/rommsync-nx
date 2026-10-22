@@ -83,6 +83,8 @@ ipc::Status LoadedStatus() {
   status.failed = 2;
   status.queue_depth = 4;
   status.config_error_count = 2;
+  status.server_version = "5.3.1";
+  status.server_supported = false;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -186,9 +188,16 @@ int Version() {
   checks.ExpectEq(ipc::EncodeInterfaceVersion(4294967295u),
                   std::string("{\"interface\":4294967295}"), "and holds a whole u32");
   // 2 since M4-1 (#23): `Status` gained two fields the decoder requires, and a
-  // required field is an incompatible change by this header's own rule. What is
-  // frozen is command 0's *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{2},
+  // required field is an incompatible change by this header's own rule. 3 since
+  // M9-6 (#209): `RestoreBackup` answers a `RestoreState` rather than the
+  // finished report. 4 since M10-9 (#235): `SyncResult` gained a value a v3
+  // decoder refuses. 5 since M10-2 (#228): `Status` gained the server's version
+  // and whether this build syncs with it. 6 since M10-16 (#242): `SyncOutcome`
+  // gained `kDeferred`, which a v5 decoder refuses. 7 since M10-7 (#233): a
+  // conflict entry's `event` gained `deleted`, which a v6 decoder refuses. What
+  // is frozen is command 0's *encoding*, asserted above
+  // -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{7},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -316,6 +325,9 @@ int RoundTrip() {
     checks.ExpectEq(back.value.queue_depth, sent.queue_depth, "the queue depth survives");
     checks.ExpectEq(back.value.config_error_count, sent.config_error_count,
                     "config_error_count survives");
+    checks.ExpectEq(back.value.server_version, sent.server_version, "server_version survives");
+    checks.ExpectEq(back.value.server_supported, sent.server_supported,
+                    "server_supported survives");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");
@@ -342,8 +354,9 @@ int RoundTrip() {
     checks.Expect(back.ok() && back.value.auth == state,
                   std::string("auth state survives: ") + ipc::ToString(state));
   }
-  for (const ipc::SyncResult result : {ipc::SyncResult::kNever, ipc::SyncResult::kOk,
-                                       ipc::SyncResult::kPartial, ipc::SyncResult::kFailed}) {
+  for (const ipc::SyncResult result :
+       {ipc::SyncResult::kNever, ipc::SyncResult::kOk, ipc::SyncResult::kPartial,
+        ipc::SyncResult::kFailed, ipc::SyncResult::kServerDisabled}) {
     ipc::Status status;
     status.last_sync_result = result;
     const ipc::Decoded<ipc::Status> back = ipc::DecodeStatus(ipc::EncodeStatus(status));
@@ -362,7 +375,7 @@ int RoundTrip() {
   for (const ipc::SyncOutcome outcome :
        {ipc::SyncOutcome::kAccepted, ipc::SyncOutcome::kAlreadyRunning,
         ipc::SyncOutcome::kNotConfigured, ipc::SyncOutcome::kUnauthenticated,
-        ipc::SyncOutcome::kDisabled}) {
+        ipc::SyncOutcome::kDisabled, ipc::SyncOutcome::kDeferred}) {
     const ipc::Decoded<ipc::SyncOutcome> back =
         ipc::DecodeSyncOutcome(ipc::EncodeSyncOutcome(outcome));
     checks.Expect(back.ok() && back.value == outcome,
@@ -576,6 +589,59 @@ int RoundTrip() {
     checks.Expect(ipc::Fits(ipc::EncodeLogTail(hostile)), "what it stopped at fits");
   }
 
+  // Where a restore stands (M9-6, #209): every phase, and the report whole --
+  // the outcome a screen draws when it is done, and the backup it names.
+  {
+    ipc::RestoreState sent;
+    sent.phase = ipc::RestorePhase::kDone;
+    sent.entry_id = 77;
+    sent.report.outcome = conflicts::RestoreOutcome::kWriteFailed;
+    sent.report.message = "the copy did not land";
+    sent.report.backup_sd_path = "/config/rommsync/.backup/4-retroarch-srm-1.srm";
+    const ipc::Decoded<ipc::RestoreState> back =
+        ipc::DecodeRestoreState(ipc::EncodeRestoreState(sent));
+    checks.Expect(back.ok(), "a restore state round trips: " + back.error.Describe());
+    checks.Expect(back.value.phase == ipc::RestorePhase::kDone, "the phase survives");
+    checks.ExpectEq(back.value.entry_id, std::int64_t{77}, "which restore it is survives");
+    checks.Expect(back.value.report.outcome == conflicts::RestoreOutcome::kWriteFailed,
+                  "the outcome survives");
+    checks.ExpectEq(back.value.report.message, sent.report.message, "...and its sentence");
+    checks.ExpectEq(back.value.report.backup_sd_path, sent.report.backup_sd_path,
+                    "...and the backup it names");
+    for (const ipc::RestorePhase phase :
+         {ipc::RestorePhase::kIdle, ipc::RestorePhase::kRunning, ipc::RestorePhase::kDone}) {
+      ipc::RestoreState state;
+      state.phase = phase;
+      checks.Expect(ipc::DecodeRestoreState(ipc::EncodeRestoreState(state)).value.phase == phase,
+                    std::string("the phase reads back as itself: ") + ipc::ToString(phase));
+    }
+    checks.Expect(!ipc::DecodeRestoreState("{\"phase\":\"queued\",\"entry_id\":1,"
+                                           "\"report\":{\"outcome\":\"restored\","
+                                           "\"message\":\"\",\"backup_sd_path\":\"\"}}")
+                       .ok(),
+                  "a phase this build has no name for is refused, not guessed at");
+
+    // The service bounds the sentence and keeps a running restore's report empty:
+    // a report riding along with `kRunning` would be read by somebody as its
+    // outcome.
+    FakeEngine slow;
+    slow.restore_runs_inline = false;
+    slow.restore_report.message = std::string(4 * ipc::kMaxRestoreMessageBytes, 'm');
+    ipc::ServiceCore core(slow);
+    const ipc::RestoreState taken = core.RestoreBackup(9);
+    checks.Expect(taken.phase == ipc::RestorePhase::kRunning && taken.entry_id == 9,
+                  "a restore the engine has not finished is answered as running");
+    checks.Expect(taken.report.message.empty(), "with no report beside it");
+    slow.FinishRestore();
+    const ipc::RestoreState done = core.GetRestoreState();
+    checks.Expect(done.phase == ipc::RestorePhase::kDone, "and the poll sees it finish");
+    // `text::ShortenInPlace` cuts at the bound and then marks the cut, so the
+    // sentence ends a few bytes past it rather than exactly on it.
+    checks.Expect(done.report.message.size() < ipc::kMaxRestoreMessageBytes + 8,
+                  "with the sentence bounded for the wire");
+    checks.Expect(ipc::Fits(ipc::EncodeRestoreState(done)), "so the answer fits a payload");
+  }
+
   // Every string field is user data and may hold anything a filesystem allows.
   // `json::Quote` is what carries it rather than interpreting it, and this is
   // the check that nothing here builds a payload by concatenation instead.
@@ -636,6 +702,12 @@ std::vector<Decoder> AllDecoders() {
                       [](std::string_view text) { return ipc::DecodeListPage(text).ok(); }});
   decoders.push_back({"empty", ipc::EncodeEmpty(),
                       [](std::string_view text) { return ipc::DecodeEmpty(text).ok(); }});
+  ipc::RestoreState restore;
+  restore.phase = ipc::RestorePhase::kDone;
+  restore.entry_id = 3;
+  restore.report.outcome = conflicts::RestoreOutcome::kRestored;
+  decoders.push_back({"restore state", ipc::EncodeRestoreState(restore),
+                      [](std::string_view text) { return ipc::DecodeRestoreState(text).ok(); }});
   return decoders;
 }
 
@@ -856,6 +928,7 @@ int Secrets() {
       {ipc::Command::kListConflicts, ipc::EncodeConflictQuery({0, ipc::kMaxConflictPage})},
       {ipc::Command::kRestoreBackup, ipc::EncodeEntryId(3)},
       {ipc::Command::kGetLog, ipc::EncodeLogRequest(ipc::kMaxLogLines)},
+      {ipc::Command::kGetRestoreState, ipc::EncodeEmpty()},
   };
 
   // The log is the newest way a credential could reach this wire: a call site
@@ -944,6 +1017,22 @@ int Secrets() {
     }
     checks.Expect(named, "the user is told why the field is blank");
   }
+
+  // #230: what the last tick found about RetroArch reaches the settings screen
+  // with config.ini's own complaints, and after them.
+  {
+    FakeEngine engine;
+    engine.notes.push_back({config::Severity::kWarning, 3, "sync", "states", "a config.ini line"});
+    engine.sources.push_back({config::Severity::kNotice, 0, "", "",
+                              "RetroArch syncs itself: Cloud Sync is on in retroarch.cfg"});
+    ipc::ServiceCore core(engine);
+    const ipc::ConfigView view = core.GetConfig();
+    checks.ExpectEq(view.diagnostics.size(), std::size_t{2},
+                    "GetConfig serves config.ini's diagnostics and the source notes");
+    checks.Expect(view.diagnostics.size() == 2 && view.diagnostics[0].key == "states" &&
+                      view.diagnostics[1].message.find("RetroArch syncs itself") == 0,
+                  "config.ini's first, then RetroArch's");
+  }
   return checks.failures();
 }
 
@@ -965,7 +1054,7 @@ config::Config PathologicalConfig() {
 }
 
 /// Nothing on this wire may grow with the size of the user's library or the size
-/// of their `config.ini`. The heap is `0x150000` with a download buffer and the
+/// of their `config.ini`. The heap is `0x180000` with a download buffer and the
 /// `state.db` baseline already claimed out of it, so a payload that scales with
 /// a file is a payload that is one bad edit away from not being sendable.
 ///
@@ -1334,6 +1423,17 @@ int DispatchTable() {
     checks.Expect(core.SyncNow() == ipc::SyncOutcome::kAlreadyRunning,
                   "unless one is already running");
     checks.ExpectEq(engine.sync_requests, 2, "and the engine is only asked when it could act");
+
+    // #242: a game in the foreground. The press is still taken -- it runs when
+    // the game closes -- and the answer says so rather than "Sync started".
+    engine.sync_accepted = true;
+    engine.application_running_now = true;
+    checks.Expect(core.SyncNow() == ipc::SyncOutcome::kDeferred,
+                  "a press under a running game is taken and held, and says so");
+    checks.ExpectEq(engine.sync_requests, 3, "the engine was asked, so the press is queued");
+    engine.sync_accepted = false;
+    checks.Expect(core.SyncNow() == ipc::SyncOutcome::kAlreadyRunning,
+                  "a tick already running is still that, game or not");
   }
 
   // SetEnabled answers with the state that *took*, inside a successful reply.
@@ -1706,9 +1806,8 @@ class HarnessEngine : public ipc::Engine {
   ipc::Error ListConflicts(const ipc::ConflictQuery&, ipc::ConflictPage*) override {
     return ipc::Error::kOk;
   }
-  ipc::Error RestoreBackup(std::int64_t, conflicts::RestoreReport*) override {
-    return ipc::Error::kOk;
-  }
+  ipc::RestoreState RequestRestore(std::int64_t) override { return {}; }
+  ipc::RestoreState restore_state() const override { return {}; }
 
   auth::StoredToken token() const {
     std::lock_guard<std::mutex> held(mutex_);

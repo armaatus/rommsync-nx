@@ -37,11 +37,14 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <tuple>
 #include <vector>
 
+#include "crash_disk.hpp"
 #include "engine.hpp"
 #include "harness.hpp"
 #include "rig.hpp"
@@ -126,6 +129,23 @@ conflicts::Entry SaveEntry(std::int64_t rom_id, std::string file_name) {
   entry.server_updated_at = "2026-09-04T11:36:27+00:00";
   entry.backup_sd_path = std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
   return entry;
+}
+
+/// A finished restore of `entry_id`, as `GetRestoreState` answers it.
+ipc::RestoreState Done(std::int64_t entry_id, const conflicts::RestoreReport& report) {
+  ipc::RestoreState state;
+  state.phase = ipc::RestorePhase::kDone;
+  state.entry_id = entry_id;
+  state.report = report;
+  return state;
+}
+
+/// A restore of `entry_id` the sysmodule has taken and not finished.
+ipc::RestoreState Running(std::int64_t entry_id) {
+  ipc::RestoreState state;
+  state.phase = ipc::RestorePhase::kRunning;
+  state.entry_id = entry_id;
+  return state;
 }
 
 // --- store --------------------------------------------------------------------
@@ -227,6 +247,45 @@ void Store(checks::Checks& c) {
     c.Expect(partial.diagnostics[0].find("still on the card") != std::string::npos,
              "...saying the backup it pointed at was not deleted with it: " +
                  partial.diagnostics[0]);
+  }
+
+  // #240: where else the losing bytes are -- on the server as an archival row,
+  // or on this card alone -- round-trips. And a row written before #240, which
+  // has neither field, still reads: it is an index to a real backup, and the
+  // file's version is not bumped for a field an older build can ignore.
+  {
+    conflicts::Entry on_server = SaveEntry(4, "kept.srm");
+    on_server.id = 3;
+    on_server.local_copy = conflicts::LocalCopy::kOnServer;
+    on_server.archive_save_id = 77;
+    conflicts::Entry card_only = SaveEntry(5, "card.srm");
+    card_only.id = 2;
+    card_only.local_copy = conflicts::LocalCopy::kCardOnly;
+    conflicts::Entry before = SaveEntry(6, "before.srm");
+    before.id = 1;
+    // Nothing recorded is written as nothing at all: the row rc1 wrote.
+    const std::string old_row = conflicts::SerializeEntry(before);
+    c.Expect(old_row.find("local_copy") == std::string::npos &&
+                 old_row.find("archive_save_id") == std::string::npos,
+             "an entry with nothing recorded spells neither key: " + old_row);
+    const conflicts::LoadedHistory read = conflicts::ParseHistory(
+        std::string(conflicts::kFormatMagic) + " " + std::to_string(conflicts::kFormatVersion) +
+        " 9\n" + conflicts::SerializeEntry(on_server) + "\n" +
+        conflicts::SerializeEntry(card_only) + "\n" + old_row + "\n");
+    c.ExpectEq(read.entries.size(), std::size_t{3}, "all three rows read back");
+    if (read.entries.size() == 3) {
+      c.Expect(read.entries[0].local_copy == conflicts::LocalCopy::kOnServer &&
+                   read.entries[0].archive_save_id == 77,
+               std::string("a copy on the server round-trips with its row: ") +
+                   conflicts::ToString(read.entries[0].local_copy));
+      c.Expect(read.entries[1].local_copy == conflicts::LocalCopy::kCardOnly &&
+                   read.entries[1].archive_save_id == 0,
+               std::string("a copy on the card alone round-trips: ") +
+                   conflicts::ToString(read.entries[1].local_copy));
+      c.Expect(read.entries[2].local_copy == conflicts::LocalCopy::kUnrecorded,
+               std::string("a pre-#240 row reads as not recorded: ") +
+                   conflicts::ToString(read.entries[2].local_copy));
+    }
   }
 
   // A header that is not this file's is fatal, because those bytes are not this
@@ -379,6 +438,12 @@ void Record(checks::Checks& c) {
       Reported(6, "retroarch-srm", "six.srm", "device six\n"),
   };
 
+  // #240: the first conflict's local copy went up as an archival row, the
+  // second's did not.
+  report.operations[0].archive = sync::ArchiveOutcome::kKept;
+  report.operations[0].archive_save_id = 77;
+  report.operations[1].archive = sync::ArchiveOutcome::kFailed;
+
   conflicts::RecordOptions options = At(kWhen);
   options.rom_name = [](std::int64_t rom_id) { return "Rom " + std::to_string(rom_id); };
   const std::size_t recorded = conflicts::RecordSaves(&history, plan, report, reported, options);
@@ -403,6 +468,16 @@ void Record(checks::Checks& c) {
   c.ExpectEq(both_changed.backup_sd_path, std::string(harness::kBackupDir) + "/4-a.srm",
              "the backup path is the one M2-5 wrote, stored exactly");
   c.ExpectEq(both_changed.when, kWhen, "stamped from the clock it was given");
+  c.Expect(both_changed.local_copy == conflicts::LocalCopy::kOnServer &&
+               both_changed.archive_save_id == 77,
+           std::string("a conflict records that its local copy is on the server, and as which "
+                       "row: ") +
+               conflicts::ToString(both_changed.local_copy));
+  c.Expect(same_timestamp.local_copy == conflicts::LocalCopy::kCardOnly,
+           std::string("...or that the server holds none: ") +
+               conflicts::ToString(same_timestamp.local_copy));
+  c.Expect(history.entries()[0].local_copy == conflicts::LocalCopy::kUnrecorded,
+           "a replacement was never a question of keeping both");
   c.Expect(history.entries()[0].event == conflicts::Event::kReplaced,
            "a download that landed on an existing file is a replacement, not a conflict");
 
@@ -459,6 +534,77 @@ void Record(checks::Checks& c) {
                "the emulator comes off the scan and the server row -- it is NOT on "
                "StateOperationResult, which is what #36 assumed");
     c.Expect(replaced.restorable(), "a state that was replaced can be put back");
+  }
+
+  // M10-7 (#233): a save removed because RomM deleted it is listed, so the
+  // player can find its backup and put it back. A kept delete changed nothing
+  // on the card, and one with nothing to remove has no backup: neither is an
+  // entry.
+  {
+    Sandbox deleted(c, "conflicts-record-deleted");
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(deleted.root().string());
+    conflicts::History removals(deleted.Host(std::string(conflicts::kHistorySdPath)));
+    removals.Load();
+
+    sync::SyncPlan delete_plan;
+    sync::ExecutionReport delete_report;
+    const std::string removed_backup =
+        std::string(harness::kBackupDir) + "/10-retroarch-srm-1757000000.srm";
+    for (const auto& [rom_id, outcome, backup] :
+         std::vector<std::tuple<std::int64_t, sync::OperationOutcome, std::string>>{
+             {10, sync::OperationOutcome::kRemoved, removed_backup},
+             {11, sync::OperationOutcome::kKept, std::string()},
+             {12, sync::OperationOutcome::kRemoved, std::string()}}) {
+      sync::SyncOperation operation;
+      operation.action = sync::Action::kDelete;
+      operation.rom_id = rom_id;
+      operation.slot = "retroarch-srm";
+      operation.file_name = "ten.srm";
+      operation.reason = sync::Reason::kDeletedOnServer;
+      operation.reason_text = sync::ReasonText(sync::Reason::kDeletedOnServer);
+      delete_plan.operations.push_back(operation);
+      sync::OperationResult result;
+      result.action = sync::Action::kDelete;
+      result.rom_id = rom_id;
+      result.slot = "retroarch-srm";
+      result.outcome = outcome;
+      result.sd_path = SavePath("ten.srm");
+      result.backup_sd_path = backup;
+      delete_report.operations.push_back(result);
+    }
+    const std::vector<sync::ClientSaveState> deleted_reported = {
+        Reported(10, "retroarch-srm", "ten.srm", "the save RomM deleted\n")};
+    c.ExpectEq(conflicts::RecordSaves(&removals, delete_plan, delete_report, deleted_reported,
+                                      options),
+               std::size_t{1}, "a removal with a backup is an entry, and nothing else is");
+    if (removals.size() == 1) {
+      const conflicts::Entry& removal = removals.entries()[0];
+      c.Expect(removal.event == conflicts::Event::kDeleted,
+               std::string("listed as a deletion: ") + conflicts::ToString(removal.event));
+      c.ExpectEq(removal.reason, std::string("Save was deleted on the server"),
+                 "with the server's sentence");
+      c.ExpectEq(removal.backup_sd_path, removed_backup, "and the backup it can be restored from");
+      c.ExpectEq(removal.local_content_hash, crypto::Md5Hex("the save RomM deleted\n"),
+                 "and the digest of the bytes that were removed");
+      c.Expect(removal.restorable(), "a removed save can be put back");
+      conflicts::History reread(deleted.Host(std::string(conflicts::kHistorySdPath)));
+      reread.Load();
+      c.Expect(reread.size() == 1 && reread.entries()[0].event == conflicts::Event::kDeleted,
+               "and conflicts.db reads the deletion back as one");
+
+      // ...and is. Nothing is at the path any more, so the restore replaces
+      // nothing and writes the bytes back.
+      c.Expect(deleted.Write(removed_backup, "the save RomM deleted\n"), "the backup is on the card");
+      conflicts::RestoreOptions restore;
+      restore.backup_dir = harness::kBackupDir;
+      restore.now = []() { return Moment(kWhen + 600); };
+      const conflicts::RestoreReport back =
+          conflicts::Restore(*card, removals, removal.id, restore);
+      c.Expect(back.ok(), "the removed save is restored: " + back.message);
+      c.ExpectEq(deleted.Read(SavePath("ten.srm")), std::string("the save RomM deleted\n"),
+                 "byte for byte");
+    }
   }
 
   // **`conflict_show` is not in the recording path at all.** Grepped rather than
@@ -719,6 +865,55 @@ void Interrupted(checks::Checks& c) {
 #endif
 }
 
+// --- crash --------------------------------------------------------------------
+//
+// M9-14 (#203): `restore`, with a power cut at every call it makes. A restore is
+// the overwrite a *person* starts, through `CopyAtomically` rather than a
+// download, and is held to the same replay: old or new, and never new without
+// the old bytes under `.backup/`. Then again with the card refusing to confirm
+// `.backup/` itself, which must stop the restore before it writes.
+
+void Crash(checks::Checks& c) {
+  const std::string previous = "the bytes this console had, and wants back\n";
+  const std::string server = "the server's copy, which a power cut must not cost\n";
+  const std::string backup = std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+  const crash::Overwrite expected{SavePath("game.srm"), server, previous, harness::kBackupDir};
+
+  conflicts::RestoreOptions options;
+  options.backup_dir = harness::kBackupDir;
+  options.now = []() { return Moment(kWhen + 500); };
+
+  for (const bool confirmed : {true, false}) {
+    Sandbox sandbox(c, confirmed ? "conflicts-crash" : "conflicts-crash-unconfirmed");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    sandbox.Write(backup, previous);
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+    conflicts::Entry entry = SaveEntry(4, "game.srm");
+    entry.backup_sd_path = backup;
+    const std::int64_t id = history.Append(entry).id;
+
+    std::set<std::string> refused;
+    if (!confirmed) refused.insert(harness::kBackupDir);
+    crash::Recorder recorder(sandbox.root(), refused);
+    const conflicts::RestoreReport done = conflicts::Restore(*files, history, id, options);
+    if (confirmed) {
+      c.Expect(done.ok(), std::string("the restore ran: ") + conflicts::ToString(done.outcome) +
+                              " -- " + done.message);
+    } else {
+      c.Expect(recorder.refused() > 0, "the card refused to confirm the backup directory");
+      c.Expect(done.outcome == conflicts::RestoreOutcome::kBackupFailed,
+               std::string("a restore whose backup the card would not confirm does not run: ") +
+                   conflicts::ToString(done.outcome) + " -- " + done.message);
+      c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and the save is untouched");
+    }
+    crash::ExpectSurvives(c, recorder, expected, rig::ScratchDir() + "/crash-restore",
+                          confirmed ? "a restore" : "a restore whose backup was not confirmed");
+  }
+}
+
 // --- service ------------------------------------------------------------------
 //
 // Both commands through `ipc::Dispatch` over a real `SdEngine`, which is the
@@ -789,20 +984,30 @@ void Service(checks::Checks& c) {
            "an offset past the end is still answered");
   c.Expect(ipc::DecodeConflictPage(response).value.entries.empty(), "...with an empty page");
 
-  // The restore, through the wire.
+  // The restore, through the wire. This engine has no worker, so it runs on the
+  // caller and the answer is already `kDone` -- the shape a console whose
+  // worker never started gets, and the one a worker's poll ends in (#209).
   const std::int64_t entry_id = page.value.entries[1].entry.id;
   c.Expect(Call(core, ipc::Command::kRestoreBackup, ipc::EncodeEntryId(entry_id), &response) ==
                ipc::Error::kOk,
            "RestoreBackup never fails at the transport -- the outcome is in the answer");
-  const ipc::Decoded<conflicts::RestoreReport> report = ipc::DecodeRestoreReport(response);
-  c.Expect(report.ok(), "the report decodes: " + report.error.Describe());
-  c.Expect(report.value.outcome == conflicts::RestoreOutcome::kRestored,
-           std::string("and says it restored: ") + conflicts::ToString(report.value.outcome) +
-               " -- " + report.value.message);
+  const ipc::Decoded<ipc::RestoreState> state = ipc::DecodeRestoreState(response);
+  c.Expect(state.ok(), "the state decodes: " + state.error.Describe());
+  c.Expect(state.value.phase == ipc::RestorePhase::kDone && state.value.entry_id == entry_id,
+           std::string("with no worker, the restore is done when it answers: ") +
+               ipc::ToString(state.value.phase));
+  const conflicts::RestoreReport& report = state.value.report;
+  c.Expect(report.outcome == conflicts::RestoreOutcome::kRestored,
+           std::string("and says it restored: ") + conflicts::ToString(report.outcome) + " -- " +
+               report.message);
   c.ExpectEq(sandbox.Read(SavePath("game.srm")), previous, "the bytes are back on the card");
-  c.Expect(!report.value.backup_sd_path.empty() &&
-               sandbox.Read(report.value.backup_sd_path) == server,
-           "and the server's copy was backed up first: " + report.value.message);
+  c.Expect(!report.backup_sd_path.empty() && sandbox.Read(report.backup_sd_path) == server,
+           "and the server's copy was backed up first: " + report.message);
+  c.Expect(Call(core, ipc::Command::kGetRestoreState, ipc::EncodeEmpty(), &response) ==
+                   ipc::Error::kOk &&
+               ipc::DecodeRestoreState(response).value.report.outcome ==
+                   conflicts::RestoreOutcome::kRestored,
+           "and the poll answers the same outcome afterwards");
 
   // An entry whose backup is gone refuses, and the refusal is an outcome rather
   // than a failing call -- so a screen has a sentence for it.
@@ -810,7 +1015,7 @@ void Service(checks::Checks& c) {
   c.Expect(Call(core, ipc::Command::kRestoreBackup, ipc::EncodeEntryId(orphan_id), &response) ==
                ipc::Error::kOk,
            "a refused restore is still a successful call");
-  c.Expect(ipc::DecodeRestoreReport(response).value.outcome ==
+  c.Expect(ipc::DecodeRestoreState(response).value.report.outcome ==
                conflicts::RestoreOutcome::kBackupMissing,
            "with the reason in the answer");
 
@@ -882,6 +1087,24 @@ ipc::ConflictRow Row(conflicts::Entry entry, bool backup_present) {
   row.entry.id = row.entry.id == 0 ? 1 : row.entry.id;
   row.backup_present = backup_present;
   return row;
+}
+
+/// A model with one restorable entry loaded, opened, confirmed and pressed --
+/// so its next `Next()` is the restore.
+overlay::ConflictsModel OneRestorable(std::int64_t entry_id) {
+  overlay::ConflictsModel model;
+  model.Next();
+  ipc::ConflictPage page;
+  page.offset = 0;
+  page.total = 1;
+  conflicts::Entry entry = SaveEntry(4, "polled.srm");
+  entry.id = entry_id;
+  page.entries = {Row(entry, true)};
+  model.OnPage(page);
+  model.Activate();  // open
+  model.Activate();  // confirm
+  model.Activate();  // press
+  return model;
 }
 
 void Overlay(checks::Checks& c) {
@@ -970,6 +1193,54 @@ void Overlay(checks::Checks& c) {
                "and never says the save was left alone: " + drawn.rows[0].note);
     }
 
+    // #240: a conflict whose losing copy could not be put on the server says so
+    // -- on the row, before a press, and in the detail -- and one that is there
+    // names the row it is in.
+    {
+      overlay::ConflictsModel archive;
+      archive.Next();
+      ipc::ConflictPage two;
+      two.offset = 0;
+      two.total = 2;
+      conflicts::Entry card_only = SaveEntry(4, "card.srm");
+      card_only.id = 22;
+      card_only.local_copy = conflicts::LocalCopy::kCardOnly;
+      conflicts::Entry on_server = SaveEntry(5, "server.srm");
+      on_server.id = 21;
+      on_server.local_copy = conflicts::LocalCopy::kOnServer;
+      on_server.archive_save_id = 77;
+      two.entries = {Row(card_only, true), Row(on_server, true)};
+      archive.OnPage(two);
+      overlay::ConflictsView drawn = archive.Render();
+      c.Expect(drawn.rows[0].note.find("server holds no copy") != std::string::npos,
+               "the row of a card-only copy says the server holds none: " + drawn.rows[0].note);
+      c.Expect(drawn.rows[0].tone == overlay::Tone::kWarn, "as a warning");
+      c.Expect(drawn.rows[1].note.find("server holds no copy") == std::string::npos,
+               "and a copy that is on the server is not said to be missing: " +
+                   drawn.rows[1].note);
+
+      const auto detail_value = [](const overlay::ConflictsView& view, const std::string& label) {
+        for (const overlay::ConflictDetailLine& line : view.detail) {
+          if (line.label == label) {
+            return line.value;
+          }
+        }
+        return std::string();
+      };
+      archive.Activate();
+      drawn = archive.Render();
+      const std::string card_line = detail_value(drawn, "On the server");
+      c.Expect(card_line.find("no copy") != std::string::npos,
+               "the detail says the server holds no copy: " + card_line);
+      archive.Back();
+      archive.MoveSelection(1);
+      archive.Activate();
+      drawn = archive.Render();
+      const std::string server_line = detail_value(drawn, "On the server");
+      c.Expect(server_line.find("77") != std::string::npos,
+               "the detail names the archival row: " + server_line);
+    }
+
     // A press on an entry whose backup is gone opens it and stops there.
     model.MoveSelection(1);
     model.Activate();
@@ -1024,7 +1295,7 @@ void Overlay(checks::Checks& c) {
     conflicts::RestoreReport report;
     report.outcome = conflicts::RestoreOutcome::kRestored;
     report.backup_sd_path = "/config/rommsync/.backup/4-retroarch-srm-1757000500.srm";
-    model.OnRestored(report);
+    model.OnRestoreState(Done(3, report));
     view = model.Render();
     c.Expect(view.mode == overlay::ConflictsMode::kDetail,
              "the screen comes back to the entry rather than staying on the confirmation");
@@ -1032,7 +1303,7 @@ void Overlay(checks::Checks& c) {
              "and says what happened: " + view.headline);
     c.Expect(!view.can_restore, "with the restore no longer on offer");
     // Nothing is re-read: a restore rewrites no entry and deletes no backup, so
-    // every loaded row is as true as it was (`OnRestored`).
+    // every loaded row is as true as it was (`OnRestoreState`).
     c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
              "and nothing needs re-reading, because a restore changed no entry");
   }
@@ -1158,7 +1429,7 @@ void Overlay(checks::Checks& c) {
     conflicts::RestoreReport report;
     report.outcome = conflicts::RestoreOutcome::kRestored;
     report.backup_sd_path = "/config/rommsync/.backup/4-retroarch-srm-1757000500.srm";
-    model.OnRestored(report);
+    model.OnRestoreState(Done(301, report));
     const overlay::ConflictsView after = model.Render();
     c.Expect(after.mode == overlay::ConflictsMode::kDetail, "the detail stays open");
     c.Expect(after.headline.find("Restored") != std::string::npos,
@@ -1186,11 +1457,131 @@ void Overlay(checks::Checks& c) {
     model.Next();
     conflicts::RestoreReport gone;
     gone.outcome = conflicts::RestoreOutcome::kBackupMissing;
-    model.OnRestored(gone);
+    model.OnRestoreState(Done(44, gone));
     c.Expect(model.Back(), "back to the list");
     const overlay::ConflictsView view = model.Render();
     c.Expect(view.rows[0].restorable == overlay::Restorability::kBackupGone,
              "a restore that could not find the backup marks the row it was for");
+  }
+
+  // **M9-6 (#209): the restore is polled, not waited for.** `RestoreBackup`
+  // answers the moment the sysmodule has taken it, and the screen says so and
+  // asks `GetRestoreState` until the copy is done -- a frame at a time, so
+  // nothing the overlay draws waits on the card.
+  {
+    overlay::ConflictsModel model = OneRestorable(51);
+    const overlay::ConflictsModel::Command sent = model.Next();
+    c.Expect(sent.kind == overlay::ConflictsModel::Command::Kind::kRestore,
+             "the confirmed press sends the restore");
+    model.OnRestoreState(Running(51));
+    overlay::ConflictsView view = model.Render();
+    c.Expect(view.headline.find("Restoring") != std::string::npos,
+             "a taken restore reads as one in progress: " + view.headline);
+    c.Expect(!view.can_restore, "and is not on offer a second time while it runs");
+    for (int frame = 0; frame < 3; ++frame) {
+      const overlay::ConflictsModel::Command poll = model.Next();
+      c.Expect(poll.kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+               "every frame while it runs asks where it stands");
+      model.OnRestoreState(Running(51));
+    }
+    model.Next();
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kRestored;
+    model.OnRestoreState(Done(51, report));
+    view = model.Render();
+    c.Expect(view.headline.find("Restored") != std::string::npos,
+             "and the outcome lands when it is done: " + view.headline);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "after which nothing more is asked");
+  }
+
+  // Leaving the entry while it runs does not drag the user back to it: the
+  // outcome is kept for that entry, and the list stays where they went.
+  {
+    overlay::ConflictsModel model = OneRestorable(52);
+    model.Next();
+    model.OnRestoreState(Running(52));
+    c.Expect(model.Back(), "B leaves the running restore's entry");
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+             "and the restore is still followed from the list");
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kRestored;
+    model.OnRestoreState(Done(52, report));
+    c.Expect(model.Render().mode == overlay::ConflictsMode::kList,
+             "a restore finishing does not pull the screen back to its entry");
+  }
+
+  // Somebody else's restore is running: the press started nothing, and says so
+  // rather than drawing "Restoring" over the wrong entry.
+  {
+    overlay::ConflictsModel model = OneRestorable(53);
+    model.Next();
+    model.OnRestoreState(Running(999));
+    const overlay::ConflictsView view = model.Render();
+    c.Expect(view.headline.find("Nothing was written") != std::string::npos,
+             "a press while another restore runs wrote nothing, and says so: " + view.headline);
+    c.Expect(view.hint.find("another restore") != std::string::npos,
+             "...and why: " + view.hint);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "and nothing is polled for a restore this screen did not start");
+  }
+
+  // **A sysmodule that is slow to answer is not one that went away** (#209,
+  // found in review). The press's answer ran out of the client's budget, so
+  // whether the restore was taken is unknown -- but the session was never
+  // dropped, so nothing about the screen is stale. It keeps its rows and its
+  // entry, never sends the restore twice, and asks where it stands.
+  {
+    overlay::ConflictsModel model = OneRestorable(55);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kRestore,
+             "the press goes out");
+    model.OnUnreachable(overlay::Link::kNotResponding);
+    overlay::ConflictsView view = model.Render();
+    c.Expect(view.link == overlay::Link::kNotResponding && !view.headline.empty(),
+             "the screen says the sysmodule is not responding");
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "and asks it nothing more while it is not");
+    model.OnLinkRestored();
+    const overlay::ConflictsModel::Command next = model.Next();
+    c.Expect(next.kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+             "once it answers again, the screen asks where the restore stands -- it does not "
+             "press again for the user");
+    c.ExpectEq(model.loaded(), std::size_t{1}, "and the history it had loaded is still there");
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kRestored;
+    model.OnRestoreState(Done(55, report));
+    view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail &&
+                 view.headline.find("Restored") != std::string::npos,
+             "so the outcome lands on the entry it was for: " + view.headline);
+  }
+
+  // ...while a page that ran out of budget is simply asked for again.
+  {
+    overlay::ConflictsModel model;
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "the first page goes out");
+    model.OnUnreachable(overlay::Link::kNotResponding);
+    model.OnLinkRestored();
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kListConflicts,
+             "and is asked again once the sysmodule answers");
+  }
+
+  // The sysmodule forgot the restore -- it restarted mid-copy. The screen does
+  // not wait for ever and does not claim an outcome it never heard.
+  {
+    overlay::ConflictsModel model = OneRestorable(54);
+    model.Next();
+    model.OnRestoreState(Running(54));
+    model.Next();
+    model.OnRestoreState(ipc::RestoreState{});
+    const overlay::ConflictsView view = model.Render();
+    c.Expect(view.headline.find("lost track") != std::string::npos,
+             "a restore the sysmodule no longer knows about is said to be lost: " +
+                 view.headline);
+    c.Expect(view.tone == overlay::Tone::kWarn, "as a warning rather than a success");
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "and the polling stops");
   }
 
   // A producer that echoes the wrong offset forever must not be asked forever.
@@ -1494,7 +1885,8 @@ int main(int argc, char** argv) {
   const std::string base = rig::BaseUrl();
 
   if (scenario == "store" || scenario == "record" || scenario == "restore" ||
-      scenario == "interrupted" || scenario == "service" || scenario == "overlay") {
+      scenario == "interrupted" || scenario == "service" || scenario == "overlay" ||
+      scenario == "crash") {
     checks::Checks checks;
     if (scenario == "store") {
       Store(checks);
@@ -1504,6 +1896,8 @@ int main(int argc, char** argv) {
       Restore(checks);
     } else if (scenario == "interrupted") {
       Interrupted(checks);
+    } else if (scenario == "crash") {
+      Crash(checks);
     } else if (scenario == "service") {
       Service(checks);
     } else {
@@ -1548,6 +1942,7 @@ int main(int argc, char** argv) {
 
   rig::DisarmFault(*client, base);
   harness::ExpectDisarmed(checks, *client, base, "the scenario left the proxy disarmed");
+  harness::DeleteArchivalCopies(*client, base, fixture, rom.id);  // #240
 
   if (checks.failures() == 0) {
     std::cout << "conflicts." << scenario << " ok against " << base << "\n";

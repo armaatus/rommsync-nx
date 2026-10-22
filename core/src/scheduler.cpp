@@ -72,6 +72,12 @@ bool Scheduler::RequestNow() {
   return true;
 }
 
+void Scheduler::RunSoon() {
+  if (config_.enabled) {
+    rerun_ = true;
+  }
+}
+
 std::chrono::milliseconds Scheduler::Elapsed(Steady steady_now, Wall wall_now) const {
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(steady_now - last_steady_);
   if (elapsed < std::chrono::milliseconds::zero()) {
@@ -109,6 +115,7 @@ Decision Scheduler::Poll() {
     // request that arrives while it is already off as well.
     on_demand_ = false;
     rerun_ = false;
+    held_ = Trigger::kNone;
     decision.parked = true;
     return decision;
   }
@@ -127,7 +134,19 @@ Decision Scheduler::Poll() {
     // ticked *yet* would be two ticks for one event.
     on_demand_ = false;
     booted_ = true;
+    // A tick held for a running game is covered by this one: two ticks after
+    // the game closes would be two ticks for one event (#242).
+    held_ = Trigger::kNone;
     decision.trigger = Trigger::kOnDemand;
+    return decision;
+  }
+
+  if (held_ != Trigger::kNone) {
+    // The tick the worker handed back because a game was running (#242). In
+    // front of the backoff and the interval, which is the coalescing: whatever
+    // else fell due while it was held, this is the one tick that runs for it.
+    decision.trigger = held_;
+    held_ = Trigger::kNone;
     return decision;
   }
 
@@ -195,6 +214,19 @@ Decision Scheduler::Poll() {
   return decision;
 }
 
+void Scheduler::Defer(Trigger trigger) {
+  if (trigger == Trigger::kNone || !config_.enabled) {
+    return;
+  }
+  if (trigger == Trigger::kOnDemand) {
+    // A press again, so `requested()` and its place in `Poll` are the ones a
+    // press always had.
+    on_demand_ = true;
+    return;
+  }
+  held_ = trigger;
+}
+
 void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
   const Steady steady_now = SteadyNow();
   const Wall wall_now = WallNow();
@@ -203,8 +235,14 @@ void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
     case TickOutcome::kCompleted:
     case TickOutcome::kPartial:
     case TickOutcome::kUnreported:
+    case TickOutcome::kServerDisabled:
       // It ran. Whatever it did not manage is the next negotiation's, not a
       // reason to come back sooner (sync_execute.hpp).
+      //
+      // `kServerDisabled` with them: sync switched off in RomM is a setting,
+      // not a failure (#235). The interval rather than the backoff, because the
+      // only way to notice the user turning it back on is to ask, and the
+      // backoff's ceiling would make that an hour.
       backoff_.Succeed();
       tls_failures_ = 0;
       rescans_ = 0;
@@ -225,6 +263,9 @@ void Scheduler::Finished(TickOutcome outcome, http::Error transport) {
 
     case TickOutcome::kOffline:
     case TickOutcome::kRefused:
+    // A server too old to sync with (#228) is a refusal that an upgrade lifts:
+    // backed off like one, so the console asks again without hammering it.
+    case TickOutcome::kUnsupported:
       rescans_ = 0;
       break;
 

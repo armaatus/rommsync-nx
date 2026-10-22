@@ -50,7 +50,7 @@ using namespace std::chrono_literals;
 /// What the client asks for in production, not a convenient subset.
 ///
 /// `auth.scopes` already checks this list against the document; running the real
-/// pairing with it is the other half — proof that a live RomM 5.2.0 accepts
+/// pairing with it is the other half — proof that a live RomM accepts
 /// every one of them. A scope the server does not know is the kind of thing that
 /// otherwise surfaces on a console. The approved set is still worth reading
 /// back: RomM returns what the user approved, sorted, not what was asked for.

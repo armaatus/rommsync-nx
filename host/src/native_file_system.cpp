@@ -1,9 +1,16 @@
 #include "rommsync/host/native_file_system.hpp"
 
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#if defined(__APPLE__)
+#include <sys/mount.h>
+#elif defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -74,6 +81,45 @@ bool ByNameDescending(const fs::Entry& left, const fs::Entry& right) {
   return left.name < right.name;
 }
 
+/// The kernel's name for the filesystem under `path`. Any width of FAT is
+/// `kFat32` here: FAT12 and FAT16 share its 32-bit size field, so the ceiling a
+/// caller reads this for is the same.
+fs::Format FormatOf(const std::string& path) {
+#if defined(__APPLE__)
+  struct ::statfs info {};
+  if (::statfs(path.c_str(), &info) != 0) {
+    return fs::Format::kUnknown;
+  }
+  if (std::strcmp(info.f_fstypename, "msdos") == 0) {
+    return fs::Format::kFat32;
+  }
+  if (std::strcmp(info.f_fstypename, "exfat") == 0) {
+    return fs::Format::kExFat;
+  }
+  return fs::Format::kOther;
+#elif defined(__linux__)
+  struct ::statfs info {};
+  if (::statfs(path.c_str(), &info) != 0) {
+    return fs::Format::kUnknown;
+  }
+  // MSDOS_SUPER_MAGIC and EXFAT_SUPER_MAGIC, from <linux/magic.h>, spelled out
+  // rather than included: that header is not on every libc's search path.
+  constexpr unsigned long kMsdosMagic = 0x4d44;
+  constexpr unsigned long kExfatMagic = 0x2011BAB0;
+  const auto type = static_cast<unsigned long>(info.f_type);
+  if (type == kMsdosMagic) {
+    return fs::Format::kFat32;
+  }
+  if (type == kExfatMagic) {
+    return fs::Format::kExFat;
+  }
+  return fs::Format::kOther;
+#else
+  static_cast<void>(path);
+  return fs::Format::kUnknown;
+#endif
+}
+
 class NativeFileSystem final : public fs::FileSystem {
  public:
   explicit NativeFileSystem(std::string root) : root_(std::move(root)) {}
@@ -130,12 +176,19 @@ class NativeFileSystem final : public fs::FileSystem {
       // surviving set depend on the card's directory layout -- which
       // `file_system.hpp` forbids, because the scanner's duplicate-slot rule
       // then changes its mind between ticks.
-      listing.entries.push_back(std::move(entry));
-      std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
-      if (listing.entries.size() > fs::kMaxDirectoryEntries) {
-        std::pop_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
-        listing.entries.pop_back();
+      // And never one past it, as in `card.cpp`: at the bound an entry
+      // replaces the largest name kept or is dropped, so the vector is not
+      // doubled past the bound on the way.
+      if (listing.entries.size() < fs::kMaxDirectoryEntries) {
+        listing.entries.push_back(std::move(entry));
+        std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+      } else {
         truncated = true;
+        if (entry.name < listing.entries.front().name) {
+          std::pop_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+          listing.entries.back() = std::move(entry);
+          std::push_heap(listing.entries.begin(), listing.entries.end(), ByNameDescending);
+        }
       }
     }
 
@@ -187,6 +240,27 @@ class NativeFileSystem final : public fs::FileSystem {
       return {};
     }
     return resolved.string();
+  }
+
+  /// What the volume under `sd_path` really is -- read off the kernel, so a
+  /// card in a laptop's reader, or the FAT32 image `test_fat_volume.sh` mounts,
+  /// reports the ceiling the console's card would.
+  fs::Volume VolumeOf(std::string_view sd_path) const override {
+    fs::Volume volume;
+    std::filesystem::path resolved;
+    if (!ResolveUnderRoot(root_, sd_path, &resolved)) {
+      return volume;
+    }
+    const std::string path = resolved.string();
+    volume.format = FormatOf(path);
+    volume.max_file_bytes = volume.format == fs::Format::kFat32 ? fs::kFat32MaxFileBytes : 0;
+    struct ::statvfs info {};
+    if (::statvfs(path.c_str(), &info) == 0) {
+      const std::uint64_t unit = info.f_frsize != 0 ? info.f_frsize : info.f_bsize;
+      volume.free_bytes =
+          static_cast<std::int64_t>(static_cast<std::uint64_t>(info.f_bavail) * unit);
+    }
+    return volume;
   }
 
  private:

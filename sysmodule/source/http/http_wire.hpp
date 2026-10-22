@@ -98,14 +98,67 @@ class Connector {
   Connector() = default;
 };
 
-/// The one in-flight buffer the heap budget in
-/// docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision is about.
+/// The in-flight buffer of an API exchange: `Send`, its request body and its
+/// response. One per call, on the heap.
 ///
-/// One per call, on the heap, and never one per rom: a download streams through
-/// this and lands on the card. 16 KiB is a TLS record's worth, so a read rarely
-/// stops in the middle of one, and it is small enough that two concurrent
-/// transfers still fit the inner heap (`sysmodule/source/main.cpp`).
+/// Small because nothing it carries is large enough for the chunk to matter --
+/// the biggest response is a few hundred KiB of JSON, a few dozen reads -- and
+/// because it is the one that can be in flight *beside* a download: the pairing
+/// thread's polls run while the worker streams a rom, so this is what the second
+/// concurrent request costs the inner heap (`sysmodule/source/main.cpp`).
 inline constexpr std::size_t kTransferBufferSize = 16 * 1024;
+
+/// The in-flight buffer of a `Download`, which is the one place the chunk size
+/// is a cost that scales with the file (M9-10, #201).
+///
+/// On the console every `Connection::Read` is an `sslConnectionRead`, and every
+/// one of those is an IPC round trip to the `ssl` sysmodule. At 16 KiB that is
+/// 65,536 round trips per GiB of rom; NPShopSwitch, a shipping boot2 sysmodule,
+/// measured the same choice holding its HTTPS installs under 1 MB/s
+/// (nps_http_ssl.cpp). The old justification -- "a TLS record's worth" -- was
+/// about TLS framing, and framing is not the cost: the IPC is per call, and only
+/// the call count scales with a rom.
+///
+/// **64 KiB, because that is the receive window.** A read can only return what
+/// the socket has buffered, and `SocketBudget::tcp_rx_buf_max_size` caps that at
+/// 64 KiB (`ssl_http_client.hpp`), so a larger buffer is heap the read has
+/// nothing to fill from. That is 16,384 round trips per GiB, a quarter of
+/// before -- **at best**: it assumes one `sslConnectionRead` hands back more
+/// than one TLS record, which NPShopSwitch's speed-up implies and nothing off a
+/// console can show. `tlsprobe` reports the largest read it saw, and #44 asks
+/// for it. The window and this move together, and `main.cpp` holds them to it.
+///
+/// One download is in flight at a time -- the worker drains the queue one rom
+/// after another (`download::Drain`) -- and a redirect frees one hop's buffer
+/// before the next hop allocates its own, so this costs the heap once.
+inline constexpr std::size_t kDownloadBufferSize = 64 * 1024;
+
+// **An API body declared by its `Content-Length` is reserved to that length**
+// (M9-19, #217): appended a read at a time a `std::string` doubles, holding up to
+// three times its text while the last reallocation has both buffers live, and
+// the heap table in `main.cpp` budgets every buffered response at its text,
+// once. Past `http::kMaxResponseBytes` it is refused before it is read (#248),
+// where it used to grow past a 256 KiB reservation uncapped -- a page of roms
+// RomM identified is that, at ~12 KiB a row.
+
+/// The largest API body taken **without** a `Content-Length` -- chunked, or
+/// ended by the close -- and past it the call fails (M9-20, #246).
+///
+/// Such a body has nothing to reserve, so it grows, and until #246 nothing
+/// stopped it. RomM behind its own nginx always declares a length (measured on
+/// 5.2.0), but a reverse proxy in front of it may not, and every buffered
+/// response is counted in `main.cpp`'s heap table at its text, once. So an
+/// undeclared body grows in powers of two up to this and no further: it holds at
+/// most this, and at most half again while the last step copies -- 192 KiB,
+/// which `main.cpp` asserts fits the row a response is counted under. A power of
+/// two so the last step lands on it exactly.
+///
+/// Past it the call is `http::Error::kTooLarge`, the ceiling's own refusal: a
+/// page behind a proxy that strips `Content-Length` is asked again at half the
+/// rows (`roms::FetchRomIndex`), where until #248 the index fetch failed.
+inline constexpr std::size_t kMaxUndeclaredBodyBytes = 128 * 1024;
+static_assert((kMaxUndeclaredBodyBytes & (kMaxUndeclaredBodyBytes - 1)) == 0,
+              "grown in powers of two, the cap has to be one for the last step to land on it");
 
 /// How much of a failed download's body is kept, matching the native backend.
 /// A 404 from RomM is a short JSON document and worth surfacing; anything

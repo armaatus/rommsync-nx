@@ -216,10 +216,12 @@ class SslConnector final : public Connector {
     // connection, so nothing here closes one. **Whether that is also true of the
     // `errno == ENOENT` case is not settled** -- libnx says to ignore that
     // errno, and says nothing about who owns the descriptor afterwards. If it
-    // does not, a failed handshake leaks an fd against a `handle_table_size` of
-    // 64. It is on #43's gate list, because it is answerable on a console and
-    // nowhere else; closing `fd` here on a guess would be a double close of a
-    // descriptor another process is reading.
+    // does not, a failed handshake leaks a socket: a slot in bsd's table and
+    // newlib's, not a kernel handle, so it is bsd's limit it runs into and not
+    // the npdm's `handle_table_size` (`handle_budget.hpp`, #210). It is on #43's
+    // gate list, because it is answerable on a console and nowhere else; closing
+    // `fd` here on a guess would be a double close of a descriptor another
+    // process is reading.
     owned = returned;
 
     // strlen + 1: libnx documents this parameter as a *buffer* size, and this

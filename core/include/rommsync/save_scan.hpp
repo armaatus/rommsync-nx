@@ -47,7 +47,9 @@
 
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/save_source.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
@@ -71,18 +73,29 @@ struct SaveFile {
   /// The file's own name, `Game (USA).srm`. Never a path.
   std::string file_name;
 
-  /// The pairing key with `rom_id`, derived and stable: `retroarch-srm`.
+  /// The pairing key with `rom_id`, from `SlotFor`: `autosave` for a `.srm`,
+  /// `autosave-rtc` for its companion (#236).
   ///
-  /// Derived rather than chosen because it has to be the *same* string on the
-  /// next tick and on the next boot -- a slot that moves makes the same file a
-  /// new save every time. It carries the emulator as well as the save's
-  /// extension because RomM pairs on `(rom_id, slot)` alone: a rom whose
-  /// RetroArch `.srm` and Tico `.srm` both mapped to `srm` would have the two
-  /// files overwrite each other through the server, forever.
+  /// The shared slot other clients use, so a save made here is the save they
+  /// see. Derived from the configured slot and the extension and nothing else,
+  /// because it has to be the *same* string on the next tick and on the next
+  /// boot -- a slot that moves makes the same file a new save every time. A
+  /// rom's RetroArch `.srm` and Tico `.srm` are therefore one slot, and the
+  /// second the walk finds is a `kDuplicateSlot` skip: RomM pairs on
+  /// `(rom_id, slot)` alone, and two files in one pair would overwrite each
+  /// other through the server.
   std::string slot;
 
-  /// `retroarch` or `tico`, when the directory said so; empty when it did not,
-  /// which is sent as `null`.
+  /// The name the server is told -- the negotiate entry's `file_name` and the
+  /// upload's -- `<rom fs_name_no_ext><extension>`: RomM serves RetroArch the
+  /// newest autosave under that stem, and matches its uploads by it (#226 R2).
+  /// Differs from `file_name` when the card's copy matched by `fs_name_no_tags`
+  /// or by another case.
+  std::string server_name;
+
+  /// RomM's `emulator` for it -- `snes9x`, `tico-duckstation`, an override --
+  /// from `scan::ResolveSource`. Empty when nothing says, which is sent as
+  /// `null`.
   std::string emulator;
 
   /// The rom's platform, for callers that lay files out by it.
@@ -124,11 +137,15 @@ struct StateFile {
   /// The file's own name, `Game (USA).state`. Never a path -- and this is the
   /// pairing key with `rom_id`, on both sides: RomM stores a state under the
   /// name it was sent, without the ingest tag it stamps on a save.
+  ///
+  /// The one exception is a Tico slot under `[sync] map_state_slots`, which is
+  /// RetroArch's name for it -- `Game.state.auto` for the card's `Game.state5`
+  /// (#239, `RetroArchStateName`). `sd_path` keeps the card's.
   std::string file_name;
 
-  /// `retroarch` or `tico`, when the directory said so; empty when it did not.
-  /// Sent as the `emulator` query parameter and used to place a download, but
-  /// never part of the key -- see `SkipReason::kDuplicateName`.
+  /// RomM's `emulator` for it, from `scan::ResolveSource`; empty when nothing
+  /// says. Sent as the `emulator` query parameter, but never part of the key --
+  /// see `SkipReason::kDuplicateName`.
   std::string emulator;
 
   /// The rom's platform, for callers that lay files out by it.
@@ -171,6 +188,30 @@ enum class SkipReason {
   kDuplicateName,
 
   kTooManyStates,   ///< the state scan hit `kMaxStates` and stopped
+
+  /// A file directly in a folder RetroArch sorts by core. RetroArch reads
+  /// `<folder>/<CoreFolder>/` and nothing beside it, so this is a copy left from
+  /// before sorting was on -- and synced, it would win a slot from the copy
+  /// RetroArch actually reads.
+  ///
+  /// Also a file in Tico's folder from before 0.8.0 once the per-account layout
+  /// is in use beside it (#231): Tico reads `users/<uid>/<slug>/` instead.
+  kOutsideLayout,
+
+  /// Tico keeps saves for several accounts under this `users/` folder (the
+  /// skip's path) and `[tico] account` does not say whose to sync -- or the
+  /// folder would not list -- so none of them is (`tico::Resolve`). Once per
+  /// folder, not per file: its files were never read.
+  kTicoAccount,
+
+  /// A folder in Tico's psp folder: PPSSPP keeps each game's save as a folder
+  /// (`<GAMEFOLDER>/` at the SAVEDATA level), and M10 syncs no PSP save (#238).
+  /// RomM and RetroArch hold those as a `PSP-<folder>.zip`, and the adapter that
+  /// would bundle one -- hashed by RomM's per-entry ZIP rule, #234 -- comes after
+  /// #44 captures real folders. One skip per folder; its files were never read.
+  /// The module's own `backups/` is not one. A loose file in that folder is
+  /// skipped the same way: PPSSPP writes none, so it is no PSP save either.
+  kSaveFolder,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -193,14 +234,14 @@ struct Skip {
 /// How many saves one tick will report, and how many skips it will spell out.
 ///
 /// Both bounds are the `config::kMaxDiagnostics` reasoning: a flat `saves/`
-/// holding four thousand files nobody has roms for must cost one log line and a
-/// count, not four thousand strings on a sysmodule heap. The *count* is always
+/// holding hundreds of files nobody has roms for must cost one log line and a
+/// count, not hundreds of strings on a sysmodule heap. The *count* is always
 /// exact -- only the spelling out is bounded.
 /// `kMaxSaves` is `state::kMaxRecords` and not a round number of its own.
 ///
 /// `state.db` holds one row per reported save and its writer *refuses* a
 /// baseline with more rows than that (`state_db.hpp` sizes it against the
-/// sysmodule's ~1.2 MiB, and says the two constants and `kInnerHeapSize` move
+/// sysmodule's heap, and says the two constants and `kInnerHeapSize` move
 /// together). A scanner that emitted more would produce a tick whose baseline
 /// can never be written: the write fails, nothing is stored, and the whole
 /// library is re-hashed on the next tick and every tick after it -- silently,
@@ -209,6 +250,15 @@ struct Skip {
 /// and says nothing.
 inline constexpr std::size_t kMaxSaves = state::kMaxRecords;
 inline constexpr std::size_t kMaxSkipsReported = 64;
+
+/// How many RetroArch core folders one scan reads, on top of the folder map's
+/// own: sort-by-core expands one folder into one per core (`ScanSaves`).
+///
+/// A bound because the plan of folders is held for the whole walk beside a
+/// listing, on the sysmodule heap. RomM's table names under forty distinct
+/// folders and a console runs a handful of cores, so 64 is reached only by a
+/// card whose save folder is something other than RetroArch's.
+inline constexpr std::size_t kMaxRetroArchFolders = 64;
 
 /// How many states one tick will report.
 ///
@@ -242,6 +292,15 @@ struct ScanResult {
   /// Files seen in the mapped directories, matched or not.
   std::size_t files_seen = 0;
 
+  /// Every save directory the scan read for files, in the order it read them:
+  /// the folder map's, and the ones `retroarch.cfg` led it to. What a sweep for
+  /// an interrupted write has to cover, since a save is overwritten where it was
+  /// found (`sync::TickOptions::recover_dirs`).
+  ///
+  /// **Not the rom folders** read for saves kept beside the content: a rom
+  /// download stages its `.tmp` there, and the sweep removes every `.tmp`.
+  std::vector<std::string> folders;
+
   /// The rom index did not hold the whole library (`roms::RomIndex::truncated`).
   ///
   /// Carried because it changes what an unmatched file *means*: with a short
@@ -249,6 +308,15 @@ struct ScanResult {
   /// caller that reported those as files-with-no-rom would send a user hunting
   /// for a library problem that is really a client bound.
   bool index_truncated = false;
+
+  /// The walk stopped at its bound -- `kMaxSaves`, or `kMaxStates` for the
+  /// state walk -- and the rest of the card was not read (M9-20, #246).
+  ///
+  /// Its own flag rather than a skip to look for: the skip that says so is
+  /// recorded last, and past `kMaxSkipsReported` it is counted but not spelled
+  /// out. A tick that synced every save it saw is still not a clean one when
+  /// it could not see them all, and the engine says so on the status screen.
+  bool stopped_at_bound = false;
 
   /// Saves reported with no digest because their bytes could not be read, in
   /// scan order and bounded like `skipped`.
@@ -271,9 +339,60 @@ struct ScanResult {
   std::string DescribeSkipped() const;
 };
 
-/// Walk `config`'s save directories and match what is in them.
+/// Walk `config`'s save directories, and RetroArch's, and match what is in them.
 ///
-/// Directories come from `config::Config::SaveScanDirs()`, so one physical
+/// **RetroArch's folders are the ones `retroarch.cfg` names, read the way
+/// RetroArch lays them out** (#230), and they are read first, so the copy
+/// RetroArch actually reads wins a contested slot over one the folder map also
+/// finds:
+///
+///   - its `savefile_directory`, whatever it is called -- and when that is not
+///     there, the build's default, because RetroArch ignores a folder it cannot
+///     use and writes to its default instead;
+///   - with sort-by-core on, the folders one level under it, each through
+///     RomM's core table (`RetroArchCoreId`), and a file directly in it is a
+///     `kOutsideLayout` skip; a folder starting with `.` (`.netplay`) is not a
+///     core. At most `kMaxRetroArchFolders` of them. When the folder is past
+///     `fs::kMaxDirectoryEntries`, every folder RomM's table names is read
+///     as well, since the cut keeps the first names and a core folder may not
+///     be among them;
+///   - with `savefiles_in_content_dir`, the map's `roms` folders instead -- only
+///     with `[sources] retroarch_content_dir` on, and only RetroArch's own
+///     `.srm`/`.rtc` (`.state`, `.stateN`) in them. Sorted, only a subfolder
+///     RomM's table names is a core there. **A rom folder past
+///     `fs::kMaxDirectoryEntries` is read only as far as its listing reaches**,
+///     with a `kDirectoryFailed` skip saying so: the bound counts the roms;
+///   - with a per-content-directory layout, nothing: it is not read.
+///
+/// **A folder the map lists as `roms` is a rom folder however the scan got to
+/// it** -- `savefile_directory` naming one, or a sorted folder above them making
+/// each a "core" folder: read as the content-dir rule above reads one, and
+/// never in `ScanResult::folders`.
+///
+/// The folder map's own entry for that folder is not read a second time, flat,
+/// beside it. And while `retroarch::Enabled` says no -- RetroArch's Cloud Sync,
+/// or `[sources] retroarch = off` -- no RetroArch folder is read at all, the
+/// map's included.
+///
+/// **A Tico folder is read in the layout the card is in** (#231): `<root>/<slug>`
+/// from the map is `<root>/users/<uid>/<slug>` once `<root>/users/` exists, the
+/// account chosen by `[tico] account` (`tico::Resolve`). A file still in the old
+/// folder is then a `kOutsideLayout` skip; several accounts and none named is
+/// one `kTicoAccount` skip for the root and nothing read under it.
+///
+/// In every folder, `*.tmp`, `*.png` and `*.restart` are passed over without a
+/// skip: an emulator's half-written file, a state's screenshot, DuckStation's
+/// restart marker -- never a save. Subfolders (Tico's `backups/`) are not read;
+/// one in Tico's psp folder is a `kSaveFolder` skip, since that is where PPSSPP
+/// keeps its saves (#238).
+///
+/// **The systems whose Tico format no libretro core reads** -- psx, n64, dc,
+/// nds, saturn and psp -- are reported under their `tico-*` ids (#226 D3), so
+/// they meet only the same module on another Switch. Each N64 file (`.eep`,
+/// `.sra`, `.fla`, `.mpk`) is a save of its own in its own slot, and DuckStation's
+/// cards are matched as `MemoryCardName` names them.
+///
+/// Everything else comes from `config::Config::SaveScanDirs()`, so one physical
 /// folder listed under a dozen platforms is walked **once** and yields one
 /// record per file. Order is the config's first-seen order, and each directory's
 /// entries are sorted by name, so two runs over an unchanged card produce the
@@ -283,10 +402,20 @@ struct ScanResult {
 /// than defaulted: an empty one is a perfectly good baseline that hashes
 /// everything, and a caller that *forgot* the argument would otherwise get a
 /// scan that quietly reported no digests at all.
-ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
-                     fs::FileSystem& files, const state::Baseline& baseline);
+///
+/// `retroarch` is required for the reason `baseline` is: a console with no
+/// `retroarch.cfg` passes `retroarch::Settings{}`, which is what RetroArch would
+/// use, and a caller that forgot it would scan a layout nobody chose.
+ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& retroarch,
+                     const roms::RomIndex& index, fs::FileSystem& files,
+                     const state::Baseline& baseline);
 
-/// The same walk over `config::Config::StateScanDirs()`, emitting states.
+/// The same walk over `config::Config::StateScanDirs()` and RetroArch's
+/// `savestate_directory`, under its own four settings, emitting states.
+///
+/// A state is matched by `StateMatchName`, so RetroArch's `Game.state.auto` is
+/// `Game`'s; and a libretro module's Tico slot is reported under RetroArch's
+/// name when `[sync] map_state_slots` is on (#239, state_names.hpp).
 ///
 /// **It does not consult `sync.states`.** `StateScanDirs()` answers regardless
 /// of the toggle because whether to scan is the engine's decision rather than
@@ -295,8 +424,9 @@ ScanResult ScanSaves(const config::Config& config, const roms::RomIndex& index,
 /// all. A second copy of that check here would be a second thing to get wrong,
 /// and the failure mode of getting it wrong is silent: a console reading state
 /// directories the user never opted into.
-ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
-                      fs::FileSystem& files, const state::Baseline& baseline);
+ScanResult ScanStates(const config::Config& config, const retroarch::Settings& retroarch,
+                      const roms::RomIndex& index, fs::FileSystem& files,
+                      const state::Baseline& baseline);
 
 // --- the pieces, exposed because they are the parts worth testing directly ----
 
@@ -306,18 +436,65 @@ ScanResult ScanStates(const config::Config& config, const roms::RomIndex& index,
 /// One extension, not every one: `Game.state.auto` reduces to `Game.state`,
 /// which matches no rom and is reported. That is the honest answer -- stripping
 /// until something matches is how `Game.nes.srm` becomes a match for a rom
-/// called `Game.nes` that the user does not have.
+/// called `Game.nes` that the user does not have. (The state walk knows
+/// `.state.auto` as one extension, RetroArch's, and strips it first:
+/// `StateMatchName`.)
 std::string BaseName(std::string_view file_name);
 
-/// The emulator a mapped directory belongs to: `retroarch`, `tico`, or empty.
+/// The slot a save called `file_name` is synced in, under the configured `slot`
+/// (`config::SyncConfig::slot`, `autosave` by default). See `SaveFile::slot`.
 ///
-/// Any segment of the path, not just the first, so `/emulators/retroarch/saves`
-/// is recognised as well as the default `/retroarch/saves`. The comparison is
-/// case-insensitive because FAT32 is.
-std::string EmulatorFor(std::string_view sd_dir);
+///   - A `.srm` -- save RAM, in any case -- is `slot` itself.
+///   - Anything else is `<slot>-<extension>`, lowercased: `autosave-rtc`,
+///     `autosave-mcd`, and `autosave-save` for a file with no extension.
+///
+/// One save per rom per slot, because that is all a slot can hold: RomM pairs on
+/// `(rom_id, slot)` and keeps the newest row of a slot as its head, so a `.rtc`
+/// beside the `.srm` in one slot would become the head the `.srm` downloads.
+/// RomM's own RetroArch path slots `.srm` only, for the same reason (#236).
+std::string SlotFor(std::string_view slot, std::string_view file_name);
 
-/// The slot for a file from `emulator`'s directory. See `SaveFile::slot`.
-std::string SlotFor(std::string_view emulator, std::string_view file_name);
+/// The slot a `state.db` version-2 row's `old_slot` describes now: the
+/// `<source>-<extension>` (`tico-srm`, `retroarch-rtc`) or bare extension a v2
+/// build derived, as `SlotFor` would derive it under `slot`. The migration
+/// `state::AdoptLegacySaves` performs (#236).
+std::string MigratedSlot(std::string_view slot, std::string_view old_slot);
+
+/// The emulators negotiate is filtered to (`SyncNegotiatePayload::emulators`,
+/// #236): the ids this console can load. Every scanned save's emulator, and the
+/// id each mapped platform's save folders resolve to (`ResolveSource`) so a core
+/// with no save on the card yet is still offered its server saves -- only the
+/// folders of the frontend `Config::PlayWithFor` names, where it names one,
+/// since that is the one a first-time restore is placed for (#238) -- each with
+/// its `RetroArchAliases`, since other clients name a lineage by RetroArch's
+/// folder too. Sorted, without repeats.
+///
+/// **Nullopt -- no filter -- when a save has no emulator.** RomM filters on the
+/// row's `emulator` and a list cannot name `null`, so that save's own uploads
+/// would leave the pairing: negotiated as missing, uploaded again, every tick.
+/// Also nullopt when there is nothing to list.
+std::optional<std::vector<std::string>> EmulatorFilter(const config::Config& config,
+                                                       const std::vector<SaveFile>& saves);
+
+/// The name DuckStation gives memory card `card` (1 or 2) of the rom whose
+/// `fs_name_no_ext` is `rom_name`, in Tico's psx folder (#226 R5, #238): the
+/// rom's name without a trailing ` (Disc N)` -- every disc of a game shares one
+/// card -- with `_2` for card 2, and `.mcd`. `Two Disc (USA) (Disc 1)`, 2 ->
+/// `Two Disc (USA)_2.mcd`.
+///
+/// The scan reads that name back the other way: a `.mcd` there whose name is not
+/// exactly one rom's is tried as card 2 (`<name>_2`) and as the first disc's
+/// (`<name> (Disc 1)`), and card 2 is synced in the slot `<slot>-card2`, since
+/// the two cards of one rom are two saves. [verify on #44]
+std::string MemoryCardName(std::string_view rom_name, int card);
+
+/// The rom a save called `file_name`, in a folder implying `platform_hint`, is
+/// matched to -- the scan's own rule, for a caller that has to know what the
+/// scan will read a file back as (`place::Placer`): `RomIndex::Find` on the base
+/// name, and in Tico's psx folder (`memory_cards`) DuckStation's card names as
+/// `MemoryCardName` describes them. `*card` is 2 for a card-2 reading, else 1.
+roms::Match MatchSave(const roms::RomIndex& index, std::string_view file_name,
+                      std::string_view platform_hint, bool memory_cards, int* card);
 
 /// Which platform each save directory implies, keyed by directory.
 ///

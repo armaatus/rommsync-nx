@@ -89,7 +89,7 @@ struct BaselineUpdate {
 
   /// Rows dropped to keep `value` inside `state::kMaxRecords` -- saves that were
   /// neither reported nor operated on this tick, so almost always saves that are
-  /// no longer on the card. See `AdvanceBaseline`.
+  /// no longer on the card, and then state rows. See `AdvanceBaseline`.
   std::size_t dropped = 0;
 
   /// One line per save that could not be advanced, bounded by
@@ -101,8 +101,8 @@ struct BaselineUpdate {
 
 /// Move `previous` forward by what this tick did.
 ///
-/// `reported` is the `ClientSaveState` vector the tick negotiated with -- the
-/// scan's own facts, which are still exactly right for every save this tick did
+/// `reported` is the `ClientSaveState` vector step 0 produced -- the scan's own
+/// facts, which are still exactly right for every save this tick did
 /// not rewrite. `plan` and `report` are paired by index, the order
 /// `ExecutePlan` promises; an operation whose two halves disagree about
 /// `(rom_id, slot)` is skipped and named rather than guessed at.
@@ -130,7 +130,14 @@ struct BaselineUpdate {
 /// `state::kMaxRecords`, which is the point at which keeping them costs the
 /// *whole* baseline (`SaveBaseline` refuses a file `ParseBaseline` would
 /// discard whole). Dropping the stale ones first is the only order that loses
-/// nothing this tick knows.
+/// nothing this tick knows. **Then state rows**, which share the bound and
+/// which this half is handed too (state_db.hpp): a state goes before a save
+/// this tick knows, `sync::SyncStates`' own order, and is compared from scratch.
+///
+/// `reported` is every save the scan found, a save `RunTick` withheld as deleted
+/// on the server (#233) included: its marked row is what keeps the deleted
+/// bytes from being offered again, and a withheld save is on the card, not
+/// stale.
 ///
 /// **It cannot invent room.** A tick that reports and plans more than
 /// `kMaxRecords` saves by itself has nothing droppable left, and neither this
@@ -146,7 +153,7 @@ struct BaselineUpdate {
 /// `state::kMaxStateBytes` worth of parsed rows -- more than that, since a row
 /// costs more parsed than as text -- on the same tick that is already holding
 /// the plan, the report, the reported saves and a directory listing, against a
-/// 1.3 MiB inner heap (state_db.hpp, core/AGENTS.md).
+/// 1.5 MiB inner heap (state_db.hpp, core/AGENTS.md).
 BaselineUpdate AdvanceBaseline(state::Baseline previous, const SyncPlan& plan,
                                const ExecutionReport& report,
                                const std::vector<ClientSaveState>& reported,
@@ -246,10 +253,15 @@ struct TickCompletion {
 /// written either way. That is the split on purpose. A caller that wants
 /// neither can persist the baseline itself with `AdvanceBaseline` and
 /// `state::SaveBaseline`, in that order.
+///
+/// `advanced`, when given, receives the baseline as it was written -- moved,
+/// not copied -- for a tick that finishes several plans one after another and
+/// starts each from what the one before it left (#246).
 TickCompletion FinishTick(http::HttpClient& client, fs::FileSystem& files,
                           const auth::StoredToken& token, const SyncPlan& plan,
                           const ExecutionReport& report,
                           const std::vector<ClientSaveState>& reported,
-                          state::Baseline previous, const FinishOptions& options = {});
+                          state::Baseline previous, const FinishOptions& options = {},
+                          state::Baseline* advanced = nullptr);
 
 }  // namespace rommsync::sync

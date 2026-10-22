@@ -79,9 +79,8 @@ class KnobEngine : public ipc::Engine {
   ipc::Error ListConflicts(const ipc::ConflictQuery&, ipc::ConflictPage*) override {
     return ipc::Error::kOk;
   }
-  ipc::Error RestoreBackup(std::int64_t, conflicts::RestoreReport*) override {
-    return ipc::Error::kOk;
-  }
+  ipc::RestoreState RequestRestore(std::int64_t) override { return {}; }
+  ipc::RestoreState restore_state() const override { return {}; }
 
  private:
   std::vector<config::Diagnostic> notes_;
@@ -386,7 +385,7 @@ void CheckEveryOutcomeIsDrawn(Checks& checks) {
   const ipc::SyncOutcome kOutcomes[] = {
       ipc::SyncOutcome::kAccepted,      ipc::SyncOutcome::kAlreadyRunning,
       ipc::SyncOutcome::kNotConfigured, ipc::SyncOutcome::kUnauthenticated,
-      ipc::SyncOutcome::kDisabled,
+      ipc::SyncOutcome::kDisabled,      ipc::SyncOutcome::kDeferred,
   };
   std::vector<std::string> sentences;
   for (ipc::SyncOutcome outcome : kOutcomes) {
@@ -426,6 +425,21 @@ void CheckEveryOutcomeIsDrawn(Checks& checks) {
   ran.sync_seen_running = true;
   checks.Expect(ViewOf(Working(), ran).notice.empty(),
                 "and it does not come back once that tick has finished");
+
+  // #242: a press under a running game. It says when for as long as nothing is
+  // running -- which is the whole game -- and goes the way "Sync started" does
+  // once the tick it promised starts, so it cannot outlive the game.
+  const overlay::LastCommand held = overlay::LastCommand::SyncNow(ipc::SyncOutcome::kDeferred);
+  checks.Expect(overlay::SyncOutcomeText(ipc::SyncOutcome::kDeferred).find("game") !=
+                    std::string::npos,
+                "a held press names the game it is waiting for");
+  checks.Expect(!ViewOf(Working(), held).notice.empty(), "and stays while the game runs");
+  checks.Expect(ViewOf(syncing, held).notice.empty(),
+                "but stops being news once the tick it promised is running");
+  overlay::LastCommand served = held;
+  served.sync_seen_running = true;
+  checks.Expect(ViewOf(Working(), served).notice.empty(),
+                "and does not come back once that tick has finished");
 }
 
 /// A sysmodule that could not be reached is a screen of its own: both controls

@@ -21,6 +21,8 @@
 //   skew      -- a wall clock that jumps backwards is neither a storm nor a stall
 //   failures  -- a failed tick reschedules on the backoff; the next success
 //                returns to the floor
+//   held      -- #242: ticks due under a running game are held, and one runs
+//                when it closes
 //   tls       -- a handshake failure is capped rather than retried forever
 //   idle      -- many simulated hours of an offline or switched-off console cost
 //                a bounded, small number of ticks
@@ -253,6 +255,14 @@ void OnDemand(checks::Checks& c) {
   c.Expect(scheduler.Poll().run(), "the first press runs");
   scheduler.Finished(TickOutcome::kCompleted);
   c.Expect(scheduler.Poll().parked, "and the second is the same tick, not another one");
+
+  // A rom just downloaded (#241): a tick now, which nobody pressed for.
+  scheduler.RunSoon();
+  c.Expect(!scheduler.requested(), "a download's tick does not read as a press");
+  const Decision soon = scheduler.Poll();
+  c.Expect(soon.trigger == Trigger::kInterval, "and runs as the schedule's own tick");
+  scheduler.Finished(TickOutcome::kCompleted);
+  c.Expect(scheduler.Poll().parked, "once");
 }
 
 /// The switch. A disabled scheduler never fires -- not on boot, not on a timer,
@@ -267,6 +277,7 @@ void Disabled(checks::Checks& c) {
   c.ExpectEq(RunFor(scheduler, clocks, hours{24}, minutes{1}, TickOutcome::kCompleted), 0,
              "and fires nothing over a day at a five-minute interval");
   c.Expect(!scheduler.RequestNow(), "a Sync now against the switch is refused, not queued");
+  scheduler.RunSoon();
   c.Expect(scheduler.Poll().parked, "so nothing is waiting when it is switched back on");
   // ...and neither is one that was already waiting when the switch went off,
   // which is the case `Poll` and not `Reconfigure` has to catch.
@@ -415,6 +426,123 @@ void Failures(checks::Checks& c) {
   }
   c.ExpectEq(rescans, 2, "a rescan runs again immediately, and no more than twice in a row");
   c.ExpectEq(rescanning.failures(), 1, "past which it is treated as a failure and backed off");
+}
+
+/// Sync switched off for this console in RomM is a setting, not a failure
+/// (#235): the schedule keeps its interval rather than backing off, so the tick
+/// after the user turns it back on is at most one interval away -- and it does
+/// not come round sooner either, because asking every thirty seconds is the
+/// hammering the backoff exists to prevent.
+void ServerDisabled(checks::Checks& c) {
+  Clocks clocks;
+  Scheduler scheduler(ConfigWith(minutes{30}), clocks.steady_fn(), clocks.wall_fn());
+  c.Expect(scheduler.Poll().trigger == Trigger::kBoot, "boot");
+
+  scheduler.Finished(TickOutcome::kOffline);
+  c.ExpectEq(scheduler.failures(), 1, "an offline tick first, so there is a backoff to clear");
+
+  clocks.Advance(seconds{31});
+  c.Expect(scheduler.Poll().run(), "the retry fires");
+  scheduler.Finished(TickOutcome::kServerDisabled);
+  c.ExpectEq(scheduler.failures(), 0, "a server that says sync is off is not a failure");
+  c.Expect(scheduler.backoff() == milliseconds{0}, "and clears the backoff");
+  c.Expect(scheduler.last_tick_at().time_since_epoch().count() != 0,
+           "the tick is stamped as one that ran");
+
+  const Decision waiting = scheduler.Poll();
+  c.Expect(!waiting.run() && !waiting.parked,
+           "nothing runs before the interval, and nothing parks either");
+  clocks.Advance(minutes{29});
+  c.Expect(!scheduler.Poll().run(), "still nothing a minute short of it");
+  clocks.Advance(minutes{2});
+  c.Expect(scheduler.Poll().trigger == Trigger::kInterval,
+           "and the interval asks again, which is how a switch turned back on is noticed");
+
+  // Every interval, not on a growing curve: ten in a row are still ten ticks
+  // one interval apart.
+  for (int i = 0; i < 10; ++i) {
+    scheduler.Finished(TickOutcome::kServerDisabled);
+    clocks.Advance(minutes{31});
+    c.Expect(scheduler.Poll().run(), "each interval asks again");
+  }
+  c.ExpectEq(scheduler.failures(), 0, "and none of them counts as a failure");
+}
+
+/// #242: a tick that falls due under a running game is held, and however many
+/// fall due while it runs, **one** runs when it closes.
+///
+/// The worker is the one that knows a game is running (`SdEngine`'s foreground
+/// probe); what it asks of this object is that a tick it handed back with
+/// `Defer` is not lost -- the boot tick and a press are flags `Poll` consumes --
+/// and is not multiplied either.
+void Held(checks::Checks& c) {
+  Clocks clocks;
+  Scheduler scheduler(ConfigWith(minutes{30}), clocks.steady_fn(), clocks.wall_fn());
+
+  // The boot tick, handed out while a game runs. It is the one a plain re-poll
+  // would lose: `Poll` marks it taken the moment it answers `kBoot`.
+  const Decision boot = scheduler.Poll();
+  c.Expect(boot.trigger == Trigger::kBoot, "the boot tick is due");
+  scheduler.Defer(boot.trigger);
+  c.Expect(scheduler.Poll().trigger == Trigger::kBoot,
+           "and handed back, it is the next thing Poll answers rather than lost");
+  scheduler.Defer(Trigger::kBoot);
+
+  // Three intervals pass with the game still open, and a press lands among
+  // them. The worker re-polls on its own short cadence the whole time and
+  // hands every answer back.
+  int asked = 0;
+  for (int i = 0; i < 6 * 30; ++i) {
+    clocks.Advance(seconds{30});
+    if (i == 100) {
+      c.Expect(scheduler.RequestNow(), "a Sync now during the game is taken");
+      c.Expect(scheduler.requested(), "and reads as waiting");
+    }
+    const Decision decision = scheduler.Poll();
+    if (decision.run()) {
+      ++asked;
+      scheduler.Defer(decision.trigger);
+    }
+  }
+  c.ExpectEq(asked, 6 * 30, "every re-poll under the game finds the held tick still due");
+  c.Expect(scheduler.requested(), "the press is still waiting: deferring it did not drop it");
+
+  // The game closes.
+  const Decision after = scheduler.Poll();
+  c.Expect(after.trigger == Trigger::kOnDemand,
+           "one tick runs, and it is the press -- somebody asked for it");
+  scheduler.Finished(TickOutcome::kCompleted);
+  c.Expect(!scheduler.requested(), "which is the press served");
+  c.ExpectEq(RunFor(scheduler, clocks, minutes{29}, minutes{1}, TickOutcome::kCompleted), 0,
+             "and the boot tick, the press and three intervals were that one tick: nothing "
+             "else is due until the next interval");
+  c.ExpectEq(RunFor(scheduler, clocks, minutes{2}, minutes{1}, TickOutcome::kCompleted), 1,
+             "which then runs as it always did");
+
+  // A rescan handed back is the other consumed flag.
+  Scheduler rescanning(ConfigWith(minutes{30}), clocks.steady_fn(), clocks.wall_fn());
+  rescanning.Poll();
+  rescanning.Finished(TickOutcome::kRescanNeeded);
+  const Decision again = rescanning.Poll();
+  c.Expect(again.trigger == Trigger::kInterval, "a rescan asks to run again");
+  rescanning.Defer(again.trigger);
+  c.Expect(rescanning.Poll().trigger == Trigger::kInterval,
+           "and handed back it is still owed, not forgotten");
+  c.Expect(!rescanning.requested(), "without ever reading as a user's press");
+
+  // The switch going off drops a held tick as it drops a press.
+  SchedulerConfig config = ConfigWith(minutes{30});
+  Scheduler switched(config, clocks.steady_fn(), clocks.wall_fn());
+  switched.Poll();
+  switched.Finished(TickOutcome::kCompleted);
+  switched.RequestNow();
+  switched.Defer(switched.Poll().trigger);
+  config.enabled = false;
+  switched.Reconfigure(config);
+  c.Expect(switched.Poll().parked, "a held tick does not survive the switch going off");
+  config.enabled = true;
+  switched.Reconfigure(config);
+  c.Expect(!switched.Poll().run(), "so nothing fires the instant it is switched back on");
 }
 
 /// A handshake failure is a configuration fault, and is capped rather than
@@ -622,6 +750,10 @@ int main(int argc, char** argv) {
     Skew(checks);
   } else if (scenario == "failures") {
     Failures(checks);
+  } else if (scenario == "server_disabled") {
+    ServerDisabled(checks);
+  } else if (scenario == "held") {
+    Held(checks);
   } else if (scenario == "tls") {
     Tls(checks);
   } else if (scenario == "idle") {

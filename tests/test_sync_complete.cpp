@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "harness.hpp"
+#include "rommsync/config.hpp"
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
@@ -288,9 +289,9 @@ void Counts(rig::Checks& checks) {
 
 // --- parse --------------------------------------------------------------------
 //
-// The response, read against the body a live 5.2.0 actually sent
-// (server/contract/captures/sync-complete.json). Everything here is offline: the
-// capture is the same bytes docs/API_CONTRACT.md quotes.
+// The response, read against the body a live 5.4.0 actually sent
+// (server/contract/captures/5.4.0/sync-complete.json). Everything here is
+// offline: the capture is the bytes contract.captures re-checks live.
 
 void Parse(rig::Checks& checks) {
   const std::string body =
@@ -758,6 +759,93 @@ void Advance(rig::Checks& checks) {
                   "so the file can still be written at all");
   }
 
+  // `kMaxRecords` bounds save rows and state rows together (#246), and the saves
+  // half is handed both. With every save row reported, nothing stale is left to
+  // drop, and a trim of saves alone left a file `SaveBaseline` refused whole on
+  // every tick. State rows go before a save row does, as `TrimStates` has it.
+  {
+    state::Baseline mixed;
+    std::vector<sync::ClientSaveState> all;
+    const std::size_t saves = state::kMaxRecords - 28;
+    for (std::size_t index = 0; index < saves; ++index) {
+      state::SaveRecord row;
+      row.rom_id = static_cast<std::int64_t>(2000 + index);
+      row.slot = "autosave";
+      row.content_hash = crypto::Md5Hex("save " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.file_size_bytes = 1;
+      mixed.Set(row);
+      all.push_back(ReportedSave(row.rom_id, "autosave", row.content_hash, kReportedMtime, 1));
+    }
+    for (std::size_t index = 0; index < 32; ++index) {
+      state::StateRecord row;
+      row.rom_id = static_cast<std::int64_t>(2000 + index);
+      row.file_name = "Game " + std::to_string(index) + ".state";
+      row.content_hash = crypto::Md5Hex("state " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.server_state_id = static_cast<std::int64_t>(index) + 1;
+      row.server_updated_at = row.mtime;
+      mixed.SetState(row);
+    }
+    const sync::BaselineUpdate fitted =
+        sync::AdvanceBaseline(mixed, sync::SyncPlan{}, sync::ExecutionReport{}, all, *files);
+    checks.ExpectEq(fitted.value.size(), state::kMaxRecords,
+                    "saves and states past the bound are trimmed to it, states first");
+    checks.ExpectEq(fitted.value.rows().size(), saves, "...and every save row stands");
+    checks.Expect(!fitted.warnings.empty(), "...and the drop is said");
+    checks.Expect(state::SaveBaseline(files->Resolve(sync::kStateSdPath), fitted.value).ok(),
+                  "so the file can be written");
+  }
+
+  // The other file-level bound is bytes. Rows inside `kMaxRecords` can still
+  // outgrow `kMaxStateBytes` -- slots at their longest, many rows marked
+  // `deleted_on_server`, states with long names -- and `SaveBaseline` refuses
+  // that file whole just the same, losing this tick's marks with it (#233).
+  {
+    state::Baseline wide;
+    std::vector<sync::ClientSaveState> all;
+    const std::string slot(rommsync::config::kMaxSlotLength, 's');
+    const std::size_t saves = 100;
+    for (std::size_t index = 0; index < saves; ++index) {
+      state::SaveRecord row;
+      row.rom_id = static_cast<std::int64_t>(3000 + index);
+      row.slot = slot;
+      row.content_hash = crypto::Md5Hex("wide save " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.file_size_bytes = 1;
+      row.deleted_on_server = true;
+      wide.Set(row);
+      all.push_back(ReportedSave(row.rom_id, slot, row.content_hash, kReportedMtime, 1));
+    }
+    for (std::size_t index = 0; index < state::kMaxRecords - saves; ++index) {
+      state::StateRecord row;
+      row.rom_id = static_cast<std::int64_t>(3000 + index);
+      row.file_name = std::string(200, 'n') + std::to_string(index) + ".state";
+      row.content_hash = crypto::Md5Hex("wide state " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.server_state_id = static_cast<std::int64_t>(index) + 1;
+      row.server_updated_at = row.mtime;
+      wide.SetState(row);
+    }
+    checks.Expect(wide.size() <= state::kMaxRecords &&
+                      state::SerializeBaseline(wide).size() > state::kMaxStateBytes,
+                  "the case is rows inside the bound and bytes past it");
+    const sync::BaselineUpdate fitted =
+        sync::AdvanceBaseline(wide, sync::SyncPlan{}, sync::ExecutionReport{}, all, *files);
+    checks.ExpectEq(fitted.value.rows().size(), saves, "every save row stands");
+    std::size_t marked = 0;
+    for (const auto& [key, row] : fitted.value.rows()) {
+      (void)key;
+      marked += row.deleted_on_server ? 1 : 0;
+    }
+    checks.ExpectEq(marked, saves, "...with its deleted_on_server mark");
+    checks.Expect(fitted.value.state_rows().size() < state::kMaxRecords - saves,
+                  "state rows go first, to bring the text inside the byte bound");
+    checks.Expect(!fitted.warnings.empty(), "...and the drop is said");
+    checks.Expect(state::SaveBaseline(files->Resolve(sync::kStateSdPath), fitted.value).ok(),
+                  "so the file can be written, marks and all");
+  }
+
   // `kStateSdPath` spells the file name that `state::kStateFileName` owns. Two
   // spellings of it is one tick writing a baseline the next one cannot find.
   {
@@ -824,6 +912,70 @@ void Advance(rig::Checks& checks) {
   checks.Expect(missing.value.Find(6, std::string("gone")) == nullptr,
                 "a download that cannot be read back erases the row it replaced");
   checks.Expect(!missing.warnings.empty(), "...and the loss is named");
+
+  // M10-7 (#233): a `delete`. Removed, the row describes a file that is gone
+  // and is erased. Kept, the row is the bytes RomM deleted, marked so the next
+  // tick does not offer them -- from what this tick reported, since the file
+  // was not touched -- and a kept save this tick did not report has no facts
+  // to mark, so it is erased too.
+  for (const sync::OperationOutcome outcome :
+       {sync::OperationOutcome::kRemoved, sync::OperationOutcome::kKept}) {
+    const std::string what = sync::ToString(outcome);
+    sync::SyncPlan deleted_plan;
+    deleted_plan.session_id = 1;
+    deleted_plan.operations.push_back(OperationOf(sync::Action::kDelete, 6, "gone"));
+    sync::ExecutionReport deleted_report;
+    deleted_report.operations.push_back(
+        ResultOf(outcome, 6, "gone", SavePath("gone.srm")));
+    const sync::BaselineUpdate untracked =
+        sync::AdvanceBaseline(had_a_row, deleted_plan, deleted_report, {}, *files);
+    checks.Expect(untracked.value.Find(6, std::string("gone")) == nullptr,
+                  what + ": a delete with nothing reported for the slot erases its row");
+    checks.Expect(untracked.warnings.empty(), what + ": ...as an ordinary outcome, not a loss");
+
+    sync::ClientSaveState local;
+    local.rom_id = 6;
+    local.slot = "gone";
+    local.file_name = "gone.srm";
+    local.content_hash = crypto::Md5Hex("the bytes RomM deleted");
+    local.updated_at = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+    local.file_size_bytes = 22;
+    const sync::BaselineUpdate marked =
+        sync::AdvanceBaseline(had_a_row, deleted_plan, deleted_report, {local}, *files);
+    const state::SaveRecord* row = marked.value.Find(6, std::string("gone"));
+    if (outcome == sync::OperationOutcome::kRemoved) {
+      checks.Expect(row == nullptr, "removed: the row goes with the file");
+    } else {
+      checks.Expect(row != nullptr && row->deleted_on_server &&
+                        row->content_hash == *local.content_hash &&
+                        !row->server_content_hash.has_value(),
+                    "kept: the row is the reported bytes, marked deleted on the server");
+      // ...and the mark goes the moment the slot syncs again.
+      if (row != nullptr) {
+        sync::SyncPlan up;
+        up.session_id = 1;
+        up.operations.push_back(OperationOf(sync::Action::kUpload, 6, "gone"));
+        sync::ExecutionReport went;
+        went.operations.push_back(
+            ResultOf(sync::OperationOutcome::kUploaded, 6, "gone", SavePath("gone.srm")));
+        const sync::BaselineUpdate synced =
+            sync::AdvanceBaseline(marked.value, up, went, {local}, *files);
+        const state::SaveRecord* again = synced.value.Find(6, std::string("gone"));
+        checks.Expect(again != nullptr && !again->deleted_on_server,
+                      "kept: an upload of new progress clears the mark");
+      }
+    }
+
+    // A delete that failed did nothing, and keeps the row so the next tick
+    // negotiates the save again.
+    sync::ExecutionReport failed_report;
+    failed_report.operations.push_back(
+        ResultOf(sync::OperationOutcome::kFailed, 6, "gone", SavePath("gone.srm")));
+    const sync::BaselineUpdate retried =
+        sync::AdvanceBaseline(had_a_row, deleted_plan, failed_report, {}, *files);
+    checks.Expect(retried.value.Find(6, std::string("gone")) != nullptr,
+                  what + ": a failed delete keeps the row");
+  }
 
   // The opposite path, and the opposite answer: an upload leaves the card alone,
   // so a reported digest that is missing costs the save nothing -- the row the
@@ -952,8 +1104,8 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
   // existed. Both are asserted rather than assumed because both are on the
   // ordinary path: `CompleteSession` retries a 5xx, so a first attempt that
   // reached RomM before the connection died makes the *second* one land here --
-  // and a tick that gave up on a negotiation completes an id the next negotiate
-  // already cancelled (docs/API_CONTRACT.md).
+  // and on 5.2.0 a tick that gave up on a negotiation completed an id the next
+  // negotiate had already cancelled -- which 5.4.0 no longer does; see below.
   const sync::Completion again = sync::CompleteSession(
       client, TokenFor(base, fixture), plan.session_id, tick.counts, {},
       FinishInstantly().complete);
@@ -972,11 +1124,13 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
                     sync::ToString(missing.error) + " -- " + missing.message);
   checks.Expect(!sync::ShouldRetry(missing.error), "...and is not worth another attempt");
 
-  // And the stale id a tick actually ends up holding, which is a different
-  // answer from both of those: negotiate twice and the first session is
-  // CANCELLED, so completing it is a 400 whose detail says the counts were
-  // never recorded rather than that the body was wrong. This is the reachable
-  // path -- a tick that gave up on one negotiation and made another is in it.
+  // And an earlier id after a later negotiation. On 5.2.0 every negotiate
+  // cancelled the device's previous session, so this was the 400 `kSuperseded`
+  // names. 5.4.0 cancels nothing: a session belongs to the negotiation that
+  // opened it, two can be open at once, and the earlier one still completes
+  // (`sync-complete-earlier-session.json`, #235). What the client owes that is
+  // to read the answer as the success it is -- no warning about a status it did
+  // not expect, no retry -- and to leave the later session completable too.
   {
     sync::SyncNegotiatePayload empty;
     empty.device_id = fixture.device_id;
@@ -986,16 +1140,25 @@ void Session(rig::Checks& checks, http::HttpClient& client, const std::string& b
         PlanFor(checks, client, base, fixture, empty, {}, &second)) {
       checks.Expect(first.session_id != second.session_id,
                     "negotiating twice opens a second session");
-      const sync::Completion stale =
+      const sync::Completion earlier =
           sync::CompleteSession(client, TokenFor(base, fixture), first.session_id,
                                 tick.counts, {}, FinishInstantly().complete);
-      checks.Expect(stale.error == sync::CompleteError::kSuperseded,
-                    std::string("a session a later negotiation cancelled is named apart from a "
-                                "refused body: ") +
-                        sync::ToString(stale.error) + " -- " + stale.message);
-      checks.Expect(!sync::ShouldRetry(stale.error),
-                    "...and is not retried: the next tick negotiates its own session");
-      harness::Complete(client, base, fixture, second.session_id, 0, 0);
+      checks.Expect(earlier.ok(), std::string("the earlier session still completes: ") +
+                                      sync::ToString(earlier.error) + " -- " + earlier.message);
+      checks.ExpectEq(earlier.attempts, 1, "...on the first attempt");
+      if (earlier.ok()) {
+        checks.ExpectEq(earlier.value.session.status, std::string("COMPLETED"),
+                        "...as COMPLETED");
+        checks.Expect(earlier.value.warnings.empty(),
+                      "...with nothing to warn about: " +
+                          (earlier.value.warnings.empty() ? std::string()
+                                                          : earlier.value.warnings[0]));
+      }
+      const sync::Completion later =
+          sync::CompleteSession(client, TokenFor(base, fixture), second.session_id, {}, {},
+                                FinishInstantly().complete);
+      checks.Expect(later.ok(), std::string("and so does the later one: ") +
+                                    sync::ToString(later.error) + " -- " + later.message);
     }
   }
 
@@ -1391,8 +1554,9 @@ void Refused(rig::Checks& checks, http::HttpClient& client, const std::string& b
   checks.Expect(row != nullptr && row->content_hash == *local.content_hash,
                 "so the next tick does not re-upload a save the server already has");
 
-  // The session was never closed, which is not a corrupted anything: the next
-  // negotiate cancels it (docs/API_CONTRACT.md).
+  // The session was never closed, which is not a corrupted anything: 5.4.0's
+  // cleanup fails it after 24 hours (docs/API_CONTRACT.md). Closed here so the
+  // fixture device does not collect open ones.
   harness::Complete(client, base, fixture, plan.session_id, 1, 0);
   if (save_id != 0) {
     harness::DeleteSave(client, base, fixture, save_id);

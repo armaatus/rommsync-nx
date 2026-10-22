@@ -46,7 +46,7 @@ with `cat`, and both substitute the same `version.hpp.in`.
   because libultrahand's own objects reference them (its updater and its package
   handling), and `--gc-sections` cannot drop a symbol a linked object still
   names. The overlay is a launched process with the applet's memory, not a
-  resident sysmodule in a `0x150000` heap, so the footprint M0-1 was measuring
+  resident sysmodule in a `0x180000` heap, so the footprint M0-1 was measuring
   does not apply to it -- and `ovl-rommsync` itself opens no socket: everything
   it does over the network happens in `sys-rommsync` (overlay/AGENTS.md). The
   rule for the **sysmodule** is unchanged.
@@ -58,7 +58,177 @@ with `cat`, and both substitute the same `version.hpp.in`.
   checks out with `submodules: recursive`.
 
 Recommended: build in the official devkitpro docker image
-`devkitpro/devkita64` so contributors and CI match. See `.github/workflows/ci.yml`.
+`devkitpro/devkita64`, at the tag CI pins, so contributors and CI match. See
+`.github/workflows/ci.yml`.
+
+### The toolchain pin
+
+Neither input to the Switch build is ours, and neither announces a break (#199):
+
+- **The image** is pinned to a dated tag, `DEVKITPRO_IMAGE` in
+  [`scripts/toolchain.sh`](../scripts/toolchain.sh) -- not `:latest`, which
+  moves under every build at once. The `switch-build-canary` CI job builds
+  against `:latest` on every push, with `continue-on-error`, so a devkitPro
+  release that breaks us shows up as one red, non-blocking job rather than as a
+  red required check on an unrelated PR.
+- **libultrahand** is pinned to a **tag** commit, recorded as
+  `# Pinned at tag vX.Y.Z = <sha>` in [`.gitmodules`](../.gitmodules). Upstream's
+  `main` is a pre-release "in constant revision"; its tags are its releases. The
+  library has no version macro, so the pin is the only control there is.
+
+`ctest -R toolchain` holds both: `toolchain.pins` that every file naming the
+image names the pin (the canary alone excepted), `toolchain.submodule` that the
+gitlink is the recorded tag's commit, and `toolchain.libnx` that the pinned
+image's libnx is at least `LIBNX_FLOOR` (4.10.0, HOS 21.0.0's TLS ABI). The
+`switch-build` job runs that last check in the container on every push.
+
+**Moving the image.** Pick a dated tag from
+[Docker Hub](https://hub.docker.com/r/devkitpro/devkita64/tags), preferably one
+the canary has been green on. Change `DEVKITPRO_IMAGE`; `ctest -R
+toolchain.pins` then lists every other line that still names the old one
+(ci.yml's `switch-build` and `release` containers, and the build commands in
+the README and CLAUDE.md). `docker pull` the new tag and run `ctest -R
+'toolchain|switch|package|npdm'`: the libnx floor and the real cross-compiles
+are the part that says the move is safe. Put the new libnx version
+(`scripts/toolchain.sh libnx` prints it) in the commit message.
+
+**Moving libultrahand.** Only to a tag. `git -C overlay/lib/libultrahand fetch
+--tags && git -C overlay/lib/libultrahand checkout vX.Y.Z`, stage the gitlink,
+and update the `# Pinned at tag` line. Then read upstream's changes for
+signatures that still compile but mean something else -- v2.0.0 changed four
+(`drawString`, `CategoryHeader`, `OverlayFrame`, `ListItem`; #199 has the
+table) -- before trusting a green `switch.builds`.
+
+### The toolchain's ctest entries
+
+Six entries need the image: `switch.builds`, `switch.tlsprobe`,
+`toolchain.libnx`, `npdm.svcs`, `package.builds` and `stack.measured`, the
+`toolchain` label (`ctest -L toolchain`). They skip without it, and the
+host-tests runner never has it, so they run in the `switch-build` job instead:
+that job is already inside the pinned image, and its last step is
+`tests/toolchain_suite.sh --here`, which runs all six in place and **fails on a
+skip** (M9-12, #211). Before
+that, CI read four bytes of each artifact and nothing else; the symbols, the
+NACP and the NPDM checks had never run anywhere. `switch.toolchain_suite` holds
+the suite's list to the label, so a new entry needs both.
+
+The entries reach the image through `toolchain_run` in `scripts/toolchain.sh`:
+`docker run` on a workstation, in place when `ROMMSYNC_IN_TOOLCHAIN=1` says the
+shell is inside it already. Explicit rather than sniffed, because a devkitPro
+installed natively on a laptop is not the pin.
+
+What they read out of the built files, beyond the build succeeding:
+
+- **libnx's `LNY2` stamp** in MOD0, version >= 1, on the `.nsp`, the `.ovl` and
+  the probe (`scripts/artifact-check.py lny2`). It is how a binary says it was
+  built for HOS 21.0.0's TLS ABI. Ultrahand reads it out of the `.ovl` on the
+  card and on Atmosphère >= 1.10.0 hides an overlay without it. The libnx floor
+  check says the toolchain *should* stamp it; this says it did.
+- **The overlay's NACP**, parsed by Ultrahand's `getOverlayInfo` route — the
+  NRO's size, the `ASET` header after it, the NACP that names — with the name
+  and version the menu shows. An entry whose NACP does not parse is skipped.
+- **`ROMMSYNC_NX_VERSION=<VERSION>`** as a string in both artifacts. It is
+  `kBuildMarker`, and `version()` returns its tail, so `--gc-sections` cannot
+  drop it. elf2nso LZ4-compresses every NSO segment with no switch to stop it,
+  so `strings` on the `.nsp` finds it only by luck;
+  `scripts/artifact-check.py version FILE` decompresses first, and is how a file
+  from a bug report is identified.
+- **The NPDM** against the SVCs the linked sysmodule issues (`npdm.svcs`), and
+  **toolbox.json's `tid`** against the program id read back out of that NPDM
+  (`package.builds`).
+- **The release zip's layout**, the image budget, and the `.ovl`'s 1 MiB
+  ceiling (`scripts/image-budget.sh`).
+
+The overlay has no NPDM: it runs inside nx-ovlloader's process, with
+nx-ovlloader's capabilities, so an SVC or service question about `ovl-rommsync`
+is one about nx-ovlloader's NPDM, which this repo does not build.
+
+### What the image costs
+
+Both Switch targets live in a memory budget somebody else sets. The sysmodule's
+comes out of what Atmosphere leaves custom system modules, shared with every
+other sysmodule installed. That has shrunk on recent firmware -- Atmosphere's
+1.9.0 and 1.10.0 changelogs each say so -- and boot2 aborts outright on a launch
+that does not fit. (How much is left on HOS 21: #200 cites 7 MB from
+`kern_k_system_control.cpp` and 32 MB from pm's `pm_spec.cpp`, constants in
+different layers, not yet reconciled. Nothing here is sized against either.) The
+overlay's is nx-ovlloader's heap, 4 MB by default, into which the whole `.ovl`
+is read before anything is allocated. So `switch.mk` compiles for size (#200):
+
+- **`-fno-unwind-tables -fno-asynchronous-unwind-tables`.** The build is
+  `-fno-exceptions`, so nothing unwinds through our frames, and `.eh_frame`
+  lives in the rodata segment -- resident for the life of the process. What is
+  left after the flags is libnx's, newlib's and libstdc++'s prebuilt tables.
+  Atmosphere also `/DISCARD/`s those in its linker script; we do not, because
+  that means forking libnx's `switch.ld` (which `switch.specs` names and which
+  `KEEP`s `.eh_frame`) and re-merging it on every move of the pin above, for
+  ~27 KiB in the sysmodule (~34 KiB in the overlay, which links more of libnx).
+- **`-Os`, not `-O2`.** The larger win by far, and libultrahand's own
+  recommended flag set.
+- **No `snprintf` in the sysmodule.** One call links newlib's `_svfprintf_r`,
+  and with it `_dtoa_r`, `assert` and `_vfiprintf_r`: about 40 KiB of `.text`
+  for lines that only format a string and an integer. Boot lines go through
+  `boot::Append`/`AppendNumber` and timestamps through `std::to_chars`;
+  `switch.builds` fails if the formatter comes back. (libnx's resolver keeps
+  `fprintf`'s own.)
+
+Measured in `devkitpro/devkita64:20260219` (GCC 15.2.0) with
+`aarch64-none-elf-size -A`; "image" is the end of `.bss`, i.e. everything the loader maps:
+
+| | `-O2` (before) | `+` no unwind tables | `+ -Os` (now) |
+|---|---|---|---|
+| sysmodule `.text` | 1,177,792 | 1,177,792 | **506,624** |
+| sysmodule `.rodata` | 62,912 | 62,912 | 56,592 |
+| sysmodule `.eh_frame` | 85,672 | 26,992 | 27,112 |
+| sysmodule `.bss` | 1,393,792 | 1,393,792 | 1,393,792 |
+| sysmodule image | 2,745,296 (2.62 MiB) | 2,687,952 (2.56 MiB) | **2,008,016 (1.92 MiB)** |
+| `.nsp` | 980,504 | 944,557 | 432,370 |
+| overlay `.text` | 820,608 | 820,608 | 506,944 |
+| overlay `.eh_frame` | 81,376 | 34,864 | 34,936 |
+| `.ovl` | 1,015,868 | 970,812 | **647,228** |
+
+The trade `-Os` could have cost is speed on the one hot loop: hashing a whole rom
+to verify a download (`crypto::Sha1FileHex` / `Md5FileHex`, 4 KiB at a time).
+core/'s `md5.cpp` and `sha1.cpp` compiled by that devkitA64 with `switch.mk`'s
+exact flags, linked into a Linux arm64 driver and run over 256 MiB in 4 KiB
+chunks (best of five, Apple-silicon host, not a Cortex-A57):
+
+| | `-O2` | `-Os` |
+|---|---|---|
+| MD5 | 579 MiB/s | 548 MiB/s (−5%) |
+| SHA-1 | 311 MiB/s | 418 MiB/s (+34%) |
+
+On this host either is several times what a console's SD card reads. An A57 is
+slower at both, but `-Os` did not make the slower hash materially slower, and it
+made the one a verify prefers -- SHA-1, whenever RomM recorded one -- faster.
+
+The rig's own download and hash tests (`download.roundtrip|verify|resume`,
+`wire.download`, `core.md5`, `core.sha1_fixture`), rebuilt at `-O2` and at
+`-Os`, are identical to the 10 ms except `download.resume` (1.36--1.44 s
+against 1.47--1.50 s). That says little: the rig runs host-compiled code over
+small fixtures, so it cannot see `switch.mk`'s flags at all. How long a verify
+takes on a real A57 is a hardware measurement, and waits for the M8-1 gate.
+
+`ctest -R switch.builds` holds the result: no object this build compiles may
+carry an `.eh_frame`, the sysmodule's linked `.eh_frame` stays under 32 KiB, and
+both targets' `.text` under 640 KiB, which a revert to `-O2` overshoots in both;
+and the build log carries no warning, vendored code and the link included, since
+neither is `-Werror`.
+Those ceilings, and the budget for the whole image, live in
+`scripts/image-budget.sh` (M9-15, #204): the three LOAD segments an NSO maps,
+each rounded up to its page, must stay under **2.25 MiB** (2,080,768 bytes when
+the budget was set), and `.bss` must hold `kInnerHeapSize` and at most 64 KiB
+besides. The `switch-build` job runs it after its upload and writes the numbers
+to the run's summary; `switch.builds` runs the same script over its own build.
+Moving the budget is an edit to that script, with its reason beside it -- the CI
+step passes no flag, and `switch.ci_requires_artifacts` refuses one.
+
+What is still linked and could go: newlib's full `printf` (`_svfprintf_r`,
+~15 KiB, plus `_dtoa_r`), first pulled in by our six `snprintf` calls, none of
+which formats a float (whether libnx needs it too is not audited); and
+libstdc++'s `fast_float` (a 10 KiB power-of-five table and ~6 KiB of parser),
+which `core/src/json.cpp` genuinely uses to parse JSON numbers with a
+fraction or exponent.
 
 ## Repo build layout
 
@@ -131,22 +301,33 @@ console rather than loudly here:
   installed homebrew set (`sysmodule/README.md`), so it will move, and every
   other copy of it is how a move lands in one place only.
 - **No `flags/boot2.flag`, and no `config.ini`.** The sysmodule ships disabled
-  (#33), and an upgrade is this same zip unpacked over the top — replacing a
-  user's settings is not something a release may do. `token.dat`, `device.dat`,
-  `state.db`, `queue.json` and `rommsync.log` are not in the archive either, so
-  they survive — the log in particular, because the failure a user is about to
-  report is usually the one they upgraded to fix.
+  (#33) — `flags/` itself ships, empty, for the older ovl-sysmodules that do
+  not create it (#211) — and an upgrade is this same zip unpacked over the
+  top — replacing a user's settings is not something a release may do.
+  `token.dat`, `device.dat`, `state.db`, `queue.json` and `rommsync.log` are not
+  in the archive either, so they survive — the log in particular, because the
+  failure a user is about to report is usually the one they upgraded to fix.
 - **The archive is byte-deterministic** — fixed entry order, timestamps and
   permissions — so the checksums a release publishes describe the build and not
   one upload.
 
-`ctest -R package` is what holds all of it: four scenarios against stubbed
-artifacts that need no toolchain, plus `package.builds`, which packages a real
-devkitPro build inside the same container. `switch-build` runs the script on
-every push as well, so a failure specific to packaging *inside* the container is
-not something a tag discovers first. `tests/toolbox_check.py` is the part that
-reads `toolbox.json` the way ovl-sysmodules does, so a field that overlay
-requires cannot quietly go missing.
+`ctest -R package` is what holds all of it: five scenarios that need no
+toolchain, plus `package.builds`, which packages a real devkitPro build inside
+the same container. `switch-build` runs the script on every push as well, and
+`package.builds` with it (see [the toolchain's ctest entries](#the-toolchains-ctest-entries)),
+so a failure specific to packaging *inside* the container is not something a tag
+discovers first. The script also refuses an archive whose listing is anything
+but its own entries, so a `__MACOSX/` or a `._exefs.nsp` cannot ship.
+
+`tests/toolbox_check.py` is the part that reads `toolbox.json` the way
+ovl-sysmodules does, and it is strict where that overlay is fatal: ovl-sysmodules
+builds `-fno-exceptions` over nlohmann/json, which then aborts on a wrong-typed
+value, and its `gui_main.cpp` catches nothing — so `"requires_reboot": "false"`
+takes down the whole overlay and every other module's entry with it. The check
+holds the exact four keys, each key's JSON type, a 16-hex-digit `tid` equal to
+its directory's name, and, in `package.builds`, equal to the program id
+`scripts/npdm-check.py` reads out of the built NPDM. `package.toolbox` feeds it
+each malformed file in turn.
 
 ## The two switches
 
@@ -163,10 +344,11 @@ that does nothing.
 console; the two are meant to agree, and changing one means changing the other.
 
 **`ovl-rommsync` never writes `boot2.flag`.** It may read it to explain a
-silence. Creating it is ovl-sysmodules' job — that overlay `mkdir`s the `flags/`
-directory itself before writing the flag into it, which is why the archive ships
-no `flags/` entry and does not need to — and two overlays writing one flag is how
-they come to disagree about what is on.
+silence. Creating it is ovl-sysmodules' job, and two overlays writing one flag
+is how they come to disagree about what is on. The archive ships the `flags/`
+directory empty, as a zip directory entry (#211): current ovl-sysmodules
+`mkdir`s it before writing the flag, but builds older than its #6 fix do not,
+and their toggle then does nothing.
 
 ### What the sysmodule has to survive
 
@@ -416,15 +598,16 @@ The experiment is [`tlsprobe/`](../tlsprobe/README.md): a manually-launched
 through `ssl` and reports what each stage cost. It is built by CI on every push
 and by `ctest -R switch.tlsprobe`, and it has **not been run** — see below.
 
-**Code size.** Three aarch64 images, identical flags and libnx, differing only in
-what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
+**Code size.** Three aarch64 images, identical flags (`switch.mk`'s, re-measured
+at its `-Os` by #200, which moved each figure by under 60 bytes) and libnx,
+differing only in what they link (`./tlsprobe/measure-footprint.sh`, devkitA64 r29.2-1,
 libnx 4.12.0-1, switch-mbedtls 2.28.10-1):
 
 | image | `.text` | `.data` | `.bss` | Δ`.text` |
 |---|---|---|---|---|
-| baseline — libnx + newlib stdio | 113,806 | 14,264 | 19,392 | — |
-| **`ssl` service** — sockets + the full handshake sequence | 176,513 | 15,216 | 19,712 | **+62,707** |
-| mbedTLS — the same handshake in-process | 501,685 | 30,952 | 29,088 | +387,879 |
+| baseline — libnx + newlib stdio | 113,774 | 14,264 | 19,392 | — |
+| **`ssl` service** — sockets + the full handshake sequence | 176,465 | 15,216 | 19,712 | **+62,691** |
+| mbedTLS — the same handshake in-process | 501,629 | 30,952 | 29,088 | +387,855 |
 
 Borrowing Horizon's TLS costs **61 KiB of code**; carrying our own costs
 **379 KiB**, six times more, before its per-connection heap. That is the whole
@@ -457,27 +640,115 @@ a sysmodule pays for a TLS request is therefore:
    left as it was — it measured what it measured, and a spike edited after the
    fact measures nothing.
 
-   `sys-rommsync`'s inner heap is `0x150000` (1.3 MiB), derived term by term in
+   `sys-rommsync`'s inner heap is `0x180000` (1.5 MiB), derived term by term in
    `sysmodule/source/main.cpp` and checked there by a `static_assert` and by
    `tests/test_heap_budget.py` rather than by this table. It was `0xC0000` until
    M9-2 (#207), which found the table wrong by more than its own margin — two
    thread stacks budgeted at a quarter of what devkitA64 gives them, and an open
-   `DIR` costing ~24 KiB with no term at all. The default socket config does not
-   fit in it and never will; the sysmodule's leaves ~1.2 MiB. **Never call
+   `DIR` costing ~24 KiB with no term at all — M9-10 (#201) added 64 KiB to
+   it: 48 KiB for the download's bigger read chunk and 16 KiB for the pairing
+   thread's buffer, which the table had never counted (item 2) — and M9-20
+   (#246) 128 KiB more, for a tick's saves and the list service's pages. The
+   default socket config does not fit in it and never will; the sysmodule's
+   leaves ~1.4 MiB. **Never call
    `socketInitializeDefault()` from the sysmodule** — that single line is the
    difference between a working engine and one that dies at `socketInitialize`.
 
    The heap was `0x80000` until M1-7, and the two terms it was short by are the
    two easiest to miss. **A list response is buffered whole** — `Send` returns a
-   `std::string` and nothing caps it — and the two that can be large were
+   `std::string`, which nothing capped until `http::kMaxResponseBytes` (#248) — and the two that can be large were
    measured against the fixture rather than guessed: `/api/platforms` is an
    unpaged bare array in 5.2.0 at ~800 bytes a row, so `kMaxPlatforms` of them is
    ~200 KiB, and `/api/roms?limit=64` is ~136 KiB. And there are **two** worker
    threads to come, not one — M1-6's pairing thread and M7-2's scheduler — each
    paying its stack out of this heap.
-2. **One in-flight buffer** — the download-streaming buffer, ours to size. Roms
-   stream to file and never sit in RAM whole (hard rule 2's sibling: nothing is
-   buffered that does not have to be).
+
+   M9-19 (#217) found the response term short by ten times: a parsed
+   `json::Value` document weighs ~11× its text on aarch64's libstdc++, so a
+   200-row rom page held as one was ~4.6 MiB. A page is now parsed a row at a time
+   (`json::ParseEach`) and its body reserved to its `Content-Length`, so a
+   response costs its text once and one row beside it. The same issue derived
+   the three bounds that had been set beside the heap rather than from it — the
+   rom index's page (64) and size (1,024 roms), and a directory listing (512
+   entries) — and `main.cpp` holds each as a row or a pinned term.
+
+   M9-20 (#246) counted what was left. Every other response whose size comes
+   from an array — the negotiate plan, the state listing, the device list,
+   `queue.json` — is read a row at a time too; a body of the wrong shape is
+   refused before it is parsed; and an API body with no `Content-Length` is
+   capped at 128 KiB (`kMaxUndeclaredBodyBytes`), where it used to grow without
+   one. It also measured what a **tick holds for every save** — the scan's
+   record, what is reported and targeted, the plan's operation and what it did,
+   ~1.7 KiB a save at the tick's worst moment — and what the list service keeps
+   between pumps, now one platform snapshot and one built page across every
+   cursor. Neither had a row. At the 512 saves `state::kMaxRecords` allowed, the
+   tick alone was ~856 KiB, so the bound is now **128 saves**, what the heap
+   holds after growing to `0x180000`; each further 64 is ~140 KiB of resident
+   `.bss`, and the image was then within 36 KiB of `scripts/image-budget.sh`'s
+   ceiling, and is closer since (the script prints what is left).
+
+   M9-21 (#247) counted the last three it found. The **states half of a tick**
+   is a fifth phase of the tick's row, pinned under the saves' run phase: the
+   engine now lets go of every save before it, and one run places at most
+   `sync::kMaxStatePlacements` (32) of the server's states, where a full
+   listing could have placed ~220. The **baseline** is held twice, not three
+   times: the engine moves it into `sync::RunTick` instead of keeping a copy.
+   And the **download queue** has a row: it is resident, and a change to it
+   used to hold it three times over — the queue, a copy to roll back to, and all
+   of it serialised. A change now keeps the rows it touched, `queue.json` is
+   written a piece at a time, and the queue's page reads the rows in place; even
+   so the rows are ~21 KiB at 32 entries, which is why `kMaxQueueEntries` is 32
+   and not 64. That left a 23 KiB margin and six things uncounted (#248).
+
+   M9-22 (#248) counted them, and found the widths everything above was sized
+   at were the fixture's: homebrew roms with no metadata, ~2.1 KiB a row. A rom
+   RomM identified on IGDB is ~12 KiB, so a 64-row page was ~750 KiB, grown past
+   a 256 KiB reservation into a heap that could not hold it. **Every backend now
+   caps a buffered body** at `http::kMaxResponseBytes` (200 KiB) — refused
+   unread when it declares its length, `Error::kTooLarge` — and the two rom
+   pagers ask for half the rows when a page meets it. A reader builds only the
+   members of a row it reads (`json::ParseEach`'s keeping form), so a wide row
+   in flight costs what is kept of it rather than ~16× its text. The negotiate
+   body is held once and freed before the plan is read; the last chunk's plan
+   goes before the next is asked; the #232 resolution resolves at most
+   `sync::kMaxResolvedUploads` (4) uploads a plan, and a tick's plans are held
+   one at a time; a list page is measured at its
+   peak, not re-encoded per append; the device search keeps one row; and the
+   **conflict history** — resident and never counted — has a row, and is
+   written an entry at a time. The margin is 8 KiB.
+2. **The in-flight buffers** — ours to size. Roms stream to file and never sit
+   in RAM whole (hard rule 2's sibling: nothing is buffered that does not have
+   to be). Every `sslConnectionRead` is an IPC round trip to the `ssl`
+   sysmodule, so the buffer a download reads into is the IPC count per rom:
+   65,536 round trips per GiB at 16 KiB, which NPShopSwitch measured holding a
+   shipping sysmodule's HTTPS installs under 1 MB/s. At 64 KiB it is 16,384 —
+   *if* one `sslConnectionRead` returns more than a TLS record's 16 KiB, which
+   nothing off a console can tell (`tlsprobe` now reports it). Since M9-10 (#201) a
+   download reads **64 KiB** at a time (`kDownloadBufferSize`,
+   `sysmodule/source/http/http_wire.hpp`) and an API call keeps 16 KiB; two
+   requests can be in flight — the worker's and the pairing thread's — and only
+   the worker downloads, so the heap pays 80 KiB.
+
+   64 rather than NPShopSwitch's 128 because of the **second ceiling**: a read
+   returns what the socket has buffered, and `tcp_rx_buf_max_size = 0x10000`
+   with `sb_efficiency = 1` caps that, and the TCP receive window, at 64 KiB. A
+   bigger chunk is heap the read has nothing to fill from, and `main.cpp` holds
+   the chunk to the window with a `static_assert`. The window is also a
+   throughput ceiling of its own, window ÷ RTT:
+
+   | RTT | ceiling at a 64 KiB window | a 1 GiB rom |
+   |---|---|---|
+   | 2 ms (a home LAN) | ~32 MB/s | ~33 s, if the Wi-Fi keeps up |
+   | 10 ms | ~6.5 MB/s | ~2.7 min |
+   | 30 ms (a RomM across the internet) | ~2.2 MB/s | ~8 min |
+
+   **That is the intended limit for v1**, and it is recorded rather than raised:
+   RomM is self-hosted and usually on the LAN, where the window is not what
+   binds. Raising it costs transfer memory out of the same heap, one for one at
+   `sb_efficiency = 1` — `tcp_rx_buf_max_size = 0x40000` is another 192 KiB of
+   `kHeapSocketMemory` — and the chunk could then follow it. Whether either
+   number is right is a console measurement, and M8-2 (#44) asks for it:
+   `tlsprobe`'s `read_buf` and `tcp_rx_max` keys sweep both without a rebuild.
 3. **Transiently, the CA PEM** while `sslContextImportServerPki` copies it, for a
    self-signed server. Freed immediately after.
 
@@ -546,11 +817,11 @@ No auto-boot sysmodule was installed on any console for this spike, and no
 console was involved in it at all.
 
 Budget note: sysmodules declare their heap in `config.json`/`npdm`; size it for
-one in-flight download buffer + the bsd transfer memory above + the `state.db`
+the in-flight buffers (a download's and an API call's) + the bsd transfer memory above + the `state.db`
 baseline, and stream to file rather than buffering whole roms in RAM. The
 baseline is the one item that grows with the library rather than being a fixed
 buffer — its text and then its parsed rows, bounded by `state::kMaxStateBytes`
-and `state::kMaxRecords`, which are sized against the ~1.2 MiB this section
+and `state::kMaxRecords`, which are sized against the ~1.4 MiB this section
 leaves free and have to move with it (`core/include/rommsync/state_db.hpp`).
 Since M1-7 (#126) that budget is written out term by term above
 `kInnerHeapSize` in `sysmodule/source/main.cpp`, and a `static_assert` there
@@ -588,8 +859,28 @@ A removed command leaves a hole.
 | 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` | never fails; an empty history is a page |
-| 15 | `RestoreBackup` | `entry_id` -> `RestoreReport` (outcome + the new backup's path) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed` |
+| 15 | `RestoreBackup` | `entry_id` -> `RestoreState` (phase + which entry) | never fails, never waits for the copy; a press while one runs answers that one |
 | 16 | `GetLog` | `lines` -> the last N log lines + how many were ever written | never fails; an empty tail is an answer |
+| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed` |
+
+`RestoreBackup` and `GetRestoreState` are one restore in two calls, since M9-6
+(#209). A restore copies a whole save, and a save is as large as a game makes
+it, so the command hands the copy to the sysmodule's worker -- the thread every
+tick runs on, so the two save writers cannot overlap -- and answers `running` at
+once; the overlay polls command 17 until it says `done`. Before that the copy
+ran on the IPC thread and held the overlay's call, and every other command, for
+as long as the card took. That change of answer made `ipc::kVersion` 3;
+`SyncResult::kServerDisabled` (M10-9, #235) made it 4, the two required
+`Status` fields M10-2 (#228) added made it 5, and `SyncOutcome::kDeferred` --
+"Sync now" pressed during a game, held until it closes (M10-16, #242) -- made
+it 6, and a conflict entry's `deleted` event -- a save RomM deleted, taken off
+the card after a backup (M10-7, #233) -- made it 7.
+
+The overlay bounds every call anyway: `IpcClient` dispatches on a worker thread
+of its own and the draw thread waits at most `kCallBudget` (half a second) for
+an answer. Past that the screen says "not responding" and every later call
+answers at once until the one that is out comes back
+(`overlay/source/ipc_client.hpp`).
 
 `GetLog` is the one command answered from neither the engine nor the card.
 `core/include/rommsync/log.hpp` keeps the last `log::kTailLines` lines in memory
@@ -637,10 +928,10 @@ Three more errors belong to the transport rather than to any one command:
 different releases), `kMalformedRequest` (a request payload that did not decode)
 and `kTooLarge` (a response that would not fit the cap).
 
-A fourth, `kUnavailable`, belongs to *this stage of the project* rather than to
-the wire: the sysmodule hosts the whole command set from M4-1 on, because the
-overlay needs a service to talk to, while the machinery behind half of it is
-still being built. A command whose engine does not exist yet answers
+A fourth, `kUnavailable`, belonged to *a stage of the project* rather than to
+the wire: the sysmodule hosted the whole command set from M4-1 on, because the
+overlay needed a service to talk to, while the machinery behind half of it was
+still being built. A command whose engine did not exist answered
 `kUnavailable` -- nothing attempted, nothing changed -- rather than a plausible
 refusal that would send a user looking for a full queue or a failing SD card.
 Each of M3-2, M5-3, M5-4 and M7-2 removes its own use of it, and the last one to
@@ -651,17 +942,18 @@ M5-4 took the three list commands, and M7-2 took the last of `SyncNow`'s;
 
 The list commands came off it in a way worth knowing about, because `kOffline`
 does some of the work `kUnavailable` used to. The paging engine is `core/`'s
-(`lists::Service`) and the sysmodule holds one, but **this build has no
-`http::HttpClient` for Horizon** -- M0-1 measured what TLS would cost and nothing
-implements the interface there yet. So on a console the `queue` kind, which is
-served off `queue.json` and never touches the network, works in full, while
-`platforms` and `roms` answer `kOffline`: the same sentence a console with its
-Wi-Fi off gets, which is what a build with no network amounts to.
-`SdEngine::UseServer` is the seam M7-2 filled: `main.cpp` now installs M1-7's
-Horizon client through it and starts the worker that drives `PumpLists()` in the
-same breath, which is the pair that had to land together -- a client with no
-worker turns "offline" into "pending" forever. The host suite passes it a libcurl
-client and the fixture token, which is what proves the paging (`lists.*`).
+(`lists::Service`) and the sysmodule holds one. When M5-4 landed **there was no
+`http::HttpClient` for Horizon** -- M0-1 had measured what TLS would cost and
+M1-7 (#126) had not yet built it -- so the `queue` kind, which is served off
+`queue.json` and never touches the network, worked in full, while `platforms`
+and `roms` answered `kOffline`: the same sentence a console with its Wi-Fi off
+gets, which is what a build with no network amounts to, and what a console with
+no link still answers. `SdEngine::UseServer` is the seam M7-2 filled: `main.cpp`
+now installs M1-7's Horizon client through it and starts the worker that drives
+`PumpLists()` in the same breath, which is the pair that had to land together --
+a client with no worker turns "offline" into "pending" forever. The host suite
+passes it a libcurl client and the fixture token, which is what proves the
+paging (`lists.*`).
 
 `SyncNow` used to be the one command that could not say it: `ipc::Engine::RequestSync()`
 is a `bool`, so an engine that had not been built answered `false` and
@@ -674,7 +966,9 @@ carries, so the overlay's greyed button and the sysmodule cannot disagree.
 `Status` carries the interface version and the build, the enable switch, the auth
 state (paired / unauthenticated / never paired), configured, online, the last
 sync's time, result and counts, whether a tick is running right now
-(`sync_in_progress`), the queue depth, and the **current download**
+(`sync_in_progress`), the queue depth, the RomM version the last heartbeat
+read and whether this build syncs with it (`server_version`,
+`server_supported`, #228), and the **current download**
 (`rom_id`, `fs_name`, `bytes_done`, `bytes_total`, state). That last field is how
 M3-5 is served: one poll per frame, not a second round trip. Per-item queue
 progress rides on the `queue` list kind (M5-4).
@@ -720,7 +1014,7 @@ say "update the sysmodule" instead of decoding garbage.
 ### The bounds
 
 `ipc::kMaxPayloadBytes` (8 KiB) caps every single request and response, in both
-directions. The inner heap is `0x150000` with ~1.2 MiB left after the trimmed bsd
+directions. The inner heap is `0x180000` with ~1.4 MiB left after the trimmed bsd
 transfer memory ([M0-1](#m0-1-the-measurement-and-the-decision)), and that budget
 already owes a download buffer and the `state.db` baseline.
 
@@ -772,10 +1066,12 @@ off-console.** Full strategy in [TESTING.md](TESTING.md); the ladder:
 
 1. **Host build + real docker RomM** — the core engine (auth, sync, downloads,
    config, `state.db`, IPC protocol) compiles native and runs against a genuine
-   RomM 5.2.0 in Docker. There is **no mock**: a passing test means the behaviour
-   is real. Failure modes a healthy RomM will not produce on demand (401
-   mid-sync, truncated body, dropped connection, stall) are forced by a fault
-   proxy sitting in front of it. Runs in CI. This is the primary loop.
+   RomM in Docker -- 5.4.0 unless `ROMM_VERSION` in `.env` names another
+   ([TESTING.md](TESTING.md#choosing-the-romm-version)). There is **no mock**: a
+   passing test means the behaviour is real. Failure modes a healthy RomM will
+   not produce on demand (401 mid-sync, truncated body, dropped connection,
+   stall) are forced by a fault proxy sitting in front of it. Runs in CI. This
+   is the primary loop.
 2. **Ryujinx NRO** — a manually-launched **NRO** (not a sysmodule, not on the boot
    path) built from the same core lib, run in Ryujinx against docker RomM. This is
    where the Horizon `ssl`/`fs`/socket path is exercised without hardware.

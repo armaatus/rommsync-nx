@@ -35,6 +35,7 @@
 #include "rommsync/overlay_settings_view.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "rommsync/overlay_sync_actions.hpp"
+#include "rommsync/retroarch_cfg.hpp"
 
 namespace {
 
@@ -196,6 +197,28 @@ void CheckWarningsAndNotices(Checks& checks) {
   checks.Expect(!notice_view.complaints.empty(), "the notice is still drawn");
   checks.Expect(SectionNamed(notice_view, "[platform.vectrex]") != nullptr,
                 "a platform this build has no default for is still mapped and still drawn");
+}
+
+/// #230: "RetroArch syncs itself" is on the settings screen while RetroArch's
+/// Cloud Sync is on -- what `retroarch::Notes` says, through the wire the way
+/// `GetConfig` sends it -- and it is a notice, so the screen still reads good.
+void CheckRetroArchSyncsItself(Checks& checks) {
+  const config::LoadResult parsed = config::ParseConfig("[server]\nurl = https://romm.example.com\n");
+  rommsync::retroarch::Settings syncing;
+  syncing.cloud_sync = true;
+  ipc::ConfigView sent;
+  sent.config = parsed.value;
+  sent.diagnostics = ipc::TrimDiagnostics(rommsync::retroarch::Notes(parsed.value, syncing));
+  const ipc::Decoded<ipc::ConfigView> decoded = ipc::DecodeConfigView(ipc::EncodeConfigView(sent));
+  checks.Expect(decoded.ok(), "the config view round-trips through the wire");
+  const overlay::SettingsView view = overlay::RenderSettings(decoded.ok() ? decoded.value : sent);
+  bool drawn = false;
+  for (const auto& complaint : view.complaints) {
+    drawn = drawn || Contains(complaint.value, "RetroArch syncs itself");
+  }
+  checks.Expect(drawn, "the settings screen says RetroArch syncs itself");
+  checks.ExpectEq(view.headline, std::string("Settings in force"),
+                  "and it is not a complaint about config.ini");
 }
 
 /// An override that empties a platform: the documented way to switch one off.
@@ -512,6 +535,7 @@ void CheckMenuReachesEveryScreen(Checks& checks) {
   bool sync = false;
   bool library = false;
   bool pairing = false;
+  bool log = false;
   for (const overlay::SettingsRow& row : menu.rows) {
     const std::string what = overlay::ToString(row.destination);
     checks.Expect(row.selectable, "every menu row can be pressed: " + what);
@@ -522,7 +546,9 @@ void CheckMenuReachesEveryScreen(Checks& checks) {
     sync = sync || row.destination == overlay::Destination::kSync;
     library = library || row.destination == overlay::Destination::kLibrary;
     pairing = pairing || row.destination == overlay::Destination::kPairing;
+    log = log || row.destination == overlay::Destination::kLog;
   }
+  checks.Expect(log, "the log is reachable, so it can be read without an SD reader (#209)");
   checks.Expect(sync, "the sync screen is reachable");
   checks.Expect(library, "the library browser is reachable");
   checks.Expect(pairing, "the pairing screen is reachable without discarding anything");
@@ -943,6 +969,7 @@ int main() {
   CheckErrorConfig(checks);
   CheckErrorOverAConfiguredConsole(checks);
   CheckWarningsAndNotices(checks);
+  CheckRetroArchSyncsItself(checks);
   CheckEmptiedPlatform(checks);
   CheckPlatformMappedNowhere(checks);
   CheckHalfMappedPlatform(checks);

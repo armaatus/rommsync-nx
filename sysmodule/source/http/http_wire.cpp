@@ -3,25 +3,29 @@
 //
 // Everything in this file is deliberately transport-blind and allocation-shy:
 // it runs on the console's inner heap (`sysmodule/source/main.cpp`), so a rom
-// streams through `kTransferBufferSize` and nothing that scales with a rom is
+// streams through `kDownloadBufferSize` and nothing that scales with a rom is
 // ever built in memory -- not a download body, and not a multipart upload.
 #include "http_wire.hpp"
 
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <bit>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/disk.hpp"
 #include "rommsync/version.hpp"
 
 namespace rommsync::sysmodule {
@@ -227,6 +231,12 @@ struct BodySegment {
   std::string literal;
   std::string file_path;
   std::uint64_t file_size = 0;
+  /// The caller's own text, read where it is instead of copied into `literal`:
+  /// a request's body outlives the exchange that sends it, and a copy was the
+  /// negotiate body again for the length of the exchange (#248).
+  const std::string* borrowed = nullptr;
+
+  const std::string& text() const { return borrowed != nullptr ? *borrowed : literal; }
 };
 
 /// The request body, streamed. `size()` is the `Content-Length` -- known before
@@ -237,7 +247,7 @@ class BodyStream {
  public:
   explicit BodyStream(std::vector<BodySegment> segments) : segments_(std::move(segments)) {
     for (const BodySegment& segment : segments_) {
-      total_ += segment.file_path.empty() ? segment.literal.size() : segment.file_size;
+      total_ += segment.file_path.empty() ? segment.text().size() : segment.file_size;
     }
   }
 
@@ -258,12 +268,13 @@ class BodyStream {
     while (*produced == 0 && at_ < segments_.size()) {
       const BodySegment& segment = segments_[at_];
       if (segment.file_path.empty()) {
-        const std::size_t left = segment.literal.size() - offset_;
+        const std::string& literal = segment.text();
+        const std::size_t left = literal.size() - offset_;
         const std::size_t take = std::min(size, left);
-        std::memcpy(out, segment.literal.data() + offset_, take);
+        std::memcpy(out, literal.data() + offset_, take);
         offset_ += take;
         *produced = take;
-        if (offset_ == segment.literal.size()) Advance();
+        if (offset_ == literal.size()) Advance();
         if (take == 0) continue;
         return true;
       }
@@ -446,8 +457,8 @@ class Budget {
 class Reader {
  public:
   /// `buffer` is the exchange's one in-flight buffer, owned by the caller and
-  /// on the heap: 16 KiB on a thread stack is most of the stack this process
-  /// gives a thread (`sysmodule/sys-rommsync.json`).
+  /// on the heap: a download's 64 KiB is half an engine thread's stack
+  /// (`sized_thread.hpp`), and stack is not where a peak this size belongs.
   Reader(Connection& connection, Budget& budget, char* buffer, std::size_t size)
       : connection_(connection), budget_(budget), buffer_(buffer), size_(size) {}
 
@@ -609,12 +620,16 @@ class WireHttpClient final : public http::HttpClient {
  private:
   /// One request/response exchange, redirects included. `writer` sees only the
   /// body of the response the caller ends up with.
-  Result Exchange(const Request& request, BodyWriter* writer);
+  ///
+  /// `buffer_size` is the exchange's in-flight buffer: `kTransferBufferSize`
+  /// for an API call, `kDownloadBufferSize` for a rom.
+  Result Exchange(const Request& request, BodyWriter* writer, std::size_t buffer_size);
 
   /// Everything between opening a connection and the last body byte, for one
   /// hop. `redirect_to` comes back non-empty when the caller should follow.
   Result OneHop(const Request& request, const std::string& url, BodyWriter* writer,
-                Budget& budget, bool allow_redirect, std::string* redirect_to);
+                std::size_t buffer_size, Budget& budget, bool allow_redirect,
+                std::string* redirect_to);
 
   Connector& connector_;
   http::ClientOptions options_;
@@ -625,15 +640,65 @@ class StringWriter final : public BodyWriter {
  public:
   explicit StringWriter(std::string* body) : body_(body) {}
 
-  bool Begin(const Response&, Error*) override { return true; }
+  /// Room for the whole body before any of it arrives, so appending never
+  /// doubles it -- or, past `http::kMaxResponseBytes`, a refusal before a byte
+  /// of it is read (#248): the length is the server's say-so, and the body it
+  /// promises is one the heap was never sized for. A body framed by anything but
+  /// its length -- the rule `FramingFor` reads -- is undeclared, whatever else
+  /// the head says, and is held to `kMaxUndeclaredBodyBytes` instead.
+  bool Begin(const Response& head, Error* error) override {
+    undeclared_ = true;
+    if (http::FindHeader(head.headers, "Transfer-Encoding") != nullptr) {
+      return true;
+    }
+    if (const std::string* declared = http::FindHeader(head.headers, "Content-Length")) {
+      std::uint64_t length = 0;
+      if (ParseDecimal(Trim(*declared), &length)) {
+        undeclared_ = false;
+        if (length > http::kMaxResponseBytes) {
+          refused_length_ = length;
+          *error = Error::kTooLarge;
+          return false;
+        }
+        body_->reserve(static_cast<std::size_t>(length));
+      }
+    }
+    return true;
+  }
 
-  bool Write(const char* data, std::size_t size, Error*) override {
+  bool Write(const char* data, std::size_t size, Error* error) override {
+    if (undeclared_) {
+      const std::size_t needed = body_->size() + size;
+      if (needed > kMaxUndeclaredBodyBytes) {
+        // Refused rather than kept: a prefix of a body is a body nobody can
+        // read, and the room it held goes back now rather than with the result.
+        overflowed_ = true;
+        std::string().swap(*body_);
+        *error = Error::kTooLarge;
+        return false;
+      }
+      // Grown in powers of two, so the last step lands on the cap exactly and
+      // never copies more than half of it (`kMaxUndeclaredBodyBytes`).
+      if (needed > body_->capacity()) {
+        body_->reserve(std::bit_ceil(needed));
+      }
+    }
     body_->append(data, size);
     return true;
   }
 
+  /// The body ran past `kMaxUndeclaredBodyBytes` with no length declared.
+  bool overflowed() const { return overflowed_; }
+
+  /// The length a refused body declared, past `http::kMaxResponseBytes`; zero
+  /// when none was refused.
+  std::uint64_t refused_length() const { return refused_length_; }
+
  private:
   std::string* body_;
+  bool undeclared_ = false;
+  bool overflowed_ = false;
+  std::uint64_t refused_length_ = 0;
 };
 
 /// `Download`'s sink: `<path>.part`, and the resume bookkeeping around it.
@@ -658,15 +723,19 @@ class FileWriter final : public BodyWriter {
   bool Open(bool resuming, std::uint64_t already_have) {
     resume_from_ = already_have;
     if (!resuming) {
-      file_ = std::fopen(path_.c_str(), "wb");
+      file_ = io::OpenForWriting(path_, "wb");
       return file_ != nullptr;
     }
     // "r+b" rather than "ab": O_APPEND would ignore the seek needed when the
     // server turns out to have ignored the Range header.
-    file_ = std::fopen(path_.c_str(), "r+b");
+    file_ = io::OpenForWriting(path_, "r+b");
     if (file_ == nullptr) return false;
     if (std::fseek(file_, 0, SEEK_END) != 0) {
+      // Kept across the close, which may set its own: the caller names the
+      // refusal from it (`http::ErrorForWrite`).
+      const int why = errno;
       Close();
+      errno = why;
       return false;
     }
     return true;
@@ -696,12 +765,14 @@ class FileWriter final : public BodyWriter {
       // The server ignored `Range` and is sending the whole resource.
       // Appending would splice it into itself, so the bytes already on disk go.
       if (status_ != 206 && !Restart()) {
-        *error = Error::kWriteFailed;
+        *error = http::ErrorForWrite(errno);
         return false;
       }
     }
-    if (size != 0 && (file_ == nullptr || std::fwrite(data, 1, size, file_) != size)) {
-      *error = Error::kWriteFailed;
+    errno = 0;
+    if (size != 0 && (file_ == nullptr || io::Write(file_, data, size) != size)) {
+      // The `errno` the card left, so a full one is named as one (#202).
+      *error = http::ErrorForWrite(errno);
       return false;
     }
     received_ += size;
@@ -712,7 +783,7 @@ class FileWriter final : public BodyWriter {
     return true;
   }
 
-  /// Flush and close, and make it durable through the same `io::FileSync` every
+  /// Flush and close, and make it durable through the same `io::Sync` every
   /// atomic write in `core/` goes through -- `fsdevCommitDevice` on the console
   /// (`main.cpp`), rather than a second spelling of "make this durable".
   bool Finish() {
@@ -720,17 +791,31 @@ class FileWriter final : public BodyWriter {
     // response never confirmed the bytes already on disk. Counting them would
     // let an empty 200 promote a stale partial file.
     if (staged_unconfirmed_) resume_from_ = 0;
-    bool flushed = file_ == nullptr || std::fflush(file_) == 0;
+    errno = 0;
+    flushed_ = file_ == nullptr || std::fflush(file_) == 0;
+    // Where a real full card often shows first: stdio held the last buffer.
+    flush_errno_ = errno;
     Close();
-    if (flushed) {
-      if (const io::FileSync sync = io::GetFileSync(); sync != nullptr) {
-        flushed = sync(path_);
-      }
+    if (!flushed_) {
+      return false;
     }
-    return flushed;
+    // Through `io::Disk`, which asks the same hook: a sync made beside the
+    // seam is one the crash replay cannot see (#203). Its `errno` is the one
+    // that names a card full at commit -- `fsdevCommitDevice` writing the FAT
+    // -- and a hook may refuse without setting one, which is still I/O.
+    errno = 0;
+    if (!io::Sync(path_)) {
+      flush_errno_ = errno != 0 ? errno : EIO;
+      return false;
+    }
+    return true;
   }
 
   std::uint64_t resume_from() const { return resume_from_; }
+  /// False when the flush itself was refused, true when only the sync was --
+  /// which of the two sentences the caller writes.
+  bool flushed() const { return flushed_; }
+  int flush_errno() const { return flush_errno_; }
   std::uint64_t received() const { return received_; }
   std::string& error_body() { return error_body_; }
 
@@ -743,7 +828,7 @@ class FileWriter final : public BodyWriter {
   /// declared. `fopen(..., "wb")` is the truncation both targets do have.
   bool Restart() {
     Close();
-    file_ = std::fopen(path_.c_str(), "wb");
+    file_ = io::OpenForWriting(path_, "wb");
     if (file_ == nullptr) return false;
     resume_from_ = 0;
     return true;
@@ -770,6 +855,8 @@ class FileWriter final : public BodyWriter {
   std::uint64_t body_length_ = 0;
   std::uint64_t received_ = 0;
   std::string error_body_;
+  bool flushed_ = false;
+  int flush_errno_ = 0;
 };
 
 }  // namespace
@@ -940,7 +1027,8 @@ Error ReadBody(Framing framing, std::uint64_t length, Reader& reader, BodyWriter
 }  // namespace
 
 Result WireHttpClient::OneHop(const Request& request, const std::string& url, BodyWriter* writer,
-                              Budget& budget, bool allow_redirect, std::string* redirect_to) {
+                              std::size_t buffer_size, Budget& budget, bool allow_redirect,
+                              std::string* redirect_to) {
   Result result;
   Url parsed;
   if (!ParseUrl(url, &parsed)) {
@@ -963,7 +1051,9 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
     }
     content_type = "multipart/form-data; boundary=" + boundary;
   } else if (!request.body.empty()) {
-    segments.push_back({request.body, "", 0});
+    BodySegment borrowed;
+    borrowed.borrowed = &request.body;
+    segments.push_back(std::move(borrowed));
   }
   BodyStream body(std::move(segments));
   const bool has_body = request.method == Method::kPost || request.method == Method::kPut;
@@ -972,7 +1062,7 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
   // the thread's stack, and reused for the request body and then the response:
   // the two never overlap, and a second one would double what a download costs
   // the inner heap for nothing.
-  const std::unique_ptr<char[]> scratch(new (std::nothrow) char[kTransferBufferSize]);
+  const std::unique_ptr<char[]> scratch(new (std::nothrow) char[buffer_size]);
   if (scratch == nullptr) {
     result.error = Error::kTransport;
     result.message = "no room for a transfer buffer";
@@ -1049,7 +1139,7 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
     char* const chunk = scratch.get();
     for (;;) {
       std::size_t produced = 0;
-      if (!body.Next(chunk, kTransferBufferSize, &produced)) {
+      if (!body.Next(chunk, buffer_size, &produced)) {
         result.error = Error::kInvalidRequest;
         result.message = "the request body could not be read from the card";
         return result;
@@ -1060,7 +1150,7 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
   }
 
   // --- read the response ---
-  Reader reader(*connection, budget, scratch.get(), kTransferBufferSize);
+  Reader reader(*connection, budget, scratch.get(), buffer_size);
   Head response_head;
   if (const Error error = ReadHead(reader, &response_head); error != Error::kNone) {
     result.error = error;
@@ -1099,7 +1189,8 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
   return result;
 }
 
-Result WireHttpClient::Exchange(const Request& request, BodyWriter* writer) {
+Result WireHttpClient::Exchange(const Request& request, BodyWriter* writer,
+                                std::size_t buffer_size) {
   Result result;
   if (request.url.empty()) {
     result.error = Error::kInvalidRequest;
@@ -1128,14 +1219,20 @@ Result WireHttpClient::Exchange(const Request& request, BodyWriter* writer) {
   }
 
   Budget budget(request, Clock::now());
-  Request hop = request;
+  // The caller's request until a redirect changes it, and a copy only then: a
+  // copy up front was the negotiate body twice for the length of every
+  // exchange, in the tick's plan phase (#248).
+  std::optional<Request> redirected;
   std::string url = request.url;
   const int limit = options_.follow_redirects ? std::max(0, options_.max_redirects) : 0;
 
   for (int redirect = 0;; ++redirect) {
     std::string next;
-    result = OneHop(hop, url, writer, budget, redirect < limit, &next);
+    result = OneHop(redirected ? *redirected : request, url, writer, buffer_size, budget,
+                    redirect < limit, &next);
     if (next.empty()) return result;
+    if (!redirected) redirected = request;
+    Request& hop = *redirected;
 
     // A 303 -- and, by every client's convention, a 301 or 302 on a POST --
     // continues as a GET with no body. 307 and 308 keep both, which is why a
@@ -1165,7 +1262,16 @@ Result WireHttpClient::Send(const Request& request) {
   // several exchanges, and only the last one's body is the caller's.
   std::string body;
   StringWriter writer(&body);
-  Result result = Exchange(request, &writer);
+  Result result = Exchange(request, &writer, kTransferBufferSize);
+  if (writer.overflowed()) {
+    result.message = "the response declared no Content-Length and ran past the " +
+                     std::to_string(kMaxUndeclaredBodyBytes / 1024) +
+                     " KiB this client holds without one";
+  } else if (writer.refused_length() != 0) {
+    result.message = "the response declared " + std::to_string(writer.refused_length()) +
+                     " bytes, past the " + std::to_string(http::kMaxResponseBytes / 1024) +
+                     " KiB this client holds";
+  }
   result.response.body = std::move(body);
   return result;
 }
@@ -1194,13 +1300,13 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
 
   FileWriter writer(partial_path, resuming, target.progress ? &target.progress : nullptr);
   if (!writer.Open(resuming, already_have)) {
-    result.error = Error::kWriteFailed;
+    result.error = http::ErrorForWrite(errno);
     result.message = "could not open " + partial_path;
     return result;
   }
 
-  result = Exchange(effective, &writer);
-  const bool flushed = writer.Finish();
+  result = Exchange(effective, &writer, kDownloadBufferSize);
+  const bool finished = writer.Finish();
   const std::uint64_t written = writer.resume_from() + writer.received();
   result.response.body = std::move(writer.error_body());
   if (!result.ok()) {
@@ -1212,7 +1318,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
     // Our offset is not valid for this resource any more, so the bytes we were
     // building on are worthless -- and keeping them would make every future
     // resume ask for the same impossible range.
-    std::remove(partial_path.c_str());
+    io::Remove(partial_path);
     result.error = Error::kTruncated;
     result.message = "the partial file no longer matches the resource; retry from the start";
     return result;
@@ -1220,12 +1326,14 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
   if (status != 200 && status != 206) {
     // Not a body-bearing response: a status the caller has to handle, with
     // nothing at the destination. Do not leave the empty part file behind.
-    if (!resuming) std::remove(partial_path.c_str());
+    if (!resuming) io::Remove(partial_path);
     return result;
   }
-  if (!flushed) {
-    result.error = Error::kWriteFailed;
-    result.message = "could not flush " + partial_path;
+  if (!finished) {
+    result.error = http::ErrorForWrite(writer.flush_errno());
+    result.message = std::string(writer.flushed() ? "could not make durable "
+                                                  : "could not flush ") +
+                     partial_path + ": " + std::strerror(writer.flush_errno());
     return result;
   }
 
@@ -1250,7 +1358,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
     return result;
   }
 
-  if (std::rename(partial_path.c_str(), target.path.c_str()) != 0) {
+  if (io::Rename(partial_path, target.path) != 0) {
     result.error = Error::kWriteFailed;
     result.message = "could not rename " + partial_path;
   }

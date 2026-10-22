@@ -94,7 +94,7 @@ downloads|suite|Downloads (M3) pass with Range resume + hash verify against dock
 auth|suite|Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM.
 ipc|suite|Config + IPC (M5) proven on host harness.
 ssl|console|HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD.
-backup|suite|Every save-overwrite path shown to back up first (SYNC_PROTOCOL hard rule) -- verified by tests.
+backup|suite|Every save-overwrite path shown to back up first, durably (SYNC_PROTOCOL hard rule) -- verified by tests, a power cut replayed at every call.
 release|repo|A tagged, released v1 build exists (M6).
 media|console|A known-good NAND/SD backup exists; testing will be on a spare/backup SD or emuMMC, not the daily driver.
 ROWS
@@ -177,11 +177,41 @@ T
       # `states.*` are the two paths that overwrite bytes a player cares about;
       # `tick.backupdir` and `tick.durable` are the ones that check the backup
       # survives the interruption it exists for.
+      #
+      # The `crash` scenarios are what make "first" an order of persistence and
+      # not only of calls (M9-14, #203): each of the three paths the census
+      # below classifies as landing on a save -- `execute.crash` (a download),
+      # `states.crash` (a state), `conflicts.crash` (a restore) -- is recorded
+      # through `io::Disk`, cut at every call, and every card a non-journalling
+      # FAT may keep is swept and judged: old bytes or new, and never new
+      # without the old under `.backup/`. `execute.crash_model` is the replay's
+      # own check, and is in `^execute\.` already -- as is `execute.crash_delete`
+      # (#233), the one save path whose "new" is no file at all: a removal, after
+      # `BackUpFirst`, judged old-or-gone and never gone without the backup.
+      #
+      # `tick.newer_download` and `tick.newer_conflict` replay the same way over
+      # the overwrite a tick makes when RomM's slot guard refuses an upload and
+      # the tick takes the server's head instead (#232). It goes through
+      # `ExecutePlan`, so the census below has no new row; the replays are what
+      # hold the resolution to the ordering.
+      #
+      # `tick.migrated` replays the first tick after an upgrade from rc1 (#236):
+      # a version-2 `state.db` row moved to the shared slot, and that slot's newer
+      # head landing over the save. `ExecutePlan` again, so again no census row.
+      #
+      # `execute.placed` (#237, in `^execute\.`) is a first-time restore: the
+      # same `ExecutePlan` download, onto no file -- a placement only creates --
+      # replayed for no file or all of it, and nothing beside it touched.
       cat <<'T'
 ^harness\.backup$
 ^execute\.
 ^states\.overwrite$
 ^states\.keeps_both$
+^states\.crash$
+^conflicts\.crash$
+^tick\.newer_download$
+^tick\.newer_conflict$
+^tick\.migrated$
 ^tick\.backupdir$
 ^tick\.durable$
 T
@@ -222,7 +252,7 @@ core/src/download.cpp|1|0|1||not a save: rom bytes, and the queue record
 core/src/play_sessions.cpp|0|0|1||not a save: the play-session buffer M7-4 writes
 core/src/state_db.cpp|0|0|1||not a save: the sync baseline
 core/src/state_sync.cpp|1|0|0|io::CommitStaged|SAVE STATE: sync::BackUpFirst runs first
-core/src/sync_execute.cpp|1|1|0|io::CommitStaged|SAVE: sync::BackUpFirst runs first, and IS the CopyAtomically here
+core/src/sync_execute.cpp|1|1|0|io::CommitStaged|SAVE: sync::BackUpFirst runs first, and IS the CopyAtomically here; a server delete removes only after it too (#233)
 core/src/token_store.cpp|0|0|1||not a save: token.dat
 sysmodule/source/engine.cpp|0|0|1||not a save: config.ini, written back by the engine'
 
@@ -593,7 +623,8 @@ row_note() {
          called it.
       3. who owns the descriptor when socketSslConnectionSetSocketDescriptor
          returns -1 with errno == ENOENT? If the service did not take it, every
-         failed handshake leaks an fd against a handle_table_size of 64. The
+         failed handshake leaks a socket against bsd's own limit -- a socket
+         is not a kernel handle, so not against handle_table_size (#210). The
          backend closes nothing and says so in a comment, because closing on a
          guess is a double close.
     The answers go in docs/DEVELOPMENT.md, beside the measurement they correct,

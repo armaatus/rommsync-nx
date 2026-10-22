@@ -1,19 +1,21 @@
 // The negotiate PLAN against the real captured responses.
 //
 // The bodies here are not typed out from the docs: they are read from
-// server/contract/captures/, the unedited replies a live RomM 5.2.0 sent
-// (issue M0-4), which `contract.captures` re-checks against a running server.
+// server/contract/captures/5.4.0/, the unedited replies a live RomM 5.4.0 sent
+// -- the floor this client accepts -- which `contract.captures` re-checks
+// against a running server. The root captures are 5.2.0's (M0-4), kept as
+// history and read by nothing here.
 // So this keeps `SyncPlan` honest against those bytes, the way `auth.shapes`
 // does for the pairing responses.
 //
 // Two things the captures cannot cover, and that are checked here anyway:
 //
-//   - **The other eight reasons.** Only five of the thirteen strings 5.2.0 can
-//     emit appear in a capture, so the rest are pinned against the table in
+//   - **The other reasons.** Only some of the strings RomM can emit appear in
+//     a capture, so the rest are pinned against the table in
 //     docs/API_CONTRACT.md, in both directions -- a `reason` this client stopped
 //     recognising is a save it would silently take no action on.
 //   - **A server that moved.** An `action` this build does not know cannot be
-//     produced by a healthy 5.2.0 at all, and it is the one case where the
+//     produced by a healthy 5.4.0 at all, and it is the one case where the
 //     default branch is what overwrites a save. It is downgraded to `no_op`,
 //     reported, and checked here on a hand-built body -- the only shape in this
 //     file that no server sent.
@@ -29,6 +31,7 @@
 
 #include "checks.hpp"
 #include "rommsync/auth.hpp"
+#include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
 namespace {
@@ -39,6 +42,7 @@ namespace {
 // a libc++ one. That is a green local run and a red CI, which is the worst way
 // to find out.
 namespace auth = rommsync::auth;
+namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 
 std::string ReadCapture(checks::Checks& c, const std::string& name) {
@@ -195,9 +199,49 @@ void EmptyCapture(checks::Checks& c) {
              std::int64_t{0}, "and the totals agree");
 }
 
+/// 5.4.0's `delete` (#233): a slot emptied on the server, offered back by the
+/// device that wrote it. It is the first action that removes a file from the
+/// card, so it is pinned to the bytes the probe asserted rather than to a
+/// hand-built body.
+void DeleteCapture(checks::Checks& c) {
+  const auth::Parsed<sync::SyncPlan> parsed = ParseCapture(c, "sync-negotiate-delete.json");
+  const sync::SyncPlan& plan = parsed.value;
+  c.ExpectEq(plan.total_delete, std::int64_t{1}, "total_delete is read");
+  const sync::SyncOperation* deleted = nullptr;
+  for (const sync::SyncOperation& operation : plan.operations) {
+    if (operation.action_text == "delete") {
+      deleted = &operation;
+    }
+  }
+  if (deleted == nullptr) {
+    c.Expect(false, "the delete capture carries a delete");
+    return;
+  }
+  c.Expect(deleted->action == sync::Action::kDelete, "delete classifies");
+  c.Expect(deleted->known_action, "...as an action this build knows, not a downgraded no_op");
+  c.Expect(deleted->reason == sync::Reason::kDeletedOnServer, "and so does its reason");
+  c.Expect(!deleted->save_id.has_value(), "a deleted slot names no save row");
+  c.Expect(!deleted->server_content_hash.has_value(), "and no server copy");
+}
+
+/// A body without `total_delete` is a plan with no deletions. 5.4.0 sends it
+/// on every plan and declares it required, but every hand-built body here omits
+/// it and a server below the 5.4.0 floor never reaches negotiate
+/// (sync_tick.hpp) -- so absent reads as zero rather than refusing a whole plan
+/// over a count nothing acts on. The body is 5.4.0's empty capture with that
+/// one field taken out, typed here because no server this client talks to
+/// sends it.
+void TotalDeleteIsOptional(checks::Checks& c) {
+  const auth::Parsed<sync::SyncPlan> parsed = sync::ParseNegotiateResponse(
+      "{\"session_id\":1,\"operations\":[],\"total_upload\":0,\"total_download\":0,"
+      "\"total_conflict\":0,\"total_no_op\":0}");
+  c.Expect(parsed.ok(), "a plan without total_delete parses: " + parsed.error.Describe());
+  c.ExpectEq(parsed.value.total_delete, std::int64_t{0}, "an absent total_delete is zero");
+}
+
 // --- the reason table ---------------------------------------------------------
 
-/// The complete set 5.2.0 can emit, from
+/// The complete set RomM can emit, from
 /// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete. Typed out here
 /// on purpose: this table and the one in core/src/sync_negotiate.cpp are the two
 /// directions, and a reason that drifted in one of them is caught by the other.
@@ -227,6 +271,9 @@ const ReasonCase kReasons[] = {
     {sync::Reason::kNoChanges, sync::Action::kNoOp, "No changes since last sync"},
     {sync::Reason::kAppearIdentical, sync::Action::kNoOp, "Saves appear identical"},
     {sync::Reason::kUntracked, sync::Action::kNoOp, "Save is untracked on this device"},
+    // 5.4.0 (#233): a slot emptied on the server, held by a client that wrote
+    // its copy before the removal (`compare_missing_server_save`).
+    {sync::Reason::kDeletedOnServer, sync::Action::kDelete, "Save was deleted on the server"},
 };
 
 /// A plan carrying one operation with the given action and reason, spelled the
@@ -247,7 +294,8 @@ void EveryDocumentedReason(checks::Checks& c) {
   // silent no-op months later.
   c.ExpectEq(static_cast<int>(sync::Reason::kUnrecognized), 0,
              "kUnrecognized is what a default-constructed operation carries");
-  c.ExpectEq(static_cast<int>(sync::Reason::kUntracked), static_cast<int>(std::size(kReasons)),
+  c.ExpectEq(static_cast<int>(sync::Reason::kDeletedOnServer),
+             static_cast<int>(std::size(kReasons)),
              "the enum holds exactly the documented reasons and the unrecognised one");
 
   std::vector<std::string> slugs;
@@ -300,6 +348,7 @@ void EveryAction(checks::Checks& c) {
       {sync::Action::kDownload, "download"},
       {sync::Action::kConflict, "conflict"},
       {sync::Action::kNoOp, "no_op"},
+      {sync::Action::kDelete, "delete"},
   };
   for (const Case& scenario : kActions) {
     bool recognized = false;
@@ -313,7 +362,7 @@ void EveryAction(checks::Checks& c) {
   // The near-misses a client writes by hand. `noop` is the one worth naming: it
   // is what an obvious guess produces, and it would send every no-op through the
   // unknown branch.
-  for (const char* unknown : {"noop", "no-op", "NO_OP", "Upload", "delete", ""}) {
+  for (const char* unknown : {"noop", "no-op", "NO_OP", "Upload", "Delete", "total_delete", ""}) {
     bool recognized = true;
     c.Expect(sync::ClassifyAction(unknown, &recognized) == sync::Action::kNoOp,
              std::string("an unknown action is a no_op: ") + unknown);
@@ -565,6 +614,53 @@ void RefusesWhatItCannotRead(checks::Checks& c) {
            "...and the readable entry before it is not handed back on its own");
 }
 
+/// A plan is held for the whole tick, an operation at ~450 bytes on aarch64, so
+/// it has a bound: as many operations as `state.db` can record (M9-20, #246).
+/// Past it the plan is refused whole -- not cut, for `RefusesWhatItCannotRead`'s
+/// reason: a plan with operations missing is a plan nobody can tell from one
+/// that is in sync.
+void RefusesAPlanPastTheBound(checks::Checks& c) {
+  const auto plan_of = [](std::size_t operations) {
+    std::string body = "{\"session_id\":1,\"operations\":[";
+    for (std::size_t at = 0; at < operations; ++at) {
+      body += (at == 0 ? "" : ",") + std::string("{\"action\":\"upload\",\"rom_id\":") +
+              std::to_string(at + 1) +
+              ",\"save_id\":null,\"file_name\":\"a.srm\",\"slot\":\"autosave\","
+              "\"emulator\":null,\"reason\":\"Save does not exist on server\","
+              "\"server_updated_at\":null,\"server_content_hash\":null}";
+    }
+    return body + "],\"total_upload\":" + std::to_string(operations) +
+           ",\"total_download\":0,\"total_conflict\":0,\"total_no_op\":0}";
+  };
+  const auth::Parsed<sync::SyncPlan> full =
+      sync::ParseNegotiateResponse(plan_of(state::kMaxRecords));
+  c.Expect(full.ok(), "a plan of exactly the bound is read: " + full.error.Describe());
+  c.ExpectEq(full.value.operations.size(), state::kMaxRecords, "...all of it");
+
+  const auth::Parsed<sync::SyncPlan> over =
+      sync::ParseNegotiateResponse(plan_of(state::kMaxRecords + 1));
+  c.Expect(!over.ok(), "one operation past the bound refuses the plan");
+  c.ExpectEq(over.error.field, std::string("operations"), "...naming the array");
+  c.Expect(over.error.message.find(std::to_string(state::kMaxRecords)) != std::string::npos,
+           "...and the bound it passed: " + over.error.message);
+  c.Expect(over.value.operations.empty(), "...and hands back no part of it");
+
+  // A caller that keeps some of the answer is bounded by what it keeps (#248):
+  // the #232 resolution asks about a few saves and is answered for every save of
+  // their roms.
+  bool too_large = false;
+  const auth::Parsed<sync::SyncPlan> kept = sync::ParseNegotiateResponse(
+      plan_of(2 * state::kMaxRecords), &too_large,
+      [](const sync::SyncOperation& operation) { return operation.rom_id % 64 == 0; });
+  c.Expect(kept.ok() && !too_large, "an answer past the bound is read when little of it is kept: " +
+                                        kept.error.Describe());
+  c.ExpectEq(kept.value.operations.size(), std::size_t{4}, "...and only what was kept is held");
+  const auth::Parsed<sync::SyncPlan> all_kept = sync::ParseNegotiateResponse(
+      plan_of(state::kMaxRecords + 1), &too_large,
+      [](const sync::SyncOperation&) { return true; });
+  c.Expect(!all_kept.ok() && too_large, "and keeping past the bound is still refused");
+}
+
 }  // namespace
 
 int main() {
@@ -575,6 +671,8 @@ int main() {
   ConflictCaptures(c);
   NoOpCapture(c);
   EmptyCapture(c);
+  DeleteCapture(c);
+  TotalDeleteIsOptional(c);
   EveryDocumentedReason(c);
   EveryAction(c);
   AnUnknownActionIsANoOp(c);
@@ -582,6 +680,7 @@ int main() {
   AServerHashThatIsNotAnMd5IsReported(c);
   APathWhereANameBelongsIsFlagged(c);
   RefusesWhatItCannotRead(c);
+  RefusesAPlanPastTheBound(c);
 
   if (c.failures() != 0) {
     std::cerr << c.failures() << " failure(s)\n";

@@ -1,0 +1,131 @@
+name: soak
+
+# The sysmodule is meant to run for weeks without restarting, on a 1.5 MiB heap
+# where running out is `std::terminate` (M9-15, #204). `ctest -R alloc.steady`
+# holds sixteen ticks flat on every push; this holds hundreds of rounds -- a
+# tick and a rom download each -- flat every night, against the same real RomM
+# the host tests use. The engine runs its own worker and is asked for each tick
+# rather than waiting out `interval_min`, so a night's run is weeks of a
+# console's schedule (tests/test_heap_steady.cpp).
+#
+# What it asserts is steady-state memory, not the absence of leaks: what the
+# engine holds between rounds must not grow with the number of rounds. LSan and
+# valgrind cannot see a growing reachable map; this can.
+#
+# A schedule can stop without a word -- GitHub disables one after 60 days of
+# repository inactivity -- so nothing trusts it: ci.yml's `soak-fresh` job goes
+# red on main when this has not passed for three days (scripts/soak-fresh.sh).
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Rounds to run, each a sync tick and a rom download
+        default: '1000'
+  # Once when this file changes on main, so the soak's first run is the push
+  # that adds or changes it rather than the next night's.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/soak.yml
+
+concurrency:
+  group: soak
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ROUNDS: ${{ github.event.inputs.rounds || '1000' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libcurl4-openssl-dev
+
+      # The fixture, exactly as host-tests stands it up (ci.yml).
+      - name: Derive environment and seed ROM fixtures
+        run: |
+          ./scripts/orca/env.sh
+          ./server/testing/seed.sh
+
+      - name: Start the RomM fixture
+        run: ./scripts/orca/compose.sh up -d
+
+      - name: Wait for RomM
+        run: |
+          set -a; . ./.env; set +a
+          curl -fsS --retry 60 --retry-delay 5 --retry-all-errors --retry-connrefused \
+            -o /dev/null -w 'romm: %{http_code}\n' "$ROMM_BASE_URL/api/heartbeat"
+          curl -fsS --retry 20 --retry-delay 2 --retry-all-errors --retry-connrefused \
+            -o /dev/null -w 'proxy: %{http_code}\n' "$PROXY_BASE_URL/api/heartbeat"
+
+      - name: Provision the fixture
+        run: |
+          set -a; . ./.env; set +a
+          . ./scripts/orca/lib.sh
+          PYTHON="$(orca_pick_python)" || {
+            echo "no Python >= ${ORCA_PYTHON_MIN_MAJOR}.${ORCA_PYTHON_MIN_MINOR} on this runner; tried:"
+            orca_python_rejections
+            exit 1
+          }
+          "$PYTHON" -m venv .venv
+          ./.venv/bin/pip install -q --disable-pip-version-check -r server/requirements.txt
+          ./.venv/bin/python server/testing/provision.py --base-url "$ROMM_BASE_URL"
+
+      # Unsanitized, like every build here: ASan replaces operator new itself and
+      # the counts would not be ours (tests/count_new.hpp).
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DROMMSYNC_REQUIRE_RIG=ON
+          cmake --build build --target test_heap_steady
+
+      # The binary is run directly rather than through ctest, so its round count
+      # is this run's and its output is the log.
+      - name: Soak
+        run: |
+          set -o pipefail
+          ROMMSYNC_ALLOC_REPORT="$PWD/soak.csv" ./build/tests/test_heap_steady soak "$ROUNDS" \
+            | tee soak.log
+
+      # Observable whether it passed or not: the headline in the run's summary,
+      # the per-round samples as an artifact.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Soak: $ROUNDS rounds of a tick and a download"
+            echo
+            echo '```'
+            grep -v '^  round ' soak.log 2>/dev/null || echo "(the soak wrote no log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the samples
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: soak
+          path: |
+            soak.csv
+            soak.log
+          if-no-files-found: error
+
+      - name: RomM logs on failure
+        if: failure()
+        run: ./scripts/orca/compose.sh logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: ./scripts/orca/compose.sh down -v || true

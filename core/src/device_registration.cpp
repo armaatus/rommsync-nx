@@ -18,27 +18,6 @@ namespace {
 
 constexpr const char* kDevicesPath = "/api/devices";
 
-/// The RFC 3986 unreserved set.
-///
-/// A device id is a value read back off the SD card and then pasted into a URL
-/// *path*, which is the one place a stray character stops being data: a `?` or a
-/// `#` truncates the path, a `/` calls a different endpoint, and a `%` invites a
-/// second round of decoding. RomM sends a UUID, which is entirely inside this
-/// set, so nothing legitimate is refused -- this is a check on what a corrupted
-/// or hand-edited `token.dat` can make this client request, not on the id's
-/// format, which is the server's to change.
-bool UrlPathSafe(std::string_view value) {
-  for (const char byte : value) {
-    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
-                            byte == '_' || byte == '~';
-    if (!unreserved) {
-      return false;
-    }
-  }
-  return !value.empty();
-}
-
 http::Request AuthedGet(const std::string& url, const std::string& access_token,
                         std::chrono::milliseconds timeout) {
   http::Request request;
@@ -193,33 +172,57 @@ Parsed<DeviceRecord> ParseDeviceRecord(std::string_view body) {
 
 Parsed<std::vector<DeviceRecord>> ParseDeviceList(std::string_view body) {
   Parsed<std::vector<DeviceRecord>> parsed;
-  const json::ParseResult document = json::Parse(body);
+  // A row at a time (`json::ParseEach`), for the reason every list is: a device
+  // held as a document is ~7x its text, and a user's devices are theirs to
+  // multiply (M9-20, #246).
+  std::vector<DeviceRecord> devices;
+  const json::ParseResult document = json::ParseEach(
+      body, "",
+      [&devices](const json::Value& element, std::size_t) {
+        // Every row, not just the ones this console might be. A row that will
+        // not parse is `DeviceSchema` having changed, and skipping it quietly
+        // would hide exactly the drift this parse exists to catch -- while
+        // leaving the search below to report "no such device" for a console that
+        // is right there.
+        Parsed<DeviceRecord> device = ReadDevice(element);
+        if (device.ok()) {
+          devices.push_back(std::move(device.value));
+        }
+        return device.error;
+      },
+      "device list");
   if (!document.ok()) {
     parsed.error = document.error;
     return parsed;
   }
-  if (!document.value.is_array()) {
-    parsed.error.field = "device list";
-    parsed.error.message =
-        std::string("expected an array, got ") + json::ToString(document.value.type());
+  parsed.value = std::move(devices);
+  return parsed;
+}
+
+Parsed<DeviceSearch> FindInDeviceList(std::string_view body, std::string_view identifier) {
+  Parsed<DeviceSearch> parsed;
+  DeviceSearch search;
+  const json::ParseResult document = json::ParseEach(
+      body, "",
+      [&search, identifier](const json::Value& element, std::size_t) {
+        // Every row read, for `ParseDeviceList`'s reason; one kept.
+        Parsed<DeviceRecord> device = ReadDevice(element);
+        if (!device.ok()) {
+          return device.error;
+        }
+        if (!identifier.empty() && device.value.client_device_identifier == identifier) {
+          if (++search.matches == 1) {
+            search.device = std::move(device.value);
+          }
+        }
+        return json::Error{};
+      },
+      "device list");
+  if (!document.ok()) {
+    parsed.error = document.error;
     return parsed;
   }
-
-  std::vector<DeviceRecord> devices;
-  devices.reserve(document.value.elements().size());
-  for (const json::Value& element : document.value.elements()) {
-    // Every row, not just the ones this console might be. A row that will not
-    // parse is `DeviceSchema` having changed, and skipping it quietly would
-    // hide exactly the drift this parse exists to catch -- while leaving the
-    // search below to report "no such device" for a console that is right there.
-    Parsed<DeviceRecord> device = ReadDevice(element);
-    if (!device.ok()) {
-      parsed.error = device.error;
-      return parsed;
-    }
-    devices.push_back(std::move(device.value));
-  }
-  parsed.value = std::move(devices);
+  parsed.value = std::move(search);
   return parsed;
 }
 
@@ -350,7 +353,10 @@ Registration ConfirmRegistration(http::HttpClient& client, const StoredToken& to
     return Fail(RegistrationError::kNotRegistered,
                 "the stored token names no device; this console is paired but not registered");
   }
-  if (!UrlPathSafe(token.device_id)) {
+  // RomM sends a UUID, entirely inside the set, so nothing legitimate is
+  // refused: this is a check on what a corrupted or hand-edited `token.dat`
+  // can make this client request, not on the id's format.
+  if (!http::IsUrlPathSegment(token.device_id)) {
     return Fail(RegistrationError::kMalformed,
                 "the stored device id is not a value that can be put in a URL");
   }
@@ -402,30 +408,22 @@ Registration FindRegistration(http::HttpClient& client, const StoredToken& token
     return *refused;
   }
 
-  Parsed<std::vector<DeviceRecord>> parsed = ParseDeviceList(result.response.body);
+  // One row kept, however many devices the user has (#248).
+  Parsed<DeviceSearch> parsed = FindInDeviceList(result.response.body, client_device_identifier);
   if (!parsed.ok()) {
     return Fail(RegistrationError::kMalformed, "device list: " + parsed.error.Describe());
   }
-
-  const DeviceRecord* found = FindByIdentifier(parsed.value, client_device_identifier);
-  if (found != nullptr) {
-    return Accept(*found);
+  if (parsed.value.matches == 1) {
+    return Accept(std::move(*parsed.value.device));
   }
 
-  // `FindByIdentifier` answers nullptr to two very different situations, and
-  // they get different errors because they have different remedies: nothing
-  // carries the identifier (pair again), or several rows do (a state RomM
-  // allows, which only the user can tidy up -- pairing again would just find
-  // the same two).
-  std::size_t matches = 0;
-  for (const DeviceRecord& device : parsed.value) {
-    if (device.client_device_identifier == client_device_identifier) {
-      ++matches;
-    }
-  }
-  if (matches > 1) {
+  // Two very different situations short of one match, and they get different
+  // errors because they have different remedies: nothing carries the identifier
+  // (pair again), or several rows do (a state RomM allows, which only the user
+  // can tidy up -- pairing again would just find the same two).
+  if (parsed.value.matches > 1) {
     return Fail(RegistrationError::kAmbiguous,
-                "this server has " + std::to_string(matches) +
+                "this server has " + std::to_string(parsed.value.matches) +
                     " devices for this console; remove the extra ones in RomM");
   }
   return Fail(RegistrationError::kNoSuchDevice,

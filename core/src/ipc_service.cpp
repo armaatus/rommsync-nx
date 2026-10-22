@@ -25,6 +25,7 @@
 #include "rommsync/json.hpp"
 #include "rommsync/text.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/server_capabilities.hpp"
 
 namespace rommsync::ipc {
 namespace {
@@ -102,6 +103,11 @@ Status ServiceCore::GetStatus() const {
       ++status.config_error_count;
     }
   }
+  // The engine already cut it to `server::kMaxVersionBytes`; bounded again here
+  // because `GetStatus` may not fail, whatever an `Engine` hands it.
+  status.server_version = snapshot.server_version;
+  Shorten(&status.server_version, server::kMaxVersionBytes);
+  status.server_supported = snapshot.server_supported;
   status.download = snapshot.download;
   // A `fs_name` comes off a RomM library, so its length is not ours to assume,
   // and `GetStatus` is documented never to fail. A truncated label costs a few
@@ -115,6 +121,11 @@ ConfigView ServiceCore::GetConfig() const {
   view.config = engine_.config();
 
   std::vector<config::Diagnostic> diagnostics = engine_.config_diagnostics();
+  // After the file's own: what is wrong with `config.ini` is what this screen is
+  // for, and a trim should cost "RetroArch syncs itself" before it costs that.
+  for (config::Diagnostic& note : engine_.source_notes()) {
+    diagnostics.push_back(std::move(note));
+  }
 
   // A URL is bounded by nothing in `config.ini` (config.hpp bounds the file, not
   // the line), and this command may not fail -- so an absurd one is withheld and
@@ -213,7 +224,13 @@ SyncOutcome ServiceCore::SyncNow() {
   if (!config.sync.enabled) {
     return SyncOutcome::kDisabled;
   }
-  return engine_.RequestSync() ? SyncOutcome::kAccepted : SyncOutcome::kAlreadyRunning;
+  if (!engine_.RequestSync()) {
+    return SyncOutcome::kAlreadyRunning;
+  }
+  // Taken either way, and last because it is not a remedy: a game in the
+  // foreground holds the tick until it closes (#242), and a screen that said
+  // "Sync started" would be a press the user repeats while nothing moves.
+  return engine_.application_running() ? SyncOutcome::kDeferred : SyncOutcome::kAccepted;
 }
 
 Error ServiceCore::StartPair(auth::PairingStatus* status) {
@@ -331,6 +348,7 @@ bool TakesRequest(Command command) {
     case Command::kStartPair:
     case Command::kGetPairState:
     case Command::kUnpair:
+    case Command::kGetRestoreState:
       return false;
   }
   return false;
@@ -363,19 +381,25 @@ ConflictPage ServiceCore::ListConflicts(const ConflictQuery& query) {
   return page;
 }
 
-conflicts::RestoreReport ServiceCore::RestoreBackup(std::int64_t entry_id) {
-  conflicts::RestoreReport report;
-  const Error refused = engine_.RestoreBackup(entry_id, &report);
-  if (refused != Error::kOk && report.outcome == conflicts::RestoreOutcome::kRestored) {
-    // An engine that refused and reported success is a bug on that side; the
-    // wire says what the file did, so the safe reading is the refusal.
-    report.outcome = conflicts::RestoreOutcome::kWriteFailed;
-    report.message = "the sysmodule could not carry out the restore";
-  }
+RestoreState ServiceCore::Bounded(RestoreState state) {
   // The two paths in the message are as long as the card lets them be.
-  Shorten(&report.message, kMaxRestoreMessageBytes);
-  return report;
+  Shorten(&state.report.message, kMaxRestoreMessageBytes);
+  if (state.phase != RestorePhase::kDone) {
+    // Defaulted outside `kDone`, which the payload documents: a report that rode
+    // along with a running restore would be read by somebody as its outcome.
+    state.report = {};
+  }
+  return state;
 }
+
+RestoreState ServiceCore::RestoreBackup(std::int64_t entry_id) {
+  // Answered without waiting for the copy (#209). What the engine hands back is
+  // where the restore stands the instant it was taken -- or, while one is
+  // already running, that one -- and both are answers rather than refusals.
+  return Bounded(engine_.RequestRestore(entry_id));
+}
+
+RestoreState ServiceCore::GetRestoreState() const { return Bounded(engine_.restore_state()); }
 
 LogTail ServiceCore::GetLog(std::int32_t lines) const {
   // Clamped here rather than at the decoder, so an over-large ask is a smaller
@@ -562,12 +586,17 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
       if (!entry_id.ok()) {
         return Error::kMalformedRequest;
       }
-      // Succeeds whatever the restore did, for `SetConfig`'s reason: a `Result`
+      // Succeeds whatever the restore does, for `SetConfig`'s reason: a `Result`
       // that says the call failed takes the answer with it, and "the backup is
-      // gone" is an answer the screen has a sentence for.
-      payload = EncodeRestoreReport(core.RestoreBackup(entry_id.value));
+      // gone" is an answer the screen has a sentence for. It arrives through
+      // `GetRestoreState`, because the copy has not happened yet (#209).
+      payload = EncodeRestoreState(core.RestoreBackup(entry_id.value));
       break;
     }
+
+    case Command::kGetRestoreState:
+      payload = EncodeRestoreState(core.GetRestoreState());
+      break;
 
     case Command::kGetLog: {
       const Decoded<std::int32_t> lines = DecodeLogRequest(request);

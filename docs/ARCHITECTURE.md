@@ -1,8 +1,10 @@
 # Architecture
 
 Two on-console components plus shared state on the SD card. The server is stock
-RomM 5.2.0 — we add nothing server-side except (optionally) an HTTPS reverse
-proxy and a dedicated user/token (see [SECURITY.md](SECURITY.md)).
+RomM 5.4.0 or later — an older one is refused before any save is offered to it
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#before-step-0--which-romm-this-is)) — and we
+add nothing server-side except (optionally) an HTTPS reverse proxy and a
+dedicated user/token (see [SECURITY.md](SECURITY.md)).
 
 ## Components
 
@@ -24,8 +26,9 @@ boot by Atmosphère. No UI. Responsibilities:
   `core/include/rommsync/file_system.hpp`. It also owns the one mapping the rest
   of the engine cannot do for itself — `Resolve` turns an SD-root path into the
   one `io::ReadFile` and `state::HashFile` can open. The host backend is
-  `host/native_file_system.cpp`; **the Horizon one is not written yet** and is
-  what the save scanner needs on the console.
+  `host/native_file_system.cpp`; the Horizon one is `sysmodule/source/card.cpp`
+  (`MakeSdCard`), which the save scanner reads the console's card through, and
+  which `card.*` host-compiles against a scratch directory.
 - **Sync engine** — the negotiate → execute → complete loop.
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md))
 - **Download worker** — drains a queue of rom ids, downloads (with `Range`
@@ -120,8 +123,9 @@ overlay.
   local size/MD5/mtime, server_content_hash, server_updated_at, backup path}`.
   Bounded at `conflicts::kMaxEntries`; the oldest entry falls off the end and
   its backup stays on the card. The overlay reads it over `ListConflicts` and
-  asks the sysmodule to put bytes back over `RestoreBackup`
-  (`core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
+  asks the sysmodule to put bytes back over `RestoreBackup`, which starts the
+  copy on the worker and answers at once; the overlay polls `GetRestoreState`
+  for the outcome (M9-6, #209; `core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
   *screen* and never the recording.
 - `sdmc:/config/rommsync/play.db` — play time this console recorded and has not
   yet handed to RomM (M7-4). `conflicts.db`'s format: a header line carrying the
@@ -150,6 +154,43 @@ overlay.
 The overlay and sysmodule both read config; the **sysmodule owns writes** to
 token/state to avoid races — the overlay asks it to change things via IPC.
 
+#### Formats across releases
+
+`scripts/package.sh` ships only `config.ini.example`, so an upgrade never
+replaces a record and every file below routinely outlives the build that wrote
+it. Each carries a version, and each has a stated answer for a file from an
+**older** release (an upgrade) and from a **newer** one (a downgrade, or a card
+where only one of the two halves was updated) (#205). What can be rebuilt is
+discarded and rebuilt; what cannot is refused and **left exactly as it is**, so
+an older build never writes over a newer file it refused. A newer file it
+discarded is replaced by the next write, which is what "rebuilt" costs.
+
+| File | Version | Older | Newer |
+|---|---|---|---|
+| `config.ini` | `version = N` above the first section; none = 1 | read; a later release migrates in its parser | refused: built-in defaults, one `error`, edits refused ([CONFIG.md](CONFIG.md#version)) |
+| `token.dat` | `"version":N`; none = 1, which is what v1 writes | read | refused as `kNewerFormat`, not read from `.old`, untouched; one `error` on Settings |
+| `device.dat` | none, by design | read | read for `client_device_identifier`, whatever else it carries — refusing would mint a second console |
+| `state.db` | header line | v2 (rc1) read, at rc1's own bounds (512 rows, 128 KiB) and streamed past this build's: states and archival rows kept first, slotted rows up to `kMaxRecords` (the rest rehashed), each moved to the shared slot its file is synced in now with its server half dropped (#236, `state::AdoptLegacySaves`); v1 discarded, every save rehashed | discarded, every save rehashed |
+| `conflicts.db` | header line | read | refused and never written over: this boot's entries stay in memory, the backups stay on the card |
+| `queue.json` | `"version"` | read, up to this build's 32 entries and 80 KiB; rc1's 64 entries and 160 KiB past them are discarded whole, and the user queues again (#247) | discarded; the user queues again |
+| `play.db` | header line | read | discarded: unsent play time is lost, nothing else |
+| `auth.json` | `"version"` | read | no verdict; re-derived by asking |
+
+`compat.fixtures` (`tests/test_compat.cpp`) holds all of it to the files
+v1.0.0-rc1 actually wrote, in `tests/fixtures/v1.0.0-rc1/` — produced by that
+tag's own writers (`generate.cpp` there says how), named with `_` for `.` because
+the real names are guarded secrets. While a file's version is still rc1's, this
+build must write rc1's bytes; a format that moves needs its version moved and
+the older one read. A release that changes a format adds its own fixture
+directory the same way, so the migration after it is testable too.
+
+**The two halves on one card.** The IPC contract has its own version
+(`ipc::kVersion`): when it differs the overlay draws "sysmodule unreachable" and
+names the half to update, whichever is behind. When it matches but the builds
+do not, everything works until something only one half knows about — so the
+status screen shows both builds, as warnings, and says to install both from the
+same release.
+
 ## Data flow: a sync tick
 
 ```
@@ -160,7 +201,11 @@ scheduler fires
   → build SyncNegotiatePayload.saves[]
   → POST /api/sync/negotiate  → {session_id, operations[]}
   → for each op:
-        upload   → POST /api/saves?...&overwrite=true (multipart saveFile)
+        upload   → POST /api/saves?...&overwrite=false (multipart saveFile)
+                 → 409 (the slot holds a save this device has not synced):
+                   negotiate once more for those saves, then take the head --
+                   a download if the bytes are the last-synced ones, else a
+                   conflict; never another upload (sync::ResolveRefusedUploads)
         download → GET /api/saves/{id} for the size
                  → GET /api/saves/{id}/content → stage → verify MD5
                  → back up the local file → commit → POST .../downloaded

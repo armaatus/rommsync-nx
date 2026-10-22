@@ -1,0 +1,19 @@
+{
+  "id": "c4ef65e7-a0bc-4edd-b264-ce9afdfc739c",
+  "user_id": 1,
+  "name": "probe_contract.py",
+  "platform": "switch",
+  "client": "rommsync-nx-probe",
+  "client_version": "0.0.0",
+  "ip_address": null,
+  "mac_address": null,
+  "hostname": null,
+  "client_device_identifier": "probe-contract-script",
+  "sync_mode": "api",
+  "sync_enabled": true,
+  "sync_config": null,
+  "capabilities": null,
+  "last_seen": "2026-10-21T09:02:11+00:00",
+  "created_at": "2026-10-21T09:02:11+00:00",
+  "updated_at": "2026-10-21T09:02:11+00:00"
+}

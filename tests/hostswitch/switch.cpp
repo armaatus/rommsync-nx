@@ -2,6 +2,7 @@
 // stands in for and, more importantly, what it does not.
 #include "switch.h"
 
+#include <atomic>
 #include <cstring>
 #include <string>
 
@@ -31,6 +32,15 @@ hostswitch::Dispatched& LastDispatchedMutable() {
   return last;
 }
 
+/// Sessions handed out and not yet closed. Atomic because `serviceClose` and
+/// `smGetService` are the caller's thread while a dispatch is `IpcClient`'s
+/// worker -- never both on one session, but a counter is cheaper to make safe
+/// than to argue about.
+std::atomic<int>& Open() {
+  static std::atomic<int> open{0};
+  return open;
+}
+
 }  // namespace
 
 namespace hostswitch {
@@ -50,6 +60,8 @@ void Unregister(const char* name, Server* server) {
 }
 
 const Dispatched& LastDispatched() { return LastDispatchedMutable(); }
+
+int OpenSessions() { return Open().load(); }
 
 Result DispatchOut(Service* service, u32 command_id, void* out, std::size_t out_size,
                    const SfDispatchParams& params) {
@@ -112,5 +124,15 @@ Result smGetService(Service* out, const char* name) {
   }
   out->server = RegisteredServer();
   out->generation = Generation();
+  ++Open();
   return 0;
+}
+
+void serviceClose(Service* s) {
+  // Closing a closed session is libnx's no-op too (`serviceClose` checks the
+  // handle), so it is not counted twice.
+  if (s != nullptr && s->server != nullptr) {
+    s->server = nullptr;
+    --Open();
+  }
 }

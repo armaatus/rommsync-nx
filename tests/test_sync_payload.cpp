@@ -2,7 +2,7 @@
 //
 // One table below (`kSaveFields`) says what `ClientSaveState`'s seven fields are
 // called, which are required, and which may be null. It is checked against
-// server/contract/romm-openapi-5.2.0.json -- so a RomM that renames, re-types or
+// server/contract/romm-openapi-5.4.0.json -- so a RomM that renames, re-types or
 // re-requires a field goes red the moment the snapshot is refreshed -- and then
 // against a body `EncodeNegotiateRequest` actually produced, so the struct
 // cannot drift from the table either. Neither half is worth much alone: the
@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -67,17 +68,23 @@ constexpr FieldSpec kSaveFields[] = {
     {"file_size_bytes", "integer", true, false},
 };
 
+/// The three after `saves` are 5.3/5.4's, and the encoder sends each only when
+/// asked to: `rom_ids` (#232), `restore_unlisted` (#241), `emulators` (#236).
+/// Their encoding is pinned below, each in its own check.
 constexpr FieldSpec kPayloadFields[] = {
     {"device_id", "string", false, true},
     {"saves", "array", true, false},
+    {"rom_ids", "array", false, true},
+    {"restore_unlisted", "boolean", false, false},
+    {"emulators", "array", false, true},
 };
 
 /// `SyncOperationSchema`, the entry `SyncOperation` is read from.
 ///
 /// Five of the nine are declared `T | null` and only four are in the schema's
 /// `required` set -- which is a pydantic default, not a promise that the other
-/// five may be absent: 5.2.0 emits all nine on every operation, as every capture
-/// under server/contract/captures/ shows. `ParseNegotiateResponse` therefore
+/// five may be absent: 5.4.0 emits all nine on every operation, as every capture
+/// under server/contract/captures/5.4.0/ shows. `ParseNegotiateResponse` therefore
 /// reads all nine with `RequiredNullable`, so a server that genuinely stopped
 /// sending one is a named error rather than a field that silently defaulted.
 constexpr FieldSpec kOperationFields[] = {
@@ -99,6 +106,9 @@ constexpr FieldSpec kPlanFields[] = {
     {"total_download", "integer", true, false},
     {"total_conflict", "integer", true, false},
     {"total_no_op", "integer", true, false},
+    // 5.4.0's (#233), and required by it. `ParseNegotiateResponse` still reads
+    // it as optional -- absent is no deletions -- which `sync.plan` pins.
+    {"total_delete", "integer", true, false},
 };
 
 /// `SyncCompletePayload`, the body step 3 sends (M2-6).
@@ -117,8 +127,8 @@ constexpr FieldSpec kCompletePayloadFields[] = {
 ///
 /// All twelve are read by `ParseCompleteResponse`, not the six a caller looks
 /// at, and all twelve strictly -- including the two this table marks *not*
-/// required. 5.2.0 emits every one of them on every response
-/// (`captures/sync-complete.json`), so a server that stopped sending one is a
+/// required. 5.4.0 emits every one of them on every response
+/// (`captures/5.4.0/sync-complete.json`), so a server that stopped sending one is a
 /// change worth a named error rather than a field that silently defaulted. This
 /// table pins what the snapshot *declares*; the strictness is the reader's
 /// decision and is argued in sync.hpp.
@@ -145,10 +155,10 @@ constexpr FieldSpec kCompleteResponseFields[] = {
     {"play_session_ingest", "", false, true},
 };
 
-/// The four actions, in the schema's own order. `no_op` carries the underscore;
+/// The five actions, in the schema's own order. `no_op` carries the underscore;
 /// a client that guessed `noop` would take every no-op through the unknown
-/// branch (`sync.plan` checks the classifier itself).
-constexpr const char* kActions[] = {"upload", "download", "conflict", "no_op"};
+/// branch (`sync.plan` checks the classifier itself). `delete` is 5.4.0's (#233).
+constexpr const char* kActions[] = {"upload", "download", "conflict", "no_op", "delete"};
 
 std::string ReadFile(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
@@ -354,7 +364,7 @@ void SnapshotPin(checks::Checks& c) {
   if (enumerated == nullptr) {
     c.Expect(false, "SyncOperationSchema.action enumerates its values");
   } else {
-    c.ExpectEq(enumerated->size(), std::size(kActions), "the snapshot declares four actions");
+    c.ExpectEq(enumerated->size(), std::size(kActions), "the snapshot declares five actions");
     for (const char* expected : kActions) {
       c.Expect(Lists(enumerated, expected),
                std::string("the snapshot still declares the action ") + expected);
@@ -507,6 +517,99 @@ void EncodesAnEmptyLibrary(checks::Checks& c) {
   const json::Value* saves = document.value.Find("saves");
   c.Expect(saves != nullptr && saves->is_array() && saves->size() == 0,
            "saves is an empty array, not a missing field");
+}
+
+/// `rom_ids` (#232): absent unless asked for, an array of ids when it is, and
+/// refused past RomM's own bound rather than sent to be refused there.
+void EncodesTheRomScope(checks::Checks& c) {
+  sync::SyncNegotiatePayload payload;
+  payload.saves.push_back(SampleSave());
+  {
+    const sync::Encoded unscoped = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(unscoped.body);
+    c.Expect(document.ok() && document.value.Find("rom_ids") == nullptr,
+             "an unscoped negotiation sends no rom_ids at all");
+  }
+  payload.rom_ids = std::vector<std::int64_t>{4, 9};
+  {
+    const sync::Encoded scoped = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(scoped.body);
+    const json::Value* ids = document.ok() ? document.value.Find("rom_ids") : nullptr;
+    c.Expect(ids != nullptr && ids->is_array() && ids->size() == 2 &&
+                 ids->elements()[0].is_integer() && ids->elements()[0].integer() == 4 &&
+                 ids->elements()[1].integer() == 9,
+             "a scoped one sends them as an array of integers: " + scoped.body);
+  }
+  payload.rom_ids = std::vector<std::int64_t>(sync::kMaxNegotiateRomIds + 1, 1);
+  const sync::Encoded too_many = sync::EncodeNegotiateRequest(payload);
+  c.Expect(!too_many.ok() && too_many.error.field == "rom_ids",
+           "more than RomM's 500 is refused here, by name");
+  payload.rom_ids = std::vector<std::int64_t>{0};
+  c.Expect(!sync::EncodeNegotiateRequest(payload).ok(), "and so is a rom id that is not one");
+}
+
+/// #241: `restore_unlisted` is sent only when asked for -- RomM reads it as
+/// "every save I did not list is lost", so a body that carried `false` by habit
+/// would be one edit away from a console re-downloading what its user deleted.
+/// And the scope a chunk adds stays inside `kMaxRomScopeBytes`, the number the
+/// heap table's negotiate row is written from (#217, #246).
+void EncodesRestoreUnlisted(checks::Checks& c) {
+  sync::SyncNegotiatePayload payload;
+  payload.saves.push_back(SampleSave());
+  const sync::Encoded plain = sync::EncodeNegotiateRequest(payload);
+  {
+    const json::ParseResult document = json::Parse(plain.body);
+    c.Expect(document.ok() && document.value.Find("restore_unlisted") == nullptr,
+             "an ordinary negotiation sends no restore_unlisted at all");
+  }
+  payload.restore_unlisted = true;
+  {
+    const sync::Encoded restoring = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(restoring.body);
+    const json::Value* flag = document.ok() ? document.value.Find("restore_unlisted") : nullptr;
+    c.Expect(flag != nullptr && flag->is_bool() && flag->boolean(),
+             "a restoring one sends it as true: " + restoring.body);
+  }
+  payload.restore_unlisted = false;
+
+  // The widest scope there is: 500 ids, each the largest a JSON integer here
+  // can be. 9223372036854775807 is 19 digits.
+  payload.rom_ids =
+      std::vector<std::int64_t>(sync::kMaxNegotiateRomIds, std::numeric_limits<std::int64_t>::max());
+  const sync::Encoded widest = sync::EncodeNegotiateRequest(payload);
+  c.Expect(widest.ok(), "500 of the largest ids encode");
+  c.Expect(widest.body.size() - plain.body.size() <= sync::kMaxRomScopeBytes,
+           "and add at most kMaxRomScopeBytes to the body: " +
+               std::to_string(widest.body.size() - plain.body.size()));
+  c.Expect(sync::kMaxRomScopeBytes <= 10 * 1024,
+           "which is under 10 KiB -- a fraction of the heap table's 94 KiB margin (#217)");
+}
+
+/// #236: `emulators` (RomM 5.4) pairs and offers only server saves one of these
+/// wrote, so a lineage this console cannot load is never downloaded.
+void EncodesTheEmulatorFilter(checks::Checks& c) {
+  sync::SyncNegotiatePayload payload;
+  payload.saves.push_back(SampleSave());
+  {
+    const sync::Encoded unfiltered = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(unfiltered.body);
+    c.Expect(document.ok() && document.value.Find("emulators") == nullptr,
+             "an unfiltered negotiation sends no emulators at all -- not [], which matches none");
+  }
+  payload.emulators = std::vector<std::string>{"snes9x", "Snes9x", "a\"b"};
+  {
+    const sync::Encoded filtered = sync::EncodeNegotiateRequest(payload);
+    const json::ParseResult document = json::Parse(filtered.body);
+    const json::Value* ids = document.ok() ? document.value.Find("emulators") : nullptr;
+    c.Expect(ids != nullptr && ids->is_array() && ids->size() == 3 &&
+                 ids->elements()[0].is_string() && ids->elements()[0].string() == "snes9x" &&
+                 ids->elements()[1].string() == "Snes9x" && ids->elements()[2].string() == "a\"b",
+             "a filtered one sends them as an array of strings, quoted: " + filtered.body);
+  }
+  payload.emulators = std::vector<std::string>{"snes9x", ""};
+  const sync::Encoded blank = sync::EncodeNegotiateRequest(payload);
+  c.Expect(!blank.ok() && blank.error.field == "emulators",
+           "a blank id is refused by name: it is no emulator, and RomM matches none to it");
 }
 
 /// A file name RomM is entitled to store and a JSON encoder is entitled to get
@@ -678,6 +781,9 @@ int main() {
   EncodesTheSnapshotShape(c);
   EncodesTheAbsentFieldsAsNull(c);
   EncodesAnEmptyLibrary(c);
+  EncodesTheRomScope(c);
+  EncodesRestoreUnlisted(c);
+  EncodesTheEmulatorFilter(c);
   QuotesRatherThanConcatenates(c);
   RefusesWhatItCannotSendFaithfully(c);
   FormatsTimestampsAsRomMReadsThem(c);

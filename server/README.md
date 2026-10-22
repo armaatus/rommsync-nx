@@ -6,12 +6,15 @@ machine hosting RomM — the Switch components live in `../sysmodule` and
 
 ## Contents
 
-- **`contract/romm-openapi-5.2.0.json`** — a snapshot of the target RomM's
-  OpenAPI spec. **Source of truth** for the API contract. Regenerate on upgrade:
+- **`contract/romm-openapi-5.4.0.json`** — a snapshot of the target RomM's
+  OpenAPI spec, the floor since #228; `romm-openapi-5.2.0.json` stays beside it
+  for the contract page's older body. **Source of truth** for the API contract.
+  Regenerate on upgrade:
   ```bash
   curl -s http://localhost:1515/openapi.json -o contract/romm-openapi-<version>.json
   ```
-- **`contract/captures/`** — the real responses behind those docs, produced by
+- **`contract/captures/`** — 5.2.0's real responses, with 5.4.0's under
+  `captures/5.4.0/`: what is behind those docs, produced by
   `probe_contract.py --capture` against the docker fixture. The snapshot says
   what RomM declares; these say what it does. `ctest -R contract` re-captures and
   compares, so a RomM upgrade cannot leave the docs quietly wrong.

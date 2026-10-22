@@ -6,16 +6,22 @@
 // the view models in `core/` -- what a screen *says* -- and the greps in them
 // assert what the directory must not contain. Neither reaches the code.
 //
-// What is compiled in here, and why it is these four files:
+// What is compiled in here, and why it is these files:
 //
 //   `card_probe.cpp`   the "not installed" / "installed but not set to boot"
 //                      diagnosis. Portable already; it needed only a seam for
 //                      the `sdmc:` mount (`ProbeCardAt`).
 //   `ipc_client.cpp`   the entire client half of the IPC wire, behind the
-//                      `switch.h` shim in `tests/hostswitch/`.
+//                      `switch.h` shim in `tests/hostswitch/`, and the budget
+//                      every call is held to (M9-6, #209).
 //   `screen_frame.cpp` the version handshake and the "not running" /
-//                      "unreachable" decision every screen shares.
+//                      "unreachable" / "not responding" decision every screen
+//                      shares.
 //   `status_paint.cpp` the status screen's layout, behind the `DrawList` seam.
+//   `conflicts_pump.cpp` the conflicts screen's IPC frame (#209).
+//   `lifecycle.cpp`    start, show, and the one teardown every exit path ends
+//                      in; and `Cadence`, the clock a screen polls by (#209).
+//   `log_paint.cpp`    the log screen's layout (#209).
 //
 // The far side of the wire is the *real* dispatch table -- `ipc::Dispatch` over
 // an `ipc::ServiceCore` -- and the real `Error` -> `Result` mapping the
@@ -28,30 +34,43 @@
 // by argv[1], so a red run names the behaviour that broke. Nothing here needs a
 // server, so nothing here skips.
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "checks.hpp"
+#include "count_new.hpp"
 #include "fake_engine.hpp"
 #include "scratch.hpp"
 
 #include "rommsync/config.hpp"
+#include "rommsync/conflict_log.hpp"
 #include "rommsync/ipc.hpp"
+#include "rommsync/log.hpp"
+#include "rommsync/overlay_conflicts_view.hpp"
+#include "rommsync/overlay_log_view.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 // The overlay's own headers, and the sysmodule's half of the error mapping.
 // Both reach `switch.h`, which here is `tests/hostswitch/switch.h`.
 #include "card_probe.hpp"
+#include "conflicts_pump.hpp"
 #include "draw_list.hpp"
 #include "ipc_client.hpp"
+#include "lifecycle.hpp"
+#include "log_paint.hpp"
 #include "prompts.hpp"
 #include "result.hpp"
 #include "screen_frame.hpp"
@@ -71,10 +90,57 @@ namespace sysmodule = rommsync::sysmodule;
 /// bound the request, dispatch it, bound the response, and answer with the
 /// `Result` the real mapping produces.
 ///
-/// The knobs are the three things a *healthy* sysmodule cannot be asked to do
-/// on demand and that the overlay has code for anyway -- answer a payload from
-/// another build, answer one that will not parse, and claim a length that is
-/// not the one it wrote. Everything else goes through `ipc::Dispatch`.
+/// A sysmodule that does not answer until it is told to (M9-6, #209).
+///
+/// What a wedged IPC thread looks like from the overlay's side: the call goes
+/// out and nothing comes back. `Handle` runs on `IpcClient`'s worker, so this
+/// blocks *that* thread -- which is the whole claim under test: the draw thread
+/// is not the one that waits.
+class Hold {
+ public:
+  void Arm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = true;
+    entered_ = false;
+  }
+
+  void Release() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      armed_ = false;
+    }
+    changed_.notify_all();
+  }
+
+  /// The far side's half: wait here while armed.
+  void Pass() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!armed_) {
+      return;
+    }
+    entered_ = true;
+    changed_.notify_all();
+    changed_.wait(lock, [this] { return !armed_; });
+  }
+
+  /// A call is being held right now, or was within `budget`.
+  bool AwaitEntered(std::chrono::milliseconds budget) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, budget, [this] { return entered_; });
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool armed_ = false;
+  bool entered_ = false;
+};
+
+/// The knobs are the things a *healthy* sysmodule cannot be asked to do on
+/// demand and that the overlay has code for anyway -- answer a payload from
+/// another build, answer one that will not parse, claim a length that is not
+/// the one it wrote, and not answer at all. Everything else goes through
+/// `ipc::Dispatch`.
 class HostSysmodule : public hostswitch::Server {
  public:
   explicit HostSysmodule(ipc::ServiceCore& core) : core_(core) {}
@@ -86,13 +152,19 @@ class HostSysmodule : public hostswitch::Server {
   /// The reply's length word, when it is to disagree with what was written.
   std::optional<std::uint64_t> claim_length;
 
-  int calls = 0;
+  /// Armed, every call blocks before it is dispatched. See `Hold`.
+  Hold hold;
+
+  /// Atomic because a call the overlay gave up on is still running on the
+  /// client's worker while the test reads this.
+  std::atomic<int> calls{0};
   std::uint32_t last_command = 0;
   std::string last_request;
 
   Result Handle(u32 command_id, const void* request, std::size_t request_size, void* response,
                 std::size_t capacity, u64* length) override {
     ++calls;
+    hold.Pass();
     last_command = command_id;
     last_request.assign(static_cast<const char*>(request), request_size);
     *length = 0;
@@ -312,8 +384,18 @@ constexpr ClientCall kClientCalls[] = {
      }},
     {ipc::Command::kRestoreBackup, "RestoreBackup",
      [](overlay::IpcClient& c) {
-       rommsync::conflicts::RestoreReport out;
+       ipc::RestoreState out;
        return c.RestoreBackup(3, &out);
+     }},
+    {ipc::Command::kGetRestoreState, "GetRestoreState",
+     [](overlay::IpcClient& c) {
+       ipc::RestoreState out;
+       return c.GetRestoreState(&out);
+     }},
+    {ipc::Command::kGetLog, "GetLog",
+     [](overlay::IpcClient& c) {
+       ipc::LogTail out;
+       return c.GetLog(ipc::kMaxLogLines, &out);
      }},
 };
 
@@ -353,18 +435,13 @@ int RunWire(Checks& checks) {
                   "the response buffer is the contract's whole cap");
 
   // Every command this contract has, against the client that is supposed to be
-  // able to send it. `kGetLog` is the one hole and it is a known one: the
-  // sysmodule dispatches it and no screen calls it (#209, which decides whether
-  // to wire it or drop it). Pinned rather than left implicit, so a *new*
-  // command with no client is a red test rather than a discovery on a console.
+  // able to send it. `kGetLog` was the one hole until M9-6 (#209) wired it to
+  // the log screen; there is none now, so a *new* command with no client is a
+  // red test rather than a discovery on a console.
   for (const ipc::Command command : ipc::kAllCommands) {
     bool covered = false;
     for (const ClientCall& call : kClientCalls) {
       covered = covered || call.command == command;
-    }
-    if (command == ipc::Command::kGetLog) {
-      checks.Expect(!covered, "kGetLog still has no client -- #209 decides its fate");
-      continue;
     }
     checks.Expect(covered, std::string("IpcClient can send ") + ipc::ToString(command));
   }
@@ -380,7 +457,7 @@ int RunWire(Checks& checks) {
     ipc::ConfigResult result;
     const Result rc = client.SetConfig(huge, &result);
     checks.Expect(R_FAILED(rc), "an over-long request fails");
-    checks.ExpectEq(console.sysmodule().calls, before,
+    checks.ExpectEq(console.sysmodule().calls.load(), before,
                     "...without reaching the sysmodule at all");
   }
   return checks.failures();
@@ -491,14 +568,35 @@ int RunRoundtrip(Checks& checks) {
   engine.restore_report.outcome = rommsync::conflicts::RestoreOutcome::kRestored;
   engine.restore_report.message = "restored from 2026-03-01";
   engine.restore_report.backup_sd_path = "/switch/rommsync/.backup/some-game.sav";
-  rommsync::conflicts::RestoreReport report;
-  checks.Expect(R_SUCCEEDED(client.RestoreBackup(3, &report)), "RestoreBackup succeeds");
+  // Taken and finished on the spot, which is what an engine with no worker
+  // does -- so the whole state, report included, crosses in one answer.
+  ipc::RestoreState state;
+  checks.Expect(R_SUCCEEDED(client.RestoreBackup(3, &state)), "RestoreBackup succeeds");
+  checks.Expect(state.phase == ipc::RestorePhase::kDone, "the phase survives");
+  checks.ExpectEq(state.entry_id, static_cast<std::int64_t>(3), "...and which restore it is");
+  const rommsync::conflicts::RestoreReport& report = state.report;
   checks.Expect(report.ok(), "the restore outcome survives");
   checks.ExpectEq(report.message, engine.restore_report.message, "...and its message");
   checks.ExpectEq(report.backup_sd_path, engine.restore_report.backup_sd_path,
                   "...and the backup this restore itself wrote first (hard rule 2)");
   checks.ExpectEq(engine.last_restore_id, static_cast<std::int64_t>(3),
                   "against the entry id the overlay named");
+  // The log tail, which the log screen reads (#209). The sysmodule answers it
+  // from `log::Tail`, so what goes in is a line logged in this process.
+  rommsync::log::Reset();
+  rommsync::log::Warn(rommsync::log::Event::kNetOffline, "negotiate: connection failed");
+  ipc::LogTail tail;
+  checks.Expect(R_SUCCEEDED(client.GetLog(ipc::kMaxLogLines, &tail)), "GetLog succeeds");
+  checks.ExpectEq(tail.total, static_cast<std::int64_t>(1), "the total survives");
+  checks.Expect(tail.lines.size() == 1 &&
+                    tail.lines[0].find("negotiate: connection failed") != std::string::npos,
+                "and the line, as the log rendered it");
+
+  ipc::RestoreState polled;
+  checks.Expect(R_SUCCEEDED(client.GetRestoreState(&polled)), "GetRestoreState succeeds");
+  checks.Expect(polled.phase == ipc::RestorePhase::kDone && polled.entry_id == 3 &&
+                    polled.report.message == engine.restore_report.message,
+                "and answers the same restore when polled");
   return checks.failures();
 }
 
@@ -715,6 +813,548 @@ int RunErrors(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.timeout ----------------------------------------------------------
+
+/// The budget these scenarios give a call. Short, so a red run is quick; the
+/// device's is `IpcClient::kCallBudget`.
+constexpr std::chrono::milliseconds kTestBudget{60};
+
+/// How long a call that is meant to return at once may take on a loaded CI
+/// runner. Well under any budget a frame could notice.
+constexpr std::chrono::milliseconds kPrompt{40};
+
+/// Generous, for the waits that are not the claim: a thread starting, a late
+/// answer arriving.
+constexpr std::chrono::milliseconds kPatience{5000};
+
+using Clock = std::chrono::steady_clock;
+
+std::chrono::milliseconds Since(Clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start);
+}
+
+/// M9-6 (#209): a sysmodule that does not answer holds the overlay's draw
+/// thread for one budget, once, and then not at all.
+///
+/// Before this, `IpcClient::Call` was `serviceDispatchOut` on the draw thread,
+/// and a call into a wedged sysmodule blocked there **forever** -- the overlay
+/// frozen on the panel, holding exclusive input, with nothing a user can press.
+int RunTimeout(Checks& checks) {
+  Console console;
+  console.Start();
+  overlay::IpcClient client(kTestBudget);
+  overlay::ScreenFrame frame(client);
+  checks.Expect(frame.Ready() == overlay::Link::kOk, "the handshake passes while it answers");
+
+  // The bound. The call comes back at the budget with a `Result` of its own,
+  // while the far side is still sitting on it.
+  console.sysmodule().hold.Arm();
+  {
+    const Clock::time_point start = Clock::now();
+    ipc::Status status;
+    status.queue_depth = 1234;
+    const Result rc = client.GetStatus(&status);
+    const std::chrono::milliseconds took = Since(start);
+    checks.Expect(console.sysmodule().hold.AwaitEntered(kPatience),
+                  "the call reached the sysmodule, which is sitting on it");
+    checks.ExpectEq(rc, overlay::NotResponding(), "a call past its budget is NotResponding");
+    checks.Expect(took >= kTestBudget, "...after the budget, not before it");
+    checks.Expect(took < kTestBudget + kPatience, "...and not long after it");
+    checks.ExpectEq(status.queue_depth, static_cast<std::int64_t>(1234),
+                    "the caller's struct is left alone");
+    ipc::Error refusal = ipc::Error::kOk;
+    checks.Expect(!overlay::DecodeError(rc, &refusal),
+                  "it is not a refusal the sysmodule named -- nothing was answered");
+  }
+
+  // What it means, and what it does not do. **The session is not dropped**:
+  // the worker is still inside a call on it, and closing a handle another
+  // thread is dispatching on is the one thing worse than waiting.
+  checks.Expect(frame.Diagnose(overlay::NotResponding()) == overlay::Link::kNotResponding,
+                "Diagnose names it 'not responding', not 'not running'");
+  checks.Expect(client.open(), "...and keeps the session the call is still on");
+  checks.Expect(client.busy(), "the client knows a call is still out");
+  {
+    const overlay::StatusView view = overlay::RenderUnreachable(overlay::Link::kNotResponding);
+    checks.Expect(!view.headline.empty() && !view.hint.empty(),
+                  "kNotResponding renders a headline and something to do about it");
+    checks.Expect(view.headline != overlay::RenderUnreachable(overlay::Link::kNotRunning).headline,
+                  "...and it is not the 'not running' sentence: it is running, and stuck");
+  }
+
+  // **Once, and then not at all.** While the first call is still out, every
+  // later one is answered at once without being sent -- one session answers one
+  // request at a time -- so the frames after the first are not held either.
+  {
+    const int before = console.sysmodule().calls.load();
+    for (int frame_number = 0; frame_number < 5; ++frame_number) {
+      const Clock::time_point start = Clock::now();
+      ipc::ConfigView view;
+      const Result rc = client.GetConfig(&view);
+      checks.ExpectEq(rc, overlay::NotResponding(), "a frame while it is stuck is answered...");
+      checks.Expect(Since(start) < kPrompt, "...at once, not after another budget");
+    }
+    checks.ExpectEq(console.sysmodule().calls.load(), before,
+                    "and nothing more was sent into a session that has not answered");
+  }
+
+  // The handshake is bounded the same way. A fresh client whose first call --
+  // command 0 -- is held is "not responding", not "unreadable": `Ready` must not
+  // drop and reopen a session a worker is still dispatching on.
+  //
+  // Declared out here rather than in a block: its destructor waits for the call
+  // it still has out, and that call is released below.
+  overlay::IpcClient fresh(kTestBudget);
+  overlay::ScreenFrame fresh_frame(fresh);
+  checks.Expect(fresh_frame.Ready() == overlay::Link::kNotResponding,
+                "a handshake that is not answered is kNotResponding");
+  checks.Expect(fresh.open(), "...on a session that is kept");
+
+  // It recovers by itself, and the late answer goes nowhere. The `Status` the
+  // sysmodule finally sends is not handed to whichever call comes next -- a
+  // `GetConfig` that decoded a `Status` would be a `MalformedResponse`, and one
+  // that *could* decode it would be worse.
+  console.sysmodule().hold.Release();
+  {
+    Result rc = overlay::NotResponding();
+    ipc::ConfigView view;
+    const Clock::time_point start = Clock::now();
+    while (rc == overlay::NotResponding() && Since(start) < kPatience) {
+      rc = client.GetConfig(&view);
+    }
+    checks.ExpectEq(rc, Result{0}, "once it answers, the next call goes through");
+    checks.Expect(!client.busy(), "and nothing is left out");
+    checks.Expect(frame.Ready() == overlay::Link::kOk, "the screen is back without a reopen");
+  }
+
+  // An exit with a call still out waits for it: the worker cannot be left
+  // running into an overlay that is about to be unloaded. libtesla releases
+  // input before `exitServices` (tesla.hpp's tail), so this waits holding none.
+  {
+    console.sysmodule().hold.Arm();
+    ipc::Status status;
+    checks.ExpectEq(client.GetStatus(&status), overlay::NotResponding(), "a call is left out");
+    std::thread releaser([&console] {
+      std::this_thread::sleep_for(std::chrono::milliseconds{100});
+      console.sysmodule().hold.Release();
+    });
+    client.Shutdown();
+    releaser.join();
+    checks.Expect(!client.open(), "Shutdown closes the session once the call is back");
+    checks.Expect(!client.busy(), "...with nothing left out");
+  }
+  fresh.Shutdown();
+  checks.ExpectEq(hostswitch::OpenSessions(), 0, "every session this scenario opened is closed");
+  return checks.failures();
+}
+
+// --- overlay.restore ----------------------------------------------------------
+
+/// M9-6 (#209): a restore that is still copying holds no frame.
+///
+/// `RestoreBackup` used to copy the save before it answered, on the
+/// sysmodule's IPC thread, with the overlay's draw thread inside
+/// `serviceDispatchOut` for the whole of it -- a large save on a slow card was a
+/// frozen overlay holding the user's input. Now the command answers the moment
+/// the restore is taken, and the screen polls. This drives the conflicts
+/// screen's own frame -- `PumpConflicts`, the code `ConflictsScreen::update`
+/// runs -- through the real client against an engine whose restore does not
+/// finish until the test says so, and times every frame.
+///
+/// The sysmodule's half of the same claim -- that the copy really is off its
+/// IPC thread -- is `engine.restore_polled`, against the real `SdEngine`.
+int RunRestore(Checks& checks) {
+  Console console;
+  fakes::FakeEngine& engine = console.engine();
+  engine.restore_runs_inline = false;
+  engine.restore_report.outcome = rommsync::conflicts::RestoreOutcome::kRestored;
+  {
+    ipc::ConflictRow row;
+    row.entry.id = 7;
+    row.entry.kind = rommsync::conflicts::EntryKind::kSave;
+    row.entry.event = rommsync::conflicts::Event::kReplaced;
+    row.entry.rom_id = 4;
+    row.entry.rom_name = "Game";
+    row.entry.file_name = "game.srm";
+    row.entry.sd_path = "/roms/gba/game.srm";
+    row.entry.backup_sd_path = "/config/rommsync/.backup/4-retroarch-srm-1.srm";
+    row.backup_present = true;
+    engine.conflicts_.push_back(row);
+  }
+  console.Start();
+
+  overlay::IpcClient client(kTestBudget);
+  overlay::ScreenFrame frame(client);
+  overlay::ConflictsModel model;
+  overlay::Link link = overlay::Link::kOk;
+
+  // One frame, timed. What a frame costs is the claim, so every frame below
+  // goes through this.
+  std::chrono::milliseconds slowest{0};
+  const auto pump = [&] {
+    const Clock::time_point start = Clock::now();
+    overlay::PumpConflicts(frame, client, model, link);
+    slowest = std::max(slowest, Since(start));
+  };
+
+  pump();  // the handshake and the first page
+  checks.ExpectEq(model.loaded(), std::size_t{1}, "the history's one entry is loaded");
+  model.Activate();  // open it
+  model.Activate();  // confirm
+  model.Activate();  // press
+
+  pump();  // the restore goes out, and is answered at once
+  checks.ExpectEq(engine.last_restore_id, static_cast<std::int64_t>(7),
+                  "the restore was asked for the entry that was open");
+  overlay::ConflictsView view = model.Render();
+  checks.Expect(view.headline.find("Restoring") != std::string::npos,
+                "the screen says it is restoring rather than freezing: " + view.headline);
+
+  // **The copy is still running for all of these**, and not one frame waits
+  // for it: each is one poll, answered from memory.
+  for (int frames = 0; frames < 30; ++frames) {
+    pump();
+  }
+  checks.Expect(slowest < kPrompt, "no frame is held while the save copies: the slowest took " +
+                                       std::to_string(slowest.count()) + "ms");
+  checks.Expect(model.Render().headline.find("Restoring") != std::string::npos,
+                "and it still says so, thirty frames in");
+  checks.ExpectEq(engine.restore_requests, 1, "the restore was asked for once, then polled");
+
+  engine.FinishRestore();
+  pump();
+  view = model.Render();
+  checks.Expect(view.headline.find("Restored") != std::string::npos,
+                "the outcome arrives on the next frame after it finishes: " + view.headline);
+  checks.Expect(!view.can_restore, "with the restore no longer on offer");
+  checks.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+                "and the polling stops");
+  checks.Expect(slowest < kPrompt, "and still no frame was held");
+  return checks.failures();
+}
+
+// --- overlay.cycles -----------------------------------------------------------
+
+std::string WithoutComment(const std::string& line);  // overlay.portable's, below
+
+/// Every `requestForeground` the lifecycle made, in order. A plain function
+/// rather than a lambda with captures, because on a console it is libtesla's
+/// free function and `Lifecycle` takes a function pointer.
+std::vector<bool>& ForegroundCalls() {
+  static std::vector<bool> calls;
+  return calls;
+}
+void RecordForeground(bool enabled) { ForegroundCalls().push_back(enabled); }
+
+/// `RommsyncOverlay`, minus `tsl::Overlay`: the client and the lifecycle it
+/// owns, declared in the same order `main.cpp` declares them.
+struct OverlayUnderTest {
+  overlay::IpcClient client{kTestBudget};
+  overlay::Lifecycle lifecycle{client, &RecordForeground};
+};
+
+/// One way libtesla's loop ends, as our overlay's hooks see it.
+///
+/// Read off `tsl::loop` in the pinned `tesla.hpp`. Every `break` out of its
+/// outer loop -- B at the root of the gui stack (`shouldClose`), a close
+/// requested while hidden (`shouldCloseAfter`), another overlay being launched
+/// (`launchingOverlay`), and the launch combo pressed over a notification while
+/// hidden (`exitAfterPrompt`) -- lands on one tail: `requestForeground(false)`,
+/// `exitScreen()`, `exitServices()`, `delete overlay`. What differs between them
+/// is only how many times the overlay was shown first, and `RunCycles` greps
+/// that tail so the table cannot drift from the library. The fifth row is the
+/// path nothing in the pinned library takes and a bump could: the overlay
+/// deleted without `exitServices` -- which the destructor has to cover, because
+/// nx-ovlloader's process never exits and anything left open is open for the
+/// life of the console (libtesla#37, Ultrahand#278).
+struct ExitPath {
+  const char* name;
+  int shows;
+  bool exit_services;
+};
+
+constexpr ExitPath kExitPaths[] = {
+    {"B at the root (shouldClose)", 1, true},
+    {"closed while hidden (shouldCloseAfter)", 2, true},
+    {"another overlay launched (launchingOverlay)", 1, true},
+    {"the combo over a hidden notification (exitAfterPrompt)", 0, true},
+    {"deleted without exitServices", 1, false},
+};
+
+/// How many times each path is driven. Enough that a counted resource leaking
+/// one per open runs out where Ultrahand#278's "sixth attempt" would.
+constexpr int kCycles = 8;
+
+/// `text` with every `//` comment removed, line by line.
+std::string CodeOnly(const std::string& text) {
+  std::string out;
+  std::size_t at = 0;
+  while (at < text.size()) {
+    std::size_t end = text.find('\n', at);
+    if (end == std::string::npos) {
+      end = text.size();
+    }
+    out += WithoutComment(text.substr(at, end - at));
+    out += '\n';
+    at = end + 1;
+  }
+  return out;
+}
+
+std::string ReadWhole(const std::filesystem::path& path) {
+  std::ifstream file(path);
+  return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+bool IsIdentifier(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+/// `word` as a whole token: `return`, and not `returning` or `returnPath`.
+std::size_t CountWord(const std::string& haystack, std::string_view word) {
+  std::size_t count = 0;
+  for (std::size_t at = haystack.find(word); at != std::string::npos;
+       at = haystack.find(word, at + word.size())) {
+    const bool starts = at == 0 || !IsIdentifier(haystack[at - 1]);
+    const std::size_t after = at + word.size();
+    const bool ends = after >= haystack.size() || !IsIdentifier(haystack[after]);
+    if (starts && ends) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+std::size_t Count(const std::string& haystack, std::string_view needle) {
+  std::size_t count = 0;
+  for (std::size_t at = haystack.find(needle); at != std::string::npos;
+       at = haystack.find(needle, at + needle.size())) {
+    ++count;
+  }
+  return count;
+}
+
+/// M9-6 (#209): every way the overlay closes gives back everything it took,
+/// and does it the same way.
+///
+/// nx-ovlloader branches back to `loadNro` when `main` returns, so the process
+/// never exits and nothing the kernel would reclaim at exit is reclaimed. The
+/// corpus rule is nx-ovlloader#41's: *normal teardown is safe; every other path
+/// leaks state only a reboot clears.* So the claim is per path, and per cycle.
+int RunCycles(Checks& checks) {
+  // The table above against the library it describes. A bump that grew a
+  // second exit -- a `return` out of the loop, a second `delete`, or the tail
+  // reordered so `exitServices` ran before input was released -- fails here
+  // rather than on the sixth open of somebody's console.
+  {
+    const std::string tesla = CodeOnly(ReadWhole(std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) /
+                                                 ".." / "lib" / "libultrahand" / "libtesla" /
+                                                 "include" / "tesla.hpp"));
+    const std::size_t begin = tesla.find("overlay = new TOverlay();");
+    const std::size_t end = tesla.find("delete overlay;", begin);
+    checks.Expect(begin != std::string::npos && end != std::string::npos,
+                  "the pinned tesla.hpp still creates and deletes the overlay in tsl::loop");
+    if (begin != std::string::npos && end != std::string::npos) {
+      const std::string loop = tesla.substr(begin, end - begin);
+      checks.ExpectEq(Count(tesla, "delete overlay;"), std::size_t{1},
+                      "the overlay is deleted in exactly one place");
+      checks.ExpectEq(Count(loop, "overlay->exitServices();"), std::size_t{1},
+                      "and exitServices is called in exactly one, before it");
+      checks.ExpectEq(CountWord(loop, "return"), std::size_t{0},
+                      "nothing returns out of tsl::loop between creating the overlay and its "
+                      "tail, so every exit reaches exitServices");
+      const std::size_t release = loop.rfind("hlp::requestForeground(false);");
+      const std::size_t screen = loop.rfind("overlay->exitScreen();");
+      const std::size_t services = loop.rfind("overlay->exitServices();");
+      checks.Expect(release != std::string::npos && release < screen && screen < services,
+                    "and the tail releases input and the panel before exitServices, so a "
+                    "Shutdown waiting on a stuck call holds neither");
+    }
+  }
+
+  // And `main.cpp` against the lifecycle: the four hooks go through it, so the
+  // host scenario below is the device's teardown and not a copy of it.
+  {
+    const std::string main = CodeOnly(ReadWhole(std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) /
+                                                "main.cpp"));
+    for (const char* wired : {"lifecycle_.Start()", "lifecycle_.Shown()", "lifecycle_.Stop()"}) {
+      checks.Expect(main.find(wired) != std::string::npos,
+                    std::string("main.cpp's hooks call ") + wired);
+    }
+    checks.Expect(main.find("client_.Close()") == std::string::npos,
+                  "and none of them closes the session around the lifecycle");
+  }
+
+  Console console;
+  console.Start();
+  const int workers_before = overlay::IpcClient::Workers();
+  std::optional<count_new::Snapshot> after_first_round;
+
+  for (int cycle = 0; cycle < kCycles; ++cycle) {
+    for (const ExitPath& path : kExitPaths) {
+      const std::string where = std::string(path.name) + ", cycle " + std::to_string(cycle);
+      ForegroundCalls().clear();
+      const int teardowns = overlay::Lifecycle::Teardowns();
+      {
+        auto under_test = std::make_unique<OverlayUnderTest>();
+        under_test->lifecycle.Start();  // initServices
+        // **Released before anything else**, on every open: a fresh instance
+        // after one that crashed holding input otherwise inherits it, and
+        // neither libtesla nor libultrahand gives it back (#209).
+        checks.Expect(ForegroundCalls() == std::vector<bool>{false},
+                      "the overlay gives input back the moment it starts: " + where);
+
+        overlay::ScreenFrame frame(under_test->client);
+        for (int show = 0; show < path.shows; ++show) {
+          under_test->lifecycle.Shown();
+          checks.Expect(frame.Ready() == overlay::Link::kOk, "a showing can talk: " + where);
+          ipc::Status status;
+          checks.Expect(R_SUCCEEDED(under_test->client.GetStatus(&status)),
+                        "and polls: " + where);
+        }
+        // One call that ran out of budget and is still out when the overlay
+        // closes -- the worst case for a teardown, released a moment later.
+        if (path.shows > 0) {
+          console.sysmodule().hold.Arm();
+          ipc::Status status;
+          checks.ExpectEq(under_test->client.GetStatus(&status), overlay::NotResponding(),
+                          "a call is left out: " + where);
+          std::thread releaser([&console] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            console.sysmodule().hold.Release();
+          });
+          if (path.exit_services) {
+            under_test->lifecycle.Stop();  // exitServices
+          }
+          under_test.reset();  // delete overlay
+          releaser.join();
+        } else {
+          if (path.exit_services) {
+            under_test->lifecycle.Stop();
+          }
+          under_test.reset();
+        }
+      }
+      checks.ExpectEq(overlay::Lifecycle::Teardowns(), teardowns + 1,
+                      "the one teardown ran exactly once: " + where);
+      checks.ExpectEq(hostswitch::OpenSessions(), 0, "no session is left open: " + where);
+      checks.ExpectEq(overlay::IpcClient::Workers(), workers_before,
+                      "no worker thread is left running: " + where);
+      checks.Expect(ForegroundCalls() == std::vector<bool>{false},
+                    "and teardown does not touch input -- libtesla's tail releases it: " + where);
+    }
+    // The heap, once the first round has paid for whatever is allocated once
+    // per process. Every round after it must give back exactly what it took.
+    if (count_new::kActive) {
+      const count_new::Snapshot now = count_new::Now();
+      if (!after_first_round.has_value()) {
+        after_first_round = now;
+      } else {
+        checks.ExpectEq(now.outstanding, after_first_round->outstanding,
+                        "round " + std::to_string(cycle) +
+                            " of open/close leaves as many blocks allocated as round 0 did");
+        checks.ExpectEq(now.outstanding_bytes, after_first_round->outstanding_bytes,
+                        "...and as many bytes");
+      }
+    }
+  }
+  return checks.failures();
+}
+
+// --- overlay.hidden -----------------------------------------------------------
+
+/// M9-6 (#209): `update()` does not run while the overlay is hidden.
+///
+/// `tsl::loop` waits on the combo event with no timeout, so the process stays
+/// resident with its gui stack frozen -- and a screen that counted frames to
+/// decide when to poll again comes back from a hide mid-count, drawing what it
+/// read before the hide as though it were current. `Cadence` is the one clock a
+/// screen polls by, and it is due on the first frame of every showing.
+int RunHidden(Checks& checks) {
+  Console console;
+  console.Start();
+  overlay::IpcClient client(kTestBudget);
+  overlay::Lifecycle lifecycle(client, &RecordForeground);
+  lifecycle.Start();
+  lifecycle.Shown();
+
+  overlay::Cadence every_thirty(30);
+  checks.Expect(every_thirty.Due(), "the first frame polls, rather than drawing nothing");
+  int skipped = 0;
+  while (!every_thirty.Due() && skipped < 100) {
+    ++skipped;
+  }
+  checks.ExpectEq(skipped, 29, "and then once every thirty frames");
+
+  // Ten frames in, the overlay is hidden and shown again. However long it was
+  // hidden, nothing ran in between -- so the count says ten frames and the
+  // clock on the wall says anything at all.
+  for (int frame = 0; frame < 10; ++frame) {
+    checks.Expect(!every_thirty.Due(), "mid-cadence frames do not poll");
+  }
+  lifecycle.Shown();
+  checks.Expect(every_thirty.Due(),
+                "the first frame after a showing polls, whatever the count said: a screen "
+                "that assumed its polling continued while hidden would draw stale data here");
+  checks.Expect(!every_thirty.Due(), "and the cadence starts again from that poll");
+
+  // A cadence of one is every frame, which is what the status screen polls at.
+  overlay::Cadence every_frame(1);
+  for (int frame = 0; frame < 5; ++frame) {
+    checks.Expect(every_frame.Due(), "a cadence of one polls every frame");
+  }
+
+  // A press asks for a poll on the next frame rather than waiting out the count.
+  for (int frame = 0; frame < 3; ++frame) {
+    every_thirty.Due();
+  }
+  every_thirty.Expire();
+  checks.Expect(every_thirty.Due(), "Expire makes the next frame poll");
+
+  // **No screen keeps a frame count of its own.** A member a screen increments
+  // or decrements is a clock that stops while the overlay is hidden and
+  // resumes as though it had not; `Cadence` is the one that knows about
+  // showings. A grep, because none of the screens' `update()`s is reachable
+  // from a test.
+  for (const std::filesystem::directory_entry& entry :
+       std::filesystem::directory_iterator(ROMMSYNC_OVERLAY_SOURCE_DIR)) {
+    const std::string name = entry.path().filename().string();
+    if (name.find("_screen.") == std::string::npos) {
+      continue;
+    }
+    std::ifstream file(entry.path());
+    std::string line;
+    int number = 0;
+    while (std::getline(file, line)) {
+      ++number;
+      const std::string code = WithoutComment(line);
+      for (std::size_t at = code.find("++"); at != std::string::npos; at = code.find("++", at + 2)) {
+        const bool member_before = at > 0 && code[at - 1] == '_';
+        const std::size_t after = code.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", at + 2);
+        const bool member_after = after != std::string::npos && after > at + 2 &&
+                                  code[after - 1] == '_';
+        checks.Expect(!member_before && !member_after,
+                      name + ":" + std::to_string(number) +
+                          " counts frames in a member of its own; poll through Cadence, which "
+                          "knows the overlay was hidden (lifecycle.hpp)");
+      }
+      for (std::size_t at = code.find("--"); at != std::string::npos; at = code.find("--", at + 2)) {
+        const bool member_before = at > 0 && code[at - 1] == '_';
+        const std::size_t after = code.find_first_not_of(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", at + 2);
+        const bool member_after = after != std::string::npos && after > at + 2 &&
+                                  code[after - 1] == '_';
+        checks.Expect(!member_before && !member_after,
+                      name + ":" + std::to_string(number) +
+                          " counts frames in a member of its own; poll through Cadence");
+      }
+    }
+  }
+  lifecycle.Stop();
+  return checks.failures();
+}
+
 // --- overlay.portable ---------------------------------------------------------
 
 /// The files that are only host-compilable because they name no libultrahand
@@ -728,8 +1368,9 @@ int RunErrors(Checks& checks) {
 /// breaking this target. That is the failure this is for, and the same shape as
 /// the greps `overlay.sync_actions` and `conflicts.overlay` already run.
 constexpr const char* kPortableFiles[] = {
-    "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",
-    "screen_frame.cpp", "status_paint.hpp", "status_paint.cpp",
+    "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",   "screen_frame.cpp",
+    "status_paint.hpp", "status_paint.cpp", "conflicts_pump.hpp", "conflicts_pump.cpp",
+    "lifecycle.hpp",    "lifecycle.cpp",    "log_paint.hpp",      "log_paint.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately
@@ -1065,6 +1706,105 @@ int RunDraw(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.log --------------------------------------------------------------
+
+/// M9-6 (#209): the log the sysmodule serves is readable without an SD reader.
+///
+/// `GetLog` (M7-3, #38) was dispatched and had no client, so the only way to
+/// read why a sync did not happen was to pull the card. This is the screen's
+/// two portable halves -- what it says (`RenderLog`, in `core/`) and where it
+/// puts it (`PaintLog`) -- the way `overlay.draw` holds the status screen's.
+int RunLog(Checks& checks) {
+  // What it says.
+  {
+    const overlay::LogView none = overlay::RenderLog(ipc::LogTail{});
+    checks.Expect(!none.headline.empty(), "a console that has logged nothing says so");
+    checks.Expect(none.lines.empty(), "and draws no lines");
+
+    ipc::LogTail whole;
+    whole.lines = {"1 info boot rommsync-nx/0.1.0", "2 warn net.offline negotiate: failed"};
+    whole.total = 2;
+    const overlay::LogView all = overlay::RenderLog(whole);
+    checks.Expect(all.headline.find('2') != std::string::npos,
+                  "the whole log says how many lines it is: " + all.headline);
+    checks.ExpectEq(all.lines.size(), std::size_t{2}, "every line is there");
+    checks.ExpectEq(all.lines.back(), whole.lines.back(), "oldest first, newest last");
+
+    ipc::LogTail tail = whole;
+    tail.total = 412;
+    const overlay::LogView end = overlay::RenderLog(tail);
+    checks.Expect(end.headline.find("412") != std::string::npos,
+                  "a tail says it is the end of a longer log: " + end.headline);
+    checks.Expect(end.hint.find(rommsync::log::kLogSdPath) != std::string::npos,
+                  "and where the rest of it is: " + end.hint);
+
+    const overlay::LogView gone = overlay::RenderLogUnreachable(overlay::Link::kNotRunning);
+    checks.Expect(gone.link == overlay::Link::kNotRunning && !gone.headline.empty(),
+                  "a sysmodule that is not there is the same sentence every screen uses");
+    checks.Expect(gone.hint.find(rommsync::log::kLogSdPath) != std::string::npos ||
+                      !gone.hint.empty(),
+                  "with something to do about it");
+  }
+
+  // Where it goes.
+  const overlay::Palette palette = TestPalette();
+  overlay::LogView view;
+  view.headline = "The last 40 of 412 lines";
+  view.hint = "The rest is on the card";
+  for (int line = 0; line < 40; ++line) {
+    view.lines.push_back(std::to_string(line) + " info sync.tick a line that is long enough to "
+                                                "need bounding on a narrow panel, " +
+                         std::string(120, 'x'));
+  }
+  {
+    Recorder out;
+    overlay::PaintLog(view, palette, out, kPanelX, kPanelY, kPanelWidth, kPanelHeight);
+    checks.Expect(out.Drew(view.headline), "the headline is drawn");
+    checks.Expect(out.Drew(overlay::Prompt(overlay::kGlyphB, "Back")), "and the way out");
+    // **The end of the log is what fits**, not the start: the newest lines are
+    // the ones that say why the last tick failed.
+    checks.Expect(out.Drew(view.lines.back()), "the newest line is drawn");
+    checks.Expect(!out.Drew(view.lines.front()),
+                  "and a panel too short for forty drops the oldest, not the newest");
+    std::int32_t newest_y = -1;
+    std::int32_t previous_y = -1;
+    bool in_order = true;
+    for (const overlay::DrawCommand& command : out.commands) {
+      if (command.text.find(" info sync.tick ") == std::string::npos) {
+        continue;
+      }
+      in_order = in_order && command.y > previous_y;
+      previous_y = command.y;
+      if (command.text == view.lines.back()) {
+        newest_y = command.y;
+      }
+    }
+    checks.Expect(in_order, "the lines run oldest to newest, down the panel");
+    checks.ExpectEq(newest_y, previous_y, "with the newest at the bottom of them");
+    for (const overlay::DrawCommand& command : out.commands) {
+      checks.Expect(command.width > 0, "no string is drawn unbounded: \"" + command.text + "\"");
+      checks.Expect(command.y >= kPanelY && command.y <= kPanelY + kPanelHeight,
+                    "nothing is drawn outside the panel");
+      checks.Expect(command.x + command.width <= kPanelX + kPanelWidth,
+                    "nor past its right edge");
+    }
+  }
+  // No room at all: nothing rather than a headline over whatever is beside it.
+  {
+    Recorder out;
+    overlay::PaintLog(view, palette, out, kPanelX, kPanelY, 4, kPanelHeight);
+    checks.Expect(out.commands.empty(), "a panel with no width draws nothing");
+  }
+  // A panel with room for the prompt and nothing else keeps the prompt.
+  {
+    Recorder out;
+    overlay::PaintLog(view, palette, out, kPanelX, kPanelY, kPanelWidth, 40);
+    checks.Expect(out.Drew(overlay::Prompt(overlay::kGlyphB, "Back")),
+                  "the way out survives a panel with no room");
+  }
+  return checks.failures();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1085,6 +1825,21 @@ int main(int argc, char** argv) {
   if (scenario == "errors") {
     return RunErrors(checks);
   }
+  if (scenario == "log") {
+    return RunLog(checks);
+  }
+  if (scenario == "cycles") {
+    return RunCycles(checks);
+  }
+  if (scenario == "hidden") {
+    return RunHidden(checks);
+  }
+  if (scenario == "restore") {
+    return RunRestore(checks);
+  }
+  if (scenario == "timeout") {
+    return RunTimeout(checks);
+  }
   if (scenario == "portable") {
     return RunPortable(checks);
   }
@@ -1092,6 +1847,6 @@ int main(int argc, char** argv) {
     return RunDraw(checks);
   }
   std::cerr << "usage: test_overlay_native "
-               "<card|wire|roundtrip|version|errors|portable|draw>\n";
+               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|log|portable|draw>\n";
   return 2;
 }

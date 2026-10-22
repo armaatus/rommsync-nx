@@ -11,18 +11,22 @@
 // carries `reused` for no other reason than that the digest is identical either
 // way, so nothing else in the process can tell the two apart -- including a
 // test that only compared digests.
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string_view>
 #include <string>
 #include <system_error>
 
 #include "checks.hpp"
 #include "scratch.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/config.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/save_scan.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
@@ -35,6 +39,7 @@ namespace {
 // CI is the failure mode, and the anonymous namespace is what removes it.
 namespace crypto = rommsync::crypto;
 namespace io = rommsync::io;
+namespace scan = rommsync::scan;
 namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 
@@ -163,6 +168,42 @@ void EveryFieldRoundTrips(checks::Checks& c) {
   c.Expect(!archival->slot.has_value(), "and its slot is still null");
   c.Expect(!archival->server_updated_at.has_value(), "with no server history");
   c.Expect(!archival->server_content_hash.has_value(), "and no server digest");
+  c.Expect(!slotted->deleted_on_server && !archival->deleted_on_server,
+           "and neither is marked deleted on the server");
+}
+
+/// #233's mark: a save RomM deleted that `[sync] on_server_delete = keep` left.
+/// Written only when set -- every other row stays the bytes earlier builds
+/// wrote and read -- and read as false from a row that does not carry it.
+void TheDeletedMarkRoundTrips(checks::Checks& c) {
+  state::SaveRecord kept = Full();
+  kept.server_updated_at.reset();
+  kept.server_content_hash.reset();
+  kept.deleted_on_server = true;
+  state::Baseline baseline;
+  baseline.Set(kept);
+  baseline.Set(NoHistory());
+  const std::string text = state::SerializeBaseline(baseline);
+  c.ExpectEq(static_cast<int>(std::count(text.begin(), text.end(), '\n')), 3,
+             "a header and two rows");
+  c.Expect(text.find("\"deleted_on_server\":true") != std::string::npos,
+           "the mark is written on the kept row");
+  c.Expect(text.find("deleted_on_server\":false") == std::string::npos,
+           "and nowhere else, not even as false");
+
+  const state::LoadedBaseline loaded = state::ParseBaseline(text);
+  c.Expect(loaded.diagnostics.empty(), "it reads back silently -- " + loaded.DescribeDiagnostics());
+  const state::SaveRecord* marked = loaded.value.Find(12, std::optional<std::string>("autosave"));
+  c.Expect(marked != nullptr && marked->deleted_on_server, "the mark comes back");
+  const state::SaveRecord* plain = loaded.value.Find(12, std::nullopt);
+  c.Expect(plain != nullptr && !plain->deleted_on_server, "and its absence reads as false");
+
+  const state::LoadedBaseline wrong = state::ParseBaseline(
+      Header() + "{\"rom_id\":12,\"slot\":\"a\",\"content_hash\":\"" + crypto::Md5Hex("x") +
+      "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
+      "\"server_content_hash\":null,\"deleted_on_server\":\"yes\"}\n");
+  c.Expect(!wrong.diagnostics.empty() && wrong.value.Find(12, std::string("a")) == nullptr,
+           "a mark of the wrong type is a row that does not read, and says so");
 }
 
 /// A slot is user data. RomM takes whatever the client sends, and a filesystem
@@ -481,13 +522,17 @@ void RefusesAFileTheReaderWouldDiscard(checks::Checks& c) {
 /// The two bounds have to agree, or the writer produces files the reader throws
 /// away. A full baseline must serialize to less than the byte bound.
 void TheTwoBoundsAgree(checks::Checks& c) {
+  // The longest slot a save can be synced in: the longest `[sync] slot` the
+  // config accepts, and a companion file's suffix -- `-save`, the one a file
+  // with no usable extension gets, is longer than any real save's (`-srm`,
+  // `-rtc`, `-mcd`). A slot is the one field of a row a user chooses, so the
+  // byte bound has to hold at that slot's longest, not at `autosave`.
+  const std::string longest = std::string(rommsync::config::kMaxSlotLength, 'x') + "-save";
   state::Baseline full;
   for (std::size_t at = 0; at < state::kMaxRecords; ++at) {
     state::SaveRecord record = Full();
     record.rom_id = static_cast<std::int64_t>(at) + 1;
-    // A slot longer than any real one, so the headroom is real and not an
-    // artefact of the eight characters `Full()` happens to use.
-    record.slot = "autosave-" + std::string(23, 'x');
+    record.slot = longest;
     full.Set(record);
   }
   const std::string text = state::SerializeBaseline(full);
@@ -508,7 +553,7 @@ void TheTwoBoundsAgree(checks::Checks& c) {
   for (std::size_t at = 0; at < state::kMaxRecords - kStates; ++at) {
     state::SaveRecord record = Full();
     record.rom_id = static_cast<std::int64_t>(at) + 1;
-    record.slot = "autosave-" + std::string(23, 'x');
+    record.slot = longest;
     mixed.Set(record);
   }
   for (std::size_t at = 0; at < kStates; ++at) {
@@ -615,6 +660,96 @@ void CorruptFilesAreAnEmptyBaselineAndADiagnostic(checks::Checks& c) {
            "and the verdict survives the cap -- " + flooded.DescribeDiagnostics());
 }
 
+/// #236: a version 2 file is the one every console upgrading from rc1 holds. Its
+/// states and archival rows mean what they meant; its slotted saves were keyed
+/// on a `<source>-<ext>` slot that no longer exists, so they are held apart
+/// rather than discarded or read as rows of the new slot.
+void AVersion2FileIsMigratedNotDiscarded(checks::Checks& c) {
+  const std::string digest = crypto::Md5Hex("rc1's save");
+  const std::string row_tail = "\",\"mtime\":1757000000,\"file_size_bytes\":32768,"
+                               "\"server_updated_at\":1757000100,\"server_content_hash\":\"" +
+                               crypto::Md5Hex("what rc1's server held") + "\"}\n";
+  const std::string v2 =
+      "rommsync-state 2\n"
+      "{\"rom_id\":12,\"slot\":null,\"content_hash\":\"" + crypto::Md5Hex("x") +
+      "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
+      "\"server_content_hash\":null}\n"
+      "{\"rom_id\":12,\"slot\":\"retroarch-srm\",\"content_hash\":\"" + digest + row_tail +
+      "{\"rom_id\":12,\"slot\":\"tico-rtc\",\"content_hash\":\"" + crypto::Md5Hex("clock") + row_tail +
+      "{\"rom_id\":12,\"slot\":\"tico-srm\",\"content_hash\":\"" + crypto::Md5Hex("tico's") + row_tail +
+      "{\"kind\":\"state\",\"rom_id\":12,\"file_name\":\"Game (USA).state\",\"emulator\":\"tico\","
+      "\"content_hash\":\"" + crypto::Md5Hex("state") +
+      "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":7,"
+      "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+
+  state::LoadedBaseline loaded = state::ParseBaseline(v2);
+  c.Expect(loaded.diagnostics.empty(), "a version 2 file reads silently -- " +
+                                           loaded.DescribeDiagnostics());
+  c.ExpectEq(loaded.version, state::kSourceSlotVersion, "and says which version it was");
+  c.Expect(loaded.value.Find(12, std::nullopt) != nullptr, "its archival row is kept as it was");
+  c.Expect(loaded.value.FindState(12, "Game (USA).state") != nullptr,
+           "and so is its state: states are keyed by name, which #236 did not move");
+  c.Expect(loaded.value.Find(12, std::string("tico-srm")) == nullptr,
+           "a slotted row is not read as a row of the slot it named");
+  c.ExpectEq(loaded.legacy_saves.size(), std::size_t{3}, "it is held apart, all three of them");
+
+  const std::size_t adopted =
+      state::AdoptLegacySaves(&loaded, [](std::string_view old_slot) -> std::optional<std::string> {
+        return scan::MigratedSlot("autosave", old_slot);
+      });
+  c.ExpectEq(adopted, std::size_t{2}, "two rows land: the save RAM and the clock");
+  c.Expect(loaded.legacy_saves.empty(), "and nothing is left apart");
+  const state::SaveRecord* save = loaded.value.Find(12, std::string("autosave"));
+  c.Expect(save != nullptr && save->content_hash == digest && save->file_size_bytes == 32768 &&
+               sync::UnixSeconds(save->mtime) == 1757000000,
+           "the shared slot's row is RetroArch's -- the copy the scan also reads first -- so "
+           "the file it describes is not hashed again");
+  c.Expect(save != nullptr && !save->server_updated_at.has_value() &&
+               !save->server_content_hash.has_value(),
+           "with no server side: this device has never synced the shared slot, and the old "
+           "slot's digest would have the 409 rule call its first meeting a download");
+  c.Expect(loaded.value.Find(12, std::string("autosave-rtc")) != nullptr,
+           "the clock's row is under the clock's new slot");
+
+  const std::string written = state::SerializeBaseline(loaded.value);
+  c.Expect(written.rfind(Header(), 0) == 0, "what is written back is this build's version");
+  const state::LoadedBaseline again = state::ParseBaseline(written);
+  c.ExpectEq(again.version, state::kFormatVersion, "and reads back as it");
+  c.Expect(again.legacy_saves.empty() && again.value.Find(12, std::string("autosave")) != nullptr,
+           "with its slotted rows in force, not held apart");
+
+  state::LoadedBaseline refused = state::ParseBaseline(v2);
+  c.ExpectEq(state::AdoptLegacySaves(&refused, [](std::string_view) -> std::optional<std::string> {
+               return std::nullopt;
+             }),
+             std::size_t{0}, "a row the caller has no slot for is dropped, not kept under its old one");
+  c.Expect(refused.value.rows().size() == 1 && refused.legacy_saves.empty(),
+           "leaving the archival row alone");
+
+  // #233's mark rides along: a v2 file written after #233 carries it on a row
+  // in an old slot, and the delete it records is the save's, whatever its slot.
+  state::LoadedBaseline marked = state::ParseBaseline(
+      "rommsync-state 2\n{\"rom_id\":13,\"slot\":\"tico-srm\",\"content_hash\":\"" + digest +
+      "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":null,"
+      "\"server_content_hash\":null,\"deleted_on_server\":true}\n");
+  state::AdoptLegacySaves(&marked, [](std::string_view old_slot) -> std::optional<std::string> {
+    return scan::MigratedSlot("autosave", old_slot);
+  });
+  const state::SaveRecord* kept = marked.value.Find(13, std::string("autosave"));
+  c.Expect(kept != nullptr && kept->deleted_on_server,
+           "a delete #233 kept is still kept under the new slot");
+  const state::LoadedBaseline rewritten =
+      state::ParseBaseline(state::SerializeBaseline(marked.value));
+  const state::SaveRecord* reread = rewritten.value.Find(13, std::string("autosave"));
+  c.Expect(rewritten.version == state::kFormatVersion && reread != nullptr &&
+               reread->deleted_on_server,
+           "and version 3 writes and reads the mark");
+
+  const state::LoadedBaseline broken = state::ParseBaseline(v2 + "{\"rom_id\":12,\n");
+  c.Expect(broken.value.empty() && broken.legacy_saves.empty(),
+           "a damaged version 2 file is discarded whole, like any other");
+}
+
 /// **Not the rows that happened to parse.** A truncation leaves a prefix that is
 /// individually well-formed and collectively a lie, and there is no way for a
 /// caller to tell it from a complete file.
@@ -713,6 +848,64 @@ void OversizedFilesAreRefusedBySize(checks::Checks& c) {
   c.Expect(loaded.value.empty(), "an oversized state.db is an empty baseline");
   c.Expect(Mentions(loaded, std::to_string(state::kMaxStateBytes)),
            "and the bound is named -- " + loaded.DescribeDiagnostics());
+}
+
+/// rc1 wrote its version 2 file at rc1's bounds -- 512 rows, 128 KiB -- and the
+/// bounds this build reads at are 128 and 32 KiB (#246). Discarded whole, its
+/// states' rows went with it, and no rescan rebuilds those: every state rc1
+/// synced was kept on both sides forever. So a v2 file is read at rc1's bounds,
+/// once, keeping what matters first -- states and archival rows -- and as many
+/// of the slotted save rows as still fit, which cost only a re-hash.
+void ARc1FileOverTheBoundsKeepsItsStates(checks::Checks& c) {
+  std::string v2 = "rommsync-state 2\n";
+  const std::size_t legacy_rows = 480;
+  for (std::size_t at = 0; at < legacy_rows; ++at) {
+    v2 += "{\"rom_id\":" + std::to_string(1000 + at) +
+          ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" + crypto::Md5Hex(std::to_string(at)) +
+          "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
+          "\"server_content_hash\":\"" + crypto::Md5Hex("server " + std::to_string(at)) + "\"}\n";
+  }
+  const std::size_t archival = 4;
+  for (std::size_t at = 0; at < archival; ++at) {
+    v2 += "{\"rom_id\":" + std::to_string(5000 + at) + ",\"slot\":null,\"content_hash\":\"" +
+          crypto::Md5Hex("archival") +
+          "\",\"mtime\":1757000000,\"file_size_bytes\":1,\"server_updated_at\":null,"
+          "\"server_content_hash\":null}\n";
+  }
+  const std::size_t states = 24;
+  for (std::size_t at = 0; at < states; ++at) {
+    v2 += "{\"kind\":\"state\",\"rom_id\":" + std::to_string(1000 + at) +
+          ",\"file_name\":\"Game (USA).state\",\"emulator\":\"tico\",\"content_hash\":\"" +
+          crypto::Md5Hex("state") +
+          "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":" +
+          std::to_string(at + 1) + ",\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
+  }
+  c.Expect(v2.size() > state::kMaxStateBytes, "the fixture is past this build's byte bound too");
+
+  const auto kept = [&](const state::LoadedBaseline& loaded, const std::string& how) {
+    c.ExpectEq(loaded.version, state::kSourceSlotVersion, how + ": read as rc1's file -- " +
+                                                              loaded.DescribeDiagnostics());
+    c.ExpectEq(loaded.value.state_rows().size(), states, how + ": every state row stands");
+    c.ExpectEq(loaded.value.rows().size(), archival, how + ": and every archival row");
+    c.ExpectEq(loaded.value.size() + loaded.legacy_saves.size(), state::kMaxRecords,
+               how + ": and slotted save rows up to the bound, the rest let go");
+    c.Expect(Mentions(loaded, "re-hash") || Mentions(loaded, "hashed"),
+             how + ": which is said -- " + loaded.DescribeDiagnostics());
+  };
+  kept(state::ParseBaseline(v2), "parsed");
+  const std::filesystem::path path = FreshPath("rc1-full.db");
+  WriteWhole(path.string(), v2);
+  kept(state::LoadBaseline(path.string()), "loaded");
+
+  // A version 3 file over the bound is not one this build wrote, and stays
+  // refused (`TooManyRowsIsRefused`); so is a v2 file past rc1's own.
+  std::string past = "rommsync-state 2\n";
+  for (std::size_t at = 0; at <= 512; ++at) {
+    past += "{\"rom_id\":" + std::to_string(1000 + at) + ",\"slot\":null,\"content_hash\":\"" +
+            crypto::Md5Hex("x") + "\",\"mtime\":1757000000,\"file_size_bytes\":1,"
+            "\"server_updated_at\":null,\"server_content_hash\":null}\n";
+  }
+  c.Expect(state::ParseBaseline(past).value.empty(), "a v2 file past rc1's 512 rows is discarded");
 }
 
 void TooManyRowsIsRefused(checks::Checks& c) {
@@ -858,6 +1051,7 @@ void ALostBaselineCostsTimeNotCorrectness(checks::Checks& c) {
 int main() {
   checks::Checks c;
   EveryFieldRoundTrips(c);
+  TheDeletedMarkRoundTrips(c);
   StateRowsAreTheirOwnKind(c);
   SkipsAStateRowItCouldNotReadBack(c);
   AnUnchangedStateIsNotRehashed(c);
@@ -870,10 +1064,12 @@ int main() {
   TheTwoBoundsAgree(c);
   NamesAMissingDirectory(c);
   CorruptFilesAreAnEmptyBaselineAndADiagnostic(c);
+  AVersion2FileIsMigratedNotDiscarded(c);
   APartialFileIsNotAPartialBaseline(c);
   AHugeTimestampIsDiagnosedNotOverflowed(c);
   AnUnusableOldIsNotABrandNewCard(c);
   OversizedFilesAreRefusedBySize(c);
+  ARc1FileOverTheBoundsKeepsItsStates(c);
   TooManyRowsIsRefused(c);
   AMissingFileIsReportedAndNotAFailure(c);
   HashesAFileTheWayTheServerWill(c);

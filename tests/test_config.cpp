@@ -116,6 +116,149 @@ void DefaultsAreTheDocumentedOnes(checks::Checks& c) {
   c.Expect(defaults.StateScanDirs().size() > 1, "the same for states");
 }
 
+// --- Tico's folder names (#231) -------------------------------------------------
+
+/// Every RomM slug the built-in map carries, and the folder Tico keeps that
+/// system in. Literal rather than derived from `scan::TicoSlugFor`: this is the
+/// table #226 R5 read off Tico, and a test that asked the code would agree with
+/// whatever the code says.
+struct TicoRow {
+  const char* romm;
+  const char* tico;
+};
+constexpr TicoRow kTicoFolders[] = {
+    {"nes", "nes"},         {"snes", "snes"},           {"gb", "gb"},
+    {"gbc", "gbc"},         {"gba", "gba"},             {"n64", "n64"},
+    {"genesis", "genesis"}, {"sms", "master-system"},   {"gamegear", "game-gear"},
+    {"segacd", "sega-cd"},  {"psx", "psx"},             {"nds", "nds"},
+    {"dc", "dc"},           {"dreamcast", "dc"},        {"psp", "psp"},
+    {"saturn", "saturn"},   {"fbneo", "fbneo"},         {"arcade", "fbneo"},
+};
+
+void DownloadsLandInTicosFolderNames(checks::Checks& c) {
+  const config::Config defaults = config::Defaults();
+  for (const TicoRow& row : kTicoFolders) {
+    const std::string slug = row.romm;
+    const config::RomDestination where =
+        defaults.DestinationFor(config::RomFile{slug, "Game (USA).bin"});
+    c.ExpectEq(where.path, "/tico/roms/" + std::string(row.tico) + "/Game (USA).bin",
+               "a " + slug + " rom downloads into the folder Tico scans");
+    const config::PlatformFolders* folders = defaults.Platform(slug);
+    if (folders == nullptr) {
+      c.Expect(false, slug + " is mapped by default");
+      continue;
+    }
+    c.Expect(folders->saves == std::vector<std::string>{"/retroarch/saves",
+                                                        "/tico/saves/" + std::string(row.tico)},
+             slug + "'s saves are read from Tico's folder for it");
+    c.Expect(folders->states == std::vector<std::string>{"/retroarch/states",
+                                                         "/tico/states/" + std::string(row.tico)},
+             slug + "'s states too");
+  }
+  c.ExpectEq(defaults.platforms.size(), std::size_t{std::size(kTicoFolders)},
+             "and the built-in map is exactly that table");
+
+  // Tico runs these, and the console struggles with them: there to turn on,
+  // never on by default.
+  const TicoRow kOptional[] = {{"ngc", "gc"}, {"wii", "wii"}, {"3ds", "3ds"}};
+  for (const TicoRow& row : kOptional) {
+    const std::string slug = row.romm;
+    c.Expect(defaults.Platform(slug) == nullptr, slug + " is off by default");
+    const auto found = config::OptionalPlatforms().find(slug);
+    if (found == config::OptionalPlatforms().end()) {
+      c.Expect(false, slug + " is available to turn on");
+      continue;
+    }
+    c.Expect(found->second.roms == std::vector<std::string>{"/tico/roms/" + std::string(row.tico)},
+             slug + " roms go to Tico's " + row.tico);
+    c.Expect(found->second.saves == std::vector<std::string>{"/retroarch/saves",
+                                                             "/tico/saves/" + std::string(row.tico)},
+             slug + " saves are read from Tico's " + row.tico);
+
+    // Turned on with the documented line, it maps exactly those folders.
+    const config::LoadResult on =
+        config::ParseConfig("[server]\nurl = https://romm.example.com\n\n[platform." + slug +
+                            "]\nenabled = true\n");
+    const config::PlatformFolders* mapped = on.value.Platform(slug);
+    c.Expect(mapped != nullptr && mapped->roms == found->second.roms &&
+                 mapped->saves == found->second.saves && mapped->states == found->second.states,
+             "`enabled = true` maps " + slug + " to Tico's folders: " + on.DescribeDiagnostics());
+    c.ExpectEq(on.value.DestinationFor(config::RomFile{slug, "Game.iso"}).path,
+               "/tico/roms/" + std::string(row.tico) + "/Game.iso",
+               "and a " + slug + " rom then downloads into Tico's " + row.tico);
+    c.Expect(on.diagnostics.empty(),
+             "and turning on a platform this build knows says nothing: " +
+                 on.DescribeDiagnostics());
+  }
+}
+
+void TicoAccountIsReadAndChecked(checks::Checks& c) {
+  const config::Config defaults = config::Defaults();
+  c.Expect(defaults.tico.account == config::TicoAccount::kAuto, "the account is auto by default");
+
+  const auto parse = [](const std::string& line) {
+    return config::ParseConfig("[server]\nurl = https://romm.example.com\n\n[tico]\n" + line +
+                               "\n");
+  };
+  const config::LoadResult legacy = parse("account = Legacy");
+  c.Expect(legacy.value.tico.account == config::TicoAccount::kLegacy && legacy.diagnostics.empty(),
+           "legacy forces the layout before 0.8.0: " + legacy.DescribeDiagnostics());
+  const config::LoadResult picked = parse("account = 0123456789ABCDEF0123456789abcdef");
+  c.Expect(picked.value.tico.account == config::TicoAccount::kNamed && picked.diagnostics.empty(),
+           "a 32-digit uid names one account: " + picked.DescribeDiagnostics());
+  c.ExpectEq(picked.value.tico.uid, std::string("0123456789abcdef0123456789abcdef"),
+             "in lowercase, the way Tico names the folder");
+  const config::LoadResult automatic = parse("account = auto");
+  c.Expect(automatic.value.tico.account == config::TicoAccount::kAuto &&
+               automatic.diagnostics.empty(),
+           "auto is accepted as written");
+
+  for (const char* bad : {"account = 0123", "account = 0123456789abcdef0123456789abcdeg",
+                          "account = ../../atmosphere"}) {
+    const config::LoadResult refused = parse(bad);
+    c.Expect(refused.value.tico.account == config::TicoAccount::kAuto,
+             std::string("'") + bad + "' leaves the account on auto");
+    c.Expect(refused.diagnostics.size() == 1 &&
+                 refused.diagnostics[0].severity == config::Severity::kWarning &&
+                 refused.diagnostics[0].section == "tico" && refused.diagnostics[0].key == "account",
+             std::string("and is a warning on its line: ") + refused.DescribeDiagnostics());
+  }
+  const config::LoadResult unknown = parse("acount = auto");
+  c.Expect(unknown.diagnostics.size() == 1 &&
+               unknown.diagnostics[0].severity == config::Severity::kWarning,
+           "a key [tico] does not have is said to be ignored");
+}
+
+/// `[sync] on_server_delete` (#233): what a save RomM deleted does on the card.
+/// `remove` -- backed up first, always -- unless the user says `keep`, and a
+/// value it is neither of leaves the default rather than guessing between them.
+void OnServerDeleteIsReadAndChecked(checks::Checks& c) {
+  c.Expect(config::Defaults().sync.on_server_delete == config::OnServerDelete::kRemove,
+           "a save RomM deleted is removed (after a backup) by default");
+
+  const auto parse = [](const std::string& line) {
+    return config::ParseConfig(WithServer("[sync]\n" + line + "\n"));
+  };
+  const config::LoadResult keep = parse("on_server_delete = Keep");
+  c.Expect(keep.value.sync.on_server_delete == config::OnServerDelete::kKeep &&
+               keep.diagnostics.empty(),
+           "keep is read, in any case: " + keep.DescribeDiagnostics());
+  const config::LoadResult remove = parse("on_server_delete = remove");
+  c.Expect(remove.value.sync.on_server_delete == config::OnServerDelete::kRemove &&
+               remove.diagnostics.empty(),
+           "remove is accepted as written");
+
+  for (const char* bad : {"on_server_delete = delete", "on_server_delete = true",
+                          "on_server_delete ="}) {
+    const config::LoadResult refused = parse(bad);
+    c.Expect(refused.value.sync.on_server_delete == config::OnServerDelete::kRemove,
+             std::string("'") + bad + "' leaves the default");
+    const config::Diagnostic* complaint = Complaint(refused, "sync", "on_server_delete");
+    c.Expect(complaint != nullptr && complaint->severity == config::Severity::kWarning,
+             std::string("and is a warning on its line: ") + refused.DescribeDiagnostics());
+  }
+}
+
 // --- the happy path ----------------------------------------------------------
 
 void AWholeFileParses(checks::Checks& c) {
@@ -269,6 +412,37 @@ void NumbersAndTheirBounds(checks::Checks& c) {
   }
   const config::LoadResult plus = config::ParseConfig(WithServer("[sync]\ninterval_min = +15\n"));
   c.ExpectEq(plus.value.sync.interval_min, 15, "a signed positive is still a number");
+}
+
+// #236: the slot every save is synced in.
+void TheSlotIsCheckedAndDefaultsToAutosave(checks::Checks& c) {
+  const config::LoadResult absent = config::ParseConfig(WithServer("[sync]\nenabled = true\n"));
+  c.ExpectEq(absent.value.sync.slot, std::string("autosave"),
+             "no slot line is the shared autosave slot");
+
+  const config::LoadResult named =
+      config::ParseConfig(WithServer("[sync]\nslot = switch_only-1\n"));
+  c.ExpectEq(named.value.sync.slot, std::string("switch_only-1"), "a named slot is used as written");
+  c.Expect(named.ok(), "and is not a complaint: " + named.DescribeDiagnostics());
+  const std::string longest(config::kMaxSlotLength, 's');
+  c.ExpectEq(config::ParseConfig(WithServer("[sync]\nslot = " + longest + "\n")).value.sync.slot,
+             longest, "a slot of kMaxSlotLength is used");
+  const config::LoadResult past = config::ParseConfig(WithServer("[sync]\nslot = " + longest + "s\n"));
+  c.ExpectEq(past.value.sync.slot, std::string("autosave"), "and one past it is refused");
+  const config::Diagnostic* warned = Complaint(past, "sync", "slot");
+  c.Expect(warned != nullptr && warned->severity == config::Severity::kWarning,
+           "as a warning on the slot line, never silently");
+
+  for (const char* text : {"", "my slot", "a/b", "auto.save", "é",
+                           "a234567890123456789012345678901234567890123456789012345678901234x"}) {
+    const config::LoadResult bad =
+        config::ParseConfig(WithServer(std::string("[sync]\nslot = ") + text + "\n"));
+    c.ExpectEq(bad.value.sync.slot, std::string("autosave"),
+               std::string("'") + text + "' is refused and autosave stays in force");
+    const config::Diagnostic* said = Complaint(bad, "sync", "slot");
+    c.Expect(said != nullptr && said->severity == config::Severity::kWarning,
+             std::string("'") + text + "' is a warning on the slot line");
+  }
 }
 
 void DuplicatesResolveToTheLastLine(checks::Checks& c) {
@@ -641,6 +815,74 @@ void NothingCrashesOnAPartialFile(checks::Checks& c) {
   c.Expect(Mentions(flood, "further problems"), "...and says how many it dropped");
 }
 
+// --- emulator overrides -----------------------------------------------------------
+
+void EmulatorOverridesAreCheckedAndKeepTheFolders(checks::Checks& c) {
+  const config::LoadResult set = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = mgba\n"
+      "[platform.gbc]\n"
+      "emulator = Genesis Plus GX\n"));
+  c.Expect(set.ok(), "an override parses: " + set.DescribeDiagnostics());
+  c.ExpectEq(std::string(set.value.EmulatorOverride("gb")), std::string("mgba"),
+             "mGBA for GB, from config.ini");
+  c.ExpectEq(std::string(set.value.EmulatorOverride("gbc")), std::string("Genesis Plus GX"),
+             "an id is taken as written, spaces and case included");
+  c.ExpectEq(std::string(set.value.EmulatorOverride("snes")), std::string(),
+             "a platform with no override has none");
+  // A section that sets *only* the emulator is not a folder map, so it must not
+  // replace one: "mGBA for GB" that also stopped GB syncing would be a trap
+  // nobody reading the line could see.
+  const config::Config defaults = config::Defaults();
+  const config::PlatformFolders* gb = set.value.Platform("gb");
+  c.Expect(gb != nullptr && gb->saves == defaults.Platform("gb")->saves &&
+               gb->roms == defaults.Platform("gb")->roms &&
+               gb->states == defaults.Platform("gb")->states,
+           "an emulator-only section keeps that platform's built-in folders");
+  c.Expect(Complaint(set, "platform.gb", "saves") == nullptr,
+           "...and says nothing about folders it did not touch");
+
+  const config::LoadResult mixed = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = mgba\n"
+      "saves = /tico/saves/gb\n"));
+  const config::PlatformFolders* mixed_gb = mixed.value.Platform("gb");
+  c.Expect(mixed_gb != nullptr && mixed_gb->roms.empty(),
+           "a section that sets a folder still replaces the map, as documented");
+  c.ExpectEq(std::string(mixed.value.EmulatorOverride("gb")), std::string("mgba"),
+             "...and keeps its override");
+
+  // The acceptance line: an id RomM would refuse is refused here, with a
+  // diagnostic naming the line, rather than turned into a 400 on every upload.
+  const config::LoadResult bad = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = retroarch/cores\n"
+      "[platform.snes]\n"
+      "emulator = " + std::string(51, 'x') + "\n"
+      "[platform.nes]\n"
+      "emulator = what?\n"));
+  for (const char* section : {"platform.gb", "platform.snes", "platform.nes"}) {
+    const config::Diagnostic* complaint = Complaint(bad, section, "emulator");
+    c.Expect(complaint != nullptr && complaint->severity == config::Severity::kWarning,
+             std::string("an invalid id is a warning on its line: ") + section);
+  }
+  c.Expect(Complaint(bad, "platform.gb", "emulator") != nullptr &&
+               Complaint(bad, "platform.gb", "emulator")->line == 4,
+           "the diagnostic carries the line number");
+  c.ExpectEq(std::string(bad.value.EmulatorOverride("gb")), std::string(),
+             "a refused id leaves the built-in one in force");
+  c.Expect(bad.value.Platform("gb") != nullptr && !bad.value.Platform("gb")->saves.empty(),
+           "and a refused id does not unmap the platform");
+
+  // `emulator =` is how an override is taken back out, like `roms =` for a folder.
+  const config::LoadResult cleared = config::ParseConfig(WithServer(
+      "[platform.gb]\n"
+      "emulator = mgba\n"
+      "emulator =\n"));
+  c.ExpectEq(std::string(cleared.value.EmulatorOverride("gb")), std::string(),
+             "an empty value clears the override");
+}
+
 // --- the document -------------------------------------------------------------------
 
 /// The first ```ini block of docs/CONFIG.md.
@@ -683,7 +925,10 @@ void TheDocumentedExampleParses(checks::Checks& c) {
   c.ExpectEq(CountOf(result, config::Severity::kWarning), std::size_t{0},
              "...and no warnings either: " + result.DescribeDiagnostics());
   c.Expect(result.value.configured(), "it configures a server");
+  c.Expect(example.rfind("version = " + std::to_string(config::kConfigVersion), 0) == 0,
+           "the documented example opens with this build's config version");
   c.ExpectEq(result.value.sync.interval_min, 30, "the interval the document shows");
+  c.ExpectEq(result.value.sync.slot, std::string("autosave"), "the slot the document shows");
   c.Expect(!result.value.sync.states, "states off, as the document shows");
   c.ExpectEq(result.value.RomTarget("snes"), std::string("/tico/roms/snes"),
              "and the snes mapping the document shows");
@@ -714,6 +959,11 @@ void TheShippedExampleParses(checks::Checks& c) {
   // which the user edits, rather than the "unconfigured" state a commented-out
   // url would leave them silently in.
   c.Expect(result.value.configured(), "it configures a server");
+  // The file a user copies carries the format it is written in, so the one a
+  // later release meets says so rather than being version 1 by omission (#205).
+  c.Expect(example.find("\nversion = " + std::to_string(config::kConfigVersion) + "\n") !=
+               std::string::npos,
+           "the shipped example carries this build's config version");
   // Every other key in it is the built-in default spelled out, so copying the
   // file changes nothing but the URL. A value that drifted from the default
   // would be a setting a user never chose.
@@ -722,10 +972,15 @@ void TheShippedExampleParses(checks::Checks& c) {
              "the interval is the built-in default");
   c.ExpectEq(result.value.sync.enabled, defaults.sync.enabled, "so is [sync] enabled");
   c.ExpectEq(result.value.sync.on_boot, defaults.sync.on_boot, "so is [sync] on_boot");
+  c.ExpectEq(result.value.sync.slot, defaults.sync.slot, "so is [sync] slot");
   c.ExpectEq(result.value.sync.saves, defaults.sync.saves, "so is [sync] saves");
   c.ExpectEq(result.value.sync.states, defaults.sync.states, "so is [sync] states");
   c.ExpectEq(result.value.sync.conflict_show, defaults.sync.conflict_show,
              "so is [sync] conflict_show");
+  c.Expect(result.value.sync.on_server_delete == defaults.sync.on_server_delete,
+           "so is [sync] on_server_delete");
+  c.Expect(example.find("\non_server_delete") != std::string::npos,
+           "which the shipped example spells out, so the choice is visible");
   c.ExpectEq(result.value.downloads.enabled, defaults.downloads.enabled,
              "so is [downloads] enabled");
   c.ExpectEq(result.value.downloads.verify_hash, defaults.downloads.verify_hash,
@@ -742,13 +997,18 @@ void TheShippedExampleParses(checks::Checks& c) {
 int main() {
   checks::Checks c;
   DefaultsAreTheDocumentedOnes(c);
+  DownloadsLandInTicosFolderNames(c);
+  TicoAccountIsReadAndChecked(c);
+  OnServerDeleteIsReadAndChecked(c);
   AWholeFileParses(c);
   ItSurvivesHowPeopleActuallyWriteFiles(c);
   ABadFileStillBoots(c);
   NumbersAndTheirBounds(c);
+  TheSlotIsCheckedAndDefaultsToAutosave(c);
   DuplicatesResolveToTheLastLine(c);
   PlatformSectionsReplaceTheBuiltInEntry(c);
   PathsAreCheckedBeforeTheyAreUsed(c);
+  EmulatorOverridesAreCheckedAndKeepTheFolders(c);
   TheServerUrlIsAnOriginOrNothing(c);
   LoadingFromDisk(c);
   NothingCrashesOnAPartialFile(c);

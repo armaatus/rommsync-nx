@@ -1,6 +1,8 @@
 # Save sync protocol (client side)
 
-How `sys-rommsync` implements RomM 5.2.0's negotiate → execute → complete loop.
+How `sys-rommsync` implements RomM's negotiate → execute → complete loop (5.4.0
+or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#520--540)
+says so).
 Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md). The payload and
 response shapes below are the ones captured from a live 5.2.0 under
 `server/contract/captures/` (issue M0-4), not a reading of the OpenAPI snapshot.
@@ -11,28 +13,97 @@ The client never decides a conflict on its own. It reports what it has (hashes +
 timestamps), the server returns a per-save action, and the client obeys. This is
 what keeps *every* device and the server converged.
 
+## Before step 0 — which RomM this is
+
+A tick asks the server which release it runs before it asks it anything else:
+the unauthenticated `GET /api/heartbeat`, whose `SYSTEM.VERSION` every RomM
+sends (M10-2, #228). RomM has no capability endpoint, so every behaviour that
+differs between releases is inferred from that one string, in one place —
+`server::CapabilitiesFor` in
+[`server_capabilities.hpp`](../core/include/rommsync/server_capabilities.hpp) —
+and handed to the tick as `TickOptions::server`.
+
+**Below RomM 5.4.0 the tick stops there** (`TickOutcome::kUnsupported`): no
+library fetch, no negotiation, nothing offered or written. A 5.2 or 5.3 cannot
+answer `delete`, filter by emulator or keep per-device baselines, and without
+those another device's save is superseded silently — which is worse than not
+syncing (D1 in #226). A pre-release reads as its release (`5.4.0-beta.1` is
+5.4.0), and a version that is missing or does not parse reads as the newest, the
+rule `server/testing/provision.py` follows too. The answer is read once a boot
+and again after a pairing; a refused server is asked again every tick, so an
+upgrade is noticed without a reboot.
+
+The heartbeat is the server's whole configuration and grows with its library,
+so it is walked rather than parsed: only `SYSTEM` reaches the JSON parser,
+bounded at `server::kMaxSystemBytes` (`alloc.heartbeat` measures it).
+
 ## Step 0 — matching local files to roms
 
 For each file under the configured save/state dirs:
 
+0. **Which dirs.** RetroArch's come first, and from `sdmc:/retroarch/retroarch.cfg`
+   rather than from the map (#230, [CONFIG.md](CONFIG.md#retroarch-read-from-retroarchcfg)):
+   its `savefile_directory`, and with sort-by-core on — the Switch build's
+   default — each `<CoreFolder>/` one level under it instead, where a loose file
+   is skipped as *outside layout* because RetroArch does not read it. First, so
+   that the copy RetroArch reads wins its slot over an older one the map's flat
+   `/retroarch/saves` still holds. While RetroArch's own Cloud Sync is on, no
+   RetroArch folder is read at all (`[sources] retroarch = auto`): two writers
+   to one save is the failure to avoid. Then the map's folders, as written —
+   except that a Tico folder `<root>/<folder>` is read where Tico 0.8 keeps it,
+   `<root>/users/<account>/<folder>`, once `<root>/users/` exists (#231,
+   [CONFIG.md](CONFIG.md#tico-per-account-saves)). Several accounts and no
+   `[tico] account` naming one is one skip for the whole `users/`, never a
+   guess; a file left in the old folder is *outside layout*. In every folder,
+   `*.tmp`, `*.png` and `*.restart` are not saves and are passed over, and no
+   subfolder — Tico's `backups/` — is read. A subfolder of Tico's psp folder is
+   where PPSSPP keeps a game's save, so it is a *save folder* skip by name rather
+   than silence: PSP saves are not synced until the `PSP-<folder>.zip` adapter
+   (#238, after #44).
 1. Strip the save/state suffix to get the base name (`Game (USA).srm` → `Game (USA)`).
 2. Match to a rom by `fs_name_no_ext` (exact), falling back to `fs_name_no_tags`.
+   In Tico's psx folder a `.mcd` that is not exactly one rom's name is read as
+   DuckStation names its cards (#238): `<name>_2.mcd` is card 2 of `<name>`,
+   and one card serves every disc of a game, so `<name>.mcd` may be the card of
+   the rom `<name> (Disc 1)`. Card 2 is a second save of the rom, in its own
+   slot `autosave-mcd-card2` and uploaded as `<name>_2.mcd`
+   (`scan::MemoryCardName` is the same rule the other way, which `place::Placer`
+   places a card by).
 3. Scope by platform when the path implies one (Tico's per-system folders do;
    RetroArch's flat `saves/` doesn't — match by name across the library then).
 4. Ambiguous match (same base name on two platforms, no platform hint) → skip and
    log; never guess.
-5. Derive the `slot` from the emulator the folder belongs to and the save's own
-   extension (`retroarch-srm`). It pairs with `rom_id` on the server, so it has
-   to be **derived, not chosen**: a slot that changes between ticks makes the
-   same file a new save every tick. The emulator is in it because RomM pairs on
-   `(rom_id, slot)` alone — a rom whose RetroArch `.srm` and Tico `.srm` both
-   mapped to `srm` would have the two files overwrite each other through the
-   server, forever.
-6. Validate the record before emitting it. A save the encoder would refuse — an
+5. Derive the `slot`: the shared one, `[sync] slot` (`autosave` by default,
+   [CONFIG.md](CONFIG.md#slot-the-shared-slot)), for a `.srm`, and
+   `<slot>-<extension>` for anything else (`autosave-rtc`, `autosave-mcd`) —
+   `scan::SlotFor` (#236). `autosave` is the slot RetroArch's Cloud Sync, the
+   web player, Argosy and Grout file a game's save RAM under, so a save here is
+   the save they see. It pairs with `rom_id` on the server, so it is **derived,
+   not chosen** per file: a slot that changes between ticks makes the same file a
+   new save every tick. One slot holds one save per rom — RomM keeps the newest
+   row of a slot as the head every client pairs against — which is why a
+   companion such as Snes9x's `.rtc` gets a slot of its own (RomM's RetroArch path
+   keeps it out of the slot too), and why a rom's RetroArch `.srm` and Tico `.srm`
+   on one card are one slot: the one found first (RetroArch's) is synced and the
+   other is skipped as a *duplicate slot*. The name the server is told is the
+   rom's own stem, `<fs_name_no_ext><ext>`, which is the name RomM serves
+   RetroArch the save under.
+6. Name the `emulator` that wrote it — the id RomM pairs lineages on and other
+   clients look saves up by, not the source's name (`scan::ResolveSource`,
+   [`save_source.hpp`](../core/include/rommsync/save_source.hpp)). A RetroArch
+   sort-by-core folder RomM's table knows names its core (`saves/mGBA/` →
+   `mgba`); otherwise `[platform.<slug>] emulator` in `config.ini` decides;
+   otherwise the built-in table: the libretro core id where the bytes are
+   RetroArch-compatible (`snes9x`, `gambatte`, `genesis_plus_gx`), a `tico-*`
+   id where they are not (`tico-duckstation`, `tico-ppsspp`), and `null` for a
+   system neither table knows. The same id goes on a state's upload. A `tico-*`
+   id is an **isolated format**: it syncs Switch to Switch and never with a
+   RetroArch core — see [Formats only one emulator reads](#formats-only-one-emulator-reads).
+7. Validate the record before emitting it. A save the encoder would refuse — an
    mtime of 0 from a console with an unset clock, a name the server would read
    as a path — is skipped with a reason, because `EncodeNegotiateRequest` stops
    at the first bad entry and would otherwise cost the tick every other save.
-7. Fill `content_hash` from `state::ContentHashFor` — the baseline's digest when
+8. Fill `content_hash` from `state::ContentHashFor` — the baseline's digest when
    the file's mtime **and** size still match, a fresh read otherwise. **Never
    leave it null to save a read**: a save reported without a digest is compared
    on timestamps and planned as an `upload` the server already has, on this tick
@@ -68,7 +139,7 @@ the SHA1 the rom schema uses:
       "updated_at": "2026-09-03T12:00:00Z",    // required — FS mtime, UTC
       "file_size_bytes": 32768,                // required
       "slot": "autosave",                      // optional, but see below
-      "emulator": "retroarch",                 // or "tico"
+      "emulator": "snes9x",                    // the core that wrote it; step 0
       "content_hash": "<MD5 of the file bytes>"
     }
     // ... one per local save
@@ -80,6 +151,99 @@ the SHA1 the rom schema uses:
 sync across ticks; a `null` slot means "archival, manual upload" to RomM and is
 never paired with a slotted server save, so it negotiates as `upload` every time
 even when the identical bytes are already there. Pick a slot and keep it.
+
+**`emulators` filters the lineages (5.4, #236).** The body also carries
+`"emulators": [...]`, the ids this console can load — every scanned save's, and
+the one each mapped platform's folders resolve to, each with RetroArch's folder
+name for it (`scan::EmulatorFilter`). Only the folders of the frontend a platform
+is played in (`play_with`) count there: n64 played in Tico names
+`tico-mupen64plus` and not the `mupen64plus_next` RomM's web player writes,
+unless a RetroArch N64 save is on the card (#238). RomM then pairs and offers only server
+saves one of them wrote, so a PlayStation core's save in a rom's `autosave` is
+never downloaded over a Tico DuckStation card. It is left out — not sent as `[]`,
+which matches nothing — when a scanned save has no emulator: RomM cannot list
+`null`, and that save's own uploads would drop out of the pairing and be
+uploaded again every tick. The slot guard is not filtered: an upload into a slot
+whose newest save is a lineage the filter hides still draws the 409 below — so
+the 409's second negotiation goes out **without** the filter, to see the save
+the guard saw. Filtered, it would answer with this console's own previous
+version, and every later upload would be refused and "resolved" the same way.
+
+### `rom_ids`: only the roms on the card (#241)
+
+Every negotiation also carries `"rom_ids": [...]`. These are the roms the card
+holds: a file named after the rom, or a folder for a multi-file rom, in one of
+its platform's mapped `roms` folders (`sync::FindRomsOnCard`). The roms of the
+saves the request reports are added. RomM then offers downloads for those roms
+only. Without the scope, a device with no history is offered every save in the
+library, and #237 would place them beside games the console does not have. The
+scope is read-only: a rom left out is outside the negotiation, never deleted.
+So a scope that is too narrow costs a first-time restore, never a save. A rom
+kept in a folder the map does not name gets no first-time restore until that
+folder is mapped (CONFIG.md).
+
+RomM takes at most 500 ids a request, so a larger card is negotiated in chunks
+(`sync::ChunkScope`). The rules:
+
+- Each rom is in exactly one chunk.
+- Each save is sent in the chunk that names its rom. RomM widens a chunk's
+  scope by the roms of the saves it carries, so a save sent elsewhere would
+  leave its own rom's chunk offering the server's copy over it.
+- The chunks are one tick, and each chunk's plan is carried out on its own
+  (#246): negotiated, executed, written into the baseline and its session
+  completed (`TickResult::other_sessions` after the first), and freed before
+  the next chunk is asked. A plan is held for its whole run, and one plan is
+  what the sysmodule's heap is sized for (`sync::kMaxPlanOperations`).
+- A chunk whose plan is past that bound is halved and asked again, down to one
+  rom; a rom whose own saves are still past it is left out of the tick, named,
+  and the tick is partial (`TickResult::oversized_roms`).
+- A chunk that fails to negotiate before any plan ran fails the tick, and
+  nothing is written. After one ran, what it did stands, the rest waits for the
+  next tick, and the tick is partial.
+
+`rom_ids` costs at most `kMaxRomScopeBytes` (about 10 KiB) of request body. The
+response only shrinks.
+
+**A rom just downloaded is asked about on its own, with `restore_unlisted`.**
+When a download finishes, the engine asks for a tick at once
+(`Scheduler::RunSoon`). That tick sends the downloaded roms in a separate
+negotiation with `"restore_unlisted": true`, and the save is placed through
+#237 before the game is launched. The flag matters for a device that synced
+the save before the rom was deleted: RomM otherwise reads the missing save as
+one the user deleted and offers nothing. The flag applies to the whole request,
+so it goes only on a request scoped to the downloaded roms; nothing else this
+console deleted comes back. Those roms are kept until a negotiation has asked
+for them, so an offline tick keeps them for the next tick. They are not kept
+across a reboot. After a reboot the rom is an ordinary rom on the card, and its
+save still comes unless this device had synced it before.
+
+### Upgrading from rc1: the old slots (#236)
+
+v1.0.0-rc1 synced each save in a slot of its own, `<source>-<extension>`
+(`tico-srm`, `retroarch-srm`). The first tick after the upgrade does **not**
+re-upload those: every save is negotiated in the shared slot like any other, and
+the server arbitrates the first meeting.
+
+- `state.db` is version 2 on that card. It is read, not discarded (state_db.hpp):
+  each `tico-srm` row moves to the slot its file is synced in now, keeping the
+  file's digest, mtime and size — so nothing is hashed again — and **dropping its
+  server half**. This device has never synced the shared slot, and the old
+  slot's digest would have the 409 rule below take any newer head as a plain
+  download of "unchanged" bytes.
+- An empty shared slot gets the save, once.
+- A shared slot holding the same bytes is a `no_op`.
+- One holding a newer save (RetroArch's, say) is a `download`, the card's bytes
+  backed up first.
+- One holding an *older* one is a `conflict`: the guard refuses the upload, and a
+  device that has never synced the slot cannot show its bytes unchanged. The
+  head lands as for any conflict and the conflicts screen offers the card's copy
+  back; with #240 the losing side is also kept on the server.
+
+**rc1's rows are left on the server**, in their old slots, untouched. RomM's web
+UI shows them as named slots (`tico-srm`) beside `autosave`; they are the copy
+of each save as rc1 last synced it, and deleting them is the user's call. With
+the `emulators` filter on they are never offered back to this console (rc1 sent
+`emulator=tico`).
 
 That entry is `rommsync::sync::ClientSaveState`
 ([`core/include/rommsync/sync.hpp`](../core/include/rommsync/sync.hpp)), and
@@ -100,7 +264,8 @@ set, and the server would read it as "very old" and plan a `download` over what
 may be the only copy of the save.
 
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
-total_upload, total_download, total_conflict, total_no_op }`.
+total_upload, total_download, total_conflict, total_no_op, total_delete }` —
+`total_delete` since 5.4.0, read as zero when absent.
 
 `sync::Negotiate` makes that call and `ParseNegotiateResponse` turns the answer
 into a `SyncPlan` (M2-4). Both live in the same header as the request side. Three
@@ -110,7 +275,16 @@ things about the answer are worth stating here rather than leaving to the code:
   response, because a plan with a save missing from it looks exactly like a plan
   for a device that is already in sync — and the save that got dropped is the one
   nobody hears about again. A truncated body is that failure in its quietest
-  form, which is why `sync.truncated` forces one.
+  form, which is why `sync.truncated` forces one. A plan of more than
+  `sync::kMaxPlanOperations` operations — `state::kMaxRecords`, 128 — is refused
+  too, as `plan_too_large`, for a sibling reason: it is read an operation at a
+  time but held for the length of its run, and past that bound it is more than
+  the sysmodule's heap was sized for (M9-20, #246). A scoped tick does not stop
+  there: it halves that negotiation's `rom_ids` and asks again, down to one rom,
+  and each chunk's plan is carried out and freed before the next is asked. Only
+  a rom whose own saves on the server are past the bound is left out — its saves
+  are not offered, so nothing of it is touched — named in a `sync.refused` line,
+  and the tick is partial rather than clean.
 - **An `action` this client does not recognise becomes `no_op`, and is logged.**
   On a save, the default branch is the one that can overwrite it. The same goes
   for an unrecognised `reason`, except that the action there is still obeyed: the
@@ -122,8 +296,9 @@ things about the answer are worth stating here rather than leaving to the code:
   `403` is a scope the user did not approve — which is a working pairing, not a
   dead one, and is why the two are separate errors. None of the four gets better
   by retrying. Everything else — no response, a `5xx`, a `429` — retries with
-  backoff, and RomM cancels the session a retried negotiation superseded, so the
-  abandoned ones do not pile up ([API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete)).
+  backoff. A session a retried negotiation abandoned was cancelled by 5.2.0 at
+  the next negotiate; 5.4.0 leaves it open until its 24-hour cleanup fails it
+  ([API_CONTRACT.md](API_CONTRACT.md#save-sync--negotiate--execute--complete)).
 
 The plan also covers saves the client did **not** report: any server save this
 device has no sync history for comes back as a `download`, for any rom. That is
@@ -143,18 +318,25 @@ For each `SyncOperationSchema`. The action is `no_op` — with the underscore:
 | action | do |
 |---|---|
 | `no_op` | nothing |
-| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&overwrite=true`, multipart `saveFile` = local bytes |
-| `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path → `POST /api/saves/{save_id}/downloaded {device_id}` |
+| `upload` | `POST /api/saves?rom_id=&emulator=&slot=&session_id=&device_id=&content_hash=&overwrite=false`, multipart `saveFile` = local bytes; a **409** is resolved below |
+| `download` | `GET /api/saves/{save_id}/content` → **back up existing local file** → write to the file's SD path → `POST /api/saves/{save_id}/downloaded {device_id, content_hash}` |
 | `conflict` | resolve by policy (below) — **always back up the loser first** |
+| `delete` | 5.4.0: **back up the local file**, then remove it — or leave it, under `[sync] on_server_delete = keep` ([below](#a-save-deleted-on-the-server)) |
 
-**`overwrite=true` is not optional on an upload.** Given a `device_id` and a
-`slot`, RomM refuses the post with `409 {"detail": "Slot has a newer save since
-your last sync"}` whenever this device has no sync row for the slot's current
-save, or one older than it. That is precisely the plan's own
-`upload` / `Client save is newer (no sync history)` case — the first upload after
-a re-pair, or from a device registered this boot. Executing a plan the server
-just issued must not be rejected by the server, so send `overwrite=true` and let
-negotiate be the arbiter.
+**Both carry `content_hash`** (#234): the MD5 of the file hashed as it is
+uploaded, and of the verified bytes a download put on the card. RomM 5.4 keeps
+it as this device's baseline on that save row, and a later report that matches
+it proves this side did not change -- so an mtime-only touch (Tico's atomic
+rewrites) against a row that moved in place negotiates as `download`, not
+`conflict` (`tick.baseline_moved`, `tick.baseline_downloaded`). A baseline can
+only ever remove a conflict, never create one, and the one way it could remove a
+*real* one is a digest of bytes the server does not hold; hashing just before
+the upload streams the file, and confirming only the verified digest, is what
+keeps that from happening (`harness::BaselineAudit`). It is the bytes' own MD5 even for a ZIP, whose
+server digest hashes the entries instead: RomM holds a device's baseline only
+against that device's later reports, so the different function costs the
+suppression and nothing else. A baseline lives on one row, and another device's upload is a new head with no
+history for this device -- that case is #232's 409 (`tick.baseline_other_row`).
 
 Three traps in the operation itself:
 
@@ -163,7 +345,7 @@ Three traps in the operation itself:
   operation echoes that. Match the operation back to your local file on
   `(rom_id, slot)` and keep your own path; writing the server's name to the SD
   produces a file no emulator will load.
-- **`overwrite=true` clears the 409 and nothing else. It does not stop a slot
+- **`overwrite` decides the 409 and nothing else. It does not stop a slot
   accreting a row per upload.** This page has now had this wrong twice, in both
   directions, so here is the mechanism rather than the conclusion: RomM stamps a
   slot upload with a **second-granularity** datetime tag and then looks the
@@ -185,6 +367,56 @@ Three traps in the operation itself:
 Pass `session_id` on uploads so the server ties them to this session, and
 `device_id` so the sync history that the *next* negotiation arbitrates against is
 written. Track `operations_completed` / `operations_failed`.
+
+### The slot guard, and the 409 (#232)
+
+**An upload goes out with `overwrite=false`.** Given a `device_id` and a `slot`,
+RomM then refuses the post with `409 {"detail": "Slot has a newer save since
+your last sync"}` whenever the slot's newest save — written by any device or
+emulator — is newer than this device's last sync of it. That is the protection a
+shared slot needs: without it, a RetroArch or Argosy upload landing between this
+tick's negotiate and its upload would be silently superseded. So the guard is
+kept, and only a player's explicit **Keep local** for one save sends
+`overwrite=true` (`ExecuteOptions::keep_local`; #240 split the overlay choice
+that fills it into a later PR, so nothing fills it yet).
+
+On 5.4.0 the 409 is not only a race. Every other device's upload is a new row
+and becomes the head, this device has no sync row against it, and negotiate
+falls back to timestamps and plans `upload` / `Client save is newer (no sync
+history)` — even for bytes this device sent itself (#227). So a 409 is what a
+device meets after any other device writes the slot, and the tick resolves it
+rather than counting it failed forever (`sync::ResolveRefusedUploads`,
+[`sync_resolve.hpp`](../core/include/rommsync/sync_resolve.hpp)):
+
+1. **Negotiate once more**, for the refused saves only, scoped with `rom_ids`.
+   The first plan may name a head that has since been replaced, and downloading
+   that row would fetch — and confirm — a superseded save. Never more than one
+   second negotiation per plan — a tick scoped in chunks runs one per chunk
+   (#246), each resolving at most `sync::kMaxResolvedUploads` saves, the rest
+   the next tick's — and none while a game is running: the engine's
+   own check (#242) is before the plan, and this is a round trip after it, so
+   it asks again (`TickOptions::hold`) and a held resolution leaves
+   the 409 for the next tick.
+2. **Decide** with Grout's rule (#226 R3): local bytes whose MD5 equals the
+   server digest `state.db` recorded at the last sync take the head as a
+   **download**; anything else — changed bytes, no row, no digest — is a
+   **conflict**. A conflict the server names stays one; a `no_op` stays one.
+   **Never another upload**, and never a file step 0 did not find: a save the
+   scan left out (a Tico account it could not decide, #231) is not reported,
+   so it is never uploaded, and a resolution without a matched target is not
+   run rather than placed.
+3. **Execute** that through `ExecutePlan`, so it is fetched, verified, backed up
+   and committed exactly as a planned download is, and merge it into the tick's
+   plan and report at the refused operation's index — the baseline, the conflict
+   history and `complete`'s counts then describe what happened to the save. The
+   second session is completed with its own counts.
+
+The server stays the source of truth: the 409 *is* its verdict, and both answers
+put its head on the card. What the client decides is only whether the local
+bytes it replaces were progress never synced — and those are recorded as a
+conflict, with the guard's own sentence as the reason. `tick.newer_download` and
+`tick.newer_conflict` have a second device upload between negotiate and upload
+against the real RomM, under the crash replay.
 
 ### The order every overwrite goes through
 
@@ -229,10 +461,27 @@ owns the order of one tick and M7-2 owns the schedule between ticks.
 
 **A save the client has no local file for** (`download` /
 `Save exists on server but not on client`) needs a destination the plan cannot
-supply: the server's `file_name` carries the ingest tag and the directory
-depends on the rom's platform. `ExecuteOptions::place` is where that policy is
-injected, and it needs the rom index plus the platform→folder map (M3-1); with
-none supplied the operation fails by name rather than guessing at a path.
+supply: the server's `file_name` carries the ingest tag and the folder depends
+on which emulator plays the system. `ExecuteOptions::place` is where that policy
+is injected, and the engine's is `place::Placer` (#237):
+
+- **The emulator** is `[platform.<slug>] play_with`, Tico by default (#226 D5) —
+  never the map's first folder, which is `/retroarch/saves` for every system.
+- **The folder** is that emulator's as the card is laid out this tick: Tico's
+  through `tico::Resolve` (and nothing while several accounts are undecided),
+  RetroArch's through `retroarch.cfg` (and nothing while it syncs itself).
+- **The name** is the rom's `fs_name_no_ext` with the emulator's extension.
+- **It must come back as itself.** The placed file has to be one the next scan
+  matches to the same rom in the same slot, holding bytes the target emulator
+  reads; otherwise it would be a second save of the game, uploaded on the next
+  tick while the row it came from is offered again. Placing nothing is a named
+  failure with the reason.
+- **A placement only creates.** A file already at the path is one the scan did
+  not pair with this row — skipped, or another slot's — and the operation fails
+  with `kNoLocalSave` without touching it. A missing folder is made. The bytes
+  arrive through the same stage-verify-commit as any download, and
+  `execute.placed` replays a power cut at every call of it: no file, or all of
+  it.
 
 ### Backups
 
@@ -258,21 +507,68 @@ instead — `sync::StateBackupDiscriminator`, giving
 prevent, one asset kind over
 ([Save states](#save-states)).
 
-**The backup promises ordering, and — once the platform layer has said how —
-durability too.** The copy is flushed, closed, made durable and only then renamed
-into place, before the save is touched: no reader ever sees half a backup, no
-overwrite happens without one, and a console that loses power between the copy
-and the overwrite does not leave a backup whose name landed and whose data blocks
-never did.
+**The guarantee is an ordering of persistence, not of calls** (M9-14, #203).
+After a power cut at any instant, and the boot sweep that follows it
+(`sync::RecoverStaging`), the save holds its old bytes or its new ones — and if
+it holds the new ones, a backup holding the old ones in full is on the card.
+Neither FAT32 nor exFAT journals, so "the backup call returned before the
+overwrite call started" does not imply that; what does is each step being
+durable before the next one can be:
 
-That last part is `io::FileSync`, a hook the platform layer installs because
-neither `fsync` nor Horizon's `fsFsCommit` is reachable from `core/`.
-`host/src/file_sync.cpp` syncs one descriptor; `sysmodule/source/main.cpp` calls
-`fsdevCommitDevice("sdmc:")`, which is the only primitive devkitA64 has — its
-newlib exports no `fsync` at all, which is why the hook takes a path rather than
-an open handle. A hook that refuses fails the copy, so a backup that could not be
-put on the card stops the overwrite rather than being counted as one. With none
-installed the older, weaker promise stands.
+1. The save is copied to `.backup/<name>.tmp`, closed, and **synced**.
+2. It is renamed to `.backup/<name>`, and **`.backup/` is synced**, so the name
+   is on the card and not only the bytes. A card that will not confirm this is a
+   failed backup (`kBackupFailed`): the copy is removed and the overwrite does
+   not happen. The overwrite is in a different directory, and without this a
+   power cut could keep it and lose the backup's name — the one gap the call
+   order hid, found by the replay below.
+3. The new bytes are staged beside the save and **synced** — by
+   `io::WriteAtomically`/`CopyAtomically` for a restore, by the HTTP backend
+   before it renames its `.part` for a download.
+4. `io::CommitStaged`: the save to `<save>.old`, the staged file onto the save,
+   `<save>.old` removed, and the save's directory synced. A cut between the two
+   renames leaves `.old` and no save, which the boot sweep renames back.
+
+Every sync is `io::Sync`, through the same `io::Disk` seam every write, rename
+and remove goes through (#202), which asks the platform's `io::FileSync` hook:
+`host/src/file_sync.cpp` `fsync`s by path, and `sysmodule/source/main.cpp`
+calls `fsdevCommitDevice("sdmc:")`, which commits the whole card and ignores the
+path — which is why the hook takes a path rather than an open handle. A hook
+that refuses fails the step it guards. With none installed the older, weaker
+promise stands: no reader ever sees half a file, and nothing about power cuts.
+
+**What proves it.** `tests/crash_disk.hpp` records every call an overwrite makes
+through `io::Disk`, cuts the record at every call, and enumerates what a card
+that does not journal may keep: per directory, any prefix of the names changed
+since its last sync; per file, the data written since its last sync lost,
+truncated, torn, short, out of order, or complete. Each card is swept as the next boot would sweep it, and
+judged against the property above. `execute.crash` (a download),
+`states.crash` (a state) and `conflicts.crash` (a restore) are the three paths
+that land on a save; the first and last also run with `.backup/` unconfirmed
+(the state path shares `BackUpFirst`, so it shares that answer);
+`execute.crash_model` shows the replay catches an overwrite written in place,
+one with no backup, and a rename of bytes nothing synced. The `backup` row of
+`scripts/v1-gate.sh` counts them. What the model assumes — a sync that says yes
+did persist, a directory's own updates land in order, no flying writes — is
+listed at the top of that header; a kernel-level injector such as lazyfs is the
+check on those assumptions, and is not in the suite. Every replay drives the
+host backend; the Horizon one (`http_wire.cpp`) syncs its `.part` through the
+same `io::Sync`, and nothing off a console runs it under the replay (#44).
+
+**`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
+not deferred.** A flying write (a sector written whole, to the wrong place) can
+corrupt a file nothing opened, and A/B copies with a generation counter and a
+CRC32C would detect that. They are not worth it here, because of what
+`state.db` is: an optimisation and never a gate (`state_db.hpp`). A file that
+is garbage, truncated, or fails the strict per-row JSON read costs a re-hash and
+a renegotiation; a row that a stray write left *parseable but wrong* — the only
+case a checksum would add — costs a wrong arbitration, and every arbitration
+that replaces local bytes backs them up first under the property above. So the
+worst a corrupted baseline can do is put the server's copy on the card with the
+local one under `.backup/` — a conflict a person can undo (M7-1), never a lost
+save. Save files themselves keep the rename protocol too: doubling every save
+write is the cost the issue ruled out. If `state.db` ever becomes a gate —
+something a tick refuses to run without — this decision has to be reopened.
 
 ### Conflicts
 
@@ -298,11 +594,131 @@ carrying `device_id` and by `POST /api/saves/{id}/downloaded` — a download the
 client never confirms leaves the device looking like it has never seen the save,
 which puts every later comparison in the no-sync-history branch above.
 
+#### The losing side stays on the server too (#240)
+
+`.backup/` is on one SD card, where no other device can recover it. So keep
+both also uploads the local bytes as an **archival** save, following RomM's own
+"keep both" guidance (#226 R4):
+
+1. fetch the server copy to a staged file and verify it;
+2. back up the local file under `.backup/`;
+3. `POST /api/saves` with the backup's bytes, **no `slot`**, the local emulator
+   (what step 0 reported), `device_id`, `content_hash` and `overwrite=false`,
+   under `<stem> [switch-conflict <YYYY-MM-DD_HH-MM-SS>].<ext>`;
+4. commit the server copy onto the save, and confirm it.
+
+RomM never pairs a `null`-slot row in negotiate (it reads `slot_not_null` rows
+only) and never prunes one, so the copy cannot come back into sync, and the
+server copy still wins on the card. The name carries the conflict's second
+because RomM tags no `null`-slot upload: it keeps the name as sent, and a second
+upload of a name it already holds replaces that row's bytes. No `session_id`:
+RomM counts every upload naming one as a completed operation of the session.
+
+The upload follows the backup rather than preceding it, so a card that refuses
+the backup — every tick, until someone fixes it — refuses before anything is
+sent, and a stuck conflict does not leave an archival row per tick. It precedes
+the commit, so the server holds the copy before the card loses it. A conflict
+that lands on a path nothing was at (a placement) replaced nothing and uploads
+nothing. The 409's conflict (#232) runs through the same branch.
+
+**A failed upload does not stop the conflict.** The local bytes are in
+`.backup/` exactly as before; the result is `ArchiveOutcome::kFailed`, the tick
+logs that the bytes are only on this card, and the conflicts screen says the
+server holds no copy (`conflicts::LocalCopy::kCardOnly`), on the row and in the
+detail. An entry recorded before #240 says nothing either way.
+
+### Formats only one emulator reads
+
+Six of Tico's systems write saves no libretro core reads — DuckStation's `.mcd`
+card, Mupen64Plus's split N64 files, PPSSPP's folders, and whatever Flycast,
+DraStic and YabaSanshiro write [#44 verifies]. They sync under a `tico-*`
+emulator id (step 0, item 6) and **only with the same module on another
+Switch** (#226 D3). Adapters that would rewrite one format into the other are
+filed after #44 has captured real files; until one is proven byte for byte,
+isolation is what keeps a progress-destroying guess off the card.
+
+The id alone does not do it. RomM pairs saves on `(rom_id, slot)` whatever
+wrote them (`sync-negotiate-pairs-across-emulators.json`), and the `emulators`
+filter (#236) is one list per request: a console that reads RetroArch's psx
+core beside DuckStation names both, so a plan can still offer a Beetle `.srm`
+for DuckStation's card. So `ExecutePlan` asks before it fetches anything
+(`scan::Interchangeable`): **a `tico-*` save is never written where anything
+else reads, and nothing else is ever written over one.** A matched save is read
+as the emulator step 0 reported for it; a first-time restore as the emulator
+its placement was made for (`place::Placement::emulator` — `place::Placer`
+already places only where `place::Compatible` allows, #237, and this is the
+executor's own check behind it), else as what the scan would report for the
+path (`ExecuteOptions::reads_as`, `scan::EmulatorAt`). With nothing to say,
+a `tico-*` save is not placed at all, and the check comes before the
+placement's folder is made. A refusal is `OperationError::kOtherEmulator`: nothing fetched, nothing
+backed up, nothing touched, and counted failed — the plan asked for something
+this client will not do, and it will ask again until one of the two saves
+moves. The same holds inside #232's resolution of a 409, which executes through
+the same path. Two libretro cores in one slot are not this rule's: that is RomM's
+pairing and #236's filter.
+
+The per-system table — each Tico module, the emulator id it syncs under, and
+what else it meets — lives in [INTEROP.md](INTEROP.md#which-systems-sync-with-what),
+the page a user sets their other devices up from; `docs.install_interop_table`
+holds it to `kTicoModules` in
+[`save_source.cpp`](../core/src/save_source.cpp) both ways (#243).
+
+### A save deleted on the server
+
+5.4.0 remembers what each slot lost (`deleted_assets`: up to 100 content hashes
+per `(rom_id, slot)`, each with when it was lost). A client that reports a slot
+the server has **emptied**, holding one of those versions written no later than
+its removal, is answered `delete` / `Save was deleted on the server`, with
+`save_id: null` — and must not upload it again. RetroArch deleting a `.srm`
+removes every version of it, so a deletion arrives from other devices as well as
+from the web UI (M10-7, #233; `compare_missing_server_save` in
+`handler/sync/comparison.py`).
+
+The client obeys it, because the server is the source of truth, and obeys it the
+way it obeys an overwrite, because the file is just as gone:
+
+1. **Only a save this tick reported.** The operation is matched on
+   `(rom_id, slot)` to the scan's own targets and never to a path invented for
+   it (`ExecuteOptions::place` is a download's). A save the scan did not report
+   — an undecided Tico account (#231), a folder it could not read — cannot be
+   removed.
+2. **Backed up first**, through the same `sync::BackUpFirst`, under the same
+   name rules a download's backup gets — so the backup is durable, name and all,
+   before anything is removed.
+3. **The backup is checked against the digest the tick reported.** The ruling
+   was about those bytes; a save the player wrote to after the scan is progress
+   it never saw, so it stays and its stray copy is removed. With no digest to
+   hold it to, the delete is refused before anything is copied.
+4. **Then the file is removed**, and its directory synced. A power cut at any
+   call leaves the save or its backup, never neither (`execute.crash_delete`).
+
+The removal is recorded in the conflict history as `deleted` (M7-1), so the
+overlay lists it with its backup and can restore it. A restored file is newer
+than the removal, so the next negotiation plans its upload: progress on the
+device, which RomM then holds again.
+
+`[sync] on_server_delete = keep` leaves the file where it is instead
+([CONFIG.md](CONFIG.md#on_server_delete-a-save-deleted-in-romm)), and the
+**client** keeps the promise not to upload it: the slot's `state.db` row becomes
+the reported bytes marked `deleted_on_server`, and `sync::RunTick` leaves a save
+out of the negotiation while its digest is that row's. RomM's own memory is not
+enough on its own — it is bounded, and it reads the same bytes with a later mtime
+as progress, so an emulator that writes its save back on closing would have it
+uploaded straight away (`tick.deleted_keep` shows exactly that with the mark
+disabled). New bytes are offered as usual, and the first sync of the slot clears
+the mark. Both a removed and a kept delete count as completed in `complete`.
+
+A `delete` is obeyed only where `server::ServerCapabilities::delete_action` says
+the server means one (#228); elsewhere it is counted as not understood, like an
+action this build does not know. Every server a tick reaches is 5.4.0 or later,
+so in practice that is everywhere.
+
 #### Finding the backup again, and putting it back
 
 A backup is only a safety net if a human can find one without an SD reader, so
 every overwrite is recorded in `conflicts.db` beside `state.db` as it happens —
-a conflict, a download that replaced a file, and the same two on the states side
+a conflict, a download that replaced a file, a save removed because RomM deleted
+it (#233), and the first two on the states side
 (`core/include/rommsync/conflict_log.hpp`, M7-1). The entry stores **the exact
 path the backup was written to**, never a name derived a second time: a
 `BackUpFirst` that had to step past an occupied name would make the two
@@ -362,6 +778,8 @@ Which operations move a row:
 | `kUploaded` | advances. The local file was not touched, so the facts the tick reported are still the facts on the card. `server_content_hash` becomes the digest that was just sent — the plan's described the copy the upload replaced. |
 | `kDownloaded`, `kKeptBoth` | advances, **from the card**. The bytes changed, so the mtime, the size and the digest are all re-read; a row built from the reported ones would claim a digest for bytes nothing hashed. |
 | `kNoOp` | advances. Nothing happened and nothing stopped being true. |
+| `kRemoved` | **erased**: the row describes a file that is gone. |
+| `kKept` | **rewritten** from the reported facts with no server half and `deleted_on_server` set, so the next tick withholds those bytes ([above](#a-save-deleted-on-the-server)). Any later advance clears the mark. |
 | `kFailed`, `kNotUnderstood`, `kCanceled` | keeps its previous row, so the next tick retries the save. |
 
 A save whose hash failed is not moved forward — `SaveBaseline` refuses a row
@@ -387,7 +805,7 @@ describes, and a `no_op` moved nothing and keeps everything it does not restate.
 `core/` has no single-file stat, so the re-read for a download goes through
 `fs::FileSystem::List` of the save's directory. Only the most recent listing is
 kept — a listing may hold up to `fs::kMaxDirectoryEntries` names on a heap of
-1.3 MiB, so a memo per directory is unbounded in the one dimension that is
+1.5 MiB, so a memo per directory is unbounded in the one dimension that is
 scarce, on the tick that already downloaded the most. Keeping the last one still
 collapses the case that matters, which is several saves in one folder.
 
@@ -533,13 +951,60 @@ For one local state, keyed `(rom_id, file_name)`:
 | id X    | id ≠ X          | —         | **keep both** |
 | id X    | id X, unmoved   | unchanged | no-op |
 | id X    | id X, unmoved   | changed   | upload |
-| id X    | id X, moved     | unchanged | download |
+| id X    | id X, moved     | unchanged | download, **only if the row's `emulator` is this state's core** — else keep both |
 | id X    | id X, moved     | changed   | **keep both** |
 
 A server state no local file claimed is *placed* — and a placement may only
 **create**. Where it goes is the caller's (`sync::StateSyncOptions::place`),
 because the folder depends on the rom's platform and on which emulator the state
-belongs to; nothing said is a named failure rather than a guessed path. If there
+belongs to; nothing said is a named failure rather than a guessed path. The
+engine's is the save rule above (`place::Placer::State`), with one difference:
+the state keeps the server's name, since `(rom_id, file_name)` is what pairs it
+— Tico's slots excepted, below.
+
+**A state moves only between devices running its core** (#239). A state is a
+core's memory, so `place::LoadsState` is stricter than a save's
+`place::Compatible`: the same id, or two ids RomM files under one RetroArch core
+folder, and never a state that names no emulator. Since a POST moves a row's
+`emulator`, a row this console paired with can come back holding another core's
+state, which is kept apart rather than downloaded. And since states have no
+negotiate to filter by `emulators`, the client filters the listing itself: a row
+the placer calls `foreign` — another core's, or in a slot the frontend the
+platform is played in has no file for — is counted in `filtered` and passed over
+silently, the way a state for a rom this console lacks is. DuckStation's
+`tico-duckstation` states therefore meet only DuckStation on another Switch, and
+a RetroArch PSX core's never land in Tico's folder.
+
+**Tico's slots, under RetroArch's names** (`[sync] map_state_slots`, off by
+default; #226 D4). Tico writes `<game>.state0`–`.state4` for menu slots 1–5 and
+`.state5` for Auto; RetroArch writes `<game>.state{k}` for slot k,
+`.state` for slot 0 and `.state.auto` for Auto. With the mapping on, the scan
+reports a Tico state of a libretro module under RetroArch's name — the key,
+the upload and `state.db` all use it, the card keeps Tico's — and the placer
+writes RetroArch's back under Tico's (`scan::RetroArchStateName`,
+`scan::TicoStateName`, `core/include/rommsync/state_names.hpp`):
+
+| Slot | Tico | RetroArch |
+|---|---|---|
+| menu slot k (1–5) | `.state{k-1}` | `.state{k}` |
+| Auto | `.state5` | `.state.auto` |
+| RetroArch slot 0 | — | `.state` |
+
+Turning the mapping on or off renames the keys, not the files, so a key can meet
+a `state.db` row taken of a *different* file — the card's `Game.state0`, now
+`Game.state1`, meets the row its own `Game.state1` was synced under. The table
+reads that as "this console played on" and would upload menu slot 1 over slot
+2's row. So an upload over a row is kept both instead while another scanned
+state of the rom still matches that row exactly (`RowDescribesAnother`).
+
+Either way a placement takes only a name its frontend loads: `.state0`–`.state5`
+in Tico's folder, `.state`, `.state<N>` (N ≥ 1) or `.state.auto` in RetroArch's.
+RetroArch's `.state.auto` is matched to its rom by the name before `.state`, like
+every other state. The `<state>.png` beside a state is uploaded as its
+`screenshotFile` under the server's name plus `.png`, which is how RomM binds a
+screenshot to a state; it is never itself scanned.
+
+If there
 is already a file at the path it names, that is keep-both too: "no local state
 claimed this row" is not "there is nothing at that path" — a state the scan
 skipped, as an ambiguity or as the loser of a duplicate name, claims nothing and
@@ -687,8 +1152,10 @@ fires it is the scheduler's (M7-2) and the overlay's (M4-2).
 `TickResult::session_gone`, and none of them is a reason to re-run the plan. The
 first means the accounting succeeded — a retry landing after the first attempt
 got through looks exactly like it — and the other two mean the counts will never
-be recorded. In all three the transfers already happened and the baseline is on
-the card, so the answer is the next tick's own negotiation.
+be recorded. `kSuperseded` is every `Session is already <status>` but
+`COMPLETED`: on 5.4.0, a session closed on purpose (#235). In all three the
+transfers already happened and the baseline is on the card, so the answer is the
+next tick's own negotiation.
 
 ### What the tick says it did
 
@@ -698,8 +1165,9 @@ card; the next negotiation plans it again), `kUnreported` (the transfers landed,
 the accounting did not, and the baseline *is* on the card — the two are asked
 about in that order, because a bad minute loses both and only one of them is
 expensive), `kOffline` (nothing was written — back off), `kRefused` (an answer
-that does not change on a second attempt), `kUnauthorized`, `kRescanNeeded` and
-`kCanceled`.
+that does not change on a second attempt), `kUnauthorized`, `kRescanNeeded`,
+`kCanceled`, and `kUnsupported` (a server below RomM 5.4.0: nothing was asked of
+it — see [Before step 0](#before-step-0--which-romm-this-is)).
 `TickResult::answer` is separate and is what `auth::Gate::Observe` takes: it is
 the **last** word on the credentials rather than the worst one, because one 401
 is not a verdict and a completion the same token was accepted for is proof it
@@ -722,12 +1190,28 @@ bounds.
 
 - Offline / unreachable server → abort the tick cleanly, change nothing, retry
   next schedule. Missed ticks are harmless.
+- **No tick runs while a game is in the foreground** (M10-16, #242). A game
+  holds its save in memory and writes it when it closes — Tico does on exit —
+  so a save downloaded under it is overwritten with the old copy, which the next
+  tick uploads as the newest, and a save uploaded under it is the one from
+  before the session. A tick that falls due is held and the sysmodule asks
+  again every few seconds (`pmdmntGetApplicationProcessId`); one tick runs once
+  the game has closed, however many fell due. "Sync now" during a game is that
+  same tick (`SyncOutcome::kDeferred`). The download queue is not held — a rom is
+  not a save. `engine.foreground` holds this against the real RomM.
 - Partial plan failure → complete with the accurate `operations_failed`; leave
   unsynced files for next tick. Never leave a half-written save (write to temp,
   fsync, rename). An `action` this build does not recognise is counted with
   `operations_failed` and not with `operations_completed`: the server planned
   work that did not happen, and calling it completed tells RomM the client did
   something it cannot name.
-- One backup per overwrite, always, before writing.
+- One backup per overwrite, always, before writing — and per removal, before
+  removing (#233).
+- A card that refuses -- full, failing, or gone -- costs the incoming save and
+  never the one on the card: a refused transfer leaves the save as it was, a
+  refused backup stops the overwrite, and neither advances the baseline. The
+  operation's message says which (`the card is full`, `the card refused the
+  write`). `tick.download_full`, `tick.download_eio` and `tick.backup_full` hold
+  this with the refusal forced through `io::Disk` (#202).
 - Verify a downloaded save against the MD5 in `content_hash` /
   `server_content_hash`, and its length against `file_size_bytes`.

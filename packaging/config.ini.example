@@ -10,6 +10,12 @@
 ; folder map and what happens to a line the parser cannot use, is
 ; docs/CONFIG.md.
 
+; The format this file is written in, not the client's version. Leave it as it
+; is: only a release that changes what a key means moves it (docs/CONFIG.md,
+; "Version"), and an older sysmodule refuses a file from a newer release rather
+; than misreading it.
+version = 1
+
 [server]
 ; The RomM origin. HTTPS strongly recommended: over plain http:// the bearer
 ; token and every save cross your network in the clear. A path prefix is kept,
@@ -21,19 +27,52 @@ enabled       = true
 interval_min  = 30                 ; minutes; 0 = only on boot and on demand
 on_boot       = true
 saves         = true
+slot          = autosave           ; the slot RetroArch's Cloud Sync, the web player and Grout share
 states        = false              ; save states are core-specific; opt-in
+; A state loads only in the core, and the core version, that wrote it: one from
+; another device after a core update may not load at all. With map_state_slots,
+; Tico's Auto (.state5) and menu slots sync as RetroArch's .state.auto and
+; .state1-.state5, so play resumes across the two (docs/CONFIG.md).
+map_state_slots = false
 conflict_show = true               ; surface conflicts in the overlay
+; A save you deleted in RomM: remove takes it off the card, after backing it up
+; under /config/rommsync/.backup/; keep leaves it here and never uploads it.
+on_server_delete = remove
 
 [downloads]
 enabled     = true
 verify_hash = true                 ; check the hash after a download
 resume      = true
 
+[sources]
+; RetroArch's folders are read from sdmc:/retroarch/retroarch.cfg, sorted by
+; core or not, as RetroArch is set up. auto leaves them alone while RetroArch's
+; own Cloud Sync is on ("RetroArch syncs itself"); on reads them anyway; off
+; never reads them.
+retroarch             = auto
+; RetroArch can keep saves beside the roms (savefiles_in_content_dir). Those
+; folders hold roms, so they are read only when this is true.
+retroarch_content_dir = false
+
+[tico]
+; Tico 0.8 keeps saves per Switch account, under /tico/saves/users/<account>/.
+; auto reads the one account there is, and asks (on the settings screen) when
+; there are several; legacy always reads the layout before 0.8.0; or name the
+; account by its 32-digit id, as its folder under users/ is named.
+account = auto
+
 ; --- the platform folder map -------------------------------------------------
 ;
 ; A built-in map ships for the Switch-capable systems (nes, snes, gb, gbc, gba,
-; n64, genesis, psx, nds, dreamcast, psp), so this file only needs the ones you
-; want to change. Uncomment a section to override that platform.
+; n64, genesis, sms, gamegear, segacd, psx, nds, dc, dreamcast, psp, saturn,
+; fbneo, arcade), in Tico's folder names (sms is /tico/roms/master-system), so
+; this file only needs the ones you want to change. Uncomment a section to
+; override that platform.
+;
+; gc, wii and 3ds are off by default. Turn one on with its built-in folders:
+;
+; [platform.ngc]
+; enabled = true
 ;
 ; A [platform.<slug>] section REPLACES that platform's built-in entry rather
 ; than adding to it -- list every key you want it to have. The slug is RomM's
@@ -43,8 +82,21 @@ resume      = true
 ; saves  = directories scanned for SRAM saves
 ; states = directories scanned for save states
 ;
-; Check these against your card before the first sync. The RetroArch paths are
-; correct; the Tico ones are best guesses.
+; emulator = the RomM emulator id this platform's saves are sent as, when the
+;            built-in one is wrong -- say Tico runs GB on mGBA. A section with
+;            only this key keeps the built-in folders. See docs/CONFIG.md.
+;
+; [platform.gb]
+; emulator = mgba
+;
+; play_with = tico or retroarch: the emulator a save this console has never
+;             held is restored for. Tico by default for every system it runs;
+;             a section with only this key keeps the built-in folders.
+;
+; [platform.snes]
+; play_with = retroarch
+;
+; What the built-in map holds for two of them:
 ;
 ; [platform.snes]
 ; roms   = /tico/roms/snes

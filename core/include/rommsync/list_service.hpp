@@ -9,7 +9,7 @@
 //
 // ## Why a page at a time at all
 //
-// The sysmodule's inner heap is `0x150000` and the trimmed bsd transfer memory
+// The sysmodule's inner heap is `0x180000` and the trimmed bsd transfer memory
 // takes 116 KiB of it (docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision).
 // A library of ten thousand roms is never materialised -- not from RomM, not in
 // an IPC buffer, not in a cache here. What is held is one page and, for
@@ -116,11 +116,15 @@ inline constexpr std::chrono::seconds kCursorTtl{90};
 /// and says there is more, forever, which is a worse failure than a cut nobody
 /// can reach.
 ///
-/// The snapshot is **per cursor**, so the worst case this service holds is
-/// `kMaxCursors * kMaxPlatforms` trimmed rows rather than one snapshot's worth.
-/// Four times a number nothing reaches is still nothing, and sharing one
+/// The snapshot is a cursor's own, and **one cursor holds one at a time**
+/// (M9-20, #246): a fetch for one drops every other's before its request, and
+/// the same for a built rom page waiting for its `ListNext` (`Pump`). Sharing one
 /// snapshot between cursors would mean deciding when it goes stale -- a cache,
-/// which is the thing the header note says this never holds.
+/// which is the thing the header note says this never holds -- so a cursor
+/// whose snapshot went to another simply fetches again, from its offset. Before
+/// that this said `kMaxCursors` snapshots of a number nothing reaches were still
+/// nothing; the heap table budgets at bounds, and at this one a snapshot is
+/// ~42 KiB on aarch64 (`sysmodule/source/main.cpp`, `kHeapListPages`).
 inline constexpr std::size_t kMaxPlatforms = 256;
 
 /// How long one string on a list row may be.
@@ -287,11 +291,11 @@ class Service {
 
   /// The network the library is read over, and the credentials to read it with.
   ///
-  /// **A null client is a build with no network backend**, which is the
-  /// sysmodule today: nothing implements `http::HttpClient` for Horizon yet.
-  /// `platforms` and `roms` then answer `ipc::Error::kOffline` -- the same
-  /// sentence a console with its Wi-Fi off gets, which is what it amounts to --
-  /// while `queue`, which never touches the network, is served in full.
+  /// **A null client is a build with no network backend** -- not the sysmodule,
+  /// which hands over M1-7 (#126)'s Horizon client through `SdEngine::UseServer`
+  /// at boot. `platforms` and `roms` then answer `ipc::Error::kOffline` -- the
+  /// same sentence a console with its Wi-Fi off gets, which is what it amounts
+  /// to -- while `queue`, which never touches the network, is served in full.
   void UseServer(http::HttpClient* client, std::string bearer_token);
 
   /// Where a rom already on the card is looked for, for `on_disk`.

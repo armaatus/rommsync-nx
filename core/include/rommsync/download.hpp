@@ -67,8 +67,10 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "rommsync/auth_gate.hpp"
@@ -92,7 +94,7 @@ inline constexpr int kFormatVersion = 1;
 /// read.
 ///
 /// Bounds for `config::kMaxConfigBytes`' reason -- this runs on a sysmodule heap
-/// with ~1.2 MiB free (docs/DEVELOPMENT.md) over a FAT32 card that gets yanked
+/// of 1.5 MiB (docs/DEVELOPMENT.md) over a FAT32 card that gets yanked
 /// mid-write, so a corrupt directory entry claiming four gigabytes has to be a
 /// named refusal rather than a `bad_alloc`.
 ///
@@ -104,15 +106,35 @@ inline constexpr int kFormatVersion = 1;
 /// asserts exactly that, because a writer that can produce a file the reader
 /// discards would cost a console its whole queue at the next boot.
 ///
-/// Sixty-four is not a small queue: these are roms, so a full one is several
-/// gigabytes of transfer. A user who wants more queues more when these drain.
-inline constexpr std::size_t kMaxQueueEntries = 64;
-inline constexpr std::size_t kMaxQueueBytes = 160 * 1024;
+/// **Thirty-two, from sixty-four, because the heap holds the queue** (M9-21,
+/// #247): every entry is resident for the life of the process, and nothing in
+/// the heap's table counted them until then. At sixty-four the rows were ~41
+/// KiB at No-Intro-length names -- nearly all of the margin the table had left
+/// -- and ~131 KiB at the bounds above; the derivation is beside the table, in
+/// `sysmodule/source/main.cpp`. Thirty-two is still not a small queue: these
+/// are roms, so a full one is gigabytes of transfer, and a user who wants more
+/// queues more when these drain. What it costs:
+///   * `kQueueFull` at thirty-two roms still to do, not sixty-four;
+///   * history: finished rows make way for new ones (`Queue::Enqueue`), so the
+///     queue screen shows the last thirty-two rather than sixty-four;
+///   * a `queue.json` an older build wrote with more than thirty-two entries,
+///     or past `kMaxQueueBytes`, is discarded whole at boot, as any file past
+///     the bounds is. No console in the field holds one -- nothing has run on
+///     hardware before the v1 gate (CLAUDE.md) -- so this costs nobody a queue.
+inline constexpr std::size_t kMaxQueueEntries = 32;
+inline constexpr std::size_t kMaxQueueBytes = 80 * 1024;
 
 /// The longest `QueueEntry::message`. Long enough for the sentences
 /// `config::RomDestination::reason` and `http::Result::message` produce, short
 /// enough that `kMaxQueueEntries` of them are still a bounded file.
 inline constexpr std::size_t kMaxMessageChars = 200;
+
+/// The `message` of an entry the drain found already on the card, verified, and
+/// so settled `kDone` without a transfer. Named because a reader acts on it:
+/// it is how an install queued from the web UI is reported `already_installed`
+/// rather than `done` (remote_install.hpp, #245).
+inline constexpr const char* kAlreadyOnCardMessage =
+    "already on the card, with the bytes the server's hash describes";
 
 /// How many diagnostics a load reports before the rest are dropped.
 inline constexpr std::size_t kMaxDiagnostics = 16;
@@ -342,7 +364,9 @@ struct DownloadStatus {
 /// `state::ParseBaseline` is.
 class Queue {
  public:
-  Queue() = default;
+  /// The rows are reserved at `kMaxQueueEntries` once, here and on `Reset`, so
+  /// no change ever moves them into a bigger array with both alive (#247).
+  Queue() { entries_.reserve(kMaxQueueEntries); }
 
   Queue(const Queue&) = delete;
   Queue& operator=(const Queue&) = delete;
@@ -387,6 +411,15 @@ class Queue {
   /// running.
   std::vector<QueueEntry> Snapshot() const;
 
+  /// Hand every entry, in queue order, to `visit` under the lock, rather than a
+  /// copy of them (M9-21, #247): the overlay's queue screen reads a page of the
+  /// queue, and `Snapshot` would be the whole of it again for that page.
+  ///
+  /// `visit` may not call back into this object -- the lock is not recursive --
+  /// and should do no more than read: every other reader, the transfer
+  /// thread's progress included, waits it out.
+  void Visit(const std::function<void(const std::vector<QueueEntry>&)>& visit) const;
+
   /// The entry for `rom_id`, or a default-constructed one with `rom_id == 0`.
   QueueEntry Find(std::int64_t rom_id) const;
 
@@ -399,12 +432,13 @@ class Queue {
   /// reached this method could not put back `live_rom_id_` and the rest, and
   /// could not be atomic against the download worker either.
   ///
-  /// A rollback replaces the whole vector rather than reversing the change,
-  /// because reversing is not exact: `Enqueue` erases a terminal entry to
-  /// re-queue a rom, and a `Remove` that put the new row back would lose the
-  /// `failed` row a user is entitled to still see. Anything else that replaces
-  /// the whole queue is a bug: the queue is the user's list, and the only
-  /// things that shorten it are `Remove` and `Clear`.
+  /// A rollback puts back the rows the change touched at the positions they
+  /// held, rather than reversing the change by its meaning, because that is not
+  /// exact: `Enqueue` erases a terminal entry to re-queue a rom, and a `Remove`
+  /// of the new row would lose the `failed` row a user is entitled to still see
+  /// (`Undo`). Anything else that replaces the whole queue is a bug: the queue
+  /// is the user's list, and the only things that shorten it are `Remove` and
+  /// `Clear`.
   void Reset(std::vector<QueueEntry> entries);
 
   /// Entries the worker still has to do: everything not `Terminal`. This is the
@@ -479,8 +513,9 @@ class Queue {
   ///
   /// `store` is handed the entries as they stand after the change and answers
   /// whether they reached the card; a `false` puts the queue back exactly as it
-  /// was, `kMaxQueueEntries`-full re-queue and all -- which is why the whole
-  /// vector is kept rather than the change reversed (`Reset`).
+  /// was, `kMaxQueueEntries`-full re-queue and all -- which is why the rows the
+  /// change touched are kept, positions and all, rather than the change
+  /// reversed (`Undo`).
   ///
   /// **The lock is held across `store`, and that is the point.** Until M9-5
   /// (#197) the queue had one writer at a time -- `sysmodule::SdEngine::Commit`
@@ -506,15 +541,15 @@ class Queue {
   template <typename Store>
   ipc::Error EnqueueAndStore(std::int64_t rom_id, std::int32_t* position, Store&& store) {
     std::lock_guard<std::mutex> held(mutex_);
-    const Undo before = TakeUndoLocked();
-    const ipc::Error refused = EnqueueLocked(rom_id, position);
+    Undo before = TakeUndoLocked();
+    const ipc::Error refused = EnqueueLocked(rom_id, position, &before);
     if (refused != ipc::Error::kOk) {
       return refused;
     }
     if (store(Rows())) {
       return ipc::Error::kOk;
     }
-    RestoreLocked(before);
+    RestoreLocked(std::move(before));
     return ipc::Error::kWriteFailed;
   }
 
@@ -530,38 +565,53 @@ class Queue {
   template <typename Store>
   ipc::Error RemoveAndStore(std::int64_t rom_id, QueueEntry* removed, Store&& store) {
     std::lock_guard<std::mutex> held(mutex_);
-    const Undo before = TakeUndoLocked();
-    const ipc::Error refused = RemoveLocked(rom_id, removed);
+    Undo before = TakeUndoLocked();
+    const ipc::Error refused = RemoveLocked(rom_id, removed, &before);
     if (refused != ipc::Error::kOk) {
       return refused;
     }
     if (store(Rows())) {
       return ipc::Error::kOk;
     }
-    RestoreLocked(before);
+    RestoreLocked(std::move(before));
     return ipc::Error::kWriteFailed;
   }
 
   template <typename Store>
   Committed UpdateAndStore(const QueueEntry& entry, Store&& store) {
     std::lock_guard<std::mutex> held(mutex_);
-    const Undo before = TakeUndoLocked();
-    if (!UpdateLocked(entry)) {
+    Undo before = TakeUndoLocked();
+    if (!UpdateLocked(entry, &before)) {
       return Committed::kGone;
     }
     if (store(Rows())) {
       return Committed::kOk;
     }
-    RestoreLocked(before);
+    RestoreLocked(std::move(before));
     return Committed::kStoreFailed;
   }
 
  private:
-  /// Everything a failed write has to put back -- the rows, and the three
-  /// fields of bookkeeping that are not on them (`live_rom_id_`,
+  /// Everything a failed write has to put back -- the rows the change touched,
+  /// and the three fields of bookkeeping that are not on them (`live_rom_id_`,
   /// `live_bytes_per_second_`, `last_finished_rom_id_`).
+  ///
+  /// **The rows it touched and where they stood, not a copy of every row**
+  /// (M9-21, #247). A change is at most one row out and one appended, or one
+  /// written over, and the lock is held from the change to the undo, so putting
+  /// those back at their positions is exact -- the `failed` row an `Enqueue`
+  /// erased goes back where it was, ahead of the rows behind it. The copy it
+  /// replaces was the whole queue again on every write, ~2 KiB an entry at its
+  /// bounds, from the IPC thread as well as the worker.
   struct Undo {
-    std::vector<QueueEntry> entries;
+    /// A row the change took out (`Enqueue`'s re-queue or full queue, `Remove`)
+    /// or wrote over (`Update`), and its index.
+    std::optional<QueueEntry> row;
+    std::size_t at = 0;
+    /// `row` was written over in place rather than taken out.
+    bool replaced = false;
+    /// The change appended a row (`Enqueue`), which the undo takes off first.
+    bool appended = false;
     std::int64_t live_rom_id = 0;
     std::int64_t live_bytes_per_second = 0;
     std::int64_t last_finished_rom_id = 0;
@@ -572,14 +622,14 @@ class Queue {
 
   /// The caller holds `mutex_`.
   Undo TakeUndoLocked() const;
-  void RestoreLocked(const Undo& undo);
+  void RestoreLocked(Undo undo);
 
   /// The bodies of `Enqueue`, `Remove` and `Update`, with the lock already
   /// held, so the transactional forms above are the same code and cannot drift
-  /// from the plain ones.
-  ipc::Error EnqueueLocked(std::int64_t rom_id, std::int32_t* position);
-  ipc::Error RemoveLocked(std::int64_t rom_id, QueueEntry* removed);
-  bool UpdateLocked(const QueueEntry& entry);
+  /// from the plain ones. `undo`, when not null, is told what the change did.
+  ipc::Error EnqueueLocked(std::int64_t rom_id, std::int32_t* position, Undo* undo = nullptr);
+  ipc::Error RemoveLocked(std::int64_t rom_id, QueueEntry* removed, Undo* undo = nullptr);
+  bool UpdateLocked(const QueueEntry& entry, Undo* undo = nullptr);
 
   /// The caller holds `mutex_`.
   std::vector<QueueEntry>::iterator FindLocked(std::int64_t rom_id);
@@ -811,6 +861,10 @@ struct RomDetail {
   /// string is a named refusal. That is not the same trade -- a library serving
   /// one body of that shape serves them all, and the next rom out of it is the
   /// nested one whose name this decides.
+  ///
+  /// **The first two, not all of them** (#248): the question asked of the list
+  /// is whether it names exactly one file, and a second already answers it. A
+  /// rom of a thousand files is a thousand names nothing reads.
   std::vector<std::string> file_names;
 
   /// RomM knows the rom and its file is gone from the server's own filesystem.
@@ -926,6 +980,17 @@ struct DrainResult {
   int skipped = 0;
   int failed = 0;
 
+  /// The roms that reached `kDone` this drain by arriving, in order. What the
+  /// engine asks a save for next (#241): a rom that has just arrived has an
+  /// empty save folder, and its save is on the server. A cancelled or failed
+  /// drain still lists the ones it finished.
+  ///
+  /// **Not a rom found already on the card** (`kAlreadyOnCardMessage`), which
+  /// `downloaded` still counts: the card held it before, so an empty save
+  /// folder beside it may be a save the user deleted, and asking with
+  /// `restore_unlisted` would put it back.
+  std::vector<std::int64_t> done;
+
   /// Requests actually sent and the backoff actually asked for, so a caller can
   /// see a drain that cost three attempts and a test can check the retry without
   /// waiting it out -- `sync::Negotiation`'s reasoning.
@@ -947,7 +1012,7 @@ struct DrainResult {
 ///
 /// Per entry: `GET /api/roms/{id}` -> refuse a disc set or a rom missing from
 /// the server -> name the file -> `config::Config::DestinationFor` -> is it
-/// already on the card?
+/// already on the card? -> can the card hold it?
 /// -> stream the content to `<destination>.tmp.part`, which the backend renames
 /// onto `<destination>.tmp` -> `kVerifying` -> hash it -> `io::CommitStaged`
 /// onto the destination -> `kDone`. The queue is written after every one of
@@ -996,6 +1061,15 @@ struct DrainResult {
 /// `verify_hash = false` nor a library with no `sha1_hash` and no `md5_hash` is
 /// a failure -- the rom is on the card and the user asked for it -- but the
 /// entry's `message` records that it was not verified, and never claims it was.
+///
+/// **A rom the card cannot hold is refused before it starts, and a card that
+/// refuses mid-transfer is named.** `fs::FileSystem::VolumeOf` is asked once per
+/// rom: past the volume's per-file ceiling (4 GiB - 1 on FAT32) or past its free
+/// space is `kFailed` with a sentence and not one content request. A write the
+/// card refuses anyway is `kFailed` too, saying whether the card was full, the
+/// file too large, or the write simply refused (`http::ErrorForWrite`), and the
+/// partial goes with it. None of them is retried: asking the server again
+/// changes nothing until the user frees space or checks the card (#202).
 ///
 /// **`[downloads] enabled = false` idles; it does not drop the queue.** The
 /// answer is `kDisabled` and the file is not even opened, so switching downloads
