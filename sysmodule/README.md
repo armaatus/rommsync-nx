@@ -1,10 +1,11 @@
 # sys-rommsync (sysmodule)
 
 The background engine. It registers the `rommsync` IPC service and answers it;
-everything behind that service is still arriving milestone by milestone, so the
-commands whose machinery does not exist yet answer `ipc::Error::kUnavailable`
-rather than a plausible refusal (see `source/engine.hpp`). Build on a devkitPro
-dev machine, never on the RomM server.
+every command now has its machinery behind it, and `ipc::Error::kUnavailable` --
+which a command answered while its machinery did not exist, rather than a
+plausible refusal -- is left only for `StartPairing` in a build that wires no
+transport (see `source/engine.hpp`). Build on a devkitPro dev machine, never on
+the RomM server.
 
 ```bash
 make -C sysmodule            # -> sysmodule/sys-rommsync.nsp
@@ -253,8 +254,8 @@ docker, never a mock) before any of it runs on a Switch — see
   overlay has something to open. None of it has run: it is exercised in Ryujinx
   as a manually-launched build first, never as an auto-boot sysmodule and never
   on hardware before the M8-1 gate.
-- **M1 onward** — auth, sync and downloads, in `core/` first. Each one replaces
-  its `kUnavailable` in `source/engine.cpp`; the last one to go is what says the
-  engine is finished.
+- **M1 onward** — auth, sync and downloads, in `core/` first. Each one replaced
+  its `kUnavailable` in `source/engine.cpp`; what is left of it is `StartPairing`
+  on a build with no transport, which a console never is (M1-7, #126).
 
 See milestone M0 in [`../ISSUES.md`](../ISSUES.md).

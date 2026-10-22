@@ -1,6 +1,8 @@
 # Save sync protocol (client side)
 
-How `sys-rommsync` implements RomM 5.2.0's negotiate → execute → complete loop.
+How `sys-rommsync` implements RomM's negotiate → execute → complete loop (5.4.0
+or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#520--540)
+says so).
 Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md). The payload and
 response shapes below are the ones captured from a live 5.2.0 under
 `server/contract/captures/` (issue M0-4), not a reading of the OpenAPI snapshot.
@@ -798,7 +800,7 @@ describes, and a `no_op` moved nothing and keeps everything it does not restate.
 `core/` has no single-file stat, so the re-read for a download goes through
 `fs::FileSystem::List` of the save's directory. Only the most recent listing is
 kept — a listing may hold up to `fs::kMaxDirectoryEntries` names on a heap of
-1.4 MiB, so a memo per directory is unbounded in the one dimension that is
+1.5 MiB, so a memo per directory is unbounded in the one dimension that is
 scarce, on the tick that already downloaded the most. Keeping the last one still
 collapses the case that matters, which is several saves in one folder.
 

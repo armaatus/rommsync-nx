@@ -1,4 +1,4 @@
-// The negotiate call against a REAL RomM 5.2.0.
+// The negotiate call against a REAL RomM.
 //
 // `sync.payload` and `sync.plan` pin the two shapes against the committed
 // snapshot and captures, which are documents. These scenarios ask the running
@@ -527,7 +527,7 @@ int Revoked(http::HttpClient& client, const std::string& base, const Fixture& fi
     // and a refused one look identical if you only read `plan.operations`: both
     // are a vector of size zero. A caller that treated this as "the server has
     // no saves" would upload nothing, delete nothing it should have kept, and
-    // -- worse, once M2-7 lands a reconciliation -- take the server's silence
+    // -- worse, now that M2-7 reconciles -- take the server's silence
     // for a library that is genuinely empty. `ok()` is what separates them, and
     // it is the only thing that does, so it is pinned here rather than left to
     // a reviewer noticing that every caller checks it (M1-4, #8).

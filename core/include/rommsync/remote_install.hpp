@@ -4,7 +4,7 @@
 // server holds the request until the device takes it, and offers two ways to
 // hear about one: a Socket.IO event, and `POST /api/devices/{id}/installs/claim`.
 // This client uses only the second, once a tick. A socket client in a sysmodule
-// is a second connection held open for the whole boot, out of a heap of 1.4 MiB
+// is a second connection held open for the whole boot, out of a heap of 1.5 MiB
 // and a session count Horizon rations (docs/DEVELOPMENT.md); a claim is one
 // request on a thread that is making requests anyway. A rom queued in the
 // browser therefore starts at the next tick rather than at once -- the price,

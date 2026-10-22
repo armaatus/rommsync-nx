@@ -178,9 +178,9 @@ the file only needs to hold your **overrides**.
 Use `https://` if your RomM has it. Plain `http://` works and sends your token
 in the clear on every request — see [Security](#security) below.
 
-Once the overlay's Settings screen lands
-([#26](https://github.com/armaatus/rommsync-nx/issues/26)) you will be able to
-set the server URL from the console instead. Today, the file is the way.
+The overlay's Settings screen
+([#26](https://github.com/armaatus/rommsync-nx/issues/26)) shows the server URL
+but cannot change it; the file is the way.
 
 The full key list — the sync interval, the download options, and the folder map
 that decides where roms land and which folders saves are read from — is in
@@ -195,17 +195,12 @@ once in a browser, and the console gets a token. No account secret is ever
 entered on the console, and there is nothing to type with a joystick but a
 button press.
 
-> **Not reachable yet.** The pairing screen is built, but the only thing that
-> opens it is **Re-pair** on the Settings screen, which arrives with
-> [#26](https://github.com/armaatus/rommsync-nx/issues/26). Until that lands
-> there is no button in the overlay that starts this. The six steps below are
-> the release that ships once it does.
-
 Six steps:
 
 1. Reboot (or launch the sysmodule from ovl-sysmodules) so `sys-rommsync` is
    actually running.
-2. Open your overlay menu and choose **ovl-rommsync**.
+2. Open your overlay menu and choose **ovl-rommsync**. It opens on the status
+   screen; press **Y** for Settings and choose **Pairing** from its menu.
 3. Press **Pair**. The screen says **"Contacting the server"** while it asks RomM
    for a code.
 4. The screen then shows an **address** and an **eight-character code**. Open
@@ -364,9 +359,10 @@ client-tokens UI. That is the only thing that actually makes it stop working,
 and it is why a dedicated RomM user is worth the two minutes.
 
 The overlay's **Re-pair** does the client half for you: it discards the stored
-token and restarts the flow from step 4. It arrives with the Settings screen
-([#26](https://github.com/armaatus/rommsync-nx/issues/26)), like everything else
-that opens the pairing screen — see the note in step 4. It leaves `device.dat`
+token and restarts the flow from step 4. It is on the Settings screen
+([#26](https://github.com/armaatus/rommsync-nx/issues/26)), beside the
+**Pairing** row step 4 uses, and it starts the new pairing before it discards the
+old token, so a refused attempt loses nothing. It leaves `device.dat`
 alone, so RomM recognises the same console rather than collecting a new one each
 time. See [AUTH.md](AUTH.md#re-pairing--revocation).
 

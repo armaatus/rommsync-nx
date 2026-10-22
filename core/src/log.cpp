@@ -34,7 +34,7 @@ struct State {
   ///
   /// It was a `std::deque`, which allocates a chunk each time the window
   /// crosses into a new one and frees the old one after it: a process that
-  /// logs a line a minute churned a chunk of its 1.4 MiB heap every few dozen
+  /// logs a line a minute churned a chunk of its 1.5 MiB heap every few dozen
   /// lines, forever, and what it held stepped up and down with the window's
   /// position -- which is what `soak` saw and `alloc.log_ring` holds.
   ///

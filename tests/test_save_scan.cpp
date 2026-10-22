@@ -7,7 +7,7 @@
 // is one game's save uploaded over another game's, and that rule going quiet is
 // the worst way for this file to rot.
 //
-// The last two need the real RomM 5.2.0, because the two things a fake index
+// The last two need the real RomM, because the two things a fake index
 // cannot answer are the two the issue asks about: that `GET /api/roms` answers
 // an **envelope** which has to be paged -- a rom on the last page is exactly the
 // one a save needs -- and that the fields this client matches on

@@ -177,7 +177,7 @@ was working and then stopped, all at once, without the network changing.
 **What is happening.** RomM answered **401**. The client stops there rather than
 spending a whole plan's worth of requests on credentials that are gone — and it
 never reads a 401 as "the server has no saves", which would be a plan to upload
-everything over the server's copies. RomM 5.2.0 issues tokens with no expiry to
+everything over the server's copies. RomM issues tokens with no expiry to
 refresh, so nothing here comes back on its own
 ([AUTH.md](AUTH.md#re-pairing--revocation)).
 

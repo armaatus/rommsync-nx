@@ -158,7 +158,7 @@ using EachElement = std::function<Error(const Value& element, std::size_t index)
 ///
 /// A parsed `Value` weighs about eleven times the text it came from -- a node is
 /// ~100 bytes and a RomM row is ~100 nodes -- so a 64-row page held as one
-/// document is ~1.5 MiB, on a sysmodule whose whole heap is 1.4 MiB (M9-19,
+/// document is ~1.5 MiB, the whole of the sysmodule's 1.5 MiB heap (M9-19,
 /// #217). Streamed, the peak is the text and one element.
 ///
 /// `key` names a member of the top-level object; empty means the top-level value

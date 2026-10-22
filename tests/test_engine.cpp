@@ -674,13 +674,13 @@ void Reenable(checks::Checks& c) {
            "with the card written once more");
 
   // `SyncNow` stops answering `kDisabled` the moment the switch is back on, with
-  // no restart in between -- which is this issue's criterion. It does not yet
-  // answer `kAccepted`: `SdEngine::RequestSync` returns false until there is a
-  // scheduler to start a tick, and `ServiceCore` reports that as
-  // `kAlreadyRunning` (M7-2, #37, "What M4-1 left here"). The switch is what
-  // this issue owns; the tick behind it is #37's.
+  // no restart in between -- which is this issue's criterion. It is not pinned
+  // to `kAccepted`: what answers instead -- a tick started, or one already
+  // running -- has been M7-2 (#37)'s since it gave `SdEngine::RequestSync` a
+  // worker to start (`engine.syncnow`). The switch is what this issue owns; the
+  // tick behind it is #37's.
   c.Expect(console.SyncNow() != ipc::SyncOutcome::kDisabled,
-           "and a sync asked for now is refused by something other than the switch");
+           "and a sync asked for now is no longer refused for the switch");
 
   // The card and the engine still agree after a real reboot, so nothing above
   // was true only in memory.
@@ -1567,7 +1567,7 @@ void Unreachable(checks::Checks& c) {
            "so it is exactly the console it was");
 }
 
-// --- what is still not built --------------------------------------------------
+// --- what M4-1 left unbuilt, and the issues that built it ---------------------
 
 /// M7-2 (#37): "Sync now" starts a tick, and says so.
 ///
@@ -2477,8 +2477,8 @@ void Commands(checks::Checks& c) {
   std::string response;
   // `Unpair` came off this list in M1-4 (#8): it discards `token.dat` and the
   // verdict beside it, which is the half of "re-pairing recovers" the engine
-  // owns. Starting the device-code flow afterwards is `StartPair`'s and is not
-  // built.
+  // owns. Starting the device-code flow afterwards is `StartPair`'s, which
+  // M1-6 (#123) built (`engine.pairs`).
   // `StartPair` never reaches the engine on this console: `ServiceCore` refuses
   // first, because there is no `server.url` to pair with -- which is the right
   // answer and a different sentence from "not built yet".
@@ -2487,9 +2487,10 @@ void Commands(checks::Checks& c) {
            "StartPair is refused for want of a server before the engine is asked at all");
 
   // M1-6 built the engine half. What is left on this list is the *transport*:
-  // `core/` reaches a server through `http::HttpClient` and the console has no
-  // implementation of one yet, so a build with a server to pair with and nothing
-  // to reach it through answers `kUnavailable` -- "this build has no engine
+  // `core/` reaches a server through `http::HttpClient`, which the console has
+  // had since M1-7 (#126) and installs at boot (`main.cpp`), but a build that
+  // wires none -- this harness, here -- has a server to pair with and nothing to
+  // reach it through. It answers `kUnavailable` -- "this build has no engine
   // behind that command" -- rather than a plausible refusal about the server or
   // the card (`ipc.hpp`).
   Console configured(c, "engine-commands-2");
@@ -3690,14 +3691,15 @@ std::vector<std::int64_t> SaveIdsFor(http::HttpClient& client, const std::string
 /// holds lines. Deleted again when this goes.
 ///
 /// **A library is never empty of other people's saves**, and a console new to
-/// RomM is offered every one of them on its first tick. Until #237 places them
-/// under a name the scan reads back, each lands under RomM's tagged name and is
-/// a `scan.skipped` line on every tick after -- so a tick writes more lines than
-/// `log::kTailLines`, and the tail no longer holds the tick before it. That is
-/// what main's long-lived fixture did to `engine.foreground` and
-/// `engine.server_deleted` with twenty-two rows `sched.*` had left behind; a
-/// scenario that counts ticks has to count them on a server like that one, not
-/// only on a fresh fixture.
+/// RomM is offered every one of them on its first tick. Before #237 placed them
+/// under a name the scan reads back, each landed under RomM's tagged name and
+/// was a `scan.skipped` line on every tick after -- so a tick wrote more lines
+/// than `log::kTailLines`, and the tail no longer held the tick before it. That
+/// is what main's long-lived fixture did to `engine.foreground` and
+/// `engine.server_deleted` with twenty-two rows `sched.*` had left behind. How
+/// many lines such a tick writes since #236 and #237 has not been re-measured,
+/// which is the reason this stays: a scenario that counts ticks has to count
+/// them on a server like that one, not only on a fresh fixture.
 class OtherConsolesSaves {
  public:
   OtherConsolesSaves(rig::Checks& c, http::HttpClient& client, const std::string& base,

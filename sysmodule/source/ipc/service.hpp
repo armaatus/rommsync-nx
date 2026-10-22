@@ -14,8 +14,9 @@
 //
 // What is *not* here, on purpose: hosting the service. Registering the port
 // (`smRegisterServiceCmif`), accepting sessions and `svcReplyAndReceive` belong
-// with the sysmodule's service loop, which arrives with the first screen that
-// talks to it (M4-1, #23). This is the function that loop calls.
+// with the sysmodule's service loop, `ipc/server.*`, which arrived with the
+// first screen that talks to it (M4-1, #23). This is the function that loop
+// calls.
 #pragma once
 
 #include <switch.h>

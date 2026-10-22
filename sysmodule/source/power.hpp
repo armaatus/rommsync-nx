@@ -165,7 +165,7 @@ class Sink {
 /// The loop: one request, one dispatch, one acknowledgement, forever.
 ///
 /// **It owns no thread**, deliberately. On the console the thread is a libnx
-/// `Thread` with a stack sized against the 768 KiB inner heap
+/// `Thread` with a stack sized against the inner heap
 /// (`kInnerHeapSize`, `main.cpp`), which `std::thread` gives no way to ask for;
 /// in the tests it is the test's own. So this is the part both share -- the
 /// order of the calls and the promise that each request is answered exactly once

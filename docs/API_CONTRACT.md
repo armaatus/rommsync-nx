@@ -9,8 +9,10 @@ the captures stop matching the server.
 
 RomM **5.4.0** is pinned beside it the same way — `romm-openapi-5.4.0.json` and
 `captures/5.4.0/` — and [what changed](#520--540) is the last section of this
-page. The body of the page still describes 5.2.0 until #235 makes 5.4.0 the
-fixture's default (D1 in #226: 5.4.0 is the minimum, 5.2.0 is dropped).
+page. The body of the page still describes 5.2.0, although 5.4.0 has been the
+fixture's default since #235 and the oldest RomM the client syncs with since
+#228 (D1 in #226: 5.4.0 is the minimum, 5.2.0 is dropped). Where the two differ,
+that section says so; the body has not been re-based.
 
 > The snapshot says what RomM *declares*; the captures say what it *does*. Where
 > this page marks something **verified**, it came from a captured response, not

@@ -250,7 +250,7 @@ void Layouts(checks::Checks& c) {
   c.Expect(neither.source == scan::Source::kUnknown && neither.layout == scan::Layout::kUnknown,
            "a folder neither emulator owns says nothing -- a core-named leaf included");
   c.ExpectEq(std::string(scan::ToString(scan::Source::kRetroArch)), std::string("retroarch"),
-             "the source's name, which the slot is still built from until #236");
+             "the source's name, which slots were built from until #236");
 
   config::Config overridden = config::Defaults();
   overridden.emulators["gb"] = "mgba";

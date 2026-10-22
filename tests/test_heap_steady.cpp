@@ -1,6 +1,6 @@
 // What the sysmodule holds between ticks, measured, and held flat (M9-15, #204).
 //
-// The process is meant to run for weeks without restarting, on a 1.4 MiB heap
+// The process is meant to run for weeks without restarting, on a 1.5 MiB heap
 // where `bad_alloc` is `std::terminate` (`-fno-exceptions`, switch.mk). The
 // heap's table in sysmodule/source/main.cpp is a bound added up from constants;
 // nothing measured what a tick actually allocates, and nothing would have
@@ -447,7 +447,7 @@ void JudgeRule(checks::Checks& c) {
 /// eight bytes a round for ten more. The block was the ring's `std::deque`
 /// allocating its next chunk as the window of `log::kTailLines` lines crossed a
 /// chunk boundary -- bounded, but a heap that churns a chunk every few dozen
-/// lines on a console with 1.4 MiB of it, and a floor no judge can call steady.
+/// lines on a console with 1.5 MiB of it, and a floor no judge can call steady.
 ///
 /// Short lines first and then lines of every length, because the second half of
 /// what the soak found was the slots' capacity creeping up as longer lines
@@ -533,7 +533,7 @@ std::int64_t PeakOf(const std::string& body, const Parse& parse) {
 /// `json::Value` is ~100 bytes a node and a RomM row is ~100 nodes, so a parsed
 /// row weighs about eleven times its text -- measured at 23 KiB a row on
 /// aarch64's libstdc++ against the fixture RomM (sysmodule/source/main.cpp).
-/// Holding a 64-row page as a document is ~1.5 MiB on a 1.4 MiB heap, which is a
+/// Holding a 64-row page as a document is ~1.5 MiB, the whole heap, which is a
 /// `std::terminate` on a console the first time a library has that many roms.
 /// So the peak of a 64-row page may exceed a 1-row page's by what the 63 extra
 /// rows become -- a struct and a few short strings each -- and by nothing that
@@ -641,7 +641,7 @@ std::string DeviceRow(std::size_t at) {
 /// what the rows become, and by nothing that scales with their documents.
 ///
 /// Held whole, each was ~10x its text on aarch64: a 512-operation plan peaked at
-/// 1.3 MiB and a 117 KiB state listing at 980 KiB, on a 1.4 MiB heap.
+/// 1.3 MiB and a 117 KiB state listing at 980 KiB, on a 1.5 MiB heap.
 void ResponseParse(checks::Checks& c) {
   constexpr std::size_t kRows = 64;
   // Over what one row becomes on either standard library -- an operation is

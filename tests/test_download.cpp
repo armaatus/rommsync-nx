@@ -6,7 +6,7 @@
 // and a healthy RomM has nothing to do with any of it. Those must stay checked
 // with docker stopped.
 //
-// The other five need the real RomM 5.2.0 and the fault proxy in front of it,
+// The other five need the real RomM and the fault proxy in front of it,
 // because what they pin is a *transfer*: bytes that match the fixture on the
 // card, a 500 that leaves the entry queued rather than dropped, a connection
 // dropped 4 MiB in that resumes rather than restarts, and a disc set refused

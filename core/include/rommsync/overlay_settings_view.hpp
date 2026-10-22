@@ -127,8 +127,9 @@ struct SettingsRow {
   /// **The renderer deliberately draws nothing for it today**, and that is not
   /// an omission: every row that is not a `kNavigate` is editable, so a marker
   /// would be on every configuration row on the screen and would separate
-  /// nothing. It becomes worth drawing when #30 builds the editor and the set
-  /// stops being uniform -- a key it refuses, or a folder row that can only be
+  /// nothing. It becomes worth drawing when the overlay grows an editor -- #30
+  /// built the `SetConfig` behind one, and no screen sends it -- and the set
+  /// stops being uniform: a key it refuses, or a folder row that can only be
   /// changed as a whole `roms` list rather than one path at a time. Until then
   /// the flag is the model saying which keys `config::ApplyEdit` accepts, held
   /// by `overlay.settings` rather than by a screenshot.

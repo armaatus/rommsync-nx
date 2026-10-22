@@ -172,7 +172,7 @@ class RomIndex {
 /// offsets, and the two match keys' heap strings -- and that is a row of the
 /// table in `sysmodule/source/main.cpp`, which derives this number and pins it.
 /// It was 20,000 until then: ~4.7 MiB at the bound, in a process whose whole
-/// heap is 1.4 MiB, chosen without reference to it. More roms are more heap,
+/// heap is 1.5 MiB, chosen without reference to it. More roms are more heap,
 /// ~62 KiB a further 256, and that is a decision for that table, not for here.
 inline constexpr std::size_t kMaxIndexRoms = 1024;
 

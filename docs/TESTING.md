@@ -313,7 +313,7 @@ which were watched taking ~50s. Time the test yourself.
   in M1–M5 is written against `HttpClient`, so holding five milestones behind one
   emulator question would buy nothing. It is a gate — for **M8**.
 - **The engine edge cases in M0-5's wording.** Conflict, partial failure and
-  multi-file skip are behaviours of code M2 and M3 have not written yet. What M0
+  multi-file skip are behaviours of code M2 and M3 had not written yet. What M0
   owes is the *mechanism* that forces them and proof the mechanism works
   (`http.*`, `pair.*`, `harness.*`); each edge case is then covered by the
   milestone that implements the behaviour. M0-5 has since landed on exactly that

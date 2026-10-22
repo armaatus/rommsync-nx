@@ -1,7 +1,7 @@
 // The host harness, and the edge cases only a fault proxy can force.
 //
 // Every scenario here runs the engine's own code -- `EncodeNegotiateRequest`,
-// the native `HttpClient`, `WriteAtomically` -- against the real RomM 5.2.0 in
+// the native `HttpClient`, `WriteAtomically` -- against the real RomM in
 // docker, with `server/testing/fault_proxy.py` in front of it damaging exactly
 // one thing about one genuine response. Nothing is mocked, so a green run means
 // a live server did that.
@@ -26,10 +26,11 @@
 // **What is deliberately not here.** The issue's wording asks for the client's
 // *behaviour* on a conflict and on a partial plan -- resolve by policy, count
 // `operations_failed`, retry next tick. That behaviour is M2-5's and M2-7's
-// code, which is not written; docs/TESTING.md records the split. So these
-// scenarios prove the two things M0 owes: that each case can be produced on
-// demand, and what the server actually does in it -- including the parts a
-// reasonable client would guess wrong, which are named at each scenario.
+// code, and is tested with it rather than here; docs/TESTING.md records the
+// split. So these scenarios prove the two things M0 owes: that each case can be
+// produced on demand, and what the server actually does in it -- including the
+// parts a reasonable client would guess wrong, which are named at each
+// scenario.
 #include <chrono>
 #include <cstdint>
 #include <cstdio>

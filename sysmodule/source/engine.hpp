@@ -98,8 +98,9 @@ inline constexpr const char* kConfigSdDir = "/config/rommsync";
 /// What an SD-root path from `core/` is prefixed with to open it here.
 ///
 /// The mapping `fs::FileSystem::Resolve` performs, spelled once for the callers
-/// that have no `fs::FileSystem` to ask -- which on the console today is all of
-/// them, because nothing implements one for Horizon yet. `kConfigDir` is this
+/// that have no `fs::FileSystem` to ask -- `Load`, and `BackupPresent` on a build
+/// that never called `UseCard`. The console has one since M7-2 (#37), the
+/// Horizon backend in `card.hpp`, which is built on this. `kConfigDir` is this
 /// plus the directory `core/` names, and is kept as its own constant because it
 /// is what `Load` is *given* rather than something it derives.
 inline constexpr const char* kSdRoot = "sdmc:";
@@ -173,9 +174,11 @@ inline constexpr std::chrono::milliseconds kForegroundPollInterval{5'000};
 /// rather than to a file the host build compiles. Injecting them is what lets
 /// `engine.pairs` drive a whole pairing against the docker RomM with no console.
 struct PairingBackend {
-  /// **Null means this build has no way to reach a server**, which is the
-  /// console's situation today: the Horizon `ssl` `HttpClient` backend is listed
-  /// in the M8-1 gate (#43) and is not written. `StartPairing` answers
+  /// **Null means this build has no way to reach a server.** That is no longer
+  /// the console's situation -- `main.cpp` hands over M1-7 (#126)'s Horizon `ssl`
+  /// client (`http/ssl_http_client.cpp`) at boot, whether or not the network is
+  /// up -- so it is a host binary that wires no transport, and the tests that
+  /// pin the refusal (`engine.commands`). `StartPairing` answers
   /// `ipc::Error::kUnavailable` then -- "this build has no engine behind that
   /// command" -- rather than a refusal that blames the server or the card.
   ///
@@ -210,24 +213,22 @@ struct PairingBackend {
 /// `auth.json` under `card_mutex_`, a restore writes a save and a copy under
 /// `.backup/`. Taking `card_mutex_` for a restore would make a pairing grant
 /// wait behind a save-state copy of tens of megabytes, which is the thing the
-/// two-lock split exists to prevent. What would change that is a second writer
-/// of `.backup/` -- the scheduler running a tick (M7-2, #37) -- and that is the
-/// moment `history_` needs a lock of its own, not this one.
+/// two-lock split exists to prevent. A second writer of `.backup/` -- the worker
+/// running a tick (M7-2, #37) -- is what gave `history_` a lock of its own,
+/// `history_mutex_`, rather than this one.
 ///
 /// `config_` and `queue_` are deliberately *not* under it, and that is still a
 /// fact about today rather than a decision to keep: `ServiceServer::Run` is a
 /// single `svcReplyAndReceive` loop, so every command runs on one thread, and
 /// the pairing thread reads neither -- it is handed the server URL it needs when
 /// the attempt starts. `download::Queue` carries its own mutex for the reason
-/// `ipc::Engine` states.
+/// `ipc::Engine` states, and the worker drains it through that (M9-5, #197).
 ///
-/// **A mutex is not what would make `config()` safe the day a worker reads it.**
-/// It hands out a *reference*, so a swap under a lock would still free a
-/// `Config` a caller is holding. The seam to change then is that signature -- a
-/// snapshot, the way `Snapshot()` already answers -- and workers have to take
-/// theirs at a tick boundary, never mid-sync and never mid-download. The
-/// download worker is not started here yet; when it is, this is already the
-/// object it drains.
+/// **A mutex is not what makes `config()` safe for the worker.** It hands out a
+/// *reference*, so a swap under a lock would still free a `Config` a caller is
+/// holding. So the worker never calls it: it takes a `ConfigSnapshot` at an
+/// operation boundary and reads it to the end, never swapped mid-sync or
+/// mid-download (M7-2, #37).
 class SdEngine : public ipc::Engine, public power::Sink {
  public:
   SdEngine();
@@ -260,7 +261,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `fs` -- a sysmodule that cannot build what it needs should not come up
   /// half-working -- whereas failing on a button press would leave a pairing
   /// screen that never moves under the user's thumb. A backend with no transport
-  /// starts nothing, which is every console today.
+  /// starts nothing, which no console has been since M1-7 (#126).
   ///
   /// Until M9-2 (#207) this was also *the one throwing call in the class*:
   /// `std::thread`'s constructor throws when the thread or its stack cannot be
@@ -292,7 +293,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// **It is one thread, not two.** `sync::RunTick` and `lists::Service::Pump`
   /// both want a thread that is not the IPC one and neither wants a thread of
   /// its own: a list page is one request and a tick is a handful, and two
-  /// threads would cost two more stacks out of the 1.4 MiB inner heap to serialise
+  /// threads would cost two more stacks out of the 1.5 MiB inner heap to serialise
   /// on the same `http::HttpClient` anyway. A stack is `kThreadStackBytes` and
   /// the heap's table has a row for exactly the two this class starts
   /// (`kHeapThreadStacks`, `main.cpp`), so a third is a visible cost rather than
@@ -626,12 +627,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// The conflict history, for the tick that writes it.
   ///
-  /// **Nothing in this build drives a tick**, so nothing appends to it here yet
-  /// -- since M7-2 (#37) the worker appends to it: `conflicts::RecordSaves` after
-  /// the saves half of a tick and `conflicts::RecordStates` after the states
-  /// half, both from `RunOneTick` rather than from inside `sync::RunTick`,
-  /// because `conflict_record.hpp` includes `state_sync.hpp` and recording from
-  /// in there would be a cycle. It is guarded by `history_mutex_`.
+  /// **The worker is what appends to it** (M7-2, #37): `conflicts::RecordSaves`
+  /// after the saves half of a tick and `conflicts::RecordStates` after the
+  /// states half, both from `RunOneTick` rather than from inside
+  /// `sync::RunTick`, because `conflict_record.hpp` includes `state_sync.hpp` and
+  /// recording from in there would be a cycle. It is guarded by `history_mutex_`.
   conflicts::History& history() { return history_; }
 
   /// Whether the backup `entry` names is still on the card, for
@@ -1216,8 +1216,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// its next reboot would keep refusing a server that now works.
   ///
   /// Read on the worker, at the top of a tick, and never on the pairing thread:
-  /// that thread has nothing to decide with it yet (#245 will), and the worker
-  /// already owns every other request a tick makes.
+  /// that thread has nothing to decide with it -- #245's `install_enabled` is
+  /// read by the tick too -- and the worker already owns every other request a
+  /// tick makes.
   server::ServerCapabilities server_caps_;
   bool server_read_ = false;
 
@@ -1324,8 +1325,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// thing that lifts it.
   auth::Gate gate_;
 
-  /// The transport and the identity seed a pairing attempt runs on. Empty on the
-  /// console, which is what makes `StartPairing` answer `kUnavailable` there.
+  /// The transport and the identity seed a pairing attempt runs on. Installed on
+  /// the console at boot (`main.cpp`); left empty only by a host binary with no
+  /// transport, which is what makes `StartPairing` answer `kUnavailable` there.
   PairingBackend pairing_backend_;
 
   /// Serialises the *card* writes the two threads both make -- `token.dat` and
@@ -1347,13 +1349,14 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// Guards the in-memory state the two threads share: the attempt, `auth_`,
   /// and `gate_`. Held for assignments and never across I/O, with one exception:
-  /// `Load` holds it over the four files it reads at boot. The pairing thread
-  /// usually *does* exist by then -- `UsePairingBackend` is called before `Load`
-  /// -- so what makes that safe is not the absence of a second thread but the
-  /// absence of a reader: it is parked with no attempt to drive, and no
-  /// `ServiceCore` exists yet to answer the frame-polled commands this rule is
-  /// really about. Mutable because `Snapshot()` and `pairing_status()` are const
-  /// and both read state the pairing thread writes.
+  /// `Load` holds it over the four files it reads at boot. On a console the
+  /// pairing thread does not exist yet -- `main()` calls `Load` first -- but in
+  /// the tests' `BootPairable` it does, so what makes that safe is not the
+  /// absence of a second thread but the absence of a reader: it is parked with
+  /// no attempt to drive, and no `ServiceCore` exists yet to answer the
+  /// frame-polled commands this rule is really about. Mutable because
+  /// `Snapshot()` and `pairing_status()` are const and both read state the
+  /// pairing thread writes.
   mutable std::mutex mutex_;
 
   /// How the pairing thread is told there is something to do, and how it is
@@ -1361,10 +1364,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   std::condition_variable wake_;
 
   /// Created by `UsePairingBackend`, and only when it is handed a transport, so
-  /// a console with no `HttpClient` -- which is every console today -- creates no
-  /// thread at all. Not on the first `StartPairing`: see `UsePairingBackend` for
-  /// why a thread this process may fail to create is created at start rather
-  /// than under a user's finger.
+  /// a build with no `HttpClient` -- a host binary that wires none; never a
+  /// console since M1-7 (#126) -- creates no thread at all. Not on the first
+  /// `StartPairing`: see `UsePairingBackend` for why a thread this process may
+  /// fail to create is created at start rather than under a user's finger.
   ///
   /// **Its stack is `kThreadStackBytes`, and that is the number M9-2 (#207)
   /// derived.** It used to be devkitA64's undeclared 128 KiB default, taken out

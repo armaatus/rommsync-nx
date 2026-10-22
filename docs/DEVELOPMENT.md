@@ -676,7 +676,8 @@ a sysmodule pays for a TLS request is therefore:
    cursor. Neither had a row. At the 512 saves `state::kMaxRecords` allowed, the
    tick alone was ~856 KiB, so the bound is now **128 saves**, what the heap
    holds after growing to `0x180000`; each further 64 is ~140 KiB of resident
-   `.bss`, and the image is within 36 KiB of `scripts/image-budget.sh`'s ceiling.
+   `.bss`, and the image was then within 36 KiB of `scripts/image-budget.sh`'s
+   ceiling, and is closer since (the script prints what is left).
 
    M9-21 (#247) counted the last three it found. The **states half of a tick**
    is a fifth phase of the tick's row, pinned under the saves' run phase: the
@@ -902,10 +903,10 @@ Three more errors belong to the transport rather than to any one command:
 different releases), `kMalformedRequest` (a request payload that did not decode)
 and `kTooLarge` (a response that would not fit the cap).
 
-A fourth, `kUnavailable`, belongs to *this stage of the project* rather than to
-the wire: the sysmodule hosts the whole command set from M4-1 on, because the
-overlay needs a service to talk to, while the machinery behind half of it is
-still being built. A command whose engine does not exist yet answers
+A fourth, `kUnavailable`, belonged to *a stage of the project* rather than to
+the wire: the sysmodule hosted the whole command set from M4-1 on, because the
+overlay needed a service to talk to, while the machinery behind half of it was
+still being built. A command whose engine did not exist answered
 `kUnavailable` -- nothing attempted, nothing changed -- rather than a plausible
 refusal that would send a user looking for a full queue or a failing SD card.
 Each of M3-2, M5-3, M5-4 and M7-2 removes its own use of it, and the last one to
@@ -916,13 +917,13 @@ M5-4 took the three list commands, and M7-2 took the last of `SyncNow`'s;
 
 The list commands came off it in a way worth knowing about, because `kOffline`
 does some of the work `kUnavailable` used to. The paging engine is `core/`'s
-(`lists::Service`) and the sysmodule holds one, but **this build has no
-`http::HttpClient` for Horizon** -- M0-1 measured what TLS would cost and nothing
-implements the interface there yet. So on a console the `queue` kind, which is
-served off `queue.json` and never touches the network, works in full, while
-`platforms` and `roms` answer `kOffline`: the same sentence a console with its
-Wi-Fi off gets, which is what a build with no network amounts to.
-`SdEngine::UseServer` is the seam M7-2 filled: `main.cpp` now installs M1-7's
+(`lists::Service`) and the sysmodule holds one. When M5-4 landed **there was no
+`http::HttpClient` for Horizon** -- M0-1 had measured what TLS would cost and
+M1-7 (#126) had not yet built it -- so the `queue` kind, which is served off
+`queue.json` and never touches the network, worked in full, while `platforms`
+and `roms` answered `kOffline`: the same sentence a console with its Wi-Fi off
+gets, which is what a build with no network amounts to, and what a console with
+no link still answers. `SdEngine::UseServer` is the seam M7-2 filled: `main.cpp` now installs M1-7's
 Horizon client through it and starts the worker that drives `PumpLists()` in the
 same breath, which is the pair that had to land together -- a client with no
 worker turns "offline" into "pending" forever. The host suite passes it a libcurl
@@ -1039,7 +1040,8 @@ off-console.** Full strategy in [TESTING.md](TESTING.md); the ladder:
 
 1. **Host build + real docker RomM** — the core engine (auth, sync, downloads,
    config, `state.db`, IPC protocol) compiles native and runs against a genuine
-   RomM 5.2.0 in Docker. There is **no mock**: a passing test means the behaviour
+   RomM in Docker -- 5.4.0 unless `ROMM_VERSION` in `.env` names another
+   ([TESTING.md](TESTING.md#choosing-the-romm-version)). There is **no mock**: a passing test means the behaviour
    is real. Failure modes a healthy RomM will not produce on demand (401
    mid-sync, truncated body, dropped connection, stall) are forced by a fault
    proxy sitting in front of it. Runs in CI. This is the primary loop.

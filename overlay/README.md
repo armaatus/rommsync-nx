@@ -41,9 +41,13 @@ client, and that rule is about ownership rather than about the link map.
   no second config writer here.
 - **Pairing** — the code, the address and the countdown ✅ M4-5
 - **Settings** — the whole effective configuration, every complaint the parser
-  had about it, "Re-pair", and the **root menu** the other four are reached from
-  ✅ M4-4. Read-only: rows are marked where M5-3 (#30) will make them editable,
-  and nothing here writes `config.ini`.
+  had about it, "Re-pair", and the **root menu** the other screens are reached
+  from ✅ M4-4. Read-only: rows are marked where the sysmodule's `SetConfig`
+  (M5-3, #30) accepts an edit, but no screen sends one, and nothing here writes
+  `config.ini`.
+- **Conflicts** — what a sync overwrote, and putting the backup back ✅ M7-1
+  (#131). The one conditional row of the settings menu: `[sync] conflict_show`
+  hides it, and never stops the recording.
 - **Log** — the end of `rommsync.log`, read off the sysmodule rather than the
   card ✅ M9-6 (#209). The last row of the settings menu.
 
@@ -127,23 +131,23 @@ production RomM or a real library.
    first `roms` row reads *the write target* and the rest do not, and that
    **Ⓧ Re-pair** is still on screen with the built-in folder map's eighteen
    sections above it — the prompts are reserved before the list precisely so a
-   long map cannot push them off the bottom. Press **A** on each of the three
-   menu rows and expect the sync, library and pairing screens; **B** comes back
-   to settings, and **B** again to status.
+   long map cannot push them off the bottom. Press **A** on each menu row and
+   expect the sync, library, conflicts, pairing and log screens (conflicts only
+   while `[sync] conflict_show` is on); **B** comes back to settings, and **B**
+   again to status.
 
-8. **Re-pair, as far as it goes.** Press **Ⓧ**, expect *"This starts a new
-   pairing, then discards the one on this console"* — that order is the whole
-   design, not a wording preference — and the button to become
+8. **Re-pair asks before it discards.** Press **Ⓧ**, expect *"This starts a
+   new pairing, then discards the one on this console"* — that order is the
+   whole design, not a wording preference — and the button to become
    *press again to confirm*,
-   and expect **nothing to have happened yet**. Press **Ⓧ** again and — until
-   `SdEngine::StartPairing` is built — expect *"This sysmodule cannot start a
-   pairing yet; this console is still paired"*. Then confirm the console really
-   is still paired: go back to the status screen and expect *Paired*, not
-   *Not paired*. That is the whole point of the gate, and it is the one step
-   here that would be a destroyed pairing if it were wrong.
+   and expect **nothing to have happened yet**: back on the status screen it
+   still reads *Paired*, not *Not paired*. That is the whole point of the gate,
+   and it is the one step here that would be a destroyed pairing if it were
+   wrong. Press **Ⓧ** again and expect step 9: since M1-6 (#123) and M1-7
+   (#126) a configured console starts a real attempt, and only then is the old
+   token discarded.
 
-9. **Pairing.** From the pairing screen (or, once `StartPairing` exists, from
-   *Re-pair*), expect
+9. **Pairing.** From the pairing screen or from *Re-pair*, expect
    *"Contacting the server"* first — never *"Not paired"* — then the eight
    characters and the address, with a countdown that moves. Read the code back
    at arm's length: it is the one string on any of these screens a person has to
@@ -213,11 +217,11 @@ that.
 
 ## Where the work is
 
-**M4 is complete.** All five screens are built on the frame M4-1 landed and the
-`screen_frame.*` M4-2 lifted out of it. What is left for this directory is
-M5-3's editing UI on the settings rows (#30 landed the write path; nothing here
-sends an edit yet), M7-1's conflict UX (#36), and the layout pass against a real
-panel in M8-2 (#44). See milestone M4 in [`../ISSUES.md`](../ISSUES.md).
+**M4 is complete.** Its five screens are built on the frame M4-1 landed and the
+`screen_frame.*` M4-2 lifted out of it, and M7-1 (#131) and M9-6 (#209) added
+the conflicts and log screens on the same frame. What is left for this directory
+is an editing UI on the settings rows (#30 landed the write path; nothing here
+sends an edit yet) and the layout pass against a real panel in M8-2 (#44). See milestone M4 in [`../ISSUES.md`](../ISSUES.md).
 
 The palette (`ColorFor`), the `GetInterfaceVersion` handshake and the
 drop-and-reopen that decides *not running* from *unreachable* now live in
@@ -234,8 +238,10 @@ which writes nothing when it refuses — and only discards the token once a
 pairing is genuinely starting. M1-6 (#123) built `SdEngine::StartPairing` and
 M1-7 (#126) the transport under it, so a configured console now starts a real
 attempt and the common path is a pairing screen with a code on it. The order
-still holds, because an attempt is still refusable for want of a `server.url`,
-and that answers *"This sysmodule cannot start a pairing yet; this console is
-still paired"* with nothing lost.
+still holds, because an attempt is still refusable — for want of a
+`server.url`, which answers *"There is no server to pair with; nothing was
+changed"*, or by a build with no transport, which answers *"This sysmodule
+cannot start a pairing yet; this console is still paired"* — with nothing
+lost.
 
 [libultrahand]: https://github.com/ppkantorski/libultrahand

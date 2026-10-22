@@ -14,7 +14,7 @@
 //   scanning  -- an ambiguous state is skipped, and two states of one name are one
 //   decides   -- the whole decision table, including every keep-both branch
 //
-// ...and five need the real RomM 5.2.0, because they are claims about the
+// ...and five need the real RomM, because they are claims about the
 // server that no fake can be wrong about:
 //
 //   upsert    -- POST /api/states replaces the row with that name, in place

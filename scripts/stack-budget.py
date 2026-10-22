@@ -75,7 +75,7 @@ BOUNDED = re.compile(r"rommsync::json::")
 # copy and erase a red-black tree by recursing down one side of it. A red-black
 # tree of n nodes is at most 2*log2(n+1) tall, and no tree in this process can
 # reach 2^16 nodes -- every node is a heap block of at least 64 bytes, and the
-# whole inner heap is 0x160000 -- so 32 levels bounds every one of them.
+# whole inner heap is 0x180000 -- so 32 levels bounds every one of them.
 TREE = re.compile(r"std::_Rb_tree<")
 TREE_LEVELS = 32
 # The JSON reader's recursions are three and four functions. One much larger is
