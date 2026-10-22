@@ -54,6 +54,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -77,6 +78,17 @@
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
 #include "sized_thread.hpp"
+
+// Named by the tick's phases, which only engine.cpp defines.
+namespace rommsync::conflicts {
+struct RecordOptions;
+}
+namespace rommsync::place {
+class Placer;
+}
+namespace rommsync::sync {
+struct StateSyncReport;
+}
 
 namespace rommsync::sysmodule {
 
@@ -856,6 +868,17 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// a failed sync that uploaded four saves.
   void RecordFailedTickLocked();
 
+  /// How a tick ended, as far as the worker that ran it needs to know.
+  enum class TickRun {
+    /// Ran, or gave up, and recorded either way: `Finished` was called.
+    kFinished,
+    /// **Stopped for a game** (#242): one launched after the worker asked and
+    /// before the first save is planned. Nothing is recorded then -- not
+    /// `Finished`, not the play window -- and the worker hands the tick back to
+    /// the scheduler exactly as if the game had been running when it asked.
+    kHeld,
+  };
+
   /// One scheduled tick, start to finish: scan, `sync::RunTick`, record.
   ///
   /// **Not a second tick loop.** `sync::RunTick` is the loop (sync_tick.hpp) and
@@ -864,25 +887,118 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// here because `conflict_record.hpp` includes `state_sync.hpp`, so recording
   /// from inside the tick would be a cycle.
   ///
-  /// **False when it stopped for a game** (#242): one launched after the worker
-  /// asked and before the first save is planned. Nothing is recorded then --
-  /// not `Finished`, not the play window -- and the caller hands the tick back
-  /// to the scheduler exactly as if the game had been running when it asked.
-  bool RunOneTick();
+  /// It is the phases below, in order (M9-27, #254). Each that can end the tick
+  /// early -- `StartTick`, `ReadServerForTick`, `FetchLibraryForTick` -- records
+  /// the end itself, so the sequence here only has to stop.
+  TickRun RunOneTick();
+
+  /// What a tick runs against (`StartTick`, `ReadServerForTick`), what the card
+  /// held (`ScanForTick`), and what the saves half's plans did (`TallyPlan`).
+  /// Defined in engine.cpp; nothing outside a tick holds one.
+  struct TickInputs;
+  struct TickScan;
+  struct SavesTally;
+
+  /// Snapshot the credentials, the transport, the card and the configuration in
+  /// one slice, register the tick's cancel token, and give up -- recorded --
+  /// when the gate is blocked or there is nothing to sync with. False when the
+  /// tick ended here.
+  bool StartTick(TickInputs* inputs);
+
+  /// M10-2 (#228): the heartbeat when this server has not been read, and the
+  /// floor every tick. False when the tick ended here, recorded.
+  bool ReadServerForTick(TickInputs* inputs);
+
+  /// Step 0's library. A result that is not `ok()` has already been recorded as
+  /// the tick's end.
+  roms::FetchResult FetchLibraryForTick(const TickInputs& inputs);
+
+  /// The baseline, RetroArch's and Tico's layouts, the scan, what negotiate is
+  /// told of it, and M7-4's play sessions.
+  TickScan ScanForTick(const TickInputs& inputs, const roms::FetchResult& library);
+
+  /// `sync::RunTick`'s options for this tick -- and the end of the scan's own
+  /// records, which nothing past here reads (#246).
+  sync::TickOptions SavesOptionsFor(const TickInputs& inputs, const roms::FetchResult& library,
+                                    TickScan* found, place::Placer* placer);
+
+  /// The saves half: `sync::RunTick`, then what it settles -- fresh roms, play
+  /// sessions, the oversized roms' lines -- and every save it held let go before
+  /// the states half (#247). Under `save_write_mutex_`.
+  sync::TickResult RunSavesHalf(const TickInputs& inputs, const roms::FetchResult& library,
+                                sync::TickOptions* options, TickScan* found,
+                                const conflicts::RecordOptions& record, SavesTally* tally);
+
+  /// One plan's operations, counted and recorded as it ends (`TickOptions::on_plan`).
+  void TallyPlan(const sync::SyncPlan& plan, const sync::ExecutionReport& executed,
+                 const std::vector<sync::ClientSaveState>& reported,
+                 const conflicts::RecordOptions& record, SavesTally* tally);
+
+  /// The states half, when it is due and no game started under the saves half;
+  /// `*held` says which. Under `save_write_mutex_`.
+  sync::StateSyncReport RunStatesHalf(const TickInputs& inputs, const roms::FetchResult& library,
+                                      const TickScan& found, place::Placer* placer,
+                                      const conflicts::RecordOptions& record,
+                                      sync::TickOutcome saves, bool* held);
+
+  /// The tick's outcome and counts, under `mutex_`, for `Snapshot` and the
+  /// scheduler.
+  void RecordTick(const sync::TickResult& tick, const sync::StateSyncReport& states,
+                  const SavesTally& tally, bool scan_cut, bool states_held);
+
+  /// Run `write` under `mutex_` -- **unless the server changed** since
+  /// `generation` was read: `ForgetServerLocked` or a wake that asks again
+  /// (`Resume`) bumped `server_generation_`, and what the old server answered
+  /// must not overwrite the "ask again" that stands for the new one. Every
+  /// answer a tick or a drain learns from RomM and keeps goes through here.
+  template <typename Write>
+  void RecordIfCurrent(std::uint64_t generation, Write write);
+
+  /// ...with `mutex_` already held, beside other records that must land with it.
+  template <typename Write>
+  void RecordIfCurrentLocked(std::uint64_t generation, Write write);
+
+  /// The four things every `install::` exchange is sent with, bundled once so
+  /// the remote-install phases pass one argument rather than four in whichever
+  /// order each grew (#254).
+  struct InstallLink {
+    http::HttpClient& client;
+    const std::string& base_url;
+    const auth::StoredToken& token;
+    sync::CallPolicy policy;
+
+    install::Exchange Register(bool remote_install) const {
+      return install::Register(client, base_url, token, remote_install, policy);
+    }
+    install::Claimed Claim() const { return install::Claim(client, base_url, token, policy); }
+    install::Exchange Report(std::string_view request_id, const install::Verdict& verdict) const {
+      return install::Report(client, base_url, token, request_id, verdict, policy);
+    }
+  };
+
+  /// A link whose retries back off on `AwaitBackoff` and stop on `cancel`.
+  InstallLink InstallLinkFor(http::HttpClient& client, const std::string& base_url,
+                             const auth::StoredToken& token, const http::CancelToken* cancel);
 
   /// #245, on a tick: say whether this console takes remote installs, then
   /// claim what the web UI queued for it into the download queue. Outside
   /// `mutex_`. **Never fails the tick** -- every exchange that does not work is
   /// a `download.remote` warning and the next tick asks again.
-  void ServeInstalls(http::HttpClient& client, const auth::StoredToken& token,
-                     const config::Config& config, const server::ServerCapabilities& caps,
-                     const http::CancelToken* cancel);
+  void ServeInstalls(const InstallLink& link, const config::Config& config,
+                     const server::ServerCapabilities& caps);
+
+  /// Downloads went off: settle what finished, then hand every request still
+  /// taken back as failed. True once every one went, which is when the switch
+  /// may be recorded as told.
+  bool WithdrawInstalls(const InstallLink& link, std::uint64_t generation);
+
+  /// Downloads on: settle, then claim what the web UI queued into the queue.
+  void ClaimInstalls(const InstallLink& link, std::uint64_t generation);
 
   /// Report every claimed request whose queue row has finished, and forget the
   /// ones RomM has settled. Called after each drain and before each claim, on
   /// the worker, outside `mutex_`.
-  void SettleInstalls(http::HttpClient& client, const auth::StoredToken& token,
-                      const std::string& base_url, const http::CancelToken* cancel);
+  void SettleInstalls(const InstallLink& link);
 
   /// The restore `RequestRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when

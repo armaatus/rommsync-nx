@@ -43,7 +43,8 @@ namespace rommsync::sysmodule {
 /// call graph of `sys-rommsync.elf` (#207):
 ///
 ///   * the deepest single frame the build compiles is 4,288 bytes
-///     (`io::CopyAtomically`), and `SdEngine::RunOneTick` alone is 3,136;
+///     (`io::CopyAtomically`), and `SdEngine::RunOneTick` alone was 3,136
+///     before #254 split it into phases;
 ///   * `json::Parser` is the one recursion in the tree, bounded by
 ///     `json::kMaxDepth`, which was 64 at ~496 bytes a level -- so ~31 KiB of
 ///     that worst case was JSON nesting the *server* chooses. M9-18 (#216)
