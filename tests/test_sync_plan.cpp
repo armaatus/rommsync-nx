@@ -644,6 +644,21 @@ void RefusesAPlanPastTheBound(checks::Checks& c) {
   c.Expect(over.error.message.find(std::to_string(state::kMaxRecords)) != std::string::npos,
            "...and the bound it passed: " + over.error.message);
   c.Expect(over.value.operations.empty(), "...and hands back no part of it");
+
+  // A caller that keeps some of the answer is bounded by what it keeps (#248):
+  // the #232 resolution asks about a few saves and is answered for every save of
+  // their roms.
+  bool too_large = false;
+  const auth::Parsed<sync::SyncPlan> kept = sync::ParseNegotiateResponse(
+      plan_of(2 * state::kMaxRecords), &too_large,
+      [](const sync::SyncOperation& operation) { return operation.rom_id % 64 == 0; });
+  c.Expect(kept.ok() && !too_large, "an answer past the bound is read when little of it is kept: " +
+                                        kept.error.Describe());
+  c.ExpectEq(kept.value.operations.size(), std::size_t{4}, "...and only what was kept is held");
+  const auth::Parsed<sync::SyncPlan> all_kept = sync::ParseNegotiateResponse(
+      plan_of(state::kMaxRecords + 1), &too_large,
+      [](const sync::SyncOperation&) { return true; });
+  c.Expect(!all_kept.ok() && too_large, "and keeping past the bound is still refused");
 }
 
 }  // namespace

@@ -368,7 +368,9 @@ auth::Answer AnswerOf(NegotiateError error) {
   return auth::Answer::kSilent;
 }
 
-auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body, bool* too_large) {
+auth::Parsed<SyncPlan> ParseNegotiateResponse(
+    std::string_view body, bool* too_large,
+    const std::function<bool(const SyncOperation&)>& keep) {
   auth::Parsed<SyncPlan> parsed;
   if (too_large != nullptr) {
     *too_large = false;
@@ -376,10 +378,13 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body, bool* too_l
   // An operation at a time (`json::ParseEach`): the plan held as one document is
   // ~10x its text, 1.3 MiB at 512 operations on aarch64 (M9-20, #246).
   SyncPlan plan;
+  // A dropped operation's warnings go with it (`keep`).
+  std::vector<std::string> dropped_warnings;
   const json::ParseResult document = json::ParseEach(
       body, "operations",
-      [&plan, too_large](const json::Value& element, std::size_t index) {
-        if (index >= kMaxPlanOperations) {
+      [&plan, too_large, &keep, &dropped_warnings](const json::Value& element,
+                                                   std::size_t index) {
+        if (!keep && index >= kMaxPlanOperations) {
           if (too_large != nullptr) {
             *too_large = true;
           }
@@ -387,11 +392,31 @@ auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body, bool* too_l
                                         " operations one plan may carry");
         }
         SyncOperation operation;
-        const json::Error error = ReadOperation(element, index, &operation, &plan.warnings);
-        if (error.ok()) {
-          plan.operations.push_back(std::move(operation));
+        std::vector<std::string>* warnings = keep ? &dropped_warnings : &plan.warnings;
+        const json::Error error = ReadOperation(element, index, &operation, warnings);
+        if (!error.ok() || !keep) {
+          if (error.ok()) {
+            plan.operations.push_back(std::move(operation));
+          }
+          return error;
         }
-        return error;
+        if (!keep(operation)) {
+          dropped_warnings.clear();
+          return json::Error{};
+        }
+        if (plan.operations.size() >= kMaxPlanOperations) {
+          if (too_large != nullptr) {
+            *too_large = true;
+          }
+          return Fail("operations", "holds more than the " + std::to_string(kMaxPlanOperations) +
+                                        " operations one plan may carry");
+        }
+        for (std::string& warning : dropped_warnings) {
+          plan.warnings.push_back(std::move(warning));
+        }
+        dropped_warnings.clear();
+        plan.operations.push_back(std::move(operation));
+        return json::Error{};
       },
       "negotiate response");
   if (!document.ok()) {
@@ -529,7 +554,8 @@ Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& tok
       // thing beside it (#248, `kHeapTickSaves`'s plan phase).
       std::string().swap(request.body);
       bool too_large = false;
-      auth::Parsed<SyncPlan> parsed = ParseNegotiateResponse(result.response.body, &too_large);
+      auth::Parsed<SyncPlan> parsed =
+          ParseNegotiateResponse(result.response.body, &too_large, options.keep);
       if (parsed.ok()) {
         outcome.plan = std::move(parsed.value);
       } else if (too_large) {

@@ -86,6 +86,20 @@ std::optional<SyncOperation> ResolveNewerOnServer(const SyncOperation& head,
                                                   const ClientSaveState* local,
                                                   const state::SaveRecord* last_synced);
 
+/// The most refused uploads one tick resolves (#248).
+///
+/// Each costs, beside the run it is resolving, its save asked about again, its
+/// entry in the second request, the head the server names, what that becomes
+/// and what running it did -- ~2.4 KiB on aarch64 -- and a plan's every upload
+/// can draw the 409. Unbounded, that was ~300 KiB at `kMaxPlanOperations`
+/// beside the tick's own run, which `sysmodule/source/main.cpp` counts at this
+/// bound instead (`kTickResolveBytes`). **The rest are not lost**: they stay
+/// refused, as one past RomM's rom bound already did, and the next tick
+/// negotiates them again. A 409 is another device uploading to the same slot
+/// between this tick's negotiate and its upload, seconds apart; more than a few
+/// at once is not a thing a console meets.
+inline constexpr std::size_t kMaxResolvedUploads = 8;
+
 /// How hard the resolution tries. `RunTick` fills it from `TickOptions`.
 struct ResolveOptions {
   /// `server::ServerCapabilities::rom_ids`: whether the second negotiation may

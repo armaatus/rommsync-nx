@@ -1193,6 +1193,60 @@ void NewerBounds(rig::Checks& checks) {
                   "as a download of the head the server named");
     checks.Expect(client.downloads > 0, "which is fetched");
   }
+  // Past `kMaxResolvedUploads` refused uploads, the rest wait for the next tick
+  // (#248): each is a save asked about again, a head and its run beside the
+  // tick's own, and a plan's every upload can draw the 409.
+  {
+    const std::size_t refused_uploads = sync::kMaxResolvedUploads + 4;
+    sync::SyncPlan plan;
+    sync::ExecutionReport report;
+    plan.session_id = 8;
+    std::vector<sync::ClientSaveState> reported;
+    for (std::size_t at = 0; at < refused_uploads; ++at) {
+      sync::ClientSaveState save = local;
+      save.slot = "slot-" + std::to_string(at);
+      reported.push_back(save);
+      sync::SyncOperation upload;
+      upload.action = sync::Action::kUpload;
+      upload.action_text = "upload";
+      upload.rom_id = 4;
+      upload.slot = save.slot;
+      plan.operations.push_back(upload);
+      sync::OperationResult result;
+      result.action = sync::Action::kUpload;
+      result.rom_id = 4;
+      result.slot = save.slot;
+      result.outcome = sync::OperationOutcome::kFailed;
+      result.error = sync::OperationError::kNewerOnServer;
+      result.message = "upload rom 4, slot " + *save.slot + ": 409";
+      report.operations.push_back(result);
+      report.warnings.push_back(result.message);
+      ++report.failed;
+    }
+    PlanningClient client;
+    sync::ResolveOptions options;
+    options.negotiate.wait = [](std::chrono::milliseconds) {};
+    options.complete.wait = [](std::chrono::milliseconds) {};
+    const sync::ResolveReport resolved = sync::ResolveRefusedUploads(
+        client, *files, token, reported, found, previous, &plan, &report, options);
+    checks.ExpectEq(resolved.refused, refused_uploads, "every refused upload is counted");
+    std::size_t asked = 0;
+    if (!client.negotiated.empty()) {
+      for (std::size_t at = client.negotiated[0].find("\"file_name\"");
+           at != std::string::npos; at = client.negotiated[0].find("\"file_name\"", at + 1)) {
+        ++asked;
+      }
+    }
+    checks.ExpectEq(asked, sync::kMaxResolvedUploads,
+                    "and the second negotiation asks about no more than one tick resolves");
+    std::size_t still_refused = 0;
+    for (const sync::OperationResult& result : report.operations) {
+      still_refused += result.error == sync::OperationError::kNewerOnServer ? 1 : 0;
+    }
+    checks.Expect(still_refused >= refused_uploads - sync::kMaxResolvedUploads,
+                  "the rest stand refused for the next tick");
+  }
+
   checks.ExpectEq(sandbox.Read(SavePath("Game.srm")), bytes,
                   "and the save is untouched: the fetch went nowhere");
 }

@@ -133,12 +133,15 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
     const bool new_rom =
         std::find(rom_ids.begin(), rom_ids.end(), result.rom_id) == rom_ids.end();
     const ClientSaveState* local = ReportedFor(reported, result.rom_id, result.slot);
-    if (local == nullptr || (new_rom && rom_ids.size() >= kMaxNegotiateRomIds)) {
-      // Past RomM's bound on one scope: not asked about this tick, so it stays
-      // refused and the next tick asks.
+    const bool asked_already = ReportedFor(asked, result.rom_id, result.slot) != nullptr;
+    if (local == nullptr || (new_rom && rom_ids.size() >= kMaxNegotiateRomIds) ||
+        (!asked_already && asked.size() >= kMaxResolvedUploads)) {
+      // Past RomM's bound on one scope, or past what one tick resolves
+      // (`kMaxResolvedUploads`): not asked about this tick, so it stays refused
+      // and the next tick asks.
       continue;
     }
-    if (ReportedFor(asked, result.rom_id, result.slot) == nullptr) {
+    if (!asked_already) {
       asked.push_back(*local);
     }
     if (new_rom) {
@@ -171,6 +174,20 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
   // version back over the player's progress.
   NegotiateOptions unfiltered = options.negotiate;
   unfiltered.emulators.reset();
+  // Of the answer, only the first head for each save asked about is held: the
+  // rom scope answers for every save of those roms, up to a whole plan, beside
+  // the tick's own run (#248). The rest is the next tick's anyway (below).
+  std::vector<bool> headed(asked.size(), false);
+  unfiltered.keep = [&asked, &headed](const SyncOperation& operation) {
+    for (std::size_t at = 0; at < asked.size(); ++at) {
+      if (!headed[at] && asked[at].rom_id == operation.rom_id &&
+          asked[at].slot == operation.slot) {
+        headed[at] = true;
+        return true;
+      }
+    }
+    return false;
+  };
   Negotiation second = options.rom_ids
                            ? NegotiateRoms(client, token, asked, rom_ids, unfiltered)
                            : Negotiate(client, token, asked, unfiltered);

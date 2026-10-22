@@ -508,7 +508,16 @@ struct SyncPlan {
 /// `too_large`, when given, is set to whether that is why it was refused, which
 /// `Negotiate` reports as `NegotiateError::kPlanTooLarge` rather than
 /// `kMalformed`.
-auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body, bool* too_large = nullptr);
+///
+/// `keep`, when given, decides which operations are held (#248): every one is
+/// still read and held to the shape above, and one it answers false to is
+/// dropped as it streams past, its warnings with it. The bound counts what is
+/// held. For the caller that asks a question only some of the answer is about:
+/// the #232 resolution, which plans a few refused uploads and is answered for
+/// every save of their roms.
+auth::Parsed<SyncPlan> ParseNegotiateResponse(
+    std::string_view body, bool* too_large = nullptr,
+    const std::function<bool(const SyncOperation&)>& keep = {});
 
 /// The most operations a plan may carry: as many saves as `state.db` can record
 /// (`state::kMaxRecords`, which `state_db.hpp` asserts this equals).
@@ -655,6 +664,10 @@ struct NegotiateOptions : CallPolicy {
   /// `SyncNegotiatePayload::restore_unlisted`. Only `RunTick`'s negotiation for
   /// freshly downloaded roms sets it (#241).
   bool restore_unlisted = false;
+
+  /// `ParseNegotiateResponse`'s `keep`: the operations of the answer that are
+  /// held. Empty holds every one.
+  std::function<bool(const SyncOperation&)> keep;
 };
 
 /// A plan, or the reason there isn't one. `plan` is left default-constructed on
