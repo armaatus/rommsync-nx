@@ -1392,9 +1392,17 @@ void SdEngine::Resume() {
     // asked again on the next tick -- one unauthenticated heartbeat a wake, and
     // only while the feature is not working. A server that has it on is not
     // asked.
+    //
+    // The generation moves with it, as `ForgetServerLocked`'s does: a tick
+    // `Quiesce` gave up waiting for may still be on its way back, and what its
+    // heartbeat or its claim says must not put the old answer back. Nothing
+    // else is forgotten -- the claims held, the reports given up on and the
+    // registration all stand -- and while remote install is off or refused
+    // nothing claims, so a tick's claims are not lost to the bump.
     if (install_refused_ || !server_caps_.install_enabled) {
       install_refused_ = false;
       server_read_ = false;
+      ++server_generation_;
     }
     // Wake the worker, and **nothing else** that paces it.
     //
@@ -2416,7 +2424,8 @@ bool SdEngine::RunOneTick() {
     conflicts::RecordStates(&history_, states, record);
   }
   writing.unlock();
-  // After the unlock: a verdict this completes is written to the card.
+  // The states half's requests went out on the same token, so what they were
+  // answered counts towards the one verdict, as the saves half's did.
   ObserveAnswer(sync::AnswerOf(states));
   if (states_held) {
     log::Info(log::Event::kSyncHeld,

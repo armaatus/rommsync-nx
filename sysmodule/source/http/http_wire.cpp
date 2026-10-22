@@ -1306,7 +1306,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
   }
 
   result = Exchange(effective, &writer, kDownloadBufferSize);
-  const bool flushed = writer.Finish();
+  const bool finished = writer.Finish();
   const std::uint64_t written = writer.resume_from() + writer.received();
   result.response.body = std::move(writer.error_body());
   if (!result.ok()) {
@@ -1329,7 +1329,7 @@ Result WireHttpClient::Download(const Request& request, const DownloadTarget& ta
     if (!resuming) io::Remove(partial_path);
     return result;
   }
-  if (!flushed) {
+  if (!finished) {
     result.error = http::ErrorForWrite(writer.flush_errno());
     result.message = std::string(writer.flushed() ? "could not make durable "
                                                   : "could not flush ") +

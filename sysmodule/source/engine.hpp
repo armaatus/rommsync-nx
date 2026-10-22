@@ -1225,7 +1225,8 @@ class SdEngine : public ipc::Engine, public power::Sink {
   server::ServerCapabilities server_caps_;
   bool server_read_ = false;
 
-  /// Bumped by `ForgetServerLocked`, and compared by a tick before it records
+  /// Bumped by `ForgetServerLocked` and by a wake that asks again (`Resume`),
+  /// and compared by a tick before it records
   /// what its heartbeat said: a tick that asked the old server must not mark
   /// the new one as read.
   std::uint64_t server_generation_ = 0;
