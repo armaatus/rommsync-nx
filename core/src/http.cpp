@@ -72,6 +72,18 @@ std::string JoinUrl(std::string_view server_url, std::string_view path) {
   return std::string(server_url) + std::string(path);
 }
 
+bool IsUrlPathSegment(std::string_view value) {
+  for (const char byte : value) {
+    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
+                            byte == '_' || byte == '~';
+    if (!unreserved) {
+      return false;
+    }
+  }
+  return !value.empty();
+}
+
 const std::string* FindHeader(const Headers& headers, std::string_view name) {
   for (const Header& header : headers) {
     if (EqualsIgnoreCase(header.name, name)) {

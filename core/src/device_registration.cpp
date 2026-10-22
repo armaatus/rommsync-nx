@@ -18,27 +18,6 @@ namespace {
 
 constexpr const char* kDevicesPath = "/api/devices";
 
-/// The RFC 3986 unreserved set.
-///
-/// A device id is a value read back off the SD card and then pasted into a URL
-/// *path*, which is the one place a stray character stops being data: a `?` or a
-/// `#` truncates the path, a `/` calls a different endpoint, and a `%` invites a
-/// second round of decoding. RomM sends a UUID, which is entirely inside this
-/// set, so nothing legitimate is refused -- this is a check on what a corrupted
-/// or hand-edited `token.dat` can make this client request, not on the id's
-/// format, which is the server's to change.
-bool UrlPathSafe(std::string_view value) {
-  for (const char byte : value) {
-    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
-                            byte == '_' || byte == '~';
-    if (!unreserved) {
-      return false;
-    }
-  }
-  return !value.empty();
-}
-
 http::Request AuthedGet(const std::string& url, const std::string& access_token,
                         std::chrono::milliseconds timeout) {
   http::Request request;
@@ -374,7 +353,10 @@ Registration ConfirmRegistration(http::HttpClient& client, const StoredToken& to
     return Fail(RegistrationError::kNotRegistered,
                 "the stored token names no device; this console is paired but not registered");
   }
-  if (!UrlPathSafe(token.device_id)) {
+  // RomM sends a UUID, entirely inside the set, so nothing legitimate is
+  // refused: this is a check on what a corrupted or hand-edited `token.dat`
+  // can make this client request, not on the id's format.
+  if (!http::IsUrlPathSegment(token.device_id)) {
     return Fail(RegistrationError::kMalformed,
                 "the stored device id is not a value that can be put in a URL");
   }

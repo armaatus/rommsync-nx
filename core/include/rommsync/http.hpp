@@ -114,6 +114,14 @@ const std::string* FindHeader(const Headers& headers, std::string_view name);
 /// literal plus ids this client holds.
 std::string JoinUrl(std::string_view server_url, std::string_view path);
 
+/// True for a non-empty value of RFC 3986's unreserved set only: one an id can
+/// be pasted into a URL *path* as without being escaped. The one place a stray
+/// character stops being data -- a `?` or `#` truncates the path, a `/` calls a
+/// different endpoint than the one checked, a `%` invites a second decoding --
+/// so an id read off the card or out of a response is held to this before
+/// `JoinUrl` takes it.
+bool IsUrlPathSegment(std::string_view value);
+
 /// Percent-encode one query-string *value*, RFC 3986 unreserved set only.
 ///
 /// Every value this client puts in a query string comes off the card or off

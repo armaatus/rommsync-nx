@@ -14,21 +14,6 @@ namespace {
 
 constexpr std::string_view kDevicesPath = "/api/devices/";
 
-/// The RFC 3986 unreserved set, the rule `device_registration.cpp` keeps for a
-/// device id and for the same reason: a request id goes into a URL *path*, where
-/// a `/`, `?` or `%` would call a different endpoint than the one checked.
-bool UrlPathSafe(std::string_view value) {
-  for (const char byte : value) {
-    const bool unreserved = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
-                            (byte >= '0' && byte <= '9') || byte == '-' || byte == '.' ||
-                            byte == '_' || byte == '~';
-    if (!unreserved) {
-      return false;
-    }
-  }
-  return !value.empty();
-}
-
 json::Error Fail(std::string field, std::string message) {
   json::Error error;
   error.field = std::move(field);
@@ -46,7 +31,7 @@ bool TransientStatus(int status) {
 Exchange Send(http::HttpClient& client, http::Request request, const auth::StoredToken& token,
               const sync::CallPolicy& policy, const std::string& what, std::string* body) {
   Exchange exchange;
-  if (!UrlPathSafe(token.device_id)) {
+  if (!http::IsUrlPathSegment(token.device_id)) {
     exchange.transport = http::Error::kInvalidRequest;
     exchange.message = what + " was not sent: the paired device id cannot be a URL path";
     return exchange;
@@ -131,7 +116,7 @@ auth::Parsed<ClaimPage> ParseClaim(std::string_view body, std::size_t max) {
           error.field = where + error.field;
           return error;
         }
-        if (request.id.size() > kMaxRequestIdBytes || !UrlPathSafe(request.id)) {
+        if (request.id.size() > kMaxRequestIdBytes || !http::IsUrlPathSegment(request.id)) {
           return Fail(where + "id", "is not an id this client can put in a URL");
         }
         if (request.rom_id <= 0) {
@@ -249,7 +234,7 @@ Claimed Claim(http::HttpClient& client, std::string_view base_url, const auth::S
 Exchange Report(http::HttpClient& client, std::string_view base_url,
                 const auth::StoredToken& token, std::string_view request_id,
                 const Verdict& verdict, const sync::CallPolicy& policy) {
-  if (!UrlPathSafe(request_id)) {
+  if (!http::IsUrlPathSegment(request_id)) {
     Exchange refused;
     refused.transport = http::Error::kInvalidRequest;
     refused.message = "the report was not sent: the request id cannot be a URL path";

@@ -16,6 +16,7 @@
 #include "harness.hpp"
 #include "rig.hpp"
 #include "rommsync/download.hpp"
+#include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/remote_install.hpp"
 
@@ -75,6 +76,11 @@ void Parse(rig::Checks& checks) {
   const std::string long_id(install::kMaxRequestIdBytes + 1, 'a');
   checks.Expect(!install::ParseClaim(R"([{"id":")" + long_id + R"(","rom_id":5}])").ok(),
                 "an id past kMaxRequestIdBytes is refused, not pasted into a URL");
+  // The one rule a request id and a device id are both held to before a path.
+  checks.Expect(http::IsUrlPathSegment("3f2a-9c_1.x~"), "the unreserved set is a path segment");
+  for (const char* unsafe : {"", "a/b", "a?b", "a#b", "a%2Fb", "a b", ".. /"}) {
+    checks.Expect(!http::IsUrlPathSegment(unsafe), std::string("not a path segment: ") + unsafe);
+  }
 
   // The verdict is the queue row's terminal state.
   using download::QueueState;
