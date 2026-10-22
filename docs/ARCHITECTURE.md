@@ -169,7 +169,7 @@ an older build never writes over a newer file.
 | `config.ini` | `version = N` above the first section; none = 1 | read; a later release migrates in its parser | refused: built-in defaults, one `error`, edits refused ([CONFIG.md](CONFIG.md#version)) |
 | `token.dat` | `"version":N`; none = 1, which is what v1 writes | read | refused as `kNewerFormat`, not read from `.old`, untouched; one `error` on Settings |
 | `device.dat` | none, by design | read | read for `client_device_identifier`, whatever else it carries — refusing would mint a second console |
-| `state.db` | header line | v2 (rc1) read: states and archival rows kept, each slotted row moved to the shared slot its file is synced in now with its server half dropped (#236, `state::AdoptLegacySaves`); v1 discarded, every save rehashed | discarded, every save rehashed |
+| `state.db` | header line | v2 (rc1) read, at rc1's own bounds (512 rows, 128 KiB) and streamed past this build's: states and archival rows kept first, slotted rows up to `kMaxRecords` (the rest rehashed), each moved to the shared slot its file is synced in now with its server half dropped (#236, `state::AdoptLegacySaves`); v1 discarded, every save rehashed | discarded, every save rehashed |
 | `conflicts.db` | header line | read | refused and never written over: this boot's entries stay in memory, the backups stay on the card |
 | `queue.json` | `"version"` | read | discarded; the user queues again |
 | `play.db` | header line | read | discarded: unsent play time is lost, nothing else |

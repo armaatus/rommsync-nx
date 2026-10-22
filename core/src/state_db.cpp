@@ -7,7 +7,6 @@
 #include <cstdio>
 #include <functional>
 #include <map>
-#include <set>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -387,10 +386,245 @@ void Add(std::vector<std::string>* diagnostics, std::string message) {
   }
 }
 
-/// Read at most `kMaxStateBytes` of `path`. The bound and its reasoning are
-/// `io::ReadBounded`'s, shared with `config.ini` rather than restated here.
-io::BoundedRead ReadBounded(const std::string& path, std::string* out) {
-  return io::ReadBounded(path, kMaxStateBytes, out);
+/// The bounds rc1 wrote its version 2 file at, before #246 cut them to
+/// `kMaxRecords` and `kMaxStateBytes`. A v2 file is read at these, once, on the
+/// boot after the upgrade -- and only so many of its rows are kept as this
+/// build's bound holds (`Parser`).
+constexpr std::size_t kRc1MaxRecords = 512;
+constexpr std::size_t kRc1MaxStateBytes = 128 * 1024;
+
+/// The longest line a streamed read holds: a row is a few hundred bytes, and a
+/// line past this is not one any build wrote.
+constexpr std::size_t kMaxLineBytes = 4 * 1024;
+
+/// A `state.db`, a line at a time, so a file can be read without its text held
+/// whole (`Load`).
+///
+/// **Never more than `kMaxRecords` rows kept**, which is what the heap holds of
+/// a baseline (`kHeapStateBaseline`). Only an rc1 file can have more, and of
+/// that, states and archival rows are kept first -- nothing rebuilds a state's
+/// row, and an archival row is keyed as it was -- and slotted save rows fill
+/// what is left, the rest let go: each costs its save one re-hash.
+class Parser {
+ public:
+  /// One line, without its `\n`.
+  void Line(std::string_view line) {
+    line = TrimCarriageReturn(line);
+    if (++number_ == 1) {
+      // The version before #236 is read too: its rows are this version's, keyed
+      // on slots that moved, and they are the migration's input
+      // (`legacy_saves`).
+      version_ = line == FormatHeader() ? kFormatVersion
+                 : line == std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion)
+                     ? kSourceSlotVersion
+                     : 0;
+      return;
+    }
+    if (version_ == 0 || over_) {
+      return;
+    }
+    if (line.empty()) {
+      // A trailing newline is how every file this writes ends; only a blank
+      // line with a row after it is a complaint.
+      blank_ = blank_ == 0 ? number_ : blank_;
+      return;
+    }
+    if (blank_ != 0) {
+      Add(&complaints_, "state.db line " + std::to_string(blank_) + " is blank");
+      blank_ = 0;
+    }
+    if (++rows_ > Bound()) {
+      over_ = true;
+      return;
+    }
+    Row(line);
+  }
+
+  int version() const { return version_; }
+
+  LoadedBaseline Finish() {
+    LoadedBaseline loaded;
+    if (version_ == 0) {
+      // Includes an empty file and a truncated first line. Naming the expected
+      // header rather than quoting what was found: the found bytes may be
+      // anything a corrupt card region holds.
+      loaded.diagnostics.push_back("state.db does not begin with \"" + FormatHeader() +
+                                   "\"; the baseline is discarded and every save is hashed");
+      return loaded;
+    }
+    if (over_) {
+      loaded.diagnostics.push_back("state.db holds more than the " + std::to_string(Bound()) +
+                                   " rows a baseline may have; it is discarded and every save "
+                                   "is hashed");
+      return loaded;
+    }
+    if (!complaints_.empty()) {
+      // All of it, not the rows that parsed. A truncation leaves a prefix that
+      // is individually well-formed and collectively a lie -- the saves written
+      // before the interruption and none of the ones after -- and a caller
+      // cannot tell that apart from a complete file. Dropping the lot costs one
+      // tick of hashing; trusting half of it costs a comparison that is quietly
+      // wrong.
+      loaded.diagnostics = std::move(complaints_);
+      // Unconditionally, not through `Add`: the per-row complaints are capped,
+      // and a file bad enough to hit the cap is exactly the one whose reader
+      // most needs to be told the *whole* baseline went.
+      loaded.diagnostics.push_back(
+          "state.db is not intact; the whole baseline is discarded and every save is hashed");
+      return loaded;
+    }
+    if (dropped_ > 0) {
+      loaded.diagnostics.push_back(
+          "state.db was written by rc1, past the " + std::to_string(kMaxRecords) +
+          " rows this build reads; its states and archival rows were kept first, and " +
+          std::to_string(dropped_) + " row(s) were let go -- those saves are hashed again");
+    }
+    loaded.value = std::move(baseline_);
+    loaded.legacy_saves = std::move(legacy_);
+    loaded.version = version_;
+    return loaded;
+  }
+
+ private:
+  std::size_t Bound() const {
+    return version_ == kSourceSlotVersion ? kRc1MaxRecords : kMaxRecords;
+  }
+
+  /// Whether a row more than this build's bound would be kept: a held-apart
+  /// save row is let go for it, or, with none left, the row itself.
+  bool Room() {
+    if (baseline_.size() + legacy_.size() < kMaxRecords) {
+      return true;
+    }
+    ++dropped_;
+    if (legacy_.empty()) {
+      return false;
+    }
+    legacy_.pop_back();
+    return true;
+  }
+
+  void Row(std::string_view line) {
+    const std::string where = "state.db line " + std::to_string(number_) + ": ";
+    const json::ParseResult document = json::Parse(line);
+    if (!document.ok()) {
+      Add(&complaints_, where + document.error.Describe());
+      return;
+    }
+    std::string why;
+    switch (KindOf(document.value, &why)) {
+      case RowKind::kSave: {
+        SaveRecord record;
+        if (!ParseSaveRecord(document.value, &record, &why)) {
+          Add(&complaints_, where + why);
+          return;
+        }
+        const bool held_apart = version_ == kSourceSlotVersion && record.slot.has_value();
+        const bool second =
+            held_apart ? std::any_of(legacy_.begin(), legacy_.end(),
+                                     [&record](const SaveRecord& held) {
+                                       return held.rom_id == record.rom_id &&
+                                              held.slot == record.slot;
+                                     })
+                       : baseline_.Find(record.rom_id, record.slot) != nullptr;
+        if (second) {
+          Add(&complaints_, where + "a second row for the same (rom_id, slot)");
+          return;
+        }
+        if (!Room()) {
+          return;
+        }
+        if (held_apart) {
+          legacy_.push_back(std::move(record));
+        } else {
+          baseline_.Set(std::move(record));
+        }
+        return;
+      }
+      case RowKind::kState: {
+        StateRecord record;
+        if (!ParseStateRecord(document.value, &record, &why)) {
+          Add(&complaints_, where + why);
+          return;
+        }
+        if (baseline_.FindState(record.rom_id, record.file_name) != nullptr) {
+          Add(&complaints_, where + "a second row for the same (rom_id, file_name) state");
+          return;
+        }
+        if (Room()) {
+          baseline_.SetState(std::move(record));
+        }
+        return;
+      }
+      case RowKind::kUnknown:
+        Add(&complaints_, where + why);
+        return;
+    }
+  }
+
+  std::size_t number_ = 0;
+  std::size_t blank_ = 0;
+  std::size_t rows_ = 0;
+  std::size_t dropped_ = 0;
+  int version_ = 0;
+  bool over_ = false;
+  Baseline baseline_;
+  std::vector<SaveRecord> legacy_;
+  std::vector<std::string> complaints_;
+};
+
+/// Read `path` and parse it into `*out`, or say why not.
+///
+/// At most `kMaxStateBytes`, `io::ReadBounded`'s bound and reasoning, shared
+/// with `config.ini`. Past it, the file is read on only while it is rc1's
+/// version 2 within rc1's bound -- a line at a time, its text never held, so it
+/// costs the heap what a file inside this build's bound does.
+io::BoundedRead Load(const std::string& path, LoadedBaseline* out) {
+  {
+    std::string contents;
+    const io::BoundedRead outcome = io::ReadBounded(path, kMaxStateBytes, &contents);
+    if (outcome != io::BoundedRead::kTooLarge) {
+      if (outcome == io::BoundedRead::kOk) {
+        *out = ParseBaseline(contents);
+      }
+      return outcome;
+    }
+  }
+  std::FILE* file = std::fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    return io::BoundedRead::kUnreadable;
+  }
+  Parser parser;
+  std::string line;
+  char buffer[1024];
+  std::size_t total = 0;
+  std::size_t got = 0;
+  bool fits = true;
+  while (fits && (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    total += got;
+    fits = total <= kRc1MaxStateBytes;
+    for (std::size_t at = 0; fits && at < got; ++at) {
+      if (buffer[at] != '\n') {
+        line.push_back(buffer[at]);
+        fits = line.size() <= kMaxLineBytes;
+        continue;
+      }
+      parser.Line(line);
+      line.clear();
+      fits = parser.version() == kSourceSlotVersion;
+    }
+  }
+  const bool failed = std::ferror(file) != 0;
+  std::fclose(file);
+  if (failed) {
+    return io::BoundedRead::kUnreadable;
+  }
+  if (!fits) {
+    return io::BoundedRead::kTooLarge;
+  }
+  parser.Line(line);
+  *out = parser.Finish();
+  return io::BoundedRead::kOk;
 }
 
 }  // namespace
@@ -480,126 +714,17 @@ std::string SerializeBaseline(const Baseline& baseline) {
 }
 
 LoadedBaseline ParseBaseline(std::string_view text) {
-  LoadedBaseline loaded;
-
-  std::vector<std::string_view> lines;
+  Parser parser;
   for (std::size_t at = 0; at <= text.size();) {
     const std::size_t end = text.find('\n', at);
     const std::size_t stop = end == std::string_view::npos ? text.size() : end;
-    lines.push_back(TrimCarriageReturn(text.substr(at, stop - at)));
+    parser.Line(text.substr(at, stop - at));
     if (end == std::string_view::npos) {
       break;
     }
     at = end + 1;
   }
-  // A trailing newline is how every file this writes ends; it is not a row.
-  while (!lines.empty() && lines.back().empty()) {
-    lines.pop_back();
-  }
-
-  // The version before #236 is read too: its rows are this version's, keyed on
-  // slots that moved, and they are the migration's input (`legacy_saves`).
-  const std::string source_slot_header =
-      std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion);
-  const int version = lines.empty()                         ? 0
-                      : lines.front() == FormatHeader()     ? kFormatVersion
-                      : lines.front() == source_slot_header ? kSourceSlotVersion
-                                                            : 0;
-  if (version == 0) {
-    // Includes an empty file and a truncated first line. Naming the expected
-    // header rather than quoting what was found: the found bytes may be
-    // anything a corrupt card region holds.
-    loaded.diagnostics.push_back("state.db does not begin with \"" + FormatHeader() +
-                                 "\"; the baseline is discarded and every save is hashed");
-    return loaded;
-  }
-
-  const std::size_t rows = lines.size() - 1;
-  if (rows > kMaxRecords) {
-    loaded.diagnostics.push_back("state.db holds more than the " + std::to_string(kMaxRecords) +
-                                 " rows a baseline may have; it is discarded and every save is "
-                                 "hashed");
-    return loaded;
-  }
-
-  Baseline baseline;
-  std::vector<SaveRecord> legacy;
-  std::set<Baseline::Key> legacy_keys;
-  std::vector<std::string> complaints;
-  for (std::size_t at = 1; at < lines.size(); ++at) {
-    if (lines[at].empty()) {
-      Add(&complaints, "state.db line " + std::to_string(at + 1) + " is blank");
-      continue;
-    }
-    const json::ParseResult document = json::Parse(lines[at]);
-    if (!document.ok()) {
-      Add(&complaints,
-          "state.db line " + std::to_string(at + 1) + ": " + document.error.Describe());
-      continue;
-    }
-    std::string why;
-    switch (KindOf(document.value, &why)) {
-      case RowKind::kSave: {
-        SaveRecord record;
-        if (!ParseSaveRecord(document.value, &record, &why)) {
-          Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
-          continue;
-        }
-        const bool held_apart = version == kSourceSlotVersion && record.slot.has_value();
-        const bool second = held_apart
-                                ? !legacy_keys.emplace(record.rom_id, record.slot).second
-                                : baseline.Find(record.rom_id, record.slot) != nullptr;
-        if (second) {
-          Add(&complaints, "state.db line " + std::to_string(at + 1) +
-                               ": a second row for the same (rom_id, slot)");
-          continue;
-        }
-        if (held_apart) {
-          legacy.push_back(std::move(record));
-        } else {
-          baseline.Set(std::move(record));
-        }
-        break;
-      }
-      case RowKind::kState: {
-        StateRecord record;
-        if (!ParseStateRecord(document.value, &record, &why)) {
-          Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
-          continue;
-        }
-        if (baseline.FindState(record.rom_id, record.file_name) != nullptr) {
-          Add(&complaints, "state.db line " + std::to_string(at + 1) +
-                               ": a second row for the same (rom_id, file_name) state");
-          continue;
-        }
-        baseline.SetState(std::move(record));
-        break;
-      }
-      case RowKind::kUnknown:
-        Add(&complaints, "state.db line " + std::to_string(at + 1) + ": " + why);
-        continue;
-    }
-  }
-
-  if (!complaints.empty()) {
-    // All of it, not the rows that parsed. A truncation leaves a prefix that is
-    // individually well-formed and collectively a lie -- the saves written
-    // before the interruption and none of the ones after -- and a caller cannot
-    // tell that apart from a complete file. Dropping the lot costs one tick of
-    // hashing; trusting half of it costs a comparison that is quietly wrong.
-    loaded.diagnostics = std::move(complaints);
-    // Unconditionally, not through `Add`: the per-row complaints are capped, and
-    // a file bad enough to hit the cap is exactly the one whose reader most
-    // needs to be told the *whole* baseline went, not just the rows named above.
-    loaded.diagnostics.push_back(
-        "state.db is not intact; the whole baseline is discarded and every save is hashed");
-    return loaded;
-  }
-
-  loaded.value = std::move(baseline);
-  loaded.legacy_saves = std::move(legacy);
-  loaded.version = version;
-  return loaded;
+  return parser.Finish();
 }
 
 std::size_t AdoptLegacySaves(
@@ -634,10 +759,10 @@ std::size_t AdoptLegacySaves(
 }
 
 LoadedBaseline LoadBaseline(const std::string& path) {
-  std::string contents;
-  const io::BoundedRead outcome = ReadBounded(path, &contents);
+  LoadedBaseline loaded;
+  const io::BoundedRead outcome = Load(path, &loaded);
   if (outcome == io::BoundedRead::kOk) {
-    return ParseBaseline(contents);
+    return loaded;
   }
 
   if (outcome == io::BoundedRead::kMissing) {
@@ -646,9 +771,8 @@ LoadedBaseline LoadBaseline(const std::string& path) {
     // baseline is sitting under `.old`. `token_store`, `device_identity` and
     // `config` recover from it the same way, and only from a *missing* file.
     const std::string previous_path = io::PreviousPathFor(path);
-    std::string previous;
-    if (ReadBounded(previous_path, &previous) == io::BoundedRead::kOk) {
-      LoadedBaseline recovered = ParseBaseline(previous);
+    LoadedBaseline recovered;
+    if (Load(previous_path, &recovered) == io::BoundedRead::kOk) {
       // Whatever came back, this branch answers -- including an empty baseline.
       // Falling through to the `kMissing` case would report "does not exist
       // yet", the message a brand-new card produces, and drop `recovered`'s
@@ -671,7 +795,6 @@ LoadedBaseline LoadBaseline(const std::string& path) {
     }
   }
 
-  LoadedBaseline loaded;
   switch (outcome) {
     case io::BoundedRead::kMissing:
       // Not a failure: it is the first tick on this card, or a baseline that
