@@ -60,6 +60,8 @@
 //                is back from download::Drain before the acknowledgement
 //   foreground -- M10-16: nothing reaches the server or the card while a game
 //                runs, and one tick runs once it closes
+//   remote_install -- M10-19: a rom queued in RomM's web UI is claimed on a tick,
+//                downloaded, and reported done
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -98,6 +100,7 @@
 #include "rommsync/md5.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "rommsync/pairing.hpp"
+#include "rommsync/remote_install.hpp"
 #include "rommsync/server_capabilities.hpp"
 #include "rommsync/sha1.hpp"
 #include "rommsync/token_store.hpp"
@@ -108,6 +111,7 @@ namespace conflicts = rommsync::conflicts;
 namespace download = rommsync::download;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
+namespace install = rommsync::install;
 namespace ipc = rommsync::ipc;
 // Aliased `rlog` and not `log`: at global scope that name is already taken by
 // `::log`, the C library's logarithm, and GCC refuses a namespace alias that
@@ -4733,6 +4737,99 @@ int DownloadRestores(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #245's acceptance: a rom queued for this console in RomM's web UI is
+/// claimed on a tick, downloaded through the queue, and reported done.
+///
+/// A device of its own, paired for real: the install endpoints answer only to
+/// the token bound to the device, and the fixture's device is every rig
+/// process's.
+int RemoteInstall(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  const std::string name = "engine-remote-install";
+  const auth::StoredToken token = harness::PairDevice(c, client, base, name);
+  if (rom.id == 0 || token.device_id.empty()) {
+    return c.failures();
+  }
+  // A re-run adopts its row: end whatever an earlier one left taken, and
+  // withdraw the capability, so the first tick is what registers it.
+  for (const install::Request& left : install::Claim(client, base, token).page.requests) {
+    install::Report(client, base, token, left.id, {install::Outcome::kFailed, "an earlier run"});
+  }
+  install::Register(client, base, token, false);
+  const auto queue_in_browser = [&] {
+    return rig::AsTheUser(client, base, "/api/devices/" + token.device_id + "/installs",
+                          "{\"rom_id\":" + std::to_string(rom.id) + "}");
+  };
+  c.ExpectEq(queue_in_browser().response.status, 400,
+             "before the console has ticked, the web UI cannot queue for it");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, name);
+  if (!console.sandbox.Write("/config/rommsync/config.ini",
+                             "[server]\nurl = " + base +
+                                 "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                 "on_boot = false\nstates = false\n") ||
+      !auth::SaveToken(console.directory + auth::kTokenFileName, token).ok()) {
+    c.Expect(false, "the console is configured and paired as its own device");
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.Boot();
+  console.engine.StartWorker();
+
+  TickOnce(console, ticks, c, "the first tick");
+  const http::Result queued = queue_in_browser();
+  c.ExpectEq(queued.response.status, 201,
+             "after it, the console accepts remote installs and the web UI queues nova: " +
+                 queued.response.body.substr(0, 200));
+
+  // Claimed by the next tick, then downloaded by the queue, then reported.
+  TickOnce(console, ticks, c, "the tick that claims");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  const auto open = [&] {
+    // The device's own claim takes nothing new -- the console already took it
+    // -- and lists what is still taken, which a report ends.
+    return install::Claim(client, base, token).page.requests.size();
+  };
+  while ((!console.sandbox.Exists("/tico/roms/nes/nova.nes") || open() != 0) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+  }
+  c.Expect(console.sandbox.Exists("/tico/roms/nes/nova.nes"),
+           "the rom the browser queued is on the card" + Rendered(console.Log()));
+  c.ExpectEq(open(), std::size_t{0}, "and the request is ended, not left taken");
+
+  http::Request notifications;
+  notifications.url = base + "/api/notifications";
+  notifications.headers.push_back(
+      {"Authorization", "Basic " + rig::Base64(std::string(rig::kUser) + ":" + rig::kPassword)});
+  c.Expect(client.Send(notifications)
+                   .response.body.find("\"device_name\":\"rommsync-nx " + name +
+                                       "\",\"status\":\"done\"") != std::string::npos,
+           "RomM was told it is done, and told the user");
+  c.Expect(Logged(console.Log(), "install.remote"), "the console's log says so too");
+
+  // The download asks for a tick of its own (#241); let it end before teardown.
+  while ((ticks.ticks() < 3 || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  harness::DeleteDevice(client, base, fixture, token.device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -4764,6 +4861,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"interop", Interop},
       {"upgrade", Upgrade},
       {"placement", Placement},
+      {"remote_install", RemoteInstall},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
