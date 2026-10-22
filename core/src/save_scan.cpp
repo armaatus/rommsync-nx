@@ -718,19 +718,30 @@ std::vector<ScanFolder> PlanFolders(const config::Config& config,
   return plan;
 }
 
+/// What `Walk`'s `on_match` did with a file that survived the walk's checks.
+enum class Emit {
+  kSkipped,    // a skip it recorded itself: a duplicate, an unusable record
+  kEmitted,    // a record
+  kPastBound,  // a record it would have emitted, but the walk's bound is spent
+};
+
 /// The half of both walks that is the same, which is nearly all of it.
 ///
 /// It reads each folder once, sorts its entries, matches the base name against
 /// the rom index under the folder's platform hint and range-checks the mtime --
 /// then hands what survived to `on_match` with the folder's `SaveSource`, which
-/// returns whether it emitted a record. Every decision in here is one
+/// says what it did with it (`Emit`). Every decision in here is one
 /// docs/SYNC_PROTOCOL.md states about the scan rather than about saves in
 /// particular, which is why a state gets the same one instead of a second copy
 /// that could drift from it.
 ///
 /// `limit` is how many records the caller may emit before the walk stops and
 /// says so; the two kinds have different budgets against one shared baseline
-/// file (`scan::kMaxSaves`, `scan::kMaxStates`).
+/// file (`scan::kMaxSaves`, `scan::kMaxStates`). It counts records, not files:
+/// the walk stops at the first record past it, which `on_match` -- told the
+/// budget is spent -- decides only once its own duplicate and validity checks
+/// have passed. A card holding exactly the bound's saves and a file that is no
+/// save after them is a card read whole (#246).
 template <class OnMatch>
 void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::RomIndex& index,
           fs::FileSystem& files, std::size_t limit, SkipReason limit_reason,
@@ -784,12 +795,6 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
       ++result->files_seen;
       const std::string sd_path = Join(directory, entry.name);
 
-      if (emitted >= limit) {
-        record_skip(limit_reason, sd_path, limit_message);
-        result->stopped_at_bound = true;
-        return;
-      }
-
       int card = 1;
       // RetroArch's Auto state, `Game.state.auto`, is matched by `Game` (#239).
       const roms::Match match =
@@ -825,8 +830,14 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
         continue;
       }
 
-      if (on_match(sd_path, entry, *match.rom, folder.source, card, record_skip)) {
+      const Emit emit = on_match(sd_path, entry, *match.rom, folder.source, card,
+                                 emitted >= limit, record_skip);
+      if (emit == Emit::kEmitted) {
         ++emitted;
+      } else if (emit == Emit::kPastBound) {
+        record_skip(limit_reason, sd_path, limit_message);
+        result->stopped_at_bound = true;
+        return;
       }
     }
   }
@@ -865,7 +876,8 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
            " saves; the rest of this card was not read",
        &result,
        [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
-           const SaveSource& folder_source, int card, const auto& record_skip) {
+           const SaveSource& folder_source, int card, bool past_bound,
+           const auto& record_skip) {
          // Per rom rather than per folder: RetroArch's flat folder holds every
          // system, and the id is the platform's.
          const SaveSource source = ResolveSource(folder_source, rom.platform_fs_slug, config);
@@ -901,14 +913,17 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
          const sync::ClientSaveState negotiated = save.ToClientSaveState();
          if (const json::Error error = sync::Validate(negotiated); !error.ok()) {
            record_skip(SkipReason::kUnusable, sd_path, error.Describe());
-           return false;
+           return Emit::kSkipped;
          }
 
          if (!claimed.emplace(save.rom_id, save.slot).second) {
            record_skip(SkipReason::kDuplicateSlot, sd_path,
                        "rom " + std::to_string(save.rom_id) + " already has a save in slot \"" +
                            save.slot + "\" this tick; only the first is synced");
-           return false;
+           return Emit::kSkipped;
+         }
+         if (past_bound) {
+           return Emit::kPastBound;  // a save, and the first one the walk has no room for
          }
 
          // Hashed last, after the record is known to be one that will be
@@ -933,7 +948,7 @@ ScanResult ScanSaves(const config::Config& config, const retroarch::Settings& re
          }
 
          result.saves.push_back(std::move(save));
-         return true;
+         return Emit::kEmitted;
        });
   return result;
 }
@@ -964,7 +979,8 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
            " states; the rest of this card was not read",
        &result,
        [&](const std::string& sd_path, const fs::Entry& entry, const roms::Rom& rom,
-           const SaveSource& folder_source, int /*card*/, const auto& record_skip) {
+           const SaveSource& folder_source, int /*card*/, bool past_bound,
+           const auto& record_skip) {
          StateFile file;
          file.rom_id = rom.id;
          file.sd_path = sd_path;
@@ -989,7 +1005,7 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
          if (!sync::IsSingleFileName(file.file_name)) {
            record_skip(SkipReason::kUnusable, sd_path,
                        "its name is not one this client can use as a pairing key");
-           return false;
+           return Emit::kSkipped;
          }
 
          if (!claimed.emplace(file.rom_id, file.file_name).second) {
@@ -998,7 +1014,10 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
                            file.file_name +
                            "\" this tick; RomM stores one state per name, so only the first is "
                            "synced");
-           return false;
+           return Emit::kSkipped;
+         }
+         if (past_bound) {
+           return Emit::kPastBound;
          }
 
          const std::string real_path = files.Resolve(file.sd_path);
@@ -1017,7 +1036,7 @@ ScanResult ScanStates(const config::Config& config, const retroarch::Settings& r
          }
 
          result.states.push_back(std::move(file));
-         return true;
+         return Emit::kEmitted;
        });
   return result;
 }
