@@ -17,6 +17,7 @@
 #include "rommsync/hash_file.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/newer_release.hpp"
 #include "rommsync/sync.hpp"
 
 namespace rommsync::state {
@@ -418,6 +419,7 @@ class Parser {
                  : line == std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion)
                      ? kSourceSlotVersion
                      : 0;
+      newer_ = records::NewerVersion(line, kFormatMagic, kFormatVersion);
       return;
     }
     if (version_ == 0 || over_) {
@@ -442,8 +444,22 @@ class Parser {
 
   int version() const { return version_; }
 
+  /// A later release's version, read off the header, or zero. Its rows are not
+  /// read: they are the ones this build would misread.
+  int newer() const { return newer_; }
+
   LoadedBaseline Finish() {
     LoadedBaseline loaded;
+    if (newer_ > 0) {
+      // Not "does not begin with": nothing is wrong with the file, and that
+      // sentence reads as a card going bad. The policy is the one #205 states --
+      // a baseline is rebuilt from the card -- so this is a re-hash, said as the
+      // other records say a newer release's file.
+      loaded.diagnostics.push_back(records::NewerRelease(
+          "state.db", std::to_string(newer_), kFormatVersion,
+          "its baseline is discarded and rebuilt from the card, so every save is hashed once"));
+      return loaded;
+    }
     if (version_ == 0) {
       // Includes an empty file and a truncated first line. Naming the expected
       // header rather than quoting what was found: the found bytes may be
@@ -567,6 +583,7 @@ class Parser {
   std::size_t rows_ = 0;
   std::size_t dropped_ = 0;
   int version_ = 0;
+  int newer_ = 0;
   bool over_ = false;
   Baseline baseline_;
   std::vector<SaveRecord> legacy_;
