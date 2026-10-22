@@ -1628,6 +1628,11 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
       // Downloads went off with requests taken, or before a reboot left some:
       // nothing here will fetch them, so the browser is told now rather than
       // left waiting out the request's expiry. Once per switch, not per tick.
+      //
+      // A request whose rom already settled is reported for what it is first --
+      // done, already installed -- as the `wanted` path does; the claim then
+      // hands back only what is still taken.
+      SettleInstalls(client, token, config.server.url, cancel);
       const install::Claimed held = install::Claim(client, config.server.url, token, policy);
       for (const install::Request& request : held.page.requests) {
         install::Report(client, config.server.url, token, request.id,
