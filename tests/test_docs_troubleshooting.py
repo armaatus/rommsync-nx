@@ -259,6 +259,12 @@ def phase_events(args) -> int:
 
 # --- emitted ------------------------------------------------------------------
 
+def strip_comments(text: str) -> str:
+    """`text` with its comments removed: the two passes this used to be."""
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", text)
+
+
 def phase_emitted(args) -> int:
     repo = args.repo
     known = events(repo)
@@ -282,9 +288,20 @@ def phase_emitted(args) -> int:
     # the raw text would stay green after somebody deleted a call and left the
     # paragraph above it -- exactly the rot this phase exists to catch. `///`
     # doc comments are covered by the line rule.
-    body = "\n".join(read(path) for path in sources)
-    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.DOTALL)
-    body = re.sub(r"//[^\n]*", "", body)
+    # The stripper is held to the two shapes that once hid a real call site
+    # (PR #252's host-tests): a `/*` inside a line comment (`services/*.c`) and
+    # one inside a string (`"Accept: */*"`). Read as openers, each swallowed
+    # everything to the next `*/` -- in whichever file `os.walk` listed next, so
+    # it failed on Linux's order and passed on macOS's.
+    tricky = ('// services/*.c\nWarn(Event::kA);\n'
+              'const char* h = "Accept: */*";\nInfo(Event::kB); /* c */ Info(Event::kC);\n')
+    kept = strip_comments(tricky)
+    for name in ("kA", "kB", "kC"):
+        if f"Event::{name}" not in kept:
+            return fail(f"the comment stripper swallowed Event::{name}: a `/*` in a line "
+                        "comment or a string was read as a block comment")
+
+    body = "\n".join(strip_comments(read(path)) for path in sorted(sources))
 
     # A *call*, not a mention: one of the five entry points, an open paren, and
     # the event within the same statement. The level argument in between may be a
