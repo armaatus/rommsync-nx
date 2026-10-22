@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "harness.hpp"
+#include "rommsync/config.hpp"
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
@@ -794,6 +795,55 @@ void Advance(rig::Checks& checks) {
     checks.Expect(!fitted.warnings.empty(), "...and the drop is said");
     checks.Expect(state::SaveBaseline(files->Resolve(sync::kStateSdPath), fitted.value).ok(),
                   "so the file can be written");
+  }
+
+  // The other file-level bound is bytes. Rows inside `kMaxRecords` can still
+  // outgrow `kMaxStateBytes` -- slots at their longest, many rows marked
+  // `deleted_on_server`, states with long names -- and `SaveBaseline` refuses
+  // that file whole just the same, losing this tick's marks with it (#233).
+  {
+    state::Baseline wide;
+    std::vector<sync::ClientSaveState> all;
+    const std::string slot(rommsync::config::kMaxSlotLength, 's');
+    const std::size_t saves = 100;
+    for (std::size_t index = 0; index < saves; ++index) {
+      state::SaveRecord row;
+      row.rom_id = static_cast<std::int64_t>(3000 + index);
+      row.slot = slot;
+      row.content_hash = crypto::Md5Hex("wide save " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.file_size_bytes = 1;
+      row.deleted_on_server = true;
+      wide.Set(row);
+      all.push_back(ReportedSave(row.rom_id, slot, row.content_hash, kReportedMtime, 1));
+    }
+    for (std::size_t index = 0; index < state::kMaxRecords - saves; ++index) {
+      state::StateRecord row;
+      row.rom_id = static_cast<std::int64_t>(3000 + index);
+      row.file_name = std::string(200, 'n') + std::to_string(index) + ".state";
+      row.content_hash = crypto::Md5Hex("wide state " + std::to_string(index));
+      row.mtime = sync::Timestamp{} + std::chrono::seconds{kReportedMtime};
+      row.server_state_id = static_cast<std::int64_t>(index) + 1;
+      row.server_updated_at = row.mtime;
+      wide.SetState(row);
+    }
+    checks.Expect(wide.size() <= state::kMaxRecords &&
+                      state::SerializeBaseline(wide).size() > state::kMaxStateBytes,
+                  "the case is rows inside the bound and bytes past it");
+    const sync::BaselineUpdate fitted =
+        sync::AdvanceBaseline(wide, sync::SyncPlan{}, sync::ExecutionReport{}, all, *files);
+    checks.ExpectEq(fitted.value.rows().size(), saves, "every save row stands");
+    std::size_t marked = 0;
+    for (const auto& [key, row] : fitted.value.rows()) {
+      (void)key;
+      marked += row.deleted_on_server ? 1 : 0;
+    }
+    checks.ExpectEq(marked, saves, "...with its deleted_on_server mark");
+    checks.Expect(fitted.value.state_rows().size() < state::kMaxRecords - saves,
+                  "state rows go first, to bring the text inside the byte bound");
+    checks.Expect(!fitted.warnings.empty(), "...and the drop is said");
+    checks.Expect(state::SaveBaseline(files->Resolve(sync::kStateSdPath), fitted.value).ok(),
+                  "so the file can be written, marks and all");
   }
 
   // `kStateSdPath` spells the file name that `state::kStateFileName` owns. Two
