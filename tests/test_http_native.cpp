@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -470,6 +471,35 @@ int DiskRefusals(http::HttpClient& client, const std::string& base, const std::s
   refused(ENOSPC, http::Error::kDiskFull, "full");
   refused(EFBIG, http::Error::kFileTooLarge, "too-large");
   refused(EIO, http::Error::kWriteFailed, "eio");
+
+  // Every byte taken, and the commit refused -- `fsdevCommitDevice` on the
+  // console, where a full card's FAT is written. The `errno` is the one the
+  // sync left, and a sync that left none is still an I/O failure: never
+  // "Success", which is what a flush that had gone through used to report.
+  const auto uncommitted = [&](int error, http::Error expected, const char* name,
+                               const char* says) {
+    const std::string path = Scratch(std::string("disk-commit-") + name + ".bin");
+    Clear(path);
+    http::Request request;
+    request.url = base + asset;
+    request.timeout = std::chrono::milliseconds{0};
+    http::Result result;
+    {
+      faulty::SyncRefused card(".part", error);
+      result = client.Download(request, DownloadTo(path));
+      checks.Expect(card.refusals() > 0, std::string(name) + ": the card refused the commit");
+    }
+    checks.ExpectError(result, expected, std::string(name) + ": named for what the sync said");
+    checks.Expect(result.message.find("could not make durable") != std::string::npos,
+                  std::string(name) + ": and says the bytes were not made durable: " +
+                      result.message);
+    checks.Expect(result.message.find(says) != std::string::npos,
+                  std::string(name) + ": with the reason \"" + says + "\": " + result.message);
+    checks.Expect(!Exists(path), std::string(name) + ": no file at the destination");
+    Clear(path);
+  };
+  uncommitted(ENOSPC, http::Error::kDiskFull, "full", std::strerror(ENOSPC));
+  uncommitted(0, http::Error::kWriteFailed, "silent", std::strerror(EIO));
   return checks.failures();
 }
 

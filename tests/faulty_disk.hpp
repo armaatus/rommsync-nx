@@ -10,6 +10,7 @@
 // files it is aimed at, not in time and not in stdio buffer flushes.
 #pragma once
 
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -160,6 +161,57 @@ class Disk final : public rommsync::io::Disk {
   std::uint64_t written_ = 0;
   bool tripped_ = false;
   int refusals_ = 0;
+};
+
+/// A card that takes every byte and then refuses to commit them: the `Sync` of
+/// an aimed-at path fails with `error`, and everything else passes through.
+///
+/// What a full card can look like on the console, where `fsdevCommitDevice` is
+/// the moment the FAT is written. `error` 0 is a hook that refuses without
+/// saying why, which a caller must still name as an I/O failure.
+class SyncRefused final : public rommsync::io::Disk {
+ public:
+  SyncRefused(std::string aimed_at, int error)
+      : aimed_at_(std::move(aimed_at)), error_(error) {
+    previous_ = rommsync::io::SetDisk(this);
+  }
+
+  ~SyncRefused() override { rommsync::io::SetDisk(previous_); }
+
+  SyncRefused(const SyncRefused&) = delete;
+  SyncRefused& operator=(const SyncRefused&) = delete;
+
+  std::FILE* Open(const std::string& path, const char* mode) override {
+    return Inner().Open(path, mode);
+  }
+  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
+    return Inner().Write(file, data, size);
+  }
+  int Rename(const std::string& from, const std::string& to) override {
+    return Inner().Rename(from, to);
+  }
+  int Remove(const std::string& path) override { return Inner().Remove(path); }
+
+  bool Sync(const std::string& path) override {
+    if (path.find(aimed_at_) == std::string::npos) {
+      return Inner().Sync(path);
+    }
+    refusals_.fetch_add(1);
+    errno = error_;
+    return false;
+  }
+
+  int refusals() const { return refusals_.load(); }
+
+ private:
+  rommsync::io::Disk& Inner() const {
+    return previous_ != nullptr ? *previous_ : rommsync::io::StdioDisk();
+  }
+
+  std::string aimed_at_;
+  int error_;
+  rommsync::io::Disk* previous_ = nullptr;
+  std::atomic<int> refusals_{0};
 };
 
 }  // namespace faulty
