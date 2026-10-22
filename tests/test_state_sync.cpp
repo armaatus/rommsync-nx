@@ -995,6 +995,55 @@ void Placing(rig::Checks& checks) {
                   "and the tick says the rest wait for the next");
   }
 
+  // Rows that place nothing come back every run -- their path is taken, so
+  // nothing the next scan finds claims them -- and they must not be what the
+  // budget goes on: a listing that leads with `kMaxStatePlacements` of them still
+  // places the rows behind them, and the taken ones are named in what is left.
+  {
+    Sandbox sandbox(checks, "states-placing-taken-first");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    constexpr std::size_t kPlaceable = 3;
+    const std::size_t taken = sync::kMaxStatePlacements;
+    checks.Expect(files->CreateDirectory("/placed").ok(), "the folder the taken ones sit in");
+    std::string listing = "[";
+    for (std::size_t at = 0; at < taken + kPlaceable; ++at) {
+      const std::string name = (at < taken ? "Taken " : "Free ") + std::to_string(at) + ".state";
+      if (at < taken) {
+        sandbox.SeedState("/placed/" + name, "a state the scan never read");
+      }
+      listing += (at == 0 ? "" : ",") + StateRowJson(static_cast<std::int64_t>(at) + 100, 1, name,
+                                                     "retroarch", 40, "2026-09-06T03:00:00+00:00");
+    }
+    ScriptedClient client;
+    client.listing = listing + "]";
+    client.content = std::string(40, 'z');
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [](const sync::ServerState& server) {
+      rommsync::place::Placement placement;
+      placement.sd_path = "/placed/" + server.file_name;
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.completed, static_cast<int>(kPlaceable),
+                    "the placeable rows behind the taken ones are placed");
+    for (std::size_t at = taken; at < taken + kPlaceable; ++at) {
+      checks.ExpectEq(sandbox.Read("/placed/Free " + std::to_string(at) + ".state"),
+                      std::string(40, 'z'), "row " + std::to_string(at) + " landed");
+    }
+    checks.ExpectEq(report.kept_both, static_cast<int>(taken - kPlaceable),
+                    "the taken rows have what the placements left");
+    checks.ExpectEq(report.operations.size(), sync::kMaxStatePlacements,
+                    "and the run still holds no more than the bound");
+    checks.Expect(std::any_of(report.warnings.begin(), report.warnings.end(),
+                              [](const std::string& warning) {
+                                return warning.find("not listed one by one") != std::string::npos;
+                              }),
+                  "the taken rows past it are one line");
+  }
+
   // And a placement that says why it places nothing carries the reason.
   {
     Sandbox sandbox(checks, "states-placing-reason");

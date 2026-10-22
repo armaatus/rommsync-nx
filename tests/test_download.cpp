@@ -581,6 +581,53 @@ void Transact(checks::Checks& c) {
   c.Expect(queue.RemoveAndStore(4, &untouched, accept) == ipc::Error::kNotQueued,
            "taking out one that is not there says so");
   c.ExpectEq(untouched.rom_id, std::int64_t{77}, "and leaves the caller's row alone");
+
+  // **A rollback puts back exactly the rows a change touched, where they stood**
+  // (#247): the undo keeps those rows and their indices rather than a copy of
+  // the queue. The two changes that take a row out *and* append one are where
+  // that could go wrong, and the order of every row is asserted after each.
+  const auto order = [](const download::Queue& q) {
+    std::vector<std::int64_t> ids;
+    std::vector<QueueState> states;
+    q.Visit([&](const std::vector<QueueEntry>& rows) {
+      for (const QueueEntry& row : rows) {
+        ids.push_back(row.rom_id);
+        states.push_back(row.state);
+      }
+    });
+    return std::make_pair(ids, states);
+  };
+  download::Queue three;
+  for (const std::int64_t id : {11, 12, 13}) {
+    c.Expect(three.Enqueue(id, &position) == ipc::Error::kOk, "a row is queued");
+  }
+  QueueEntry failed = three.Find(12);
+  failed.state = QueueState::kFailed;
+  failed.message = "the server said no";
+  c.Expect(three.Update(failed), "the middle one failed");
+  const auto before = order(three);
+  c.Expect(three.EnqueueAndStore(12, &position, refuse) == ipc::Error::kWriteFailed,
+           "re-queueing the failed row, refused by the card");
+  c.Expect(order(three) == before, "puts the failed row back in the middle, as it was");
+  c.ExpectEq(three.Find(12).message, std::string("the server said no"), "message and all");
+  c.Expect(three.RemoveAndStore(11, &taken, refuse) == ipc::Error::kWriteFailed,
+           "removing the first row, refused");
+  c.Expect(order(three) == before, "puts it back first");
+
+  download::Queue full;
+  for (std::size_t at = 0; at < download::kMaxQueueEntries; ++at) {
+    c.Expect(full.Enqueue(static_cast<std::int64_t>(at) + 100, &position) == ipc::Error::kOk,
+             "the queue fills");
+  }
+  QueueEntry done = full.Find(102);
+  done.state = QueueState::kDone;
+  c.Expect(full.Update(done), "and its third row finishes");
+  const auto full_before = order(full);
+  c.Expect(full.EnqueueAndStore(999, &position, refuse) == ipc::Error::kWriteFailed,
+           "a new rom in a full queue drops the oldest finished row, refused by the card");
+  c.Expect(order(full) == full_before,
+           "puts the finished row back third and takes the new one off the end");
+  c.ExpectEq(full.size(), download::kMaxQueueEntries, "and the queue is as full as it was");
 }
 
 void Corrupt(checks::Checks& c) {
