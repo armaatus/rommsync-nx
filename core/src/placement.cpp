@@ -28,46 +28,6 @@ bool Joinable(std::string_view name) {
          });
 }
 
-/// A libretro core RomM's table names. Its saves are RetroArch's SRAM format,
-/// whichever frontend ran it -- Tico's libretro modules included.
-bool IsLibretro(std::string_view id) {
-  for (const scan::RetroArchCore& core : scan::RetroArchCores()) {
-    if (id == core.id) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/// The extensions an emulator writes its saves under, as far as this build
-/// knows: `primary` is the one a save is written as when the server's name
-/// gives no better answer, `also` the others it writes beside it. Both empty is
-/// an emulator whose names are not known.
-struct Format {
-  std::string_view primary;
-  std::vector<std::string_view> also;
-  bool folders = false;  ///< its saves are directories, which are not placed
-};
-
-Format FormatOf(std::string_view id) {
-  if (IsLibretro(id)) {
-    // RetroArch's SRAM, and the real-time clock some cores keep beside it.
-    return {".srm", {".rtc"}, false};
-  }
-  if (id == "tico-duckstation") {
-    return {".mcd", {}, false};
-  }
-  if (id == "tico-mupen64plus") {
-    // EEPROM, SRAM, FlashRAM and the controller pak: four saves of one game,
-    // each its own, so only the server's name can say which this is (#238).
-    return {"", {".eep", ".sra", ".fla", ".mpk"}, false};
-  }
-  if (id == "tico-ppsspp") {
-    return {"", {}, true};
-  }
-  return {};
-}
-
 /// An extension made only of what a slot is made of (`scan::SlotFor`), so the
 /// name the scan reads back gives the slot the server sent.
 bool PlainExtension(std::string_view extension) {
@@ -105,25 +65,22 @@ std::string ExtensionFor(std::string_view emulator_id, std::string_view server_f
     *why = "no emulator is known for it, so neither is the name it would load";
     return {};
   }
-  const Format format = FormatOf(emulator_id);
+  // The emulator's format, from the one table that says (#258,
+  // `scan::SaveFormatOf`): a libretro core's, or a Tico module's own.
+  const scan::SaveFormat format = scan::SaveFormatOf(emulator_id);
   if (format.folders) {
     *why = std::string(emulator_id) + " keeps its saves as folders, which are not placed (#238)";
     return {};
   }
   const std::string theirs = LowerAscii(sync::ExtensionOf(server_file_name));
-  if (!format.primary.empty() && theirs == format.primary) {
+  if (format.Writes(theirs)) {
     return theirs;
   }
-  for (const std::string_view also : format.also) {
-    if (theirs == also) {
-      return theirs;
-    }
-  }
-  if (format.primary == ".srm" && theirs == ".sav") {
+  if (std::string_view(format.primary) == ".srm" && theirs == ".sav") {
     // The same SRAM under another client's name: mGBA's own, a web player's.
-    return std::string(format.primary);
+    return format.primary;
   }
-  if (format.primary.empty() && format.also.empty()) {
+  if (*format.primary == '\0' && format.also[0] == nullptr) {
     // A module whose names nobody has read off a console yet [#44]. The save
     // can only have come from that same module (`Compatible`), so the name it
     // uploaded under is the name it writes.
@@ -154,7 +111,7 @@ Placement JoinUnder(const Layout& layout, std::string_view emulator_id, std::str
     path.pop_back();
   }
   if (layout.by_core) {
-    if (!IsLibretro(emulator_id)) {
+    if (!scan::IsRetroArchCore(emulator_id)) {
       // `RetroArchCoreFolder` would hand the id back unchanged, and a folder
       // named after it is one RetroArch never reads.
       return Refuse("RetroArch sorts by core, and RomM's core table has no folder for " +
@@ -190,34 +147,14 @@ Placement Place(const roms::Rom& rom, std::string_view emulator_id,
 }
 
 bool Compatible(std::string_view server_emulator, std::string_view target_emulator) {
-  if (target_emulator.empty()) {
-    return false;
-  }
-  if (server_emulator == target_emulator) {
-    return true;
-  }
   if (server_emulator.empty()) {
-    return IsLibretro(target_emulator);
+    return scan::IsRetroArchCore(target_emulator);
   }
-  if (!IsLibretro(target_emulator)) {
-    return false;
-  }
-  const std::vector<std::string> aliases = scan::RetroArchAliases(target_emulator);
-  return std::find(aliases.begin(), aliases.end(), server_emulator) != aliases.end();
+  return scan::SameCore(server_emulator, target_emulator);
 }
 
 bool LoadsState(std::string_view server_emulator, std::string_view target_emulator) {
-  if (server_emulator.empty() || target_emulator.empty()) {
-    return false;
-  }
-  if (server_emulator == target_emulator) {
-    return true;
-  }
-  if (!IsLibretro(target_emulator)) {
-    return false;
-  }
-  const std::vector<std::string> aliases = scan::RetroArchAliases(target_emulator);
-  return std::find(aliases.begin(), aliases.end(), server_emulator) != aliases.end();
+  return scan::SameCore(server_emulator, target_emulator);
 }
 
 Placer::Placer(const config::Config& config, const retroarch::Settings& retroarch,
@@ -225,8 +162,9 @@ Placer::Placer(const config::Config& config, const retroarch::Settings& retroarc
     : config_(config), retroarch_(retroarch), index_(index), files_(files) {}
 
 Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_emulator,
-                                 bool saves) {
+                                 scan::Folders which) {
   Target target;
+  const bool saves = which == scan::Folders::kSaves;
   const std::string& slug = rom.platform_fs_slug;
   const std::string what = saves ? "saves" : "states";
   const config::PlatformFolders* folders = config_.Platform(slug);
@@ -244,14 +182,14 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
   target.layout.play_with = *play_with;
 
   if (*play_with == config::PlayWith::kTico) {
+    std::string map_folder;
     for (const std::string& folder : saves ? folders->saves : folders->states) {
       if (scan::SourceOf(folder).source == scan::Source::kTico) {
-        target.map_folder = folder;
+        map_folder = folder;
         break;
       }
     }
-    const std::string root =
-        target.map_folder.empty() ? std::string() : tico::RootOf(target.map_folder);
+    const std::string root = map_folder.empty() ? std::string() : tico::RootOf(map_folder);
     if (root.empty()) {
       target.reason = slug + " is played in Tico and the folder map lists no Tico folder for its " +
                       what;
@@ -270,8 +208,8 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
                           : resolved.why;
       return target;
     }
-    target.layout.folder = tico::FolderIn(resolved, target.map_folder);
-    scan::SaveSource source = scan::SourceOf(target.map_folder);
+    target.layout.folder = tico::FolderIn(resolved, map_folder);
+    scan::SaveSource source = scan::SourceOf(map_folder);
     source.layout = resolved.layout == tico::Layout::kAccount ? scan::Layout::kAccountFolder
                                                                : scan::Layout::kPlatformFolder;
     target.emulator_id = scan::ResolveSource(source, slug, config_).emulator_id;
@@ -284,16 +222,13 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
                                                                 "to its folders";
       return target;
     }
-    const bool by_content =
-        saves ? retroarch_.sort_savefiles_by_content : retroarch_.sort_savestates_by_content;
-    const bool beside_roms =
-        saves ? retroarch_.savefiles_in_content_dir : retroarch_.savestates_in_content_dir;
-    if (by_content) {
+    const retroarch::Folder layout = saves ? retroarch_.Saves() : retroarch_.States();
+    if (layout.sort_by_content) {
       target.reason = "RetroArch keeps " + what +
                       " in a folder per content directory, a layout this client does not read";
       return target;
     }
-    if (beside_roms) {
+    if (layout.in_content_dir) {
       if (!config_.sources.retroarch_content_dir) {
         target.reason = "RetroArch keeps " + what +
                         " beside the roms, which is read only with [sources] "
@@ -309,23 +244,11 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
         return target;
       }
     } else {
-      const std::string configured =
-          saves ? retroarch_.savefile_directory : retroarch_.savestate_directory;
-      const std::string fallback = saves ? retroarch::kDefaultSavefileDirectory
-                                         : retroarch::kDefaultSavestateDirectory;
-      target.layout.folder = configured;
-      if (LowerAscii(configured) != LowerAscii(fallback)) {
-        // RetroArch ignores a folder that is not a directory and writes to its
-        // default instead, and so does the scan (`scan::ScanSaves`).
-        const fs::ListError error = files_.List(configured).error;
-        if (error == fs::ListError::kMissing || error == fs::ListError::kNotADirectory) {
-          target.layout.folder = fallback;
-        }
-      }
+      // The scan's own rule for where RetroArch writes (#258).
+      target.layout.folder = retroarch::EffectiveDirectory(layout, files_);
     }
-    target.map_folder = target.layout.folder;
-    target.layout.by_core = saves ? retroarch_.sort_savefiles : retroarch_.sort_savestates;
-    if (target.layout.by_core && IsLibretro(server_emulator)) {
+    target.layout.by_core = layout.sort_by_core;
+    if (target.layout.by_core && scan::IsRetroArchCore(server_emulator)) {
       // Sorted, the core that wrote it has a folder of its own, and that core
       // is the one that loads it.
       target.emulator_id = std::string(server_emulator);
@@ -355,39 +278,46 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
   return target;
 }
 
-std::string Placer::ReadsBackAs(const roms::Rom& rom, std::string_view file_name,
-                                const Target& target, bool saves, int card) const {
-  // The platform the scan takes the folder to imply. Tico's folder implies the
-  // map's platform for it; RetroArch's own folders and core folders imply none
-  // unless the map lists them under one; a rom folder implies the platforms
-  // that keep roms in it.
-  std::string hint;
-  if (target.layout.play_with == config::PlayWith::kRetroArch &&
-      (saves ? retroarch_.savefiles_in_content_dir : retroarch_.savestates_in_content_dir)) {
-    bool first = true;
-    for (const auto& [slug, mapped] : config_.platforms) {
-      if (std::find(mapped.roms.begin(), mapped.roms.end(), target.map_folder) ==
-          mapped.roms.end()) {
-        continue;
-      }
-      hint = first ? slug : (hint == slug ? hint : std::string());
-      first = false;
-    }
-  } else {
-    const auto hints =
-        scan::PlatformHints(config_, saves ? scan::Folders::kSaves : scan::Folders::kStates);
-    const auto found = hints.find(target.map_folder);
-    hint = found == hints.end() ? std::string() : found->second;
+const scan::FolderPlan& Placer::PlanOf(scan::Folders which) {
+  std::optional<scan::FolderPlan>& plan =
+      which == scan::Folders::kSaves ? saves_plan_ : states_plan_;
+  if (!plan.has_value()) {
+    plan = scan::PlanFolders(config_, retroarch_, which, files_, nullptr);
   }
-  // Tico's psx folder is read the way DuckStation names its cards (#238).
-  const bool memory_cards = saves && target.layout.play_with == config::PlayWith::kTico &&
-                            scan::TicoSlugFor(hint) == "psx";
+  return *plan;
+}
+
+std::string Placer::ReadsBackAs(const roms::Rom& rom, const std::string& sd_path,
+                                scan::Folders which, int card) {
+  // The scan's own plan of folders, and its own rules within one, so what is
+  // placed is what it reads back (#258): a rom folder reads only RetroArch's
+  // names, a listing cut at `fs::kMaxDirectoryEntries` reads only what it
+  // reaches, and a folder the walk does not plan is not read at all.
+  std::string directory;
+  std::string leaf;
+  if (!fs::SplitPath(sd_path, &directory, &leaf)) {
+    return "there is no folder to put it in";
+  }
+  const std::optional<scan::ScanFolder> folder = scan::FolderIn(PlanOf(which), directory);
+  if (!folder.has_value()) {
+    return "the scan does not read " + directory + ", so it would come back as a file nobody syncs";
+  }
+  if (scan::RuleFor(*folder, leaf, which) != scan::FileRule::kRead) {
+    return "the scan does not read a file of that kind in " + directory +
+           (folder->beside_roms ? ", a rom folder" : "") +
+           ", so it would come back as a file nobody syncs";
+  }
+  if (!scan::Reaches(files_.List(directory), leaf)) {
+    return directory + " holds more than the " + std::to_string(fs::kMaxDirectoryEntries) +
+           " entries the scan lists, and the file would sort past them, so it would never come "
+           "back";
+  }
   int read_card = 1;
   // A state is matched as the scan matches one: RetroArch's `.state.auto` by
   // its rom's name (#239).
   const roms::Match match = scan::MatchSave(
-      index_, saves ? std::string(file_name) : scan::StateMatchName(file_name), hint,
-      memory_cards, &read_card);
+      index_, which == scan::Folders::kSaves ? leaf : scan::StateMatchName(leaf),
+      folder->platform_hint, folder->memory_cards, &read_card);
   if (!match.matched()) {
     return "the scan would not read it back as this rom's (" + match.reason +
            "), so it would come back as a file nobody syncs";
@@ -423,17 +353,17 @@ Placement Placer::Save(const sync::SyncOperation& operation) {
     return Refuse("an archival save pairs with nothing, so a copy written here would be "
                   "uploaded back as a new save");
   }
-  const Target target = TargetFor(*rom, operation.emulator.value_or(""), true);
+  const Target target = TargetFor(*rom, operation.emulator.value_or(""), scan::Folders::kSaves);
   if (!target.reason.empty()) {
     return Refuse(target.reason);
   }
-  // DuckStation names a card after the game, not the disc, and card 2 `_2`
-  // (#238): `scan::MemoryCardName`, which is the scan's own rule turned round.
-  const bool duckstation = target.emulator_id == "tico-duckstation" &&
-                           target.layout.play_with == config::PlayWith::kTico;
-  const int card = duckstation ? CardOfSlot(*operation.slot) : 1;
+  // A module with memory cards names one after the game, not the disc, and
+  // card 2 `_2` (#238): `scan::MemoryCardName`, which is the scan's own rule
+  // turned round.
+  const bool memory_cards = scan::SaveFormatOf(target.emulator_id).memory_cards;
+  const int card = memory_cards ? CardOfSlot(*operation.slot) : 1;
   Placement placed =
-      !duckstation ? Place(*rom, target.emulator_id, operation.file_name, target.layout)
+      !memory_cards ? Place(*rom, target.emulator_id, operation.file_name, target.layout)
       : Joinable(rom->fs_name_no_ext)
           ? JoinUnder(target.layout, target.emulator_id,
                       scan::MemoryCardName(rom->fs_name_no_ext, card))
@@ -450,6 +380,17 @@ Placement Placer::Save(const sync::SyncOperation& operation) {
     slot += "-card" + std::to_string(card);
   }
   if (slot != *operation.slot) {
+    if (LowerAscii(sync::ExtensionOf(operation.file_name)) == ".sav" &&
+        LowerAscii(sync::ExtensionOf(leaf)) == ".srm") {
+      // #237's (1), decided in #258: a `.sav` kept in a slot of its own stays
+      // there. Written as the `.srm` the emulator loads, the scan would read it
+      // back in another slot -- a second save of the game, uploaded next tick
+      // while this row is offered again; kept as `.sav`, nothing here loads it.
+      return Refuse("the server keeps it as a .sav in a slot of its own; as the .srm " +
+                    target.emulator_id +
+                    " loads, the scan would read it back in slot \"" + slot +
+                    "\" as a second save, so it stays on the server");
+    }
     // The server's slot is not quoted: it is whatever another client chose.
     return Refuse("the scan would read it back in slot \"" + slot +
                   "\", not the one the server keeps it in, so the next sync would upload it "
@@ -457,7 +398,8 @@ Placement Placer::Save(const sync::SyncOperation& operation) {
   }
   // A card kept under a disc-2 rom is named for the game, which the scan reads
   // back as disc 1's: refused here, so it never lands on disc 1's card.
-  if (const std::string why = ReadsBackAs(*rom, leaf, target, true, card); !why.empty()) {
+  if (const std::string why = ReadsBackAs(*rom, placed.sd_path, scan::Folders::kSaves, card);
+      !why.empty()) {
     return Refuse(why);
   }
   placed.emulator = target.emulator_id;
@@ -476,7 +418,7 @@ Placement Placer::State(std::int64_t rom_id, std::string_view file_name,
   if (!Joinable(file_name)) {
     return Refuse("the state's name is not one a file can be called");
   }
-  const Target target = TargetFor(*rom, emulator, false);
+  const Target target = TargetFor(*rom, emulator, scan::Folders::kStates);
   if (!target.reason.empty()) {
     return target.foreign ? Foreign(target.reason) : Refuse(target.reason);
   }
@@ -507,7 +449,8 @@ Placement Placer::State(std::int64_t rom_id, std::string_view file_name,
   if (!placed.ok()) {
     return placed;
   }
-  if (const std::string why = ReadsBackAs(*rom, name, target, false); !why.empty()) {
+  if (const std::string why = ReadsBackAs(*rom, placed.sd_path, scan::Folders::kStates);
+      !why.empty()) {
     return Refuse(why);
   }
   return placed;

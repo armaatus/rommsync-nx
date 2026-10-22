@@ -84,8 +84,12 @@ For each file under the configured save/state dirs:
    row of a slot as the head every client pairs against — which is why a
    companion such as Snes9x's `.rtc` gets a slot of its own (RomM's RetroArch path
    keeps it out of the slot too), and why a rom's RetroArch `.srm` and Tico `.srm`
-   on one card are one slot: the one found first (RetroArch's) is synced and the
-   other is skipped as a *duplicate slot*. The name the server is told is the
+   on one card are one slot: the copy in the frontend `[platform.<slug>]
+   play_with` plays the system in (Tico by default) is synced and the other is
+   skipped as a *duplicate slot* -- the copy a user is playing, and the one a
+   first-time restore is placed for (#258). A platform played in neither keeps
+   the one found first. A state's name, contested the same way under
+   `[sync] map_state_slots`, is settled the same way. The name the server is told is the
    rom's own stem, `<fs_name_no_ext><ext>`, which is the name RomM serves
    RetroArch the save under.
 6. Name the `emulator` that wrote it — the id RomM pairs lineages on and other

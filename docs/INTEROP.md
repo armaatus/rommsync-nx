@@ -157,8 +157,9 @@ reads no RetroArch folder at all
 ([CONFIG.md](CONFIG.md#sources)).
 
 One game played in both Tico and RetroArch on the same Switch is one save to
-RomM (one slot), and the client syncs RetroArch's copy and skips Tico's as a
-*duplicate slot*. Play each game in one of them.
+RomM (one slot), and the client syncs the copy in the emulator
+`[platform.<slug>] play_with` names — Tico unless you say otherwise — and skips
+the other as a *duplicate slot*. Play each game in one of them.
 
 ---
 

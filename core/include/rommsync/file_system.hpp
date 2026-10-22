@@ -202,6 +202,19 @@ class FileSystem {
   /// been the one that made it, and a tick runs this on entry every time.
   virtual MakeDirResult CreateDirectory(std::string_view sd_path) = 0;
 
+  /// Remove `sd_path` if it is an empty directory, and answer whether it went.
+  ///
+  /// Never more than that: a directory holding anything, a file, or a path that
+  /// is not on this card stays, and the answer is false. It exists to take back
+  /// a folder a placement made for a download that then failed (#258,
+  /// `MadeFolders`), so an emulator does not find an empty system folder the
+  /// user never played. A backend that cannot do this cheaply keeps the default,
+  /// which removes nothing -- the folder is litter, not a lost save.
+  virtual bool RemoveEmptyDirectory(std::string_view sd_path) {
+    static_cast<void>(sd_path);
+    return false;
+  }
+
   /// The platform path `sd_path` names -- `sdmc:/retroarch/saves/Game.srm` on
   /// Horizon, a path under the card's root on the host.
   ///
@@ -240,6 +253,39 @@ class FileSystem {
 /// path with no separator, or one that ends in one: neither has a directory to
 /// list and a leaf to find in it.
 bool SplitPath(const std::string& sd_path, std::string* directory, std::string* leaf);
+
+/// `name` under `directory`, with one `/` between: `/tico/saves` + `snes`.
+std::string JoinPath(std::string_view directory, std::string_view name);
+
+/// The folders one write had to make, taken away again unless it lands (#258).
+///
+/// A first-time restore makes its folder before it fetches -- the download is
+/// staged beside the save -- so a fetch that then fails would leave behind a
+/// folder nothing asked for: `users/<uid>/<slug>` for a system never played,
+/// `<rom folder>/<CoreFolder>/`. On destruction each folder `Make` created is
+/// removed, innermost first, while it is empty (`RemoveEmptyDirectory`); one
+/// that was already there, or that holds anything by then, stays. `Keep` once
+/// the file is in place.
+class MadeFolders {
+ public:
+  explicit MadeFolders(FileSystem& files) : files_(&files) {}
+  ~MadeFolders();
+
+  MadeFolders(const MadeFolders&) = delete;
+  MadeFolders& operator=(const MadeFolders&) = delete;
+
+  /// `CreateDirectory(sd_path)`, remembering which of `sd_path` and its parents
+  /// were missing before it: one listing per missing folder, and one of the
+  /// first that is there.
+  MakeDirResult Make(std::string_view sd_path);
+
+  /// The write landed: the folders stay.
+  void Keep() { made_.clear(); }
+
+ private:
+  FileSystem* files_;
+  std::vector<std::string> made_;  ///< outermost first
+};
 
 /// The most recent directory listing, and nothing older.
 ///

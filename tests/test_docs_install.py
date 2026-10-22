@@ -669,7 +669,8 @@ def phase_interop_table(args) -> int:
     cores = re.search(r"kCores = \{(.*?)\};", source, re.DOTALL)
     if not tico or not cores:
         return fail("cannot find kTicoModules or RetroArchCores' table in save_source.cpp")
-    code_modules = set(re.findall(r'\{"[a-z0-9-]+", "([^"]+)", "([a-z0-9_-]+)"\}', tico.group(1)))
+    # A row may carry its module's save format after the id (#258).
+    code_modules = set(re.findall(r'\{"[a-z0-9-]+", "([^"]+)", "([a-z0-9_-]+)"[},]', tico.group(1)))
     code_folders = set(re.findall(r'\{"([a-z0-9_-]+)", "([^"]+)"\}', cores.group(1)))
     if not code_modules or not code_folders:
         return fail("kTicoModules or RetroArchCores() parsed as empty")

@@ -262,7 +262,16 @@ emulator reads (an isolated `tico-*` format never goes to RetroArch, nor a
 RetroArch core's save to a Tico module that is not that core), in a file the next
 sync reads back as the same rom in the same slot, and where no file is already.
 Anything else is a failed operation with the reason in the log — never a guess,
-and never a file written over.
+and never a file written over. "Reads back" is the sync's own rule for where it
+looks, so nothing is placed in a rom folder under a name a rom folder is not
+read for, or past the first 512 entries of a folder. A `.sav` the server keeps
+in a slot of its own (`autosave-sav`) stays there: as the `.srm` the emulator
+loads, it would come back in `autosave` as a second save. A download that fails
+takes back the folders it made for the save.
+
+**`play_with` also decides which copy syncs** when one game has a save in both
+Tico's and RetroArch's folders on this card — one slot to RomM: the copy in the
+emulator it names, and the other is skipped as a *duplicate slot*.
 
 ### RetroArch: read from `retroarch.cfg`
 

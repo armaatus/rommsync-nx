@@ -507,8 +507,10 @@ void Unusable(::checks::Checks& checks) {
 
   // Two files for one rom land on the same `(rom_id, slot)`, which the server
   // pairs on -- so they would overwrite each other through RomM on alternating
-  // ticks. The first in scan order keeps it. Since #236 that includes one rom's
-  // `.srm` under two emulators: the shared slot holds one save per rom.
+  // ticks. One keeps it. Since #236 that includes one rom's `.srm` under two
+  // emulators: the shared slot holds one save per rom -- and since #258 the
+  // frontend `play_with` names keeps it (Tico for nes, by default), whichever
+  // folder the walk read first (`scan.contest`).
   FakeFileSystem duplicates("duplicates");
   duplicates.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.srm", 512, kMtime);
@@ -516,8 +518,8 @@ void Unusable(::checks::Checks& checks) {
   const scan::ScanResult mixed = scan::ScanSaves(config, kRetroArchDefaults, index, duplicates, kFirstTick);
   checks.ExpectEq(mixed.saves.size(), static_cast<std::size_t>(2),
                   "two extensions are two slots, and the same rom's .srm twice is one");
-  checks.Expect(SkippedFor(mixed, "/tico/saves/nes/nova.srm", scan::SkipReason::kDuplicateSlot),
-                "the copy found second -- Tico's, after RetroArch's -- is reported, not synced");
+  checks.Expect(SkippedFor(mixed, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
+                "the copy outside the frontend nes is played in is reported, not synced");
   const scan::SaveFile* sav = FindSave(mixed, "nova.sav");
   checks.Expect(sav != nullptr && sav->slot == "autosave-sav",
                 "a .sav is a slot of its own beside the .srm's");

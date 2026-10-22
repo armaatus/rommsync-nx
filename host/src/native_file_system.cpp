@@ -234,6 +234,21 @@ class NativeFileSystem final : public fs::FileSystem {
     return result;
   }
 
+  bool RemoveEmptyDirectory(std::string_view sd_path) override {
+    std::filesystem::path resolved;
+    if (!ResolveUnderRoot(root_, sd_path, &resolved)) {
+      return false;
+    }
+    // Asked first rather than left to `remove`, which takes a file as readily
+    // as an empty directory.
+    std::error_code error;
+    if (!std::filesystem::is_directory(resolved, error) ||
+        !std::filesystem::is_empty(resolved, error) || error) {
+      return false;
+    }
+    return std::filesystem::remove(resolved, error) && !error;
+  }
+
   std::string Resolve(std::string_view sd_path) const override {
     std::filesystem::path resolved;
     if (!ResolveUnderRoot(root_, sd_path, &resolved)) {

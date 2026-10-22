@@ -80,10 +80,11 @@ struct SaveFile {
   /// see. Derived from the configured slot and the extension and nothing else,
   /// because it has to be the *same* string on the next tick and on the next
   /// boot -- a slot that moves makes the same file a new save every time. A
-  /// rom's RetroArch `.srm` and Tico `.srm` are therefore one slot, and the
-  /// second the walk finds is a `kDuplicateSlot` skip: RomM pairs on
-  /// `(rom_id, slot)` alone, and two files in one pair would overwrite each
-  /// other through the server.
+  /// rom's RetroArch `.srm` and Tico `.srm` are therefore one slot, and one of
+  /// them is a `kDuplicateSlot` skip: RomM pairs on `(rom_id, slot)` alone, and
+  /// two files in one pair would overwrite each other through the server. The
+  /// copy kept is the one in the frontend `Config::PlayWithFor` names, else the
+  /// first the walk finds (#258).
   std::string slot;
 
   /// The name the server is told -- the negotiate entry's `file_name` and the
@@ -343,8 +344,9 @@ struct ScanResult {
 ///
 /// **RetroArch's folders are the ones `retroarch.cfg` names, read the way
 /// RetroArch lays them out** (#230), and they are read first, so the copy
-/// RetroArch actually reads wins a contested slot over one the folder map also
-/// finds:
+/// RetroArch actually reads wins a contested slot over a stale one the folder
+/// map also finds -- unless the other copy is in the frontend `play_with` plays
+/// the platform in, which keeps the slot whatever the order (#258):
 ///
 ///   - its `savefile_directory`, whatever it is called -- and when that is not
 ///     there, the build's default, because RetroArch ignores a folder it cannot
@@ -495,6 +497,80 @@ std::string MemoryCardName(std::string_view rom_name, int card);
 /// `MemoryCardName` describes them. `*card` is 2 for a card-2 reading, else 1.
 roms::Match MatchSave(const roms::RomIndex& index, std::string_view file_name,
                       std::string_view platform_hint, bool memory_cards, int* card);
+
+// --- the folders a walk reads, for a caller that has to agree with it (#258) ---
+
+/// One folder a walk reads, and what is known about it before a file in it is.
+struct ScanFolder {
+  std::string directory;
+
+  /// What the folder says: `SourceOf`, or -- for a folder `retroarch.cfg` led
+  /// the scan to -- RetroArch's, whatever the path is called.
+  SaveSource source;
+
+  /// The platform the folder implies, or "" for every platform (`PlatformHints`;
+  /// for a rom folder, the platforms that keep roms in it).
+  std::string platform_hint;
+
+  /// A rom folder: only RetroArch's own names are read in it (`RuleFor`).
+  bool beside_roms = false;
+
+  /// Tico's folder for a module whose saves are folders: a subfolder is a
+  /// `kSaveFolder` skip, and so is a loose save (#238).
+  bool save_folders = false;
+
+  /// Tico's folder for a module with memory cards: a `.mcd` is read as
+  /// `MemoryCardName` names them (#238).
+  bool memory_cards = false;
+};
+
+/// A folder RetroArch sorts by core, read through the core folders its listing
+/// showed.
+struct SortedFolder {
+  ScanFolder base;
+
+  /// The last name a cut listing (`fs::ListError::kTooManyEntries`) kept, or ""
+  /// for one read whole: a core folder sorting past it was not seen.
+  std::string last_kept;
+};
+
+/// The folders one walk reads, in the order it reads them.
+struct FolderPlan {
+  std::vector<ScanFolder> folders;
+
+  /// The sorted folders whose core folders are in `folders`.
+  std::vector<SortedFolder> sorted;
+
+  /// How many of `folders` are core folders, against `kMaxRetroArchFolders`.
+  std::size_t core_folders = 0;
+};
+
+/// The folders `ScanSaves` (`kSaves`) or `ScanStates` reads on this card, as
+/// that walk plans them -- the rules spelled out at `ScanSaves`. `result` takes
+/// what the planning itself skips; null, for a caller that only asks where the
+/// scan looks, skips the listings that are only there to report.
+FolderPlan PlanFolders(const config::Config& config, const retroarch::Settings& retroarch,
+                       Folders which, fs::FileSystem& files, ScanResult* result);
+
+/// How the walk `plan` describes reads `directory` -- a folder in it, or a core
+/// folder not made yet under one of its sorted folders that the walk's listing
+/// would reach once it is -- or nullopt when the walk reads nothing there.
+/// Case is ignored, as FAT32 ignores it.
+std::optional<ScanFolder> FolderIn(const FolderPlan& plan, std::string_view directory);
+
+/// What a walk does with a file called `name` in `folder`, before matching it
+/// to a rom.
+enum class FileRule {
+  kRead,        ///< matched, and reported or skipped by what it matches
+  kPassedOver,  ///< not a save at all: a rom beside RetroArch's, a `.tmp`, a screenshot
+  kSaveFolder,  ///< a loose file where PPSSPP keeps folders: a `kSaveFolder` skip
+};
+FileRule RuleFor(const ScanFolder& folder, std::string_view name, Folders which);
+
+/// True when a listing of a folder holds, or would hold, an entry called
+/// `name`: it was read whole, or `name` sorts no later than the last name its
+/// cut kept (`fs::kMaxDirectoryEntries` keeps the first by name).
+bool Reaches(const fs::Listing& listing, std::string_view name);
 
 /// Which platform each save directory implies, keyed by directory.
 ///

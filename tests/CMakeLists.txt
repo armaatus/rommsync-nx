@@ -1101,6 +1101,7 @@ set(PLACE_SCENARIOS
   state_table  # #239: Tico's state slots under RetroArch's names and back, row by row
   state_slots  # #239: a state placed only where its emulator loads it, under that frontend's name
   rom_folder   # #258: a rom folder, cut or not, is placed in exactly when the scan reads it back
+  retroarch_folder # #258: where RetroArch writes is one rule the placer and the scan both ask
 )
 foreach(scenario IN LISTS PLACE_SCENARIOS)
   add_test(NAME place.${scenario} COMMAND test_placement ${scenario})

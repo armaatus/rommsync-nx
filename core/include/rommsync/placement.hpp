@@ -38,6 +38,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -45,6 +46,7 @@
 #include "rommsync/file_system.hpp"
 #include "rommsync/retroarch_cfg.hpp"
 #include "rommsync/rom_index.hpp"
+#include "rommsync/save_scan.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/tico.hpp"
 
@@ -128,8 +130,8 @@ bool LoadsState(std::string_view server_emulator, std::string_view target_emulat
 ///
 /// Holds references: everything it is built from must outlive it. Reads the
 /// card only when asked to place something -- `tico::Resolve` once per Tico
-/// root, `retroarch.cfg`'s folder once -- so a tick with nothing to place costs
-/// nothing.
+/// root, the scan's plan of folders once per kind, and the listing of the
+/// folder a file lands in -- so a tick with nothing to place costs nothing.
 class Placer {
  public:
   Placer(const config::Config& config, const retroarch::Settings& retroarch,
@@ -155,25 +157,32 @@ class Placer {
  private:
   struct Target {
     Layout layout;
-    std::string map_folder;     ///< the map's folder the layout came from, for its platform hint
     std::string emulator_id;    ///< the emulator the file is written for
     std::string reason;         ///< set when there is no target
     bool foreign = false;       ///< ...because the server's copy is not that emulator's
   };
 
-  Target TargetFor(const roms::Rom& rom, std::string_view server_emulator, bool saves);
+  Target TargetFor(const roms::Rom& rom, std::string_view server_emulator, scan::Folders which);
 
-  /// The rom the scan would match `file_name` in `target`'s folder to, or why
-  /// it would match none. Empty reason: `rom` is the match, as DuckStation's
-  /// card `card` where the folder is Tico's psx (#238).
-  std::string ReadsBackAs(const roms::Rom& rom, std::string_view file_name, const Target& target,
-                          bool saves, int card = 1) const;
+  /// Why the scan would not read a file at `sd_path` back as `rom`'s -- as
+  /// DuckStation's card `card` where the folder is one with memory cards
+  /// (#238) -- or "" when it would. Asked of the scan's own plan of folders and
+  /// its own rules in one (`scan::FolderIn`, `scan::RuleFor`, `scan::Reaches`),
+  /// so a rom folder, a cut listing and a folder it does not read at all are
+  /// answered as the scan answers them (#258).
+  std::string ReadsBackAs(const roms::Rom& rom, const std::string& sd_path, scan::Folders which,
+                          int card = 1);
+
+  /// `scan::PlanFolders` for `which`, planned on first use and kept for the tick.
+  const scan::FolderPlan& PlanOf(scan::Folders which);
 
   const config::Config& config_;
   const retroarch::Settings& retroarch_;
   const roms::RomIndex& index_;
   fs::FileSystem& files_;
   std::map<std::string, tico::Resolution> roots_;  ///< by lowercased root
+  std::optional<scan::FolderPlan> saves_plan_;
+  std::optional<scan::FolderPlan> states_plan_;
 };
 
 }  // namespace rommsync::place

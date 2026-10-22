@@ -140,6 +140,34 @@ void TicoTable(checks::Checks& c) {
   }
   c.Expect(scan::TicoModuleFor("vectrex") == nullptr, "a system Tico does not run has no module");
 
+  // #258: an isolated module's save format is its row's, and the one answer
+  // the scan and the placer both read -- so a new module is one row.
+  const scan::TicoModule* psx = scan::TicoModuleFor("psx");
+  const scan::TicoModule* n64 = scan::TicoModuleFor("n64");
+  const scan::TicoModule* psp = scan::TicoModuleFor("psp");
+  c.Expect(psx != nullptr && psx->format.memory_cards && psx->format.Writes(".mcd"),
+           "DuckStation's row: one .mcd card per game");
+  c.Expect(n64 != nullptr && n64->format.Writes(".eep") && n64->format.Writes(".mpk") &&
+               !n64->format.Writes(".srm"),
+           "Mupen64Plus's row: its four, and no .srm");
+  c.Expect(psp != nullptr && psp->format.folders, "PPSSPP's row: folders");
+  c.Expect(scan::SaveFormatOf("tico-duckstation").memory_cards &&
+               scan::SaveFormatOf("tico-ppsspp").folders,
+           "and the format an id is placed in is that row's");
+  c.Expect(scan::SaveFormatOf("tico-flycast").also[0] == nullptr &&
+               *scan::SaveFormatOf("tico-flycast").primary == '\0',
+           "a module nobody has read names off has none yet [#44]");
+  c.Expect(scan::SaveFormatOf("fceumm").Writes(".srm") &&
+               scan::SaveFormatOf("snes9x").Writes(".rtc"),
+           "a libretro module's is RetroArch's, whatever its row says");
+  c.Expect(!scan::SaveFormatOf("pcsx2-standalone").Writes(".srm"),
+           "and an id nobody knows writes nothing this build can name");
+  c.Expect(scan::IsRetroArchCore("mgba") && !scan::IsRetroArchCore("tico-duckstation"),
+           "a core RomM's table names is libretro; an isolated id is not");
+  c.Expect(scan::SameCore("beetle_psx_hw", "mednafen_psx_hw") && !scan::SameCore("", "snes9x") &&
+               !scan::SameCore("mgba", "gambatte"),
+           "one core is the same id or one RetroArch folder, and never an unnamed one");
+
   // RomM spells five systems differently from Tico (#226 R5), and the default
   // map uses RomM's `dreamcast` where Tico's folder is `dc`.
   c.ExpectEq(scan::TicoSlugFor("dreamcast"), std::string("dc"), "dreamcast");

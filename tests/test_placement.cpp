@@ -15,6 +15,8 @@
 //   states  -- the same rule for a state, which keeps the name it pairs on
 //   rom_folder -- #258: a rom folder, cut or not, placed in exactly when the
 //              scan reads the file back
+//   retroarch_folder -- #258: where RetroArch writes, one rule the placer and
+//              the scan both ask
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -512,8 +514,13 @@ void Saves(checks::Checks& c) {
             "an archival save, which pairs with nothing");
     refused(placer.Save(Download(1, ScanSlot("x.rtc"), "snes9x", "x.srm")),
             "a slot the scan would not give it back in");
-    refused(placer.Save(Download(1, ScanSlot("x.sav"), "snes9x", "x.sav")),
-            "a .sav in a slot of its own, which renaming to .srm would move out of it");
+    // #237's (1), decided in #258: a `.sav` kept in a slot of its own stays on
+    // the server -- renamed to `.srm` it would come back in `autosave` as a
+    // second save, and kept as `.sav` no libretro core loads it.
+    const place::Placement sav = placer.Save(Download(1, ScanSlot("x.sav"), "snes9x", "x.sav"));
+    refused(sav, "a .sav in a slot of its own, which renaming to .srm would move out of it");
+    c.Expect(sav.reason.find(".sav in a slot of its own") != std::string::npos,
+             "and the reason says that is what it is: " + sav.reason);
     refused(placer.Save(Download(3, ScanSlot("x.mcd"), "mednafen_psx_hw", "Psx Game.srm")),
             "a RetroArch psx save is not a DuckStation card (#226 D3)");
     refused(placer.Save(Download(6, tico_srm, "pcsx2", "x.ps2")), "a platform nothing maps");
@@ -624,6 +631,52 @@ void RomFolder(checks::Checks& c) {
            Download(3, ScanSlot("x.mcd"), "tico-duckstation", "Psx Game.mcd"),
            "/tico/saves/psx/Psx Game.mcd", false, "a card in a Tico folder that is a rom folder");
   }
+}
+
+/// #258: one function decides where RetroArch writes -- the folder
+/// retroarch.cfg names, or the build's default when that is no folder -- and
+/// the placer writes where the scan reads because both ask it. Each row is put
+/// to the function, then to the placer, then to the scan.
+void RetroArchFolder(checks::Checks& c) {
+  const roms::RomIndex index = Library();
+  const config::LoadResult loaded = config::ParseConfig("[platform.snes]\nplay_with = retroarch\n");
+  struct Row {
+    const char* what;
+    std::string configured;
+    std::string expected;
+  };
+  const std::string fallback = retroarch::kDefaultSavefileDirectory;
+  const Row kRows[] = {
+      {"a folder that is there", "/saves/ra", "/saves/ra"},
+      {"one that is missing is RetroArch's default", "/nowhere/saves", fallback},
+      {"so is a file where the folder should be", "/saves/file", fallback},
+      {"the default, in any case, is the default", "/RetroArch/Cores/SaveFiles",
+       "/RetroArch/Cores/SaveFiles"},
+  };
+  for (const Row& row : kRows) {
+    Card card(std::string("ra-folder-") + std::to_string(&row - kRows));
+    card.MakeDirs("/saves/ra");
+    card.Write("/saves/file", "not a folder\n");
+    retroarch::Settings settings;
+    settings.savefile_directory = row.configured;
+    settings.sort_savefiles = false;
+    const std::string what = row.what;
+    c.ExpectEq(retroarch::EffectiveDirectory(settings.Saves(), card.files()), row.expected,
+               what + ": the folder");
+    place::Placer placer(loaded.value, settings, index, card.files());
+    const place::Placement placed = placer.Save(Download(1, ScanSlot("x.srm"), "snes9x", "x.srm"));
+    c.ExpectEq(placed.sd_path, row.expected + "/Super Mario World (USA).srm",
+               what + ": the placer writes there: " + placed.reason);
+    std::string said;
+    c.Expect(ReadsBack(card, loaded.value, settings, index, placed.sd_path, 1, ScanSlot("x.srm"),
+                       &said),
+             what + ": and the scan reads it there: " + said);
+  }
+  retroarch::Settings states;
+  states.savestate_directory = "/nowhere/states";
+  Card card("ra-folder-states");
+  c.ExpectEq(retroarch::EffectiveDirectory(states.States(), card.files()),
+             std::string(retroarch::kDefaultSavestateDirectory), "a state folder by the same rule");
 }
 
 /// The state scan's answer for `sd_path`, written and removed again: read back
@@ -953,6 +1006,8 @@ int main(int argc, char** argv) {
     StateSlots(c);
   } else if (scenario == "rom_folder") {
     RomFolder(c);
+  } else if (scenario == "retroarch_folder") {
+    RetroArchFolder(c);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

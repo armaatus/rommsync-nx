@@ -805,6 +805,9 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // has never seen needs one invented, which the plan cannot do -- the server's
   // `file_name` is tagged and the directory depends on the rom's platform.
   SaveTarget placed;
+  // Declared before the staged file, so a failure removes that first and then
+  // the folders made for it (#258).
+  fs::MadeFolders folders(files);
   if (target == nullptr) {
     const place::Placement placement =
         options.place != nullptr ? options.place(operation) : place::Placement{};
@@ -843,10 +846,11 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
       return refused;
     }
     // The emulator makes a system's folder the first time it saves one, which
-    // for a save the console has never held is after this.
+    // for a save the console has never held is after this. Taken back if the
+    // save then does not land: an empty folder is one the emulator did not make.
     const std::size_t parent = sd_path.rfind('/');
     if (parent != std::string::npos && parent > 0) {
-      const fs::MakeDirResult made = files.CreateDirectory(sd_path.substr(0, parent));
+      const fs::MakeDirResult made = folders.Make(sd_path.substr(0, parent));
       if (!made.ok()) {
         return Fail(operation, OperationError::kUnreadableCard,
                     "the folder for " + sd_path + " could not be made: " + made.message);
@@ -981,6 +985,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     failed.archive_save_id = result.archive_save_id;
     return failed;
   }
+  folders.Keep();
 
   // The save is on the card. What is left is telling the server so -- without
   // it, this device has no sync row for the save and every later negotiation

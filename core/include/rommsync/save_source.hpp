@@ -36,6 +36,7 @@
 // a silent mismatch.
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -185,13 +186,61 @@ std::string RetroArchCoreFolder(std::string_view id);
 /// folder as `id`, `id` and the folder name included, sorted. Empty for "".
 std::vector<std::string> RetroArchAliases(std::string_view id);
 
+/// True for an id RomM's core table names: a libretro core, whose saves are
+/// RetroArch's SRAM format whichever frontend ran it -- Tico's libretro modules
+/// included.
+bool IsRetroArchCore(std::string_view id);
+
+/// True when bytes `written_by` wrote are ones `loaded_by` loads as its own:
+/// the same id, or two ids RomM files under one RetroArch core folder. False
+/// when either is empty. The core-identity half of `place::Compatible` and
+/// `place::LoadsState`.
+bool SameCore(std::string_view written_by, std::string_view loaded_by);
+
+// --- save formats (#238) ----------------------------------------------------------
+
+/// How an emulator names its saves, as far as this build knows. All empty is
+/// an emulator whose names nobody has read off a console yet [#44].
+struct SaveFormat {
+  /// The extension a save is written as when the server's name gives no better
+  /// answer; "" when only the server's name can say which of `also` it is.
+  const char* primary = "";
+
+  /// The others it writes beside it, each a save of its own; unused ones null.
+  std::array<const char*, 4> also = {};
+
+  /// Each save is a folder (PPSSPP): never placed, and a loose file where the
+  /// folders are kept is no save of its.
+  bool folders = false;
+
+  /// One memory card per game, named by `MemoryCardName` (DuckStation).
+  bool memory_cards = false;
+
+  /// `extension` -- `.srm`, lowercased -- is one this emulator writes.
+  bool Writes(std::string_view extension) const;
+};
+
+/// A libretro core's: RetroArch's `.srm`, and the `.rtc` some keep beside it.
+const SaveFormat& LibretroFormat();
+
+/// The format a save under `emulator_id` is in: `LibretroFormat` for a core
+/// RomM's table names, a Tico module's own for its isolated `tico-*` id, and
+/// the all-empty unknown one for anything else.
+SaveFormat SaveFormatOf(std::string_view emulator_id);
+
 // --- Tico: one module per system ------------------------------------------------
 
-/// The module Tico runs for one of its systems.
+/// The module Tico runs for one of its systems. Adding one is a row of
+/// `kTicoModules` and nothing else: the scan and the placer read its format
+/// from here.
 struct TicoModule {
   const char* slug;         ///< Tico's folder name, `master-system`
   const char* module;       ///< the module, `Genesis Plus GX`
   const char* emulator_id;  ///< `genesis_plus_gx`, or `tico-*` for an isolated format
+
+  /// For an isolated module, how it names its saves. A libretro module's is
+  /// `LibretroFormat`, whatever this says.
+  SaveFormat format = {};
 };
 
 /// The module for Tico slug `tico_slug`, or nullptr when Tico runs no such

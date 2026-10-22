@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -191,6 +192,30 @@ class SdCard final : public fs::FileSystem {
     result.error = fs::MakeDirError::kUnwritable;
     result.message = std::string(sd_path) + ": the card would not create it";
     return result;
+  }
+
+  bool RemoveEmptyDirectory(std::string_view sd_path) override {
+    const std::string resolved = ResolveOnCard(mount_, sd_path);
+    if (resolved.empty()) {
+      return false;
+    }
+    // Looked into first: `fsdev`'s `rmdir` is `fsFsDeleteDirectory`, which
+    // refuses a folder that holds anything, and a folder beside saves does not
+    // lean on that alone.
+    ::DIR* directory = ::opendir(resolved.c_str());
+    if (directory == nullptr) {
+      return false;
+    }
+    bool empty = true;
+    while (const ::dirent* found = ::readdir(directory)) {
+      const std::string_view name = found->d_name;
+      if (name != "." && name != "..") {
+        empty = false;
+        break;
+      }
+    }
+    ::closedir(directory);
+    return empty && ::rmdir(resolved.c_str()) == 0;
   }
 
   std::string Resolve(std::string_view sd_path) const override {

@@ -56,6 +56,38 @@ bool SplitPath(const std::string& sd_path, std::string* directory, std::string* 
   return true;
 }
 
+std::string JoinPath(std::string_view directory, std::string_view name) {
+  std::string path(directory);
+  if (path.empty() || path.back() != '/') {
+    path.push_back('/');
+  }
+  path.append(name);
+  return path;
+}
+
+MadeFolders::~MadeFolders() {
+  // Every one is asked, innermost first: one a failed `Make` never got to is
+  // simply not there, and its parent may still be one it did make.
+  for (auto folder = made_.rbegin(); folder != made_.rend(); ++folder) {
+    files_->RemoveEmptyDirectory(*folder);
+  }
+}
+
+MakeDirResult MadeFolders::Make(std::string_view sd_path) {
+  std::vector<std::string> missing;
+  std::string folder(sd_path);
+  while (folder.size() > 1 && files_->List(folder).error == ListError::kMissing) {
+    missing.push_back(folder);
+    const std::size_t slash = folder.rfind('/');
+    if (slash == std::string::npos || slash == 0) {
+      break;
+    }
+    folder.resize(slash);
+  }
+  made_.assign(missing.rbegin(), missing.rend());
+  return files_->CreateDirectory(sd_path);
+}
+
 const Entry* Directories::Find(const std::string& sd_path, std::string* why) {
   std::string directory;
   std::string leaf;

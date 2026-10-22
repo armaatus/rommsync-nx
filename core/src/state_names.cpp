@@ -109,15 +109,7 @@ std::string StateMatchName(std::string_view name) {
 }
 
 bool MapsStateSlots(const config::Config& config, std::string_view emulator_id) {
-  if (!config.sync.map_state_slots || emulator_id.empty()) {
-    return false;
-  }
-  for (const RetroArchCore& core : RetroArchCores()) {
-    if (emulator_id == core.id) {
-      return true;
-    }
-  }
-  return false;
+  return config.sync.map_state_slots && IsRetroArchCore(emulator_id);
 }
 
 }  // namespace rommsync::scan

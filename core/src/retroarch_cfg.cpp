@@ -305,6 +305,26 @@ LoadResult Load(const std::string& path) {
   return reader.Finish(true);
 }
 
+Folder Settings::Saves() const {
+  return {savefile_directory, kDefaultSavefileDirectory, sort_savefiles,
+          sort_savefiles_by_content, savefiles_in_content_dir};
+}
+
+Folder Settings::States() const {
+  return {savestate_directory, kDefaultSavestateDirectory, sort_savestates,
+          sort_savestates_by_content, savestates_in_content_dir};
+}
+
+std::string EffectiveDirectory(const Folder& folder, fs::FileSystem& files) {
+  if (LowerAscii(folder.directory) == LowerAscii(folder.default_directory)) {
+    return folder.directory;
+  }
+  const fs::ListError error = files.List(folder.directory).error;
+  return error == fs::ListError::kMissing || error == fs::ListError::kNotADirectory
+             ? std::string(folder.default_directory)
+             : folder.directory;
+}
+
 bool Enabled(const config::Config& config, const Settings& settings) {
   switch (config.sources.retroarch) {
     case config::SourceMode::kOn:
