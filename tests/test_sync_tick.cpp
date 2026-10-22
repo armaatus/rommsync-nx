@@ -2427,9 +2427,38 @@ void Oversized(rig::Checks& checks, http::HttpClient& client, const std::string&
     largest_plan = std::max(largest_plan, plan.operations.size());
   };
 
+  // One save on the card, of the first rom, holding the server's bytes: the
+  // split has a save to carry, and each half must send its own and no other --
+  // RomM plans every rom a save is sent for, scoped or not, so a half sent the
+  // whole tick's saves plans them all again.
+  sync::ClientSaveState on_card;
+  on_card.rom_id = seeded[0].rom.id;
+  on_card.slot = OversizedSlot(seeded[0].label, 0);
+  on_card.file_name = *on_card.slot + ".srm";
+  on_card.emulator = "m2-7";
+  on_card.content_hash = crypto::Md5Hex("another device's save\n");
+  on_card.updated_at = sync::Timestamp{} + std::chrono::seconds{1'757'000'000};
+  on_card.file_size_bytes = 22;
+
   if (uploaded) {
     const sync::TickResult tick =
-        sync::RunTick(recording, *files, token, {}, {}, state::Baseline{}, options);
+        sync::RunTick(recording, *files, token, {on_card}, {}, state::Baseline{}, options);
+    for (const std::string& body : recording.negotiations) {
+      bool restoring = false;
+      const std::optional<std::vector<std::int64_t>> scope = ScopeOf(body, &restoring);
+      const json::ParseResult document = json::Parse(body);
+      const json::Value* saves = document.ok() ? document.value.Find("saves") : nullptr;
+      std::size_t foreign = 0;
+      if (scope.has_value() && saves != nullptr && saves->is_array()) {
+        for (const json::Value& save : saves->elements()) {
+          const std::int64_t rom = harness::Number(save, "rom_id");
+          foreign += std::find(scope->begin(), scope->end(), rom) == scope->end() ? 1 : 0;
+        }
+      }
+      checks.ExpectEq(foreign, std::size_t{0},
+                      "a negotiation sends only the saves of the roms it names: " +
+                          body.substr(0, 300));
+    }
     checks.Expect(tick.outcome != sync::TickOutcome::kRefused,
                   std::string("a server holding more saves than one plan carries is not a tick "
                               "refused whole -- it was every tick, forever: ") +
