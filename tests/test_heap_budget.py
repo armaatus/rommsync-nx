@@ -15,7 +15,7 @@ byte count by a `static_assert`. That closes the loop in both directions: the
 compiler catches a constant that moved away from its row, and this catches a
 row -- or a margin -- that moved away from the arithmetic.
 
-Four phases, one CTest entry each, so a red run names what broke:
+Five phases, one CTest entry each, so a red run names what broke:
 
   rows      every row's hex and KiB agree, and the terms sum to the peak row.
   pinned    every row's constant exists, is summed into `kHeapPeak`, and is
@@ -205,8 +205,8 @@ def phase_dirs(repo):
 # A line that talks about the heap, and the hex literals on it. The window is
 # deliberately narrow: `kHeapStateBaseline` (0x40000) and `kHeapListResponse`
 # (0x7D000) are legitimately quoted beside the heap and are not it, while every
-# value `kInnerHeapSize` has ever held -- 0x80000, 0xC0000, 0x100000, 0x150000 --
-# sits inside it.
+# value `kInnerHeapSize` has ever held -- 0x80000, 0xC0000, 0x100000, 0x150000,
+# 0x160000, 0x180000 -- sits inside it.
 HEAP_LINE = re.compile(r"inner heap|kInnerHeapSize|[Tt]he heap is")
 HEX = re.compile(r"0x[0-9A-Fa-f]+")
 HEAP_SIZE_MIN = 0x80000
@@ -294,7 +294,7 @@ def phase_prose(repo):
                                 "sized against it would be off by %d KiB (#207)"
                                 % (relative, number, token, MAIN, hex(size),
                                    abs(value - size) // 1024))
-                # To the precision it is written in: "1.5 MiB" is right for
+                # To a tenth of a MiB, or to the KiB: "1.5 MiB" is right for
                 # 0x180000, "1.4 MiB" is 0x160000's and is not. Outside the hex
                 # check's window it is some other heap -- a test's fake 4 KiB one.
                 for number, text, stated in heap_words(lines):

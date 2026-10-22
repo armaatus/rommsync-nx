@@ -292,10 +292,10 @@ class Service {
   /// The network the library is read over, and the credentials to read it with.
   ///
   /// **A null client is a build with no network backend** -- not the sysmodule,
-  /// which hands over M1-7 (#126)'s Horizon client through
-  /// `SdEngine::UseServer` at boot. `platforms` and `roms` then answer `ipc::Error::kOffline` -- the same
-  /// sentence a console with its Wi-Fi off gets, which is what it amounts to --
-  /// while `queue`, which never touches the network, is served in full.
+  /// which hands over M1-7 (#126)'s Horizon client through `SdEngine::UseServer`
+  /// at boot. `platforms` and `roms` then answer `ipc::Error::kOffline` -- the
+  /// same sentence a console with its Wi-Fi off gets, which is what it amounts
+  /// to -- while `queue`, which never touches the network, is served in full.
   void UseServer(http::HttpClient* client, std::string bearer_token);
 
   /// Where a rom already on the card is looked for, for `on_disk`.

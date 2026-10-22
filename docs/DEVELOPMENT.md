@@ -639,10 +639,12 @@ a sysmodule pays for a TLS request is therefore:
    `tests/test_heap_budget.py` rather than by this table. It was `0xC0000` until
    M9-2 (#207), which found the table wrong by more than its own margin — two
    thread stacks budgeted at a quarter of what devkitA64 gives them, and an open
-   `DIR` costing ~24 KiB with no term at all — and M9-10 (#201) added 64 KiB to
+   `DIR` costing ~24 KiB with no term at all — M9-10 (#201) added 64 KiB to
    it: 48 KiB for the download's bigger read chunk and 16 KiB for the pairing
-   thread's buffer, which the table had never counted (item 2). The default socket config does not
-   fit in it and never will; the sysmodule's leaves ~1.4 MiB. **Never call
+   thread's buffer, which the table had never counted (item 2) — and M9-20
+   (#246) 128 KiB more, for a tick's saves and the list service's pages. The
+   default socket config does not fit in it and never will; the sysmodule's
+   leaves ~1.4 MiB. **Never call
    `socketInitializeDefault()` from the sysmodule** — that single line is the
    difference between a working engine and one that dies at `socketInitialize`.
 
@@ -923,11 +925,12 @@ M1-7 (#126) had not yet built it -- so the `queue` kind, which is served off
 `queue.json` and never touches the network, worked in full, while `platforms`
 and `roms` answered `kOffline`: the same sentence a console with its Wi-Fi off
 gets, which is what a build with no network amounts to, and what a console with
-no link still answers. `SdEngine::UseServer` is the seam M7-2 filled: `main.cpp` now installs M1-7's
-Horizon client through it and starts the worker that drives `PumpLists()` in the
-same breath, which is the pair that had to land together -- a client with no
-worker turns "offline" into "pending" forever. The host suite passes it a libcurl
-client and the fixture token, which is what proves the paging (`lists.*`).
+no link still answers. `SdEngine::UseServer` is the seam M7-2 filled: `main.cpp`
+now installs M1-7's Horizon client through it and starts the worker that drives
+`PumpLists()` in the same breath, which is the pair that had to land together --
+a client with no worker turns "offline" into "pending" forever. The host suite
+passes it a libcurl client and the fixture token, which is what proves the
+paging (`lists.*`).
 
 `SyncNow` used to be the one command that could not say it: `ipc::Engine::RequestSync()`
 is a `bool`, so an engine that had not been built answered `false` and
@@ -1041,10 +1044,11 @@ off-console.** Full strategy in [TESTING.md](TESTING.md); the ladder:
 1. **Host build + real docker RomM** — the core engine (auth, sync, downloads,
    config, `state.db`, IPC protocol) compiles native and runs against a genuine
    RomM in Docker -- 5.4.0 unless `ROMM_VERSION` in `.env` names another
-   ([TESTING.md](TESTING.md#choosing-the-romm-version)). There is **no mock**: a passing test means the behaviour
-   is real. Failure modes a healthy RomM will not produce on demand (401
-   mid-sync, truncated body, dropped connection, stall) are forced by a fault
-   proxy sitting in front of it. Runs in CI. This is the primary loop.
+   ([TESTING.md](TESTING.md#choosing-the-romm-version)). There is **no mock**: a
+   passing test means the behaviour is real. Failure modes a healthy RomM will
+   not produce on demand (401 mid-sync, truncated body, dropped connection,
+   stall) are forced by a fault proxy sitting in front of it. Runs in CI. This
+   is the primary loop.
 2. **Ryujinx NRO** — a manually-launched **NRO** (not a sysmodule, not on the boot
    path) built from the same core lib, run in Ryujinx against docker RomM. This is
    where the Horizon `ssl`/`fs`/socket path is exercised without hardware.

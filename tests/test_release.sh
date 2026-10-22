@@ -30,7 +30,8 @@
 #                             exactly this check -- still says the same thing.
 #   test_release.sh history   ...and it picks the right previous tag, against a
 #                             throwaway repo with real tags in it. This repo has
-#                             none, so `notes` only ever exercises the
+#                             none before VERSION's own, which the notes skip,
+#                             so `notes` only ever exercises the
 #                             first-release fallback; the case that actually
 #                             ships -- v0.1.0, some rcs, then v0.2.0 -- can only
 #                             be seen here.
@@ -336,8 +337,9 @@ phase_notes() {
   # checked for.
   grep -qE '@[A-Z_]+@' "$body" && fail "the notes hold an unsubstituted @PLACEHOLDER@"
 
-  # The changes. This repo has no tags yet, so the fallback -- the whole history
-  # -- is what runs here, and it must not come out empty either way.
+  # The changes. This repo has no tag before VERSION's own, so the fallback --
+  # the whole history -- is what runs here, and it must not come out empty
+  # either way.
   grep -qi 'change' "$body" || fail "the notes have no changes section"
   # The newest commit the notes are *supposed* to list, which is not always the
   # one at HEAD: `release-notes.sh` passes `--no-merges` on purpose (a

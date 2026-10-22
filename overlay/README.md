@@ -46,7 +46,7 @@ client, and that rule is about ownership rather than about the link map.
   (M5-3, #30) accepts an edit, but no screen sends one, and nothing here writes
   `config.ini`.
 - **Conflicts** — what a sync overwrote, and putting the backup back ✅ M7-1
-  (#131). The one conditional row of the settings menu: `[sync] conflict_show`
+  (#36). The one conditional row of the settings menu: `[sync] conflict_show`
   hides it, and never stops the recording.
 - **Log** — the end of `rommsync.log`, read off the sysmodule rather than the
   card ✅ M9-6 (#209). The last row of the settings menu.
@@ -218,10 +218,11 @@ that.
 ## Where the work is
 
 **M4 is complete.** Its five screens are built on the frame M4-1 landed and the
-`screen_frame.*` M4-2 lifted out of it, and M7-1 (#131) and M9-6 (#209) added
-the conflicts and log screens on the same frame. What is left for this directory
-is an editing UI on the settings rows (#30 landed the write path; nothing here
-sends an edit yet) and the layout pass against a real panel in M8-2 (#44). See milestone M4 in [`../ISSUES.md`](../ISSUES.md).
+`screen_frame.*` M4-2 lifted out of it, and M7-1 (#36) and M9-6 (#209) added the
+conflicts and log screens on the same frame. What is left for this directory is
+an editing UI on the settings rows (#30 landed the write path; nothing here
+sends an edit yet) and the layout pass against a real panel in M8-2 (#44). See
+milestone M4 in [`../ISSUES.md`](../ISSUES.md).
 
 The palette (`ColorFor`), the `GetInterfaceVersion` handshake and the
 drop-and-reopen that decides *not running* from *unreachable* now live in
