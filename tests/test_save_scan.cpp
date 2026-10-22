@@ -565,6 +565,22 @@ void Unusable(::checks::Checks& checks) {
                 "and the core every mapped platform's folders resolve to, with no save yet");
   checks.Expect(!lists("mednafen_psx_hw"),
                 "but not a core no folder of this console writes");
+  // #238: a platform played in Tico is restored with Tico's module, so the
+  // RetroArch folder mapped beside it names no core to be offered -- RomM's web
+  // player writes `mupen64plus_next` and `ppsspp`, and a first-time restore of
+  // one would be refused on every tick.
+  checks.Expect(!lists("mupen64plus_next") && !lists("ppsspp") && !lists("pcsx_rearmed"),
+                "nor RetroArch's own core for a platform played in Tico, with no save of it here");
+  checks.Expect(lists("tico-mupen64plus") && lists("tico-ppsspp"),
+                "which is offered Tico's module's saves instead");
+  scan::SaveFile retroarch_n64 = named.saves.front();
+  retroarch_n64.emulator = "mupen64plus_next";
+  const std::optional<std::vector<std::string>> with_n64 =
+      scan::EmulatorFilter(config, {retroarch_n64});
+  checks.Expect(with_n64.has_value() &&
+                    std::find(with_n64->begin(), with_n64->end(), "mupen64plus_next") !=
+                        with_n64->end(),
+                "a RetroArch N64 save on the card still names its core: it pairs with its own");
   checks.Expect(filter.has_value() && std::is_sorted(filter->begin(), filter->end()) &&
                     std::adjacent_find(filter->begin(), filter->end()) == filter->end(),
                 "sorted and without repeats, so the body is the same every tick");
