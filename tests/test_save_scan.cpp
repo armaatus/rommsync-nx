@@ -758,6 +758,38 @@ void Truncated(::checks::Checks& checks) {
   const scan::ScanResult past = scan_of(scan::kMaxSaves + 3);
   checks.ExpectEq(past.saves.size(), scan::kMaxSaves, "one past it reports the bound");
   checks.Expect(past.stopped_at_bound, "and says the walk stopped there");
+
+  // The bound is on saves, not on files: a card holding exactly the bound's
+  // saves and then a file that is no save -- one with no rom, one whose mtime
+  // is unusable -- synced every save it has, and a later folder is still read.
+  {
+    roms::RomIndex index;
+    FakeFileSystem card("bound-not-saves");
+    for (std::size_t at = 0; at < scan::kMaxSaves; ++at) {
+      std::string name = std::to_string(at);
+      name.insert(name.begin(), 4 - name.size(), '0');
+      index.Add(MakeRom(static_cast<std::int64_t>(at) + 1, "Game " + name, "gba"));
+      card.AddFile("/tico/saves/gba", "Game " + name + ".srm", 16, kMtime);
+    }
+    card.AddFile("/tico/saves/gba", "Zzz No Rom.srm", 16, kMtime);
+    index.Add(MakeRom(static_cast<std::int64_t>(scan::kMaxSaves) + 1, "Zzz Unset Clock", "gba"));
+    card.AddFile("/tico/saves/gba", "Zzz Unset Clock.srm", 16, 0);
+    card.AddFile("/tico/saves/snes", "Also No Rom.srm", 16, kMtime);
+    const scan::ScanResult full =
+        scan::ScanSaves(config::Defaults(), kRetroArchDefaults, index, card, kFirstTick);
+    checks.ExpectEq(full.saves.size(), scan::kMaxSaves, "bound, then non-saves: every save");
+    checks.Expect(!full.stopped_at_bound,
+                  "bound, then non-saves: not a walk that stopped short: " +
+                      full.DescribeSkipped());
+    checks.Expect(SkippedFor(full, "/tico/saves/gba/Zzz No Rom.srm", scan::SkipReason::kUnmatched),
+                  "bound, then non-saves: the file with no rom is said as that");
+    checks.Expect(SkippedFor(full, "/tico/saves/gba/Zzz Unset Clock.srm",
+                             scan::SkipReason::kUnusable),
+                  "bound, then non-saves: and so is the one with an unusable mtime");
+    checks.Expect(std::find(full.folders.begin(), full.folders.end(), "/tico/saves/snes") !=
+                      full.folders.end(),
+                  "bound, then non-saves: a later folder is still read");
+  }
 }
 
 // --- sources ------------------------------------------------------------------
