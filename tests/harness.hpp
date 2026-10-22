@@ -716,6 +716,53 @@ inline void DeleteSave(http::HttpClient& client, const std::string& base, const 
   }
 }
 
+/// One archival (`null`-slot) row RomM holds for a rom: where a conflict's
+/// losing local copy goes (#240).
+struct ArchivalRow {
+  std::int64_t id = 0;
+  std::string file_name;
+  std::string emulator;
+  std::string content_hash;
+};
+
+/// Every archival row of `rom_id`. Other scenarios' rows are there too, so a
+/// caller picks its own out by digest.
+inline std::vector<ArchivalRow> ArchivalRows(http::HttpClient& client, const std::string& base,
+                                             const Fixture& fixture, std::int64_t rom_id) {
+  const http::Result listed = client.Send(
+      Authed(http::Method::kGet, base + "/api/saves?rom_id=" + std::to_string(rom_id), fixture));
+  const json::ParseResult parsed = json::Parse(listed.response.body);
+  std::vector<ArchivalRow> rows;
+  if (!listed.successful() || !parsed.ok() || !parsed.value.is_array()) {
+    return rows;
+  }
+  for (const json::Value& save : parsed.value.elements()) {
+    const json::Value* slot = save.Find("slot");
+    if (slot == nullptr || !slot->is_null()) {
+      continue;
+    }
+    ArchivalRow row;
+    row.id = Number(save, "id");
+    row.file_name = Field(save, "file_name");
+    row.emulator = Field(save, "emulator");
+    row.content_hash = Field(save, "content_hash");
+    rows.push_back(std::move(row));
+  }
+  return rows;
+}
+
+/// The archival row of `rom_id` holding `content_hash`, or one with id 0.
+inline ArchivalRow ArchivalWith(http::HttpClient& client, const std::string& base,
+                                const Fixture& fixture, std::int64_t rom_id,
+                                const std::string& content_hash) {
+  for (ArchivalRow& row : ArchivalRows(client, base, fixture, rom_id)) {
+    if (row.content_hash == content_hash) {
+      return row;
+    }
+  }
+  return {};
+}
+
 // --- save states --------------------------------------------------------------
 //
 // Deliberately thin, and deliberately not built on the save helpers above:

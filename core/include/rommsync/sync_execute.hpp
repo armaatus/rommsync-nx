@@ -146,6 +146,16 @@ std::string SlotBackupDiscriminator(const std::optional<std::string>& slot);
 std::string StateBackupDiscriminator(std::string_view file_name);
 
 
+/// The name a conflict's losing local copy is uploaded under (#240):
+/// `<stem> [switch-conflict <YYYY-MM-DD_HH-MM-SS>].<ext>`, from the client's own
+/// `file_name` and the conflict's UTC second.
+///
+/// The second is in it because RomM tags no `null`-slot upload: it stores the
+/// name as sent, and a second upload of an existing name *replaces that row's
+/// bytes*. Without it a rom's next conflict would overwrite the copy the last
+/// one kept -- the loss this upload exists to prevent.
+std::string ArchiveFileName(std::string_view file_name, std::int64_t unix_seconds);
+
 /// One local save an operation may act on.
 ///
 /// Produced from a `scan::SaveFile` by the caller -- the scan is step 0 and
@@ -347,6 +357,29 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
                            std::int64_t unix_seconds, std::string* backup_sd_path,
                            std::string* message);
 
+/// Whether a conflict's losing local copy is on the server too (#240).
+///
+/// Keep both writes the server's copy to the card and leaves the local bytes in
+/// `.backup/` -- on one SD card, where no other device can recover them. So
+/// before the server's copy lands, those bytes go up as an **archival** save:
+/// `null` slot, the local emulator id, `ArchiveFileName`. RomM never pairs a
+/// `null`-slot row in negotiate and never prunes one, so it cannot come back
+/// into sync, and the server's copy still wins on the card (hard rule 3).
+enum class ArchiveOutcome {
+  /// Nothing to keep: not a conflict, or a conflict that replaced no local file.
+  kNone,
+
+  /// The local bytes are on the server as `OperationResult::archive_save_id`.
+  kKept,
+
+  /// The upload did not happen. The conflict was still resolved, and the local
+  /// bytes are **only** under `.backup/` on this card; the overlay says so.
+  kFailed,
+};
+
+/// Stable, log-friendly name. Never null.
+const char* ToString(ArchiveOutcome outcome);
+
 /// One operation, and what became of it.
 struct OperationResult {
   Action action = Action::kNoOp;
@@ -371,6 +404,11 @@ struct OperationResult {
   /// The server's save row afterwards: the one that was downloaded, or the new
   /// one an upload created. Empty when the operation never got that far.
   std::optional<std::int64_t> save_id;
+
+  /// On a `conflict`: whether the bytes in `backup_sd_path` are on the server
+  /// too, and as which row. `kNone` on every other action.
+  ArchiveOutcome archive = ArchiveOutcome::kNone;
+  std::optional<std::int64_t> archive_save_id;
 };
 
 /// What a whole plan did. The counts are what M2-6 reports to

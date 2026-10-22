@@ -231,6 +231,20 @@ const char* ToString(OperationOutcome outcome) {
   return "failed";
 }
 
+const char* ToString(ArchiveOutcome outcome) {
+  switch (outcome) {
+    case ArchiveOutcome::kNone:
+      return "none";
+    case ArchiveOutcome::kKept:
+      return "kept";
+    case ArchiveOutcome::kFailed:
+      return "failed";
+  }
+  return "none";
+}
+
+std::string ArchiveFileName(std::string_view, std::int64_t) { return {}; }
+
 const char* ToString(OperationError error) {
   switch (error) {
     case OperationError::kNone:

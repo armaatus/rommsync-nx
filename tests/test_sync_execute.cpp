@@ -192,6 +192,20 @@ void Naming(rig::Checks& checks) {
                   std::string("9-archival-1757000000.srm"),
                   "an archival save's backup is named rather than left blank");
 
+  // The name a conflict's losing copy goes up under (#240). RomM tags no
+  // `null`-slot upload and replaces a row whose name it already holds, so the
+  // conflict's own second is what keeps the next conflict's copy from landing
+  // on this one.
+  checks.ExpectEq(sync::ArchiveFileName("Game (USA).srm", kWhen),
+                  std::string("Game (USA) [switch-conflict 2025-09-04_15-33-20].srm"),
+                  "the archival name is the client's stem, the marker and the second");
+  checks.Expect(sync::ArchiveFileName("Game.srm", kWhen) !=
+                    sync::ArchiveFileName("Game.srm", kWhen + 1),
+                "two conflicts of one save a second apart are two archival rows");
+  checks.ExpectEq(sync::ArchiveFileName("Game", kWhen),
+                  std::string("Game [switch-conflict 2025-09-04_15-33-20]"),
+                  "a save with no extension keeps having none");
+
   // The slot on an operation is whatever some other client chose. A separator
   // in it would put the backup somewhere other than `.backup/`, and `..` would
   // put it above the directory entirely.
@@ -1725,6 +1739,114 @@ void Conflict(rig::Checks& checks, http::HttpClient& client, const std::string& 
   checks.ExpectEq(sandbox.Read(done.backup_sd_path), previous,
                   "...as the bytes this device had, recoverable by the overlay");
 
+  // #240: and not on this card alone. The losing bytes are on the server as an
+  // archival row -- no slot, so negotiate never pairs it -- under the local
+  // emulator and the conflict's own name.
+  const harness::ArchivalRow archived =
+      harness::ArchivalWith(client, base, fixture, rom.id, crypto::Md5Hex(previous));
+  checks.Expect(archived.id != 0, "the server holds a null-slot row with the local bytes");
+  checks.Expect(done.archive == sync::ArchiveOutcome::kKept,
+                std::string("the result says the local copy is on the server: ") +
+                    sync::ToString(done.archive));
+  checks.Expect(done.archive_save_id == archived.id,
+                "...and names the row: " + std::to_string(done.archive_save_id.value_or(0)) +
+                    " vs " + std::to_string(archived.id));
+  checks.ExpectEq(archived.emulator, std::string("m2-5"), "under the local copy's emulator");
+  checks.ExpectEq(archived.file_name, sync::ArchiveFileName(name, 1'757'000'002),
+                  "under the conflict's archival name, untagged");
+  // The server's copy is still the slot's head: the archive did not take part.
+  checks.ExpectEq(sandbox.Read(SavePath(name)), server_bytes,
+                  "the server copy still won on the card");
+
+  harness::DeleteSave(client, base, fixture, archived.id);
+  harness::DeleteSave(client, base, fixture, server.id);
+}
+
+// --- conflict_unarchived ----------------------------------------------------------
+//
+// #240's other half: the archival upload is refused. The conflict is resolved
+// all the same -- the server copy on the card, the local bytes in `.backup/` --
+// and the result says the server holds no copy, which is what the overlay shows.
+
+void ConflictUnarchived(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                        const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "execute-conflict-unarchived");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string slot = harness::UniqueSlot("m10-14-unarchived");
+  const std::string name = "unarchived.srm";
+
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  const std::string server_bytes = "server copy " + slot + "\n";
+  rig::WriteFile(staged, server_bytes);
+  harness::Save server;
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m10-14", staged, name,
+                           /*with_device=*/false, &server)) {
+    checks.Expect(false, "the server copy was stored");
+    return;
+  }
+  sync::Timestamp when;
+  if (!harness::ParseServerTimestamp(server.updated_at, &when)) {
+    checks.Expect(false, "the server's updated_at parses: " + server.updated_at);
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
+  const std::string previous = "device copy " + slot + "\n";
+  sandbox.SeedSave(SavePath(name), previous);
+
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(rom.id, name, slot, "m10-14",
+                                             crypto::Md5Hex(previous), when,
+                                             static_cast<std::int64_t>(previous.size())));
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
+  checks.Expect(plan.operations[0].action == sync::Action::kConflict,
+                std::string("the scenario is a conflict: ") +
+                    sync::ToString(plan.operations[0].action));
+
+  const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+  sync::ExecutionReport report;
+  {
+    // The only `POST /api/saves?...` a conflict sends is the archival upload:
+    // the download is `/api/saves/{id}/content` and its confirmation
+    // `/api/saves/{id}/downloaded`.
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"status","status":503,"path":"/api/saves?"})");
+    report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets,
+                               OptionsAt(1'757'000'005));
+  }
+
+  checks.ExpectEq(report.completed, 1,
+                  "the conflict is resolved without the archive" +
+                      (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+  if (report.operations.empty()) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
+  const sync::OperationResult& done = report.operations[0];
+  checks.Expect(done.outcome == sync::OperationOutcome::kKeptBoth,
+                std::string("keep both still: ") + sync::ToString(done.outcome));
+  checks.ExpectEq(sandbox.Read(SavePath(name)), server_bytes, "the server's copy is on the card");
+  checks.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == previous,
+                "and the local bytes are in .backup/: " + done.message);
+  checks.Expect(done.archive == sync::ArchiveOutcome::kFailed,
+                std::string("the result says the server holds no copy: ") +
+                    sync::ToString(done.archive));
+  checks.Expect(!done.archive_save_id.has_value(), "and names no row");
+  checks.Expect(std::any_of(report.warnings.begin(), report.warnings.end(),
+                            [](const std::string& line) {
+                              return line.find("only in") != std::string::npos;
+                            }),
+                "a warning says the bytes are only on this card");
+  const harness::ArchivalRow archived =
+      harness::ArchivalWith(client, base, fixture, rom.id, crypto::Md5Hex(previous));
+  checks.Expect(archived.id == 0, "and the server really holds none");
+
+  harness::DeleteSave(client, base, fixture, archived.id);
   harness::DeleteSave(client, base, fixture, server.id);
 }
 
@@ -2484,6 +2606,8 @@ int main(int argc, char** argv) {
     Placed(checks, *client, base, fixture, rom);
   } else if (scenario == "conflict") {
     Conflict(checks, *client, base, fixture, rom);
+  } else if (scenario == "conflict_unarchived") {
+    ConflictUnarchived(checks, *client, base, fixture, rom);
   } else if (scenario == "same_timestamp") {
     SameTimestamp(checks, *client, base, fixture, rom);
   } else if (scenario == "truncate") {

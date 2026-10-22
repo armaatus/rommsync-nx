@@ -964,7 +964,8 @@ set(EXECUTE_RIG_SCENARIOS
   download        # verify, back up, commit, confirm -- in that order
   crash           # M9-14: ...and a power cut at every call of it loses nothing
   placed          # M10-11: a first-time restore makes its folder and writes over nothing, all or none
-  conflict        # both sides changed: keep both, lose nothing
+  conflict        # both sides changed: keep both, lose nothing -- and #240: the local copy on the server too
+  conflict_unarchived # #240: ...and when that upload fails, the server holds none and the result says so
   same_timestamp  # ...and the no-history conflict, resolved the same way
   truncate        # a clean short body never replaces a save
   corrupted       # ...and neither do the right number of the wrong bytes
