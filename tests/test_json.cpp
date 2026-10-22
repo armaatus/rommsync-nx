@@ -41,11 +41,14 @@ void Accepts(checks::Checks& c) {
   c.ExpectEq(v.Find("zero")->integer(), std::int64_t{0}, "0");
 
   // A fraction or an exponent means the value cannot be trusted as an exact
-  // id, even when it happens to land on a whole number.
+  // id, even when it happens to land on a whole number. It is a number all the
+  // same -- just not one anything can read: no double is made of it (#253).
+  c.Expect(v.Find("d")->is_number(), "1.5 is a number");
   c.Expect(!v.Find("d")->is_integer(), "1.5 is not an integer");
-  c.ExpectEq(v.Find("d")->number(), 1.5, "1.5");
+  c.ExpectEq(v.Find("d")->integer(), std::int64_t{0}, "1.5 reads back as zero");
+  c.Expect(v.Find("e")->is_number(), "2e3 is a number");
   c.Expect(!v.Find("e")->is_integer(), "2e3 is not an integer");
-  c.ExpectEq(v.Find("e")->number(), 2000.0, "2e3");
+  c.ExpectEq(v.Find("e")->integer(), std::int64_t{0}, "2e3 reads back as zero");
 
   const json::Value* array = v.Find("a");
   c.Expect(array->is_array(), "array member");
@@ -58,7 +61,7 @@ void Accepts(checks::Checks& c) {
   // Accessors on the wrong type answer empty rather than aborting, which is
   // what lets Reader report the field instead of dying on it.
   c.Expect(v.Find("i")->string().empty(), "string() of a number is empty");
-  c.ExpectEq(v.Find("s")->number(), 0.0, "number() of a string is zero");
+  c.ExpectEq(v.Find("s")->integer(), std::int64_t{0}, "integer() of a string is zero");
   c.Expect(v.Find("s")->elements().empty(), "elements() of a string is empty");
   c.Expect(v.Find("s")->Find("x") == nullptr, "Find() on a string is nullptr");
   c.ExpectEq(v.Find("s")->size(), std::size_t{0}, "size() of a string is zero");
@@ -138,16 +141,25 @@ void Rejects(checks::Checks& c) {
              std::string("rejecting ") + bad.what + " says why");
   }
 
-  // The one deliberate narrowing, and the reason it is not in kBad above: these
-  // are well-formed JSON that no double can hold. Refusing beats saturating to
-  // an infinity or a zero that would then be read as a size or a timestamp.
-  for (const char* unrepresentable : {"1e400", "-1e400", "1e-400", "[1e400]"}) {
-    const json::ParseResult result = json::Parse(unrepresentable);
-    c.Expect(!result.ok(), std::string("refuses the unrepresentable ") + unrepresentable);
+  // Well-formed numbers no double can hold. This parser used to refuse them,
+  // rather than saturate to an infinity a size could be read as; it makes no
+  // double at all now (#253), so they are what any other non-integer is: a
+  // number, valid, and refused by name by every reader that wants an integer.
+  for (const char* well_formed : {"1e400", "-1e400", "1e-400", "[1e400]", "1e308"}) {
+    const json::ParseResult result = json::Parse(well_formed);
+    c.Expect(result.ok(), std::string("parses the well-formed ") + well_formed);
   }
-  // ...but the merely large is fine, so the narrowing stays narrow.
-  c.Expect(json::Parse("1e308").ok(), "a large-but-representable double parses");
-  c.Expect(json::Parse("1e-308").ok(), "and a small one");
+  {
+    const json::ParseResult doc = json::Parse(R"({"size": 1e400})");
+    c.Expect(doc.ok() && doc.value.Find("size")->is_number() &&
+                 !doc.value.Find("size")->is_integer(),
+             "1e400 is a number that is not an integer");
+    json::Reader reader(doc.value, "fixture");
+    std::int64_t size = 7;
+    c.Expect(!reader.Required("size", &size), "an integer reader refuses 1e400");
+    c.ExpectEq(reader.error().field, std::string("size"), "...naming the field");
+    c.ExpectEq(size, std::int64_t{7}, "...and writing nothing");
+  }
 
   // Deep nesting is refused rather than recursed into: this parser runs on a
   // sysmodule thread whose stack a hostile body must not be able to walk off.
