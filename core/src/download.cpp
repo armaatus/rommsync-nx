@@ -1323,6 +1323,11 @@ Verdict Judge(const http::Result& result, Reason* why) {
       case http::Error::kFileTooLarge:
         say("this rom is larger than one file on this card can be; on FAT32 that is 4 GiB");
         return Verdict::kFatal;
+      // Only `Send`'s: the rom's detail past the transport's ceiling (#248). The
+      // same server answers the same body, so asking again buys nothing.
+      case http::Error::kTooLarge:
+        say("the server's description of this rom is larger than this console reads");
+        return Verdict::kFatal;
       case http::Error::kWriteFailed:
         // A mapped folder that does not exist is the ordinary way to reach it;
         // a failing card, or one half out of its slot, is the other.

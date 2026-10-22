@@ -35,6 +35,7 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/list_service.hpp"
+#include "rommsync/rom_index.hpp"
 
 namespace config = rommsync::config;
 namespace download = rommsync::download;
@@ -200,8 +201,11 @@ Walk WalkList(Console& console, const ipc::ListRequest& request, ipc::Cursor* ke
 
 /// One rom, as `GET /api/roms` would send it.
 std::string RomJson(std::int64_t id, const std::string& name, const std::string& fs_name) {
+  const std::string stem = fs_name.substr(0, fs_name.rfind('.'));
   return "{\"id\":" + std::to_string(id) + ",\"name\":" + rommsync::json::Quote(name) +
          ",\"fs_name\":" + rommsync::json::Quote(fs_name) +
+         ",\"fs_name_no_ext\":" + rommsync::json::Quote(stem) +
+         ",\"fs_name_no_tags\":" + rommsync::json::Quote(stem) +
          ",\"platform_fs_slug\":\"gba\",\"fs_size_bytes\":4096,\"has_multiple_files\":false}";
 }
 
@@ -223,6 +227,16 @@ class FakeClient : public http::HttpClient {
   /// that lost a rom between two requests looks like from here.
   void OverCount(std::size_t total) { over_count_ = total; }
 
+  /// Refuse a page of more than `rows` roms as too large, and any page holding
+  /// the rom at `wide` however few rows it has -- the transport's ceiling
+  /// (`http::kMaxResponseBytes`) meeting rows RomM made wide (#248).
+  void Ceiling(std::size_t rows, std::size_t wide = static_cast<std::size_t>(-1)) {
+    ceiling_rows_ = rows;
+    wide_ = wide;
+  }
+
+  std::vector<std::size_t> limits;  ///< every page size asked for, in order
+
   http::Result Send(const http::Request& request) override {
     ++requests;
     last_url = request.url;
@@ -234,6 +248,13 @@ class FakeClient : public http::HttpClient {
     }
     const std::size_t limit = static_cast<std::size_t>(Query(request.url, "limit", 10));
     const std::size_t offset = static_cast<std::size_t>(Query(request.url, "offset", 0));
+    limits.push_back(limit);
+    if (limit > ceiling_rows_ || (wide_ >= offset && wide_ < offset + limit)) {
+      http::Result refused;
+      refused.error = http::Error::kTooLarge;
+      refused.message = "past the ceiling";
+      return refused;
+    }
 
     std::string items;
     for (std::size_t index = offset; index < library_.size() && index - offset < limit; ++index) {
@@ -274,6 +295,8 @@ class FakeClient : public http::HttpClient {
   std::vector<std::pair<std::string, std::string>> library_;
   std::string platforms_ = "[]";
   std::size_t over_count_ = 0;
+  std::size_t ceiling_rows_ = static_cast<std::size_t>(-1);
+  std::size_t wide_ = static_cast<std::size_t>(-1);
 };
 
 /// A client that answers nothing and records that it was asked.
@@ -857,6 +880,70 @@ std::int64_t LibraryTotal(http::HttpClient& client, const harness::Fixture& fixt
   return total.empty() ? -1 : std::strtoll(total.c_str(), nullptr, 10);
 }
 
+/// A page past the transport's ceiling is asked for again at half the rows (#248).
+///
+/// `http::kMaxResponseBytes` refuses a body RomM made too large -- a page of
+/// roms it identified on IGDB is ~12 KiB a row -- and the two readers that page
+/// `/api/roms` are the two that can do something about it: ask for fewer.
+void TooLarge(checks::Checks& c) {
+  std::vector<std::pair<std::string, std::string>> library;
+  for (int index = 0; index < 40; ++index) {
+    library.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
+  }
+
+  // The rom index, which pages the whole library on every tick.
+  {
+    FakeClient client(library);
+    client.Ceiling(7);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.ok() && !fetched.index.truncated(),
+             "a library whose pages are past the ceiling is still indexed: " + fetched.message);
+    c.ExpectEq(fetched.index.size(), library.size(), "every rom, at the smaller page");
+    bool smaller = !client.limits.empty();
+    for (std::size_t at = 1; at < client.limits.size(); ++at) {
+      smaller = smaller && client.limits[at] <= client.limits[at - 1];
+    }
+    c.Expect(smaller && client.limits.back() <= 7,
+             "asking for half as many rows each time a page is refused, and keeping to it");
+  }
+
+  // One rom too wide to come back even alone: left out and said so, the rest read.
+  {
+    FakeClient client(library);
+    client.Ceiling(64, 12);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.ok(), "one rom too large to read does not fail the index: " + fetched.message);
+    c.ExpectEq(fetched.index.size(), library.size() - 1, "every other rom is indexed");
+    c.Expect(fetched.index.ById(13) == nullptr && fetched.index.ById(14) != nullptr,
+             "and the one past the ceiling is the one left out");
+    c.Expect(fetched.index.truncated() && !fetched.message.empty(),
+             "which reads as an index that is not whole, and says why: " + fetched.message);
+  }
+
+  // The browser's rom list.
+  {
+    Console console(c, "lists-too-large");
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   ConfigWith("http://127.0.0.1:1")),
+             "a config with a server on it");
+    console.Boot();
+    FakeClient client(library);
+    client.Ceiling(5);
+    console.engine.UseServer(&client, "fixture-token");
+    ipc::ListRequest request;
+    request.kind = ipc::ListKind::kRoms;
+    request.page_size = ipc::kMaxPageSize;
+    const Walk walk = WalkList(console, request);
+    c.ExpectEq(static_cast<int>(walk.error), static_cast<int>(ipc::Error::kOk),
+               "a list whose pages are past the ceiling still pages");
+    c.ExpectEq(walk.items.size(), library.size(), "every rom, at the smaller page");
+  }
+}
+
 /// Paging the seeded library, and the two lists that come off it.
 int Library(checks::Checks& c) {
   Rig rig_(c, "lists-library");
@@ -1155,6 +1242,8 @@ int main(int argc, char** argv) {
     QueueList(checks);
   } else if (scenario == "held") {
     Held(checks);
+  } else if (scenario == "too_large") {
+    TooLarge(checks);
   } else if (scenario == "library") {
     code = Library(checks);
   } else if (scenario == "faults") {

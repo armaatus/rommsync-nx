@@ -175,6 +175,16 @@ std::optional<Negotiation> Refused(const http::Result& result) {
                       (result.message.empty() ? std::string("the caller cancelled")
                                               : result.message));
   }
+  if (result.error == http::Error::kTooLarge) {
+    // A plan whose text is past the transport's ceiling (`http::kMaxResponseBytes`)
+    // is one past `kMaxPlanOperations` several times over, refused before it was
+    // read rather than held whole and refused while parsed (#248, §4) -- and the
+    // same answer, which a scoped tick splits (`TickOptions::rom_scope`).
+    return Refuse(NegotiateError::kPlanTooLarge,
+                  "the plan is larger than the " +
+                      std::to_string(http::kMaxResponseBytes / 1024) +
+                      " KiB this console reads in one answer");
+  }
   if (!result.ok()) {
     Negotiation refused =
         Refuse(NegotiateError::kUnreachable,

@@ -764,8 +764,8 @@ static_assert(kHeapUndeclaredBody <= kHeapPlatformsResponse,
               "a body with no Content-Length now costs more than any response the row "
               "counts; its cap was chosen so it would not (M9-20)");
 static_assert(rommsync::sync::kMaxPlanOperations * kOperationJsonBytes <=
-                      rommsync::sysmodule::kMaxReservedBodyBytes &&
-                  rommsync::sync::kMaxStateListBytes <= rommsync::sysmodule::kMaxReservedBodyBytes,
+                      rommsync::http::kMaxResponseBytes &&
+                  rommsync::sync::kMaxStateListBytes <= rommsync::http::kMaxResponseBytes,
               "the plan or the state listing is larger than the body the wire reserves");
 static_assert(kHeapInstallClaimResponse <= kHeapPlatformsResponse,
               "a claim's answer is now the largest response the worker holds (#245)");
@@ -774,8 +774,8 @@ static_assert(kHeapListResponse == 0x35400,
 // The reservation that makes "its text, once" true has to reach every response
 // the row budgets, or the largest of them doubles its way in after all.
 static_assert(rommsync::lists::kMaxPlatforms * kPlatformJsonBytes <=
-                      rommsync::sysmodule::kMaxReservedBodyBytes &&
-                  kRomPageRows * kRomJsonBytes <= rommsync::sysmodule::kMaxReservedBodyBytes,
+                      rommsync::http::kMaxResponseBytes &&
+                  kRomPageRows * kRomJsonBytes <= rommsync::http::kMaxResponseBytes,
               "a budgeted response is larger than the body the wire reserves");
 static_assert(kHeapRomIndex == 0x40C00, "roms::kMaxIndexRoms moved; retotal the table");
 // The tick's row is its last phase, and the others are pinned under it so the

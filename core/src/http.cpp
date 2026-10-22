@@ -55,6 +55,7 @@ const char* ToString(Error error) {
     case Error::kDiskFull:       return "the card is full";
     case Error::kFileTooLarge:   return "the file is too large for the card's format";
     case Error::kTransport:      return "transport failure";
+    case Error::kTooLarge:       return "the response is larger than this client holds";
   }
   return "unknown error";
 }

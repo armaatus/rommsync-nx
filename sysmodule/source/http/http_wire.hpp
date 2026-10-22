@@ -133,23 +133,13 @@ inline constexpr std::size_t kTransferBufferSize = 16 * 1024;
 /// before the next hop allocates its own, so this costs the heap once.
 inline constexpr std::size_t kDownloadBufferSize = 64 * 1024;
 
-/// The largest `Content-Length` an API body is given room for up front (M9-19,
-/// #217).
-///
-/// `Send` holds its body in a `std::string`, and appended a read at a time that
-/// string doubles: a body ends up holding as much as twice its length, and three
-/// times while the last reallocation has both buffers live. The heap table in
-/// `main.cpp` budgets every buffered response at its text, once, so the body is
-/// reserved to the length the server declared before the first byte lands.
-///
-/// Up to here and no further, because the number is the server's: a
-/// `Content-Length` of a gigabyte on a ten-byte body would otherwise be an
-/// allocation this process makes on a stranger's say-so, and on a
-/// `-fno-exceptions` build a failed one is `std::terminate`. 256 KiB is above
-/// every response the table budgets -- `main.cpp` asserts it -- so a body past
-/// it is one the heap was never sized for, and growing it the old way is no
-/// worse than it was.
-inline constexpr std::size_t kMaxReservedBodyBytes = 256 * 1024;
+// **An API body declared by its `Content-Length` is reserved to that length**
+// (M9-19, #217): appended a read at a time a `std::string` doubles, holding up to
+// three times its text while the last reallocation has both buffers live, and
+// the heap table in `main.cpp` budgets every buffered response at its text,
+// once. Past `http::kMaxResponseBytes` it is refused before it is read (#248),
+// where it used to grow past a 256 KiB reservation uncapped -- a page of roms
+// RomM identified is that, at ~12 KiB a row.
 
 /// The largest API body taken **without** a `Content-Length` -- chunked, or
 /// ended by the close -- and past it the call fails (M9-20, #246).
@@ -163,9 +153,9 @@ inline constexpr std::size_t kMaxReservedBodyBytes = 256 * 1024;
 /// which `main.cpp` asserts fits the row a response is counted under. A power of
 /// two so the last step lands on it exactly.
 ///
-/// What it costs is a library past ~60 roms a page behind a proxy that strips
-/// `Content-Length`: a 64-row page of RomM's ~2.1 KiB rows is ~135 KiB, so the
-/// index fetch fails, by name, rather than growing into a heap with no room.
+/// Past it the call is `http::Error::kTooLarge`, the ceiling's own refusal: a
+/// page behind a proxy that strips `Content-Length` is asked again at half the
+/// rows (`roms::FetchRomIndex`), where until #248 the index fetch failed.
 inline constexpr std::size_t kMaxUndeclaredBodyBytes = 128 * 1024;
 static_assert((kMaxUndeclaredBodyBytes & (kMaxUndeclaredBodyBytes - 1)) == 0,
               "grown in powers of two, the cap has to be one for the last step to land on it");

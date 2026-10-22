@@ -301,6 +301,15 @@ bool ListServerStates(http::HttpClient& client, const auth::StoredToken& token,
   const http::Result result =
       client.Send(Authed(http::Method::kGet, http::JoinUrl(token.server_url, kStatesPath), token,
                          options));
+  if (result.error == http::Error::kTooLarge) {
+    // Past the transport's ceiling, which is past `kMaxStateListBytes` too: the
+    // same refusal, made before the body was read (#248).
+    *error = StateError::kRefused;
+    *message = "the state listing is larger than the " +
+               std::to_string(kMaxStateListBytes) +
+               " bytes this client can work from; no state was touched this tick";
+    return false;
+  }
   if (const auto refused = Refused(result, "the state listing")) {
     *error = refused->first;
     *message = refused->second;

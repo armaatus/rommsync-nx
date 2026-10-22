@@ -97,6 +97,8 @@ struct Transfer {
   std::string range;
 
   std::string* body = nullptr;  ///< where Send() collects the body
+  /// Send's body ran past `http::kMaxResponseBytes` and was let go of.
+  bool too_large = false;
 
   // Download-only state.
   std::FILE* file = nullptr;
@@ -149,6 +151,14 @@ std::size_t OnHeader(char* data, std::size_t size, std::size_t nmemb, void* cont
 std::size_t OnBodyToString(char* data, std::size_t size, std::size_t nmemb, void* context) {
   auto* transfer = static_cast<Transfer*>(context);
   const std::size_t length = size * nmemb;
+  // The ceiling every backend holds a buffered body to (#248), for a body that
+  // did not declare its length -- one that did is refused before it is read
+  // (`CURLOPT_MAXFILESIZE_LARGE`, in `Send`).
+  if (transfer->body->size() + length > http::kMaxResponseBytes) {
+    transfer->too_large = true;
+    std::string().swap(*transfer->body);
+    return 0;  // aborts the transfer with CURLE_WRITE_ERROR
+  }
   transfer->body->append(data, length);
   transfer->received += length;
   return length;
@@ -256,9 +266,14 @@ Error Classify(CURLcode code, const Transfer& transfer) {
       // The connection died with bytes still owed. This is the shape a reset
       // mid-download takes, and the one the fault proxy's `drop` mode forces.
       return Error::kTruncated;
+    case CURLE_FILESIZE_EXCEEDED:
+      return Error::kTooLarge;
     case CURLE_WRITE_ERROR:
-      // Our write callback is the only thing that can short-change libcurl, and
-      // it only does so when the destination file refused the bytes.
+      // Our write callbacks are the only things that can short-change libcurl:
+      // a destination file that refused the bytes, or a body past the ceiling.
+      if (transfer.too_large) {
+        return Error::kTooLarge;
+      }
       return transfer.write_failed ? http::ErrorForWrite(transfer.write_errno)
                                    : Error::kTransport;
     default:
@@ -395,8 +410,13 @@ class CurlHttpClient final : public http::HttpClient {
     }
     curl_easy_setopt(exchange.handle(), CURLOPT_WRITEFUNCTION, OnBodyToString);
     curl_easy_setopt(exchange.handle(), CURLOPT_WRITEDATA, &transfer);
+    curl_easy_setopt(exchange.handle(), CURLOPT_MAXFILESIZE_LARGE,
+                     static_cast<curl_off_t>(http::kMaxResponseBytes));
 
     Perform(exchange, transfer, result);
+    if (result.error == Error::kTooLarge) {
+      std::string().swap(result.response.body);
+    }
     return result;
   }
 

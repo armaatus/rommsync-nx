@@ -370,6 +370,7 @@ set(LIST_UNIT_SCENARIOS
   cursors    # the cap, the TTL, and what a reclaimed cursor answers
   queue      # served off the card, and never over the network
   held       # one platform snapshot and one built page, however many cursors (M9-20)
+  too_large  # a page past the transport ceiling is asked for at half the rows (#248)
 )
 foreach(scenario IN LISTS LIST_UNIT_SCENARIOS)
   add_test(NAME lists.${scenario} COMMAND test_lists ${scenario})
@@ -676,6 +677,7 @@ set(HTTP_SCENARIOS
   cancel            # cancellation from another thread, and nothing left behind
   redirect_credentials # a bearer token does not follow a redirect off this origin
   multipart_grows   # a save still being written does not overrun its Content-Length
+  too_large         # #248: a body past http::kMaxResponseBytes is kTooLarge, declared or not
 )
 
 foreach(scenario IN LISTS HTTP_SCENARIOS)
@@ -1551,6 +1553,7 @@ set(TICK_UNIT_SCENARIOS
   newer_rule   # #232: a 409'd save becomes a download or a conflict, never another upload
   newer_bounds # #232: ...held while a game runs (#242), and never placed where step 0 found nothing
   migrated_kept  # #236: a delete #233 kept stays withheld when rc1's row moves to the shared slot
+  too_large    # #248: a plan past the transport ceiling is a plan too large, which a scoped tick splits
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because

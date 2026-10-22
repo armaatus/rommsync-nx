@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -830,11 +831,27 @@ inline std::vector<std::string> AssetLinks(std::string_view text, std::string_vi
 /// is 1.3 MB), and the first one over the bar wins. Each candidate is fetched
 /// whole, which is a few small requests -- cheaper than a test that silently
 /// streamed a file too small to cut where it means to.
+/// `request`'s whole body, however large -- streamed to a scratch file and read
+/// back, because `Send` holds no body past `http::kMaxResponseBytes` (#248) and a
+/// reference copy of a megabyte asset is exactly that. `response.body` holds it.
+inline http::Result Whole(http::HttpClient& client, const http::Request& request) {
+  static std::atomic<int> next{0};
+  const std::string path =
+      ScratchDir() + "/whole-" + std::to_string(::getpid()) + "-" + std::to_string(next++);
+  http::Result result = client.Download(request, DownloadTo(path));
+  if (result.ok()) {
+    result.response.body = ReadFile(path);
+  }
+  std::error_code ignored;
+  std::filesystem::remove(path, ignored);
+  return result;
+}
+
 inline std::string DiscoverLargeAsset(http::HttpClient& client, const std::string& base) {
   const auto fetch = [&client, &base](const std::string& path) {
     http::Request request;
     request.url = base + path;
-    return client.Send(request);
+    return Whole(client, request);
   };
   const http::Result page = fetch("/");
   if (!page.successful()) {

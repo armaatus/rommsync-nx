@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -287,7 +288,7 @@ int Download(http::HttpClient& client, const std::string& base, const std::strin
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("download.bin");
@@ -384,7 +385,7 @@ int Range(http::HttpClient& client, const std::string& base, const std::string& 
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful() && reference.response.body.size() > kOffset,
                 "the reference copy is bigger than the offset");
   if (checks.failures() != 0) {
@@ -479,7 +480,7 @@ int Resume(http::HttpClient& client, const std::string& base, const std::string&
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("resume.bin");
@@ -521,7 +522,7 @@ int ResumeWithoutRangeSupport(http::HttpClient& client, const std::string& base)
 
   http::Request reference_request;
   reference_request.url = base + "/api/heartbeat";
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("resume-no-range.bin");
@@ -603,7 +604,7 @@ int ResumeStaleRange(http::HttpClient& client, const std::string& base,
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
 
   const std::string path = Scratch("resume-stale.bin");
@@ -633,7 +634,7 @@ int RangeExpectedSize(http::HttpClient& client, const std::string& base,
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful() && reference.response.body.size() > kOffset,
                 "the reference copy is bigger than the offset");
   if (checks.failures() != 0) {
@@ -691,7 +692,7 @@ int Truncate(http::HttpClient& client, const std::string& base, const std::strin
 
   http::Request reference_request;
   reference_request.url = base + asset;
-  const http::Result reference = client.Send(reference_request);
+  const http::Result reference = rig::Whole(client, reference_request);
   checks.Expect(reference.successful(), "fetched the reference copy");
   const std::uint64_t full_size = reference.response.body.size();
 
@@ -952,6 +953,72 @@ int MultipartGrows(http::HttpClient& client) {
   return checks.failures();
 }
 
+// A buffered body has a ceiling on every backend, declared or not (#248).
+//
+// The wire reserved a declared `Content-Length` up to 256 KiB and past that let
+// the body double its way in, uncapped -- and a page of roms RomM identified on
+// IGDB is ~12 KiB a row, ~750 KiB for 64 of them, which on the console was a
+// `std::terminate`. Past `http::kMaxResponseBytes` a body is `kTooLarge`, which
+// is what lets a pager ask for less (`roms::FetchRomIndex`).
+int TooLarge(http::HttpClient& client) {
+  rig::Checks checks;
+  // A refused body is one the client stops reading, so the server's write meets
+  // a closed socket.
+  std::signal(SIGPIPE, SIG_IGN);
+  constexpr std::size_t kCeiling = http::kMaxResponseBytes;
+  const auto declared = [](std::size_t size) {
+    return "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(size) +
+           "\r\nConnection: close\r\n\r\n" + std::string(size, 'd');
+  };
+  const auto chunked = [](std::size_t size) {
+    std::string response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                           "Connection: close\r\n\r\n";
+    const std::string chunk(4096, 'c');
+    for (std::size_t sent = 0; sent < size; sent += chunk.size()) {
+      const std::size_t take = std::min(chunk.size(), size - sent);
+      char line[32];
+      std::snprintf(line, sizeof(line), "%zx\r\n", take);
+      response += line + chunk.substr(0, take) + "\r\n";
+    }
+    return response + "0\r\n\r\n";
+  };
+  struct Case {
+    const char* what;
+    std::string response;
+    bool fits;
+  };
+  const Case cases[] = {
+      {"a declared body at the ceiling", declared(kCeiling), true},
+      {"a declared body past the ceiling", declared(kCeiling + 1), false},
+      {"a declared body well past it", declared(4 * kCeiling), false},
+      {"an undeclared body past the ceiling", chunked(kCeiling + 4096), false},
+  };
+  for (const Case& served : cases) {
+    rig::LoopbackServer server;
+    if (!server.Start(1, [&](int fd, std::size_t, const std::string&) {
+          rig::WriteAll(fd, served.response);
+        })) {
+      std::cerr << "  could not start the loopback server\n";
+      return 1;
+    }
+    http::Request request;
+    request.url = server.origin() + "/api/roms";
+    const http::Result result = client.Send(request);
+    server.Stop();
+    if (served.fits) {
+      checks.ExpectOk(result, served.what);
+      checks.ExpectEq(result.response.body.size(), kCeiling,
+                      std::string(served.what) + " arrives whole");
+    } else {
+      checks.ExpectEq(static_cast<int>(result.error), static_cast<int>(http::Error::kTooLarge),
+                      std::string(served.what) + " is refused as too large: " + result.message);
+      checks.Expect(result.response.body.empty(),
+                    std::string(served.what) + " and hands back none of it");
+    }
+  }
+  return checks.failures();
+}
+
 #ifdef ROMMSYNC_TEST_WIRE_BACKEND
 // What the wire client asks of a connection per read, which on the console is
 // what it asks of the `ssl` service per IPC round trip (M9-10, #201).
@@ -1026,10 +1093,16 @@ int Chunk(const std::string& base, const std::string& asset) {
 
   http::Request request;
   request.url = base + asset;
-  const http::Result reference = client->Send(request);
-  checks.ExpectOk(reference, "the reference copy, over Send");
+  // Whole through `Download`, since `Send` holds no body that large (#248); the
+  // API read size is then watched on a slice of it that `Send` does hold.
+  const http::Result reference = rig::Whole(*client, request);
+  checks.ExpectOk(reference, "the reference copy");
   checks.Expect(reference.response.body.size() > 4 * kDownloadChunk,
                 "the asset is several download chunks long, so the sizes below mean something");
+  connector.Reset();
+  http::Request slice = request;
+  slice.range_start = reference.response.body.size() - 100 * 1024;
+  checks.ExpectOk(client->Send(slice), "a slice of it, over Send");
   checks.ExpectEq(connector.largest_asked, kApiChunk, "Send reads in 16 KiB");
 
   connector.Reset();
@@ -1059,7 +1132,7 @@ int Reserved(http::HttpClient& client, const std::string& base, const std::strin
   constexpr std::size_t kBody = 100 * 1024;
   http::Request request;
   request.url = base + asset;
-  const http::Result whole = client.Send(request);
+  const http::Result whole = rig::Whole(client, request);
   checks.Expect(whole.successful() && whole.response.body.size() > kBody,
                 "the asset is longer than the slice asked for");
   if (checks.failures() != 0) {
@@ -1143,8 +1216,8 @@ int Undeclared(http::HttpClient& client) {
                         std::to_string(result.response.body.capacity()) + ")");
     } else {
       checks.Expect(!result.ok(), std::string(served.what) + " is refused");
-      checks.ExpectEq(static_cast<int>(result.error), static_cast<int>(http::Error::kTransport),
-                      std::string(served.what) + " as a transport failure");
+      checks.ExpectEq(static_cast<int>(result.error), static_cast<int>(http::Error::kTooLarge),
+                      std::string(served.what) + " as too large (#248)");
       checks.Expect(result.message.find("Content-Length") != std::string::npos,
                     std::string(served.what) + " says why: " + result.message);
       checks.Expect(result.response.body.empty(),
@@ -1248,6 +1321,8 @@ int main(int argc, char** argv) {
     failures = RedirectCredentials(*client);
   } else if (scenario == "multipart_grows") {
     failures = MultipartGrows(*client);
+  } else if (scenario == "too_large") {
+    failures = TooLarge(*client);
 #ifdef ROMMSYNC_TEST_WIRE_BACKEND
   } else if (scenario == "chunk") {
     failures = Chunk(base, asset);

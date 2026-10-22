@@ -689,8 +689,9 @@ bool Service::Pump() {
     // otherwise haul the whole library's `rom_id_index` and a freshly
     // aggregated `filter_values` through a JSON parser on a sysmodule heap, all
     // of it discarded here. Turning them off is most of what this request costs.
-    request.url = url + "/api/roms?limit=" + std::to_string(asked.page_size) +
-                  "&offset=" + std::to_string(offset) +
+    //
+    // `limit` is filled in below, because it can shrink (#248).
+    request.url = "&offset=" + std::to_string(offset) +
                   "&order_by=id&order_dir=asc"
                   "&with_char_index=false&with_filter_values=false&with_rom_id_index=false";
     if (asked.platform_id > 0) {
@@ -700,12 +701,26 @@ bool Service::Pump() {
       request.url += "&search_term=" + http::EncodeQueryValue(asked.search);
     }
   }
+  const std::string query = std::move(request.url);
   if (!token.empty()) {
     request.headers.push_back({"Authorization", "Bearer " + token});
   }
   request.timeout = kRequestTimeout;
 
-  const http::Result sent = client->Send(request);
+  // A rom page past the transport's ceiling (`http::kMaxResponseBytes`) is asked
+  // for again at half the rows, down to one (#248): a rom RomM identified is
+  // ~12 KiB of row, and the page drawn from it a few hundred bytes of it.
+  http::Result sent;
+  for (std::int32_t limit = asked.page_size;; limit /= 2) {
+    request.url = asked.kind == ipc::ListKind::kPlatforms
+                      ? url + "/api/platforms"
+                      : url + "/api/roms?limit=" + std::to_string(limit) + query;
+    sent = client->Send(request);
+    if (sent.error != http::Error::kTooLarge || limit <= 1 ||
+        asked.kind == ipc::ListKind::kPlatforms) {
+      break;
+    }
+  }
 
   // What the exchange said about the credentials, into the one gate that counts
   // them. **Not** a second 401 path and not a widening of `ipc::Error`: the page
@@ -725,7 +740,10 @@ bool Service::Pump() {
   // from "could not reach it", and it is what a truncated body earns. The one
   // thing neither may be is a short page: that reads as the end of the library.
   ipc::Error failure = ipc::Error::kOk;
-  if (!sent.ok() || !sent.successful()) {
+  if (sent.error == http::Error::kTooLarge) {
+    // Reached, and too large to read even a row at a time: `kInternal`'s case.
+    failure = ipc::Error::kInternal;
+  } else if (!sent.ok() || !sent.successful()) {
     failure = ipc::Error::kOffline;
   } else if (asked.kind == ipc::ListKind::kPlatforms) {
     // The cut is not reported: there is no field on `ListPage` for "this list

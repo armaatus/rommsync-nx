@@ -43,7 +43,23 @@ enum class Error {
   kDiskFull,         ///< ...because the card is full (ENOSPC)
   kFileTooLarge,     ///< ...because the card's format holds no file that large (EFBIG)
   kTransport,        ///< anything else the backend could not classify
+  kTooLarge,         ///< a `Send` body past `kMaxResponseBytes`, or past what the backend holds
 };
+
+/// The largest body `Send` hands back, on every backend (#248). Past it the call
+/// is `Error::kTooLarge` and the body is empty -- refused on a declared
+/// `Content-Length` before a byte of it is read, and on an undeclared one as it
+/// crosses the line.
+///
+/// A ceiling because a buffered body is heap on the console, and it is the one
+/// size RomM decides: a page of roms it identified on IGDB is ~12 KiB a row, so
+/// 64 of them are ~750 KiB -- half the sysmodule's heap, and a `std::terminate`.
+/// The table that heap is sized from (`sysmodule/source/main.cpp`) counts every
+/// buffered response at no more than this and one row of it in flight. A caller
+/// that pages can ask for less (`roms::FetchRomIndex`); one that cannot fails by
+/// name. 200 KiB is the platforms list at its row bound, which is the response
+/// the table was already sized for.
+inline constexpr std::size_t kMaxResponseBytes = 200 * 1024;
 
 /// Stable, log-friendly name for an error. Never null.
 const char* ToString(Error error);
@@ -297,7 +313,8 @@ class HttpClient {
   HttpClient& operator=(const HttpClient&) = delete;
 
   /// Perform a request and buffer the response body in memory. For API calls;
-  /// never for rom or save content.
+  /// never for rom or save content. A body past `kMaxResponseBytes` is
+  /// `Error::kTooLarge`.
   virtual Result Send(const Request& request) = 0;
 
   /// Perform a request and stream the response body to `target`, never holding

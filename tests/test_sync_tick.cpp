@@ -1197,6 +1197,70 @@ void NewerBounds(rig::Checks& checks) {
                   "and the save is untouched: the fetch went nowhere");
 }
 
+/// A plan whose text is past the transport's ceiling is a plan too large, and a
+/// scoped tick splits it (#248, §4).
+///
+/// `kPlanTooLarge` was decided while parsing, so a chunk the server answered
+/// with thousands of operations was held as text first -- past 256 KiB, uncapped.
+/// `http::kMaxResponseBytes` now refuses it unread, and that refusal has to mean
+/// what the parse's did, or the tick would fail where it used to split.
+class CeilingClient final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    if (request.url.find("/api/sync/negotiate") == std::string::npos) {
+      result.response.status = 200;
+      result.response.body = "{}";
+      return result;
+    }
+    ++negotiations;
+    if (request.body.find("\"rom_ids\":[1,2]") != std::string::npos) {
+      result.error = http::Error::kTooLarge;
+      result.message = "past the ceiling";
+      return result;
+    }
+    result.response.status = 200;
+    result.response.body = R"({"session_id":5,"operations":[],"total_upload":0,)"
+                           R"("total_download":0,"total_conflict":0,"total_no_op":0})";
+    return result;
+  }
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+  int negotiations = 0;
+};
+
+void TooLarge(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-too-large");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = kNowhere;
+  token.access_token = "not-a-token";
+  token.device_id = "fixture-too-large";
+
+  CeilingClient alone;
+  sync::NegotiateOptions once;
+  once.max_attempts = 3;
+  once.wait = [](std::chrono::milliseconds) {};
+  const sync::Negotiation refused = sync::NegotiateRoms(alone, token, {}, {1, 2}, once);
+  checks.Expect(refused.error == sync::NegotiateError::kPlanTooLarge,
+                std::string("a plan past the ceiling is a plan too large: ") +
+                    sync::ToString(refused.error));
+  checks.ExpectEq(alone.negotiations, 1, "which is not asked again");
+
+  CeilingClient client;
+  sync::TickOptions options = OptionsAt(1'757'000'400);
+  options.server = rommsync::server::CapabilitiesFor("5.4.0");
+  options.rom_scope = std::vector<std::int64_t>{1, 2};
+  Impatient(&options);
+  const sync::TickResult tick = sync::RunTick(client, *files, token, {}, {}, {}, options);
+  checks.ExpectEq(tick.totals.plans, std::size_t{2}, "the tick split the scope and ran each half");
+  checks.ExpectEq(client.negotiations, 3, "the whole scope, then each half");
+}
+
 // --- the rig scenarios --------------------------------------------------------
 //
 // One shape, four stages. Each arranges a plan of exactly one operation, arms
@@ -3781,7 +3845,7 @@ int main(int argc, char** argv) {
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
       scenario == "disabled" || scenario == "unsupported" || scenario == "newer_rule" ||
-      scenario == "newer_bounds" || scenario == "migrated_kept") {
+      scenario == "newer_bounds" || scenario == "migrated_kept" || scenario == "too_large") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -3802,6 +3866,8 @@ int main(int argc, char** argv) {
       MigratedKept(checks);
     } else if (scenario == "newer_bounds") {
       NewerBounds(checks);
+    } else if (scenario == "too_large") {
+      TooLarge(checks);
     } else {
       Canceled(checks);
     }
