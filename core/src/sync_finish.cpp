@@ -105,9 +105,10 @@ void TrimToFit(const SyncPlan& plan, const std::map<Key, const ClientSaveState*>
   if (states > 0) {
     update->dropped += states;
     AddWarning(&update->warnings,
-               std::to_string(states) + " state row(s) dropped from the baseline to keep the "
-               "saves' inside the " + std::to_string(state::kMaxRecords) +
-               " rows it can be read back with; those states are compared from scratch");
+               std::to_string(states) + " state row(s) dropped to keep the baseline inside the " +
+                   std::to_string(state::kMaxRecords) +
+                   " rows it can be read back with, saves first; those states are compared "
+                   "from scratch");
   }
   if (update->value.size() > state::kMaxRecords) {
     // Nothing left that this tick does not know about, so the file cannot be

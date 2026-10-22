@@ -492,7 +492,7 @@ class Parser {
 
   /// Whether a row more than this build's bound would be kept: a held-apart
   /// save row is let go for it, or, with none left, the row itself.
-  bool Room() {
+  bool MakeRoom() {
     if (baseline_.size() + legacy_.size() < kMaxRecords) {
       return true;
     }
@@ -531,7 +531,7 @@ class Parser {
           Add(&complaints_, where + "a second row for the same (rom_id, slot)");
           return;
         }
-        if (!Room()) {
+        if (!MakeRoom()) {
           return;
         }
         if (held_apart) {
@@ -551,7 +551,7 @@ class Parser {
           Add(&complaints_, where + "a second row for the same (rom_id, file_name) state");
           return;
         }
-        if (Room()) {
+        if (MakeRoom()) {
           baseline_.SetState(std::move(record));
         }
         return;

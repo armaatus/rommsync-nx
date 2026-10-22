@@ -417,7 +417,8 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
       // every card: the tick that carries it is the heap's peak, and a copy of
       // it buys nothing. Asked of each chunk, not once: a split's halves carry
       // part each, and RomM plans every rom a save is sent for, so a half sent
-      // the rest would plan them all again.
+      // the rest would plan them all again. (`ChunkScope` and `Halve` give each
+      // save to one chunk, so a chunk of `offered`'s size holds all of it.)
       const bool whole = chunk.saves.size() == offered->size();
       std::vector<ClientSaveState> some;
       if (!whole) {
