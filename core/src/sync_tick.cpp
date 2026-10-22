@@ -363,7 +363,6 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   } else {
     pending.emplace_back();
   }
-  const bool whole = pending.size() == 1;
 
   state::Baseline baseline = std::move(previous);
   TickOutcome outcome = TickOutcome::kCompleted;
@@ -407,9 +406,12 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     } else {
       NegotiateOptions asked = negotiate;
       asked.restore_unlisted = chunk.restore;
-      // The whole vector when there is one chunk, which is nearly every card:
-      // the tick that carries it is the heap's peak, and a copy of it buys
-      // nothing.
+      // The whole vector when this chunk carries every save, which is nearly
+      // every card: the tick that carries it is the heap's peak, and a copy of
+      // it buys nothing. Asked of each chunk, not once: a split's halves carry
+      // part each, and RomM plans every rom a save is sent for, so a half sent
+      // the rest would plan them all again.
+      const bool whole = chunk.saves.size() == offered->size();
       std::vector<ClientSaveState> some;
       if (!whole) {
         some.reserve(chunk.saves.size());
