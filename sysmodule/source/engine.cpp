@@ -1660,14 +1660,35 @@ void SdEngine::ServeInstalls(http::HttpClient& client, const auth::StoredToken& 
         return;
       }
       const install::Claimed held = install::Claim(client, config.server.url, token, policy);
-      if (held.exchange.transport != http::Error::kNone) {
+      if (!held.exchange.ok()) {
+        if (held.exchange.transport != http::Error::kCanceled) {
+          log::Warn(log::Event::kRemoteInstall, held.exchange.message);
+        }
         return;
       }
+      // The same rule as a settled request's: the switch is told only once
+      // every failure went, and the first the link did not carry stops the
+      // pass rather than spending every claim's retries on it.
       for (const install::Request& request : held.page.requests) {
-        install::Report(client, config.server.url, token, request.id,
-                        {install::Outcome::kFailed,
-                         "downloads are switched off on the console ([downloads] enabled = false)"},
-                        policy);
+        const install::Exchange reported = install::Report(
+            client, config.server.url, token, request.id,
+            {install::Outcome::kFailed,
+             "downloads are switched off on the console ([downloads] enabled = false)"},
+            policy);
+        if (reported.ok() || reported.ended()) {
+          continue;
+        }
+        if (reported.transport == http::Error::kCanceled) {
+          return;
+        }
+        log::Warn(log::Event::kRemoteInstall,
+                  "rom " + std::to_string(request.rom_id) + " from RomM's web UI: " +
+                      reported.message);
+        if (reported.transport != http::Error::kNone || reported.transient() ||
+            reported.status == 401 || reported.status == 403) {
+          return;
+        }
+        // Refused for what it says: resending it is not taken back either.
       }
       std::lock_guard<std::mutex> lock(mutex_);
       if (server_generation_ == generation) {
