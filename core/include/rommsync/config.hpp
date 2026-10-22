@@ -111,7 +111,12 @@ inline constexpr const char* kDefaultSlot = "autosave";
 
 /// The longest `[sync] slot` accepted. RomM takes 255, and a companion file's
 /// slot is this one plus `-<extension>` (`scan::SlotFor`).
-inline constexpr std::size_t kMaxSlotLength = 64;
+///
+/// **24, because every `state.db` row carries it**: `state::kMaxRecords` rows
+/// at this slot plus `-save` have to fit `state::kMaxStateBytes`, which
+/// `core.state_db` asserts. At 64 a full baseline was 35 KiB, refused on every
+/// tick. Three times `autosave`, and nothing a private slot name needs more of.
+inline constexpr std::size_t kMaxSlotLength = 24;
 
 /// True for a `[sync] slot` value: 1 to `kMaxSlotLength` ASCII letters, digits,
 /// `-` or `_`. Narrow because the slot is a key this client must reproduce

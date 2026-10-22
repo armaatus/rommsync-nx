@@ -377,8 +377,9 @@ RomM pairs a game's slot with its newest file, and a clock in the same slot
 would be paired with the save RAM.
 
 Another name keeps this console's saves to itself, in a slot no other client
-reads: letters, digits, `-` and `_`, up to 64 of them. Anything else is a
-`warning` and `autosave` stays in force. Changing it moves every save to the new
+reads: letters, digits, `-` and `_`, up to 24 of them — every `state.db` row
+carries it, and that file is bounded. Anything else is a `warning` and
+`autosave` stays in force. Changing it moves every save to the new
 slot on the next tick, as a first meeting with whatever is there; the old slot
 is left on the server. The overlay does not edit it.
 
@@ -559,7 +560,7 @@ Each report carries a severity, the line number, and the section and key:
   is already there and truncated, so a rom queued again is downloaded again
   rather than assumed good. A download nothing could check still finishes; the
   queue entry says it was not verified and never claims it was.
-- `slot` is 1–64 ASCII letters, digits, `-` and `_`. Anything else → `warning`,
+- `slot` is 1–24 ASCII letters, digits, `-` and `_`. Anything else → `warning`,
   and the slot in force (`autosave` unless an earlier line set one) is kept.
 - `interval_min` is a whole number of minutes. Negative or unparseable →
   `warning`, default kept. Above the 10080-minute (one week) maximum → clamped

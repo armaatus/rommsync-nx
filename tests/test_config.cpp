@@ -424,6 +424,12 @@ void TheSlotIsCheckedAndDefaultsToAutosave(checks::Checks& c) {
       config::ParseConfig(WithServer("[sync]\nslot = switch_only-1\n"));
   c.ExpectEq(named.value.sync.slot, std::string("switch_only-1"), "a named slot is used as written");
   c.Expect(named.ok(), "and is not a complaint: " + named.DescribeDiagnostics());
+  const std::string longest(config::kMaxSlotLength, 's');
+  c.ExpectEq(config::ParseConfig(WithServer("[sync]\nslot = " + longest + "\n")).value.sync.slot,
+             longest, "a slot of kMaxSlotLength is used");
+  c.ExpectEq(
+      config::ParseConfig(WithServer("[sync]\nslot = " + longest + "s\n")).value.sync.slot,
+      std::string("autosave"), "and one past it is refused, as a warning like the rest");
 
   for (const char* text : {"", "my slot", "a/b", "auto.save", "é",
                            "a234567890123456789012345678901234567890123456789012345678901234x"}) {
