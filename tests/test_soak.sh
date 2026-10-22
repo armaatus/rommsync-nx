@@ -11,6 +11,8 @@
 #                           answer is known: recent passes, stale fails, a soak
 #                           that has never passed is measured from the day it
 #                           was added, and text that is not a time is never a pass.
+#   test_soak.sh bounded    a `gh` that never answers is abandoned within the
+#                           script's own timeout, on every attempt.
 #
 # Neither needs a network, a token or the rig, so neither skips.
 set -uo pipefail
@@ -64,6 +66,10 @@ phase_workflow() {
   grep -q 'fetch-depth: 0' <<<"$job" ||
     fail "soak-fresh checks out shallow, so it cannot tell when soak.yml was added"
   grep -q 'actions: read' <<<"$job" || fail "soak-fresh cannot read the soak's runs"
+  # Bounded (#256): without it a hung step holds main's run for GitHub's
+  # six-hour default, and the job exists to make main's state legible.
+  grep -qE '^    timeout-minutes: *[0-9]+' <<<"$job" ||
+    fail "soak-fresh sets no timeout-minutes; a hung step holds main's run for six hours"
   echo "ok: soak.yml is scheduled, runnable on demand and observable; ci.yml checks it is fresh"
 }
 
@@ -102,11 +108,39 @@ phase_fresh() {
     verdict 1 "nor is not knowing when the soak was added"
 }
 
+# A `gh` that never answers -- a stalled API call, the case the retries do not
+# cover -- is given up on, attempt by attempt, rather than waited for until the
+# job is killed (#256). The stub sleeps in a child, so killing only the process
+# soak-fresh.sh started would leave the sleep holding its output open, and the
+# command substitution waiting on it.
+phase_bounded() {
+  [ -f "$FRESH" ] || fail "no scripts/soak-fresh.sh"
+  local bin out status started
+  bin="$(mktemp -d)"
+  trap 'rm -rf "$bin"' RETURN
+  printf '#!/usr/bin/env bash\nsleep 300\necho 2026-10-20T03:30:00Z\n' >"$bin/gh"
+  chmod +x "$bin/gh"
+  unset SOAK_LAST_SUCCESS
+  started=$SECONDS
+  out="$(PATH="$bin:$PATH" SOAK_GH_TIMEOUT=1 SOAK_GH_RETRY_DELAY=0 \
+         SOAK_NOW="2026-10-21T12:00:00Z" SOAK_SINCE="2026-09-01T00:00:00Z" \
+         bash "$FRESH" 3 2>&1)"
+  status=$?
+  [ "$status" -eq 1 ] || { echo "$out" >&2; fail "a gh that never answers: exited $status, wanted 1"; }
+  [ $(( SECONDS - started )) -lt 20 ] ||
+    { echo "$out" >&2; fail "a gh that never answers held soak-fresh.sh $(( SECONDS - started )) s"; }
+  grep -q 'could not ask GitHub' <<<"$out" ||
+    { echo "$out" >&2; fail "soak-fresh.sh gave up on gh without saying so"; }
+  echo "ok: a gh call that never answers is abandoned, and soak-fresh says so"
+}
+
 case "${1:-}" in
+  bounded)
+    phase_bounded ;;
   workflow)
     phase_workflow ;;
   fresh)
     phase_fresh ;;
   *)
-    echo "usage: $0 {workflow|fresh}" >&2; exit 2 ;;
+    echo "usage: $0 {workflow|fresh|bounded}" >&2; exit 2 ;;
 esac

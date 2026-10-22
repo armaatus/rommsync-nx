@@ -84,6 +84,10 @@ jobs:
   soak-fresh:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # A checkout and one API question. Unbounded, a hung step held main's run
+    # for GitHub's six-hour default; scripts/soak-fresh.sh bounds each `gh`
+    # call itself, and this bounds everything else (#256).
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
