@@ -462,7 +462,9 @@ std::string MigratedSlot(std::string_view slot, std::string_view old_slot);
 /// The emulators negotiate is filtered to (`SyncNegotiatePayload::emulators`,
 /// #236): the ids this console can load. Every scanned save's emulator, and the
 /// id each mapped platform's save folders resolve to (`ResolveSource`) so a core
-/// with no save on the card yet is still offered its server saves -- each with
+/// with no save on the card yet is still offered its server saves -- only the
+/// folders of the frontend `Config::PlayWithFor` names, where it names one,
+/// since that is the one a first-time restore is placed for (#238) -- each with
 /// its `RetroArchAliases`, since other clients name a lineage by RetroArch's
 /// folder too. Sorted, without repeats.
 ///

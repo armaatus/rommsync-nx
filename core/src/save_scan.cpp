@@ -230,8 +230,19 @@ std::optional<std::vector<std::string>> EmulatorFilter(const config::Config& con
     add(save.emulator);
   }
   for (const auto& [slug, mapped] : config.platforms) {
+    // A platform played in one frontend is restored with it (`place::Placer`),
+    // so the other's folder names no core with no save here yet: RomM's web
+    // player writes `mupen64plus_next` for n64, and offered to a console that
+    // plays n64 in Tico, its save is a first-time restore refused every tick
+    // (#238). A save of that core on the card is still named, above.
+    const std::optional<config::PlayWith> play_with = config.PlayWithFor(slug);
     for (const std::string& folder : mapped.saves) {
-      add(ResolveSource(SourceOf(folder), slug, config).emulator_id);
+      const SaveSource source = SourceOf(folder);
+      if (play_with.has_value() && source.source != Source::kUnknown &&
+          (source.source == Source::kTico) != (*play_with == config::PlayWith::kTico)) {
+        continue;
+      }
+      add(ResolveSource(source, slug, config).emulator_id);
     }
   }
   if (ids.empty()) {

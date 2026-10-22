@@ -155,7 +155,10 @@ even when the identical bytes are already there. Pick a slot and keep it.
 **`emulators` filters the lineages (5.4, #236).** The body also carries
 `"emulators": [...]`, the ids this console can load — every scanned save's, and
 the one each mapped platform's folders resolve to, each with RetroArch's folder
-name for it (`scan::EmulatorFilter`). RomM then pairs and offers only server
+name for it (`scan::EmulatorFilter`). Only the folders of the frontend a platform
+is played in (`play_with`) count there: n64 played in Tico names
+`tico-mupen64plus` and not the `mupen64plus_next` RomM's web player writes,
+unless a RetroArch N64 save is on the card (#238). RomM then pairs and offers only server
 saves one of them wrote, so a PlayStation core's save in a rom's `autosave` is
 never downloaded over a Tico DuckStation card. It is left out — not sent as `[]`,
 which matches nothing — when a scanned save has no emulator: RomM cannot list
