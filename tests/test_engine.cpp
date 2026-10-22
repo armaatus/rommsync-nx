@@ -5338,6 +5338,30 @@ int InstallSettle(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(notices(before_down, "already_installed"), std::size_t{1},
              "but as already installed");
 
+  // **A request downloads-off fails, whose failure the link does not carry.**
+  // Queued in the browser and never claimed by a tick that wanted it, so the
+  // downloads-off claim is the first to take it, and its report is the only
+  // word the browser gets: the switch is not told until that report went.
+  c.Expect(console.Set(Edit("downloads", "enabled", "true")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads are switched on once more");
+  TickOnce(console, ticks, c, "the tick that offers the console once more");
+  const std::int64_t before_unsaid = rig::LatestNotificationId(client, base);
+  c.ExpectEq(queue_in_browser(device.nova).response.status, 201,
+             "the web UI queues nova, and no tick claims it yet");
+  down = true;
+  c.Expect(console.Set(Edit("downloads", "enabled", "false")).outcome ==
+               ipc::WriteOutcome::kApplied,
+           "downloads go off before it is claimed");
+  TickOnce(console, ticks, c, "the tick that claims nova to fail it, offline for reports");
+  UntilQuiet(console, wire, http::Method::kPut, "/installs/", std::chrono::seconds{5});
+  down = false;
+  TickOnce(console, ticks, c, "the tick after the link carries reports again");
+  c.ExpectEq(notices(before_unsaid, "failed"), std::size_t{1},
+             "the browser is told nova failed once the link carries it" +
+                 Rendered(console.Log()));
+  c.ExpectEq(open(), std::size_t{0}, "and nothing is left taken");
+
   install::Register(client, base, token, false);
   harness::DeleteDevice(client, base, fixture, token.device_id);
   return c.failures();
