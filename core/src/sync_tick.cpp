@@ -391,6 +391,15 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     }
     ScopeChunk chunk = std::move(pending.front());
     pending.pop_front();
+    if (result.totals.plans > 0) {
+      // The last plan and what it did were handed to `on_plan` and nothing else
+      // reads them, so they go before the next chunk is asked about: kept, they
+      // were a second plan and a run's results beside this one arriving, where
+      // `kHeapTickSaves` counts one (#248).
+      std::vector<SyncOperation>().swap(result.negotiated.plan.operations);
+      std::vector<OperationResult>().swap(result.executed.operations);
+      std::vector<std::string>().swap(result.executed.warnings);
+    }
 
     Negotiation one;
     if (!scoped) {

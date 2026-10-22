@@ -418,7 +418,10 @@ struct TickResult {
   /// What every plan the tick ran did, summed (#246). With one plan these are
   /// `executed`'s and `finished`'s; with several, `negotiated` and `executed`
   /// are the last plan's alone (`TickOptions::on_plan`) and these are the
-  /// tick's.
+  /// tick's. The operations, results and warnings of a plan are let go of
+  /// when the next chunk is asked about (#248) -- they have been handed to
+  /// `on_plan` by then -- so after a later chunk that ran no plan, they are
+  /// empty.
   struct Totals {
     std::size_t plans = 0;
     int completed = 0;
