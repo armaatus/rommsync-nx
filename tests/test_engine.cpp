@@ -4698,12 +4698,13 @@ int DownloadRestores(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(console.sandbox.Read(placed), server_bytes,
              "and its save is in Tico's nes folder, under the rom's name, with no tick asked "
              "for" + Rendered(console.Log()));
-  c.Expect(ticks.ticks() >= 1, "brought by the tick the download asked for");
-
-  // Settled before the cleanup, so the tick is not cut off half way.
-  while (console.Status().sync_in_progress && std::chrono::steady_clock::now() < by) {
+  // The tick says so as it ends, which is after the save is placed. Settled
+  // before the cleanup, too, so the tick is not cut off half way.
+  while ((ticks.ticks() < 1 || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < by) {
     std::this_thread::sleep_for(std::chrono::milliseconds{25});
   }
+  c.ExpectEq(ticks.ticks(), 1, "brought by the one tick the download asked for");
   ClearSlots(client, base, fixture, rom.id);
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();
