@@ -228,11 +228,14 @@ class FakeClient : public http::HttpClient {
   void OverCount(std::size_t total) { over_count_ = total; }
 
   /// Refuse a page of more than `rows` roms as too large, and any page holding
-  /// the rom at `wide` however few rows it has -- the transport's ceiling
-  /// (`http::kMaxResponseBytes`) meeting rows RomM made wide (#248).
-  void Ceiling(std::size_t rows, std::size_t wide = static_cast<std::size_t>(-1)) {
+  /// the rom at `wide` and more than `wide_rows` rows -- by default however few
+  /// it has -- the transport's ceiling (`http::kMaxResponseBytes`) meeting rows
+  /// RomM made wide (#248).
+  void Ceiling(std::size_t rows, std::size_t wide = static_cast<std::size_t>(-1),
+               std::size_t wide_rows = 0) {
     ceiling_rows_ = rows;
     wide_ = wide;
+    wide_rows_ = wide_rows;
   }
 
   std::vector<std::size_t> limits;  ///< every page size asked for, in order
@@ -249,7 +252,7 @@ class FakeClient : public http::HttpClient {
     const std::size_t limit = static_cast<std::size_t>(Query(request.url, "limit", 10));
     const std::size_t offset = static_cast<std::size_t>(Query(request.url, "offset", 0));
     limits.push_back(limit);
-    if (limit > ceiling_rows_ || (wide_ >= offset && wide_ < offset + limit)) {
+    if (limit > ceiling_rows_ || (wide_ >= offset && wide_ < offset + limit && limit > wide_rows_)) {
       http::Result refused;
       refused.error = http::Error::kTooLarge;
       refused.response.status = 200;
@@ -298,6 +301,7 @@ class FakeClient : public http::HttpClient {
   std::size_t over_count_ = 0;
   std::size_t ceiling_rows_ = static_cast<std::size_t>(-1);
   std::size_t wide_ = static_cast<std::size_t>(-1);
+  std::size_t wide_rows_ = 0;
 };
 
 /// A client that answers nothing and records that it was asked.
@@ -923,6 +927,50 @@ void TooLarge(checks::Checks& c) {
              "and the one past the ceiling is the one left out");
     c.Expect(fetched.index.truncated() && !fetched.message.empty(),
              "which reads as an index that is not whole, and says why: " + fetched.message);
+  }
+
+  // ...and past it the page grows back. A rom too wide to read alone halves the
+  // page down to one row on the way to it; kept there, a library of 1,024 is a
+  // request a rom and the page cap ends it a quarter of the way through, every
+  // tick -- the saves of the rest unmatched.
+  {
+    std::vector<std::pair<std::string, std::string>> large;
+    for (int index = 0; index < 400; ++index) {
+      large.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
+    }
+    FakeClient client(large);
+    client.Ceiling(64, 1);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.ExpectEq(fetched.index.size(), large.size() - 1,
+               "every rom but the one too large to read: " + fetched.message);
+    c.Expect(fetched.index.ById(2) == nullptr && fetched.index.ById(400) != nullptr,
+             "the one left out is the one at offset 1, and the library is read to its end");
+    // The pages at the size asked for, the halvings down to the rom, and its own.
+    c.Expect(client.requests <= 400 / 64 + 1 + 2 * 7,
+             "in about as many requests as the library at full pages: " +
+                 std::to_string(client.requests));
+  }
+
+  // The same for a rom wide enough to halve the page but that fits in a short
+  // one -- RetroAchievements metadata grows a row by the achievement. Nothing is
+  // left out, so nothing marks the place to grow back from but the pages after.
+  {
+    std::vector<std::pair<std::string, std::string>> large;
+    for (int index = 0; index < 400; ++index) {
+      large.push_back({"Game " + std::to_string(index), "game" + std::to_string(index) + ".gba"});
+    }
+    FakeClient client(large);
+    client.Ceiling(64, 1, 2);
+    rommsync::roms::FetchOptions options;
+    options.base_url = "http://romm.invalid";
+    const rommsync::roms::FetchResult fetched = rommsync::roms::FetchRomIndex(client, options);
+    c.Expect(fetched.ok() && !fetched.index.truncated(),
+             "a rom that fits a short page leaves the index whole: " + fetched.message);
+    c.ExpectEq(fetched.index.size(), large.size(), "every rom");
+    c.Expect(client.requests <= 400 / 64 + 2 * 7,
+             "and the pages after it are full again: " + std::to_string(client.requests));
   }
 
   // The browser's rom list.
