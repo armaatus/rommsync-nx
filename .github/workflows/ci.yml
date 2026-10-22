@@ -42,7 +42,7 @@ jobs:
             bash -n "$script"
           done
       - name: Python compiles
-        run: python3 -m compileall -q server/
+        run: python3 -m compileall -q server/ scripts/
       - name: Compose file is valid
         run: ./scripts/orca/compose.sh config --quiet
 

@@ -1778,6 +1778,12 @@ add_test(NAME switch.ci_requires_artifacts
          COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" ci)
 set_tests_properties(switch.ci_requires_artifacts PROPERTIES TIMEOUT 60)
 
+# ci.yml's `static` job byte-compiles every Python file under scripts/ and
+# server/, derived from the tree so a new script is held to it unedited (#256).
+add_test(NAME ci.static_python
+         COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_ci_static.sh" python)
+set_tests_properties(ci.static_python PROPERTIES TIMEOUT 60)
+
 # The real cross-compile, in the same devkitpro/devkita64 image CI uses. It needs
 # that image, which the CI host runner does not have and will not pull for 2.7GB.
 #
