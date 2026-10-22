@@ -29,6 +29,7 @@
 
 #include "checks.hpp"
 #include "rommsync/auth.hpp"
+#include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
 namespace {
@@ -39,6 +40,7 @@ namespace {
 // a libc++ one. That is a green local run and a red CI, which is the worst way
 // to find out.
 namespace auth = rommsync::auth;
+namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 
 std::string ReadCapture(checks::Checks& c, const std::string& name) {
@@ -604,6 +606,38 @@ void RefusesWhatItCannotRead(checks::Checks& c) {
            "...and the readable entry before it is not handed back on its own");
 }
 
+/// A plan is held for the whole tick, an operation at ~450 bytes on aarch64, so
+/// it has a bound: as many operations as `state.db` can record (M9-20, #246).
+/// Past it the plan is refused whole -- not cut, for `RefusesWhatItCannotRead`'s
+/// reason: a plan with operations missing is a plan nobody can tell from one
+/// that is in sync.
+void RefusesAPlanPastTheBound(checks::Checks& c) {
+  const auto plan_of = [](std::size_t operations) {
+    std::string body = "{\"session_id\":1,\"operations\":[";
+    for (std::size_t at = 0; at < operations; ++at) {
+      body += (at == 0 ? "" : ",") + std::string("{\"action\":\"upload\",\"rom_id\":") +
+              std::to_string(at + 1) +
+              ",\"save_id\":null,\"file_name\":\"a.srm\",\"slot\":\"autosave\","
+              "\"emulator\":null,\"reason\":\"Save does not exist on server\","
+              "\"server_updated_at\":null,\"server_content_hash\":null}";
+    }
+    return body + "],\"total_upload\":" + std::to_string(operations) +
+           ",\"total_download\":0,\"total_conflict\":0,\"total_no_op\":0}";
+  };
+  const auth::Parsed<sync::SyncPlan> full =
+      sync::ParseNegotiateResponse(plan_of(state::kMaxRecords));
+  c.Expect(full.ok(), "a plan of exactly the bound is read: " + full.error.Describe());
+  c.ExpectEq(full.value.operations.size(), state::kMaxRecords, "...all of it");
+
+  const auth::Parsed<sync::SyncPlan> over =
+      sync::ParseNegotiateResponse(plan_of(state::kMaxRecords + 1));
+  c.Expect(!over.ok(), "one operation past the bound refuses the plan");
+  c.ExpectEq(over.error.field, std::string("operations"), "...naming the array");
+  c.Expect(over.error.message.find(std::to_string(state::kMaxRecords)) != std::string::npos,
+           "...and the bound it passed: " + over.error.message);
+  c.Expect(over.value.operations.empty(), "...and hands back no part of it");
+}
+
 }  // namespace
 
 int main() {
@@ -623,6 +657,7 @@ int main() {
   AServerHashThatIsNotAnMd5IsReported(c);
   APathWhereANameBelongsIsFlagged(c);
   RefusesWhatItCannotRead(c);
+  RefusesAPlanPastTheBound(c);
 
   if (c.failures() != 0) {
     std::cerr << c.failures() << " failure(s)\n";

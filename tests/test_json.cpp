@@ -412,11 +412,36 @@ void StreamsOneArray(checks::Checks& c) {
            "an empty key streams the root array");
   c.Expect(seen == std::vector<std::int64_t>{7, 8}, "element by element");
 
+  // The wrong shape is refused before it is parsed, by the name a caller's own
+  // shape check would have given it (M9-20, #246). Parsed first and refused
+  // after, a bare array where the envelope belongs cost ~11x its text on the way
+  // to a refusal that was always coming.
   seen.clear();
   const json::ParseResult object = json::ParseEach(R"({"items":{"id":1}})", "items", collect);
-  c.Expect(object.ok() && seen.empty(), "something other than an array is not streamed");
-  c.Expect(object.value.Find("items") != nullptr && object.value.Find("items")->is_object(),
-           "it is held, so the caller's shape check refuses it by name");
+  c.Expect(!object.ok() && seen.empty(), "something other than an array is not streamed");
+  c.ExpectEq(object.error.field, std::string("items"), "it is refused by the member's name");
+  c.ExpectEq(object.error.message, std::string("expected an array, got an object"),
+             "and says what it was instead");
+  const json::ParseResult missing = json::ParseEach(R"({"total":0})", "items", collect);
+  c.Expect(missing.ok() && missing.value.Find("items") == nullptr,
+           "a member that is not there is the caller's to refuse, as it always was");
+
+  const json::ParseResult bare_page =
+      json::ParseEach(R"([{"id":1},{"id":2}])", "items", collect, "rom list");
+  c.Expect(!bare_page.ok() && seen.empty(), "a bare array where an envelope belongs is refused");
+  c.ExpectEq(bare_page.error.message,
+             std::string("rom list is an array, not the object it must be"),
+             "in the sentence `Reader` would have used, naming what was being read");
+  const json::ParseResult enveloped =
+      json::ParseEach(R"({"items":[{"id":1}],"total":1})", "", collect, "platform list");
+  c.Expect(!enveloped.ok() && seen.empty(), "and an envelope where a bare array belongs");
+  c.ExpectEq(enveloped.error.message,
+             std::string("platform list is an object, not the array it must be"),
+             "the other way round");
+  const json::ParseResult unnamed = json::ParseEach("null", "items", collect);
+  c.ExpectEq(unnamed.error.message, std::string("the document is a null, not the object it must be"),
+             "with a context of its own when the caller gave none");
+  c.Expect(!json::ParseEach("", "items", collect).ok(), "an empty body is still refused");
 
   // Strict exactly as `Parse` is, including past elements already handed over.
   seen.clear();

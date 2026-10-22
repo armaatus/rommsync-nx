@@ -568,7 +568,8 @@ ParseResult Parse(std::string_view text) {
   return parser.Run<false>();
 }
 
-ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each) {
+ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each,
+                      std::string_view) {
   Parser parser(text, key, each);
   return parser.Run<true>();
 }

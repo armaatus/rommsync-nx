@@ -27,6 +27,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -1077,6 +1078,81 @@ int Reserved(http::HttpClient& client, const std::string& base, const std::strin
                     std::to_string(kBody) + " bytes)");
   return checks.failures();
 }
+
+// An API body that declares no length -- chunked, or ended by the close -- has
+// nothing to reserve, so it grows; and nothing used to stop it growing (M9-20,
+// #246). RomM behind its own nginx always declares one, but a reverse proxy in
+// front of it may not, and a body that doubles its way in costs up to three
+// times its text while the last reallocation has both buffers live. So such a
+// body is held to a cap whose worst case fits the heap row every response is
+// counted under, and one past it is refused rather than grown into.
+//
+// A loopback server, for `RedirectCredentials`'s reason: RomM cannot be asked to
+// answer without a `Content-Length`.
+int Undeclared(http::HttpClient& client) {
+  rig::Checks checks;
+  // Comfortably under the cap, and comfortably over it.
+  constexpr std::size_t kFits = 100 * 1024;
+  constexpr std::size_t kOver = 200 * 1024;
+  const auto chunked = [](std::size_t size) {
+    std::string response = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                           "Connection: close\r\n\r\n";
+    const std::string chunk(4096, 'c');
+    for (std::size_t sent = 0; sent < size; sent += chunk.size()) {
+      const std::size_t take = std::min(chunk.size(), size - sent);
+      char line[32];
+      std::snprintf(line, sizeof(line), "%zx\r\n", take);
+      response += line + chunk.substr(0, take) + "\r\n";
+    }
+    return response + "0\r\n\r\n";
+  };
+  const auto until_close = [](std::size_t size) {
+    return "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + std::string(size, 'u');
+  };
+  struct Case {
+    const char* what;
+    std::string response;
+    std::size_t size;
+    bool fits;
+  };
+  const Case cases[] = {
+      {"a chunked body under the cap", chunked(kFits), kFits, true},
+      {"a chunked body past the cap", chunked(kOver), kOver, false},
+      {"a close-delimited body under the cap", until_close(kFits), kFits, true},
+      {"a close-delimited body past the cap", until_close(kOver), kOver, false},
+  };
+  for (const Case& served : cases) {
+    rig::LoopbackServer server;
+    if (!server.Start(1, [&](int fd, std::size_t, const std::string&) {
+          rig::WriteAll(fd, served.response);
+        })) {
+      std::cerr << "  could not start the loopback server\n";
+      return 1;
+    }
+    http::Request request;
+    request.url = server.origin() + "/api/platforms";
+    const http::Result result = client.Send(request);
+    server.Stop();
+    if (served.fits) {
+      checks.ExpectOk(result, served.what);
+      checks.ExpectEq(result.response.body.size(), served.size,
+                      std::string(served.what) + " arrives whole");
+      // At most twice what it holds: grown in powers of two, never past the cap.
+      checks.Expect(result.response.body.capacity() < 2 * served.size,
+                    std::string(served.what) + " is held in less than twice its text (capacity " +
+                        std::to_string(result.response.body.capacity()) + ")");
+    } else {
+      checks.Expect(!result.ok(), std::string(served.what) + " is refused");
+      checks.ExpectEq(static_cast<int>(result.error), static_cast<int>(http::Error::kTransport),
+                      std::string(served.what) + " as a transport failure");
+      checks.Expect(result.message.find("Content-Length") != std::string::npos,
+                    std::string(served.what) + " says why: " + result.message);
+      checks.Expect(result.response.body.empty(),
+                    std::string(served.what) + " and hands back none of it");
+    }
+  }
+  return checks.failures();
+}
 #endif
 
 }  // namespace
@@ -1177,6 +1253,8 @@ int main(int argc, char** argv) {
     failures = Chunk(base, asset);
   } else if (scenario == "reserved") {
     failures = Reserved(*client, base, asset);
+  } else if (scenario == "undeclared") {
+    failures = Undeclared(*client);
 #endif
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";

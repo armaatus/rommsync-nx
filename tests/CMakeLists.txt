@@ -367,6 +367,7 @@ set(LIST_UNIT_SCENARIOS
   platforms  # an empty list, one shorter than a page, and a rom with no name
   cursors    # the cap, the TTL, and what a reclaimed cursor answers
   queue      # served off the card, and never over the network
+  held       # one platform snapshot and one built page, however many cursors (M9-20)
 )
 foreach(scenario IN LISTS LIST_UNIT_SCENARIOS)
   add_test(NAME lists.${scenario} COMMAND test_lists ${scenario})
@@ -800,6 +801,7 @@ target_compile_definitions(test_http_wire PRIVATE
 set(WIRE_ONLY_SCENARIOS
   chunk             # a download reads 64 KiB at a time, an API call 16 KiB
   reserved          # an API body is held in the room Content-Length declared (M9-19)
+  undeclared        # one that declares no length is capped, not grown into (M9-20)
 )
 
 foreach(scenario IN LISTS HTTP_SCENARIOS WIRE_ONLY_SCENARIOS)
@@ -2528,7 +2530,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(test_heap_steady PRIVATE -fno-allocation-dce)
 endif()
 
-foreach(scenario counts judge log_ring page_parse heartbeat)
+foreach(scenario counts judge log_ring page_parse heartbeat response_parse wrong_shape)
   add_test(NAME alloc.${scenario} COMMAND test_heap_steady ${scenario})
   set_tests_properties(alloc.${scenario} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()

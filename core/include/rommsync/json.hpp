@@ -169,7 +169,8 @@ using EachElement = std::function<Error(const Value& element, std::size_t index)
 /// element is still parsed in full, so the strictness above is unchanged: a
 /// malformed element fails the document, even after earlier ones were handed
 /// over -- which is why a caller keeps what it reads only once this returns ok.
-ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each);
+ParseResult ParseEach(std::string_view text, std::string_view key, const EachElement& each,
+                      std::string_view context = {});
 
 /// `value` as a JSON string literal, quotes included.
 ///

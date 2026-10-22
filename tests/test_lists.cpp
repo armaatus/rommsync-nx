@@ -591,6 +591,96 @@ void Cursors(checks::Checks& c) {
   c.Expect(second != first, "and never carries the reclaimed one's id");
 }
 
+/// What the service holds between pumps: **one** platform snapshot and **one**
+/// built rom page, however many cursors are open (M9-20, #246).
+///
+/// Each is ~30 KiB on aarch64 and both are held beside a sync tick, so at
+/// `kMaxCursors` of each they were the heap's largest row nobody had written.
+/// The overlay has one list on screen at a time, so the cost of the rule is a
+/// refetch on a cursor nobody is looking at -- which is what is checked here: a
+/// cursor whose snapshot or page went to another one answers `pending` and
+/// fetches again, from the offset it had, rather than failing.
+void Held(checks::Checks& c) {
+  config::Config configuration = config::Defaults();
+  configuration.server.url = "http://127.0.0.1:1";
+  download::Queue queue;
+  lists::Service service(lists::Service::FixedConfig(configuration), queue);
+  FakeClient client({{"Alpha", "Alpha.gba"}, {"Beta", "Beta.gba"}, {"Gamma", "Gamma.gba"}});
+  client.SetPlatforms(
+      R"([{"id":1,"fs_slug":"gba","name":"Game Boy Advance","rom_count":3},)"
+      R"({"id":2,"fs_slug":"nes","name":"Nintendo Entertainment System","rom_count":0}])");
+  service.UseServer(&client, "fixture-token");
+
+  // A page that needs the network: asked, pumped, and asked again for what landed.
+  const auto open = [&](ipc::ListKind kind, std::int32_t page_size) {
+    ipc::ListRequest request;
+    request.kind = kind;
+    request.page_size = page_size;
+    ipc::Cursor cursor = 0;
+    c.ExpectEq(static_cast<int>(service.ListBegin(request, &cursor)),
+               static_cast<int>(ipc::Error::kOk), "a cursor opens");
+    return cursor;
+  };
+  const auto next = [&](ipc::Cursor cursor) {
+    ipc::ListPage page;
+    c.ExpectEq(static_cast<int>(service.ListNext(cursor, &page)),
+               static_cast<int>(ipc::Error::kOk), "a page is answered");
+    return page;
+  };
+
+  // Two platform lists, each with its snapshot in hand.
+  const ipc::Cursor first = open(ipc::ListKind::kPlatforms, 1);
+  c.Expect(next(first).pending, "the first platform list fetches");
+  c.Expect(service.Pump(), "and the worker fetches it");
+  const ipc::ListPage first_page = next(first);
+  c.Expect(!first_page.pending && first_page.items.size() == 1 && first_page.has_more,
+           "its first page comes out of the snapshot");
+  const int after_first = client.requests;
+
+  const ipc::Cursor second = open(ipc::ListKind::kPlatforms, 1);
+  c.Expect(next(second).pending, "the second platform list fetches");
+  c.Expect(service.Pump(), "and the worker fetches it");
+  c.Expect(!next(second).pending, "its page comes out of its own snapshot");
+
+  // The first gave its snapshot up when the second's fetch began.
+  const ipc::ListPage refetch = next(first);
+  c.Expect(refetch.pending, "a platform list whose snapshot went to another one fetches again");
+  c.Expect(service.Pump(), "which the worker does");
+  const ipc::ListPage resumed = next(first);
+  c.Expect(!resumed.pending && resumed.items.size() == 1,
+           "and it answers its next page from the new snapshot");
+  if (!resumed.items.empty() && !first_page.items.empty()) {
+    c.Expect(Number(resumed.items.front(), keys::kPlatformId) !=
+                 Number(first_page.items.front(), keys::kPlatformId),
+             "from where it was, not from the top");
+  }
+  c.ExpectEq(client.requests, after_first + 2,
+             "one request for the second list and one for the first's refetch");
+
+  // Two rom lists, each with a built page waiting that nobody has taken.
+  const ipc::Cursor roms_a = open(ipc::ListKind::kRoms, 1);
+  c.Expect(next(roms_a).pending, "a rom list fetches");
+  c.Expect(service.Pump(), "and its page is built");
+  const ipc::Cursor roms_b = open(ipc::ListKind::kRoms, 1);
+  c.Expect(next(roms_b).pending, "a second rom list fetches");
+  c.Expect(service.Pump(), "and its page is built too");
+  const int before_take = client.requests;
+  const ipc::ListPage taken_b = next(roms_b);
+  c.Expect(!taken_b.pending && taken_b.items.size() == 1, "the second's page is handed over");
+
+  // The first's built page was dropped when the second's fetch began, so its
+  // next page is fetched again -- and it is still its *first* page.
+  c.Expect(next(roms_a).pending, "a rom list whose built page went unclaimed fetches again");
+  c.Expect(service.Pump(), "which the worker does");
+  const ipc::ListPage taken_a = next(roms_a);
+  c.Expect(!taken_a.pending && taken_a.items.size() == 1, "and the page arrives");
+  if (!taken_a.items.empty()) {
+    c.ExpectEq(Number(taken_a.items.front(), keys::kRomId), std::int64_t{1},
+               "starting where the dropped page did");
+  }
+  c.ExpectEq(client.requests, before_take + 1, "for exactly one more request");
+}
+
 /// The `queue` kind: served off the card, and never over the network.
 void QueueList(checks::Checks& c) {
   Console console(c, "lists-queue");
@@ -1063,6 +1153,8 @@ int main(int argc, char** argv) {
     Cursors(checks);
   } else if (scenario == "queue") {
     QueueList(checks);
+  } else if (scenario == "held") {
+    Held(checks);
   } else if (scenario == "library") {
     code = Library(checks);
   } else if (scenario == "faults") {

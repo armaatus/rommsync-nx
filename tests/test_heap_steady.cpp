@@ -20,6 +20,12 @@
 //                  peak grows with the rows it becomes, not with their parsed
 //                  documents, which weigh ~11x their text (M9-19, see
 //                  `PageParse`).
+//   alloc.response_parse
+//                  the same for the negotiate plan, the state listing, the device
+//                  list and queue.json (M9-20, see `ResponseParse`).
+//   alloc.wrong_shape
+//                  a body of the wrong shape is refused before it is parsed, not
+//                  after (M9-20, see `WrongShape`).
 //   alloc.steady   the real `SdEngine` -- its worker, its scheduler, the fixture
 //                  RomM -- run tick after tick through the IPC table, with what
 //                  is outstanding sampled between ticks. After a warm-up that
@@ -59,6 +65,8 @@
 #include "harness.hpp"
 #include "rig.hpp"
 #include "rommsync/auth.hpp"
+#include "rommsync/device_registration.hpp"
+#include "rommsync/download.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/host/file_sync.hpp"
 #include "rommsync/host/native_file_system.hpp"
@@ -67,6 +75,8 @@
 #include "rommsync/log.hpp"
 #include "rommsync/rom_index.hpp"
 #include "rommsync/server_capabilities.hpp"
+#include "rommsync/state_sync.hpp"
+#include "rommsync/sync.hpp"
 #include "rommsync/token_store.hpp"
 
 namespace auth = rommsync::auth;
@@ -571,6 +581,157 @@ void PageParse(checks::Checks& c) {
            "lists::ParsePlatforms holds one row's document at a time, not the list's");
 }
 
+// --- every other response that grows with a library (M9-20, #246) -------------
+
+/// `rows` copies of `row(i)`, joined into an array, inside `head`/`tail` when an
+/// envelope holds it.
+std::string ArrayOf(std::size_t rows, const std::function<std::string(std::size_t)>& row,
+                    const std::string& head = "", const std::string& tail = "") {
+  std::string body = head + "[";
+  for (std::size_t at = 0; at < rows; ++at) {
+    body += (at == 0 ? "" : ",") + row(at);
+  }
+  return body + "]" + tail;
+}
+
+/// A negotiate operation as RomM 5.4.0 sends one
+/// (server/contract/captures/5.4.0/sync-negotiate-download.json), ids varied.
+std::string OperationRow(std::size_t at) {
+  return "{\"action\":\"download\",\"rom_id\":" + std::to_string(at + 1) +
+         ",\"save_id\":" + std::to_string(at + 1) +
+         ",\"file_name\":\"probe [2026-10-21_09-02-11].srm\",\"slot\":\"slot-" +
+         std::to_string(at) +
+         "\",\"emulator\":\"probe-emulator\",\"reason\":\"Save exists on server but not on "
+         "client\",\"server_updated_at\":\"2026-10-21T09:02:11+00:00\","
+         "\"server_content_hash\":\"abd8fff93894e8112c7dd17386e54a5f\"}";
+}
+
+/// A `StateSchema` row (captures/5.4.0/states-list.json).
+std::string StateRow(std::size_t at) {
+  return "{\"id\":" + std::to_string(at + 1) + ",\"rom_id\":" + std::to_string(at + 1) +
+         ",\"user_id\":1,\"file_name\":\"probe-873af96c.state\",\"file_name_no_tags\":"
+         "\"probe-873af96c\",\"file_name_no_ext\":\"probe-873af96c\",\"file_extension\":"
+         "\"state\",\"file_path\":\"users/557365723a31/states/nes/4/probe-other-emulator\","
+         "\"file_size_bytes\":32,\"full_path\":\"users/557365723a31/states/nes/4/"
+         "probe-other-emulator/probe-873af96c.state\",\"download_path\":\"/api/states/1/"
+         "content\",\"missing_from_fs\":false,\"created_at\":\"2026-09-06T15:10:41+00:00\","
+         "\"updated_at\":\"2026-09-06T15:10:41+00:00\",\"emulator\":\"probe-other-emulator\","
+         "\"is_public\":false,\"screenshot\":null}";
+}
+
+/// A `DeviceSchema` row (captures/5.4.0/devices-get.json).
+std::string DeviceRow(std::size_t at) {
+  return "{\"id\":\"b4ee319c-aea5-43ff-a0b3-" + std::to_string(100000000000 + at) +
+         "\",\"user_id\":1,\"name\":\"probe_contract.py\",\"platform\":\"switch\","
+         "\"client\":\"rommsync-nx-probe\",\"client_version\":\"0.0.0\",\"ip_address\":null,"
+         "\"mac_address\":null,\"hostname\":null,\"client_device_identifier\":\"device-" +
+         std::to_string(at) +
+         "\",\"sync_mode\":\"api\",\"sync_enabled\":true,\"sync_config\":null,\"last_seen\":"
+         "\"2026-09-06T15:10:39+00:00\",\"created_at\":\"2026-09-06T15:10:27+00:00\","
+         "\"updated_at\":\"2026-09-06T15:10:39+00:00\"}";
+}
+
+/// The other responses whose size comes from an array are read an element at a
+/// time too: the negotiate plan, the state listing, the device list, and
+/// `queue.json` at boot. `PageParse`'s rule for each -- the peak may grow by
+/// what the rows become, and by nothing that scales with their documents.
+///
+/// Held whole, each was ~10x its text on aarch64: a 512-operation plan peaked at
+/// 1.3 MiB and a 117 KiB state listing at 980 KiB, on a 1.4 MiB heap.
+void ResponseParse(checks::Checks& c) {
+  constexpr std::size_t kRows = 64;
+  // Over what one row becomes on either standard library -- an operation is
+  // the largest, ~450 bytes on aarch64 -- and under one row's document, which is
+  // ~3 KiB for the smallest of the four.
+  constexpr std::int64_t kPerRow = 1024;
+  const auto check = [&c](const char* what, const std::string& one, const std::string& many,
+                          const std::function<bool(const std::string&)>& parse) {
+    c.Expect(parse(one) && parse(many), std::string(what) + " parses");
+    const std::int64_t at_one = PeakOf(one, parse);
+    const std::int64_t at_many = PeakOf(many, parse);
+    std::cout << what << ": " << at_one << " bytes at 1 row, " << at_many << " at " << kRows
+              << " (" << many.size() << " bytes of text)\n";
+    c.Expect(at_many - at_one < static_cast<std::int64_t>(kRows) * kPerRow,
+             std::string(what) + " holds one row's document at a time, not the whole body's");
+  };
+
+  const auto plan = [](std::size_t rows) {
+    return ArrayOf(rows, OperationRow, "{\"session_id\":4,\"operations\":",
+                   ",\"total_upload\":0,\"total_download\":" + std::to_string(rows) +
+                       ",\"total_conflict\":0,\"total_no_op\":0,\"total_delete\":0}");
+  };
+  check("sync::ParseNegotiateResponse", plan(1), plan(kRows), [](const std::string& body) {
+    return rommsync::sync::ParseNegotiateResponse(body).ok();
+  });
+
+  check("sync::ParseStateList", ArrayOf(1, StateRow), ArrayOf(kRows, StateRow),
+        [](const std::string& body) { return rommsync::sync::ParseStateList(body).ok(); });
+
+  check("auth::ParseDeviceList", ArrayOf(1, DeviceRow), ArrayOf(kRows, DeviceRow),
+        [](const std::string& body) { return auth::ParseDeviceList(body).ok(); });
+
+  const auto queue = [](std::size_t rows) {
+    std::vector<rommsync::download::QueueEntry> entries;
+    for (std::size_t at = 0; at < rows; ++at) {
+      rommsync::download::QueueEntry entry;
+      entry.rom_id = static_cast<std::int64_t>(at) + 1;
+      entry.platform_fs_slug = "gba";
+      entry.fs_name = "Synthetic Game " + std::to_string(at) + " (USA).gba";
+      entry.destination = "/tico/roms/gba/" + entry.fs_name;
+      entry.queued_at = 1704067200;
+      entries.push_back(std::move(entry));
+    }
+    return rommsync::download::SerializeQueue(entries);
+  };
+  check("download::ParseQueue", queue(1), queue(kRows), [](const std::string& text) {
+    const rommsync::download::LoadedQueue loaded = rommsync::download::ParseQueue(text);
+    return !loaded.discarded && !loaded.entries.empty();
+  });
+}
+
+/// A body of the wrong shape is refused before it is parsed, not after.
+///
+/// A bare array where the `/api/roms` envelope belongs never reached the member
+/// `json::ParseEach` streams, so the whole of it was parsed -- a 64-row page at
+/// ~11x its text -- before the envelope check refused it. The refusal was right;
+/// the heap it took on the way had no row (M9-20, #246).
+void WrongShape(checks::Checks& c) {
+  const std::string bare = Page(64, false);
+  const auto index_page = [](const std::string& body) {
+    rommsync::roms::Page page;
+    return rommsync::roms::ParsePage(body, &page).ok();
+  };
+  const auto list_page = [](const std::string& body) {
+    rommsync::lists::RomPage page;
+    return rommsync::lists::ParseRomPage(body, &page).ok();
+  };
+  const auto platforms = [](const std::string& body) {
+    std::vector<rommsync::lists::PlatformRow> rows;
+    return rommsync::lists::ParsePlatforms(body, &rows).ok();
+  };
+  const std::string enveloped = Page(64, true);
+  // The refusal's own error is a few short strings; a document is hundreds of
+  // KiB. 4 KiB is far from both.
+  constexpr std::int64_t kRefusal = 4 * 1024;
+  struct Case {
+    const char* what;
+    const std::string* body;
+    std::function<bool(const std::string&)> parse;
+  };
+  const Case cases[] = {
+      {"roms::ParsePage over a bare array", &bare, index_page},
+      {"lists::ParseRomPage over a bare array", &bare, list_page},
+      {"lists::ParsePlatforms over an envelope", &enveloped, platforms},
+  };
+  for (const Case& refused : cases) {
+    c.Expect(!refused.parse(*refused.body), std::string(refused.what) + " is refused");
+    const std::int64_t peak = PeakOf(*refused.body, refused.parse);
+    std::cout << refused.what << ": refused at a peak of " << peak << " bytes ("
+              << refused.body->size() << " bytes of text)\n";
+    c.Expect(peak < kRefusal, std::string(refused.what) + " is refused before it is parsed");
+  }
+}
+
 /// One rig run: a console paired with the fixture, its worker started, the
 /// log's tick counter installed, `round` driven `rounds` times after the
 /// warm-up, and what it held judged. `what` names the run in the output and in
@@ -711,9 +872,14 @@ int main(int argc, char** argv) {
 
   rig::Checks checks;
   if (scenario == "counts" || scenario == "judge" || scenario == "log_ring" ||
-      scenario == "page_parse" || scenario == "heartbeat") {
+      scenario == "page_parse" || scenario == "heartbeat" || scenario == "response_parse" ||
+      scenario == "wrong_shape") {
     if (scenario == "counts") {
       Counts(checks);
+    } else if (scenario == "response_parse") {
+      ResponseParse(checks);
+    } else if (scenario == "wrong_shape") {
+      WrongShape(checks);
     } else if (scenario == "heartbeat") {
       HeartbeatCost(checks);
     } else if (scenario == "judge") {
