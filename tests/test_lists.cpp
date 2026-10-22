@@ -594,7 +594,7 @@ void Cursors(checks::Checks& c) {
 /// What the service holds between pumps: **one** platform snapshot and **one**
 /// built rom page, however many cursors are open (M9-20, #246).
 ///
-/// Each is ~30 KiB on aarch64 and both are held beside a sync tick, so at
+/// Each is 40-50 KiB on aarch64 and both are held beside a sync tick, so at
 /// `kMaxCursors` of each they were the heap's largest row nobody had written.
 /// The overlay has one list on screen at a time, so the cost of the rule is a
 /// refetch on a cursor nobody is looking at -- which is what is checked here: a

@@ -702,12 +702,13 @@ static_assert(kHeapPeak == 0x172800, "the table above no longer sums to its peak
 //     sit under it too. At 4,096 two were ~1.2 MiB, and `List` doubled past the
 //     bound before it popped back. It was `state::kMaxRecords` then; M9-20 moved
 //     that and left this, since a folder is read to find saves among other files.
-//   * `roms::kMaxIndexRoms` is 1,024 because that is what is left: 1,408 - 842 -
-//     213 is 353 KiB, of which 1,024 roms and the page on its way in take 259 and
-//     the margin above is the rest. Each further 256 roms is ~62 KiB of resident
+//   * `roms::kMaxIndexRoms` is 1,024 because that was what was left of the
+//     1,408 KiB heap M9-19 had (M9-20's figures are below): 1,408 - 842 - 213
+//     was 353 KiB, of which 1,024 roms and the page on its way in take 259 and
+//     the margin was the rest. Each further 256 roms is ~62 KiB of resident
 //     `.bss` -- the heap growing with it, against an image ceiling
-//     (`scripts/image-budget.sh`) with ~260 KiB to spare -- and that trade is
-//     this table's to make again rather than a constant's to drift into.
+//     (`scripts/image-budget.sh`) with 56 KiB to spare since M9-20 -- and that
+//     trade is this table's to make again rather than a constant's to drift into.
 //
 // **The bound M9-20 (#246) derived**, the same way: `state::kMaxRecords` -- and
 // with it `scan::kMaxSaves`, `scan::kMaxStates` and `sync::kMaxPlanOperations`
@@ -731,7 +732,13 @@ static_assert(kHeapPeak == 0x172800, "the table above no longer sums to its peak
 // queue, held whole for the life of the process (`kMaxQueueEntries` entries, up
 // to ~1.9 KiB each at their path bounds) and serialised whole -- up to
 // `kMaxQueueBytes` of text -- on every write, from the IPC thread as well as the
-// worker. They live in the margin today, which is what a margin is not for.
+// worker. And three smaller ones: the negotiate request's body (a save's entry,
+// `kMaxSaves` of them), a device list whose rows nothing counts, and a body that
+// declares a `Content-Length` past `kMaxReservedBodyBytes`, which still grows
+// the way an undeclared one used to. They live in the margin today, which is
+// what a margin is not for. The responses that are one row -- a save row, an
+// upload's answer, a rom's detail, the play-session answer -- are one row's
+// document beside their text, under `kHeapListResponse` with room.
 constexpr size_t kInnerHeapSize = 0x180000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 

@@ -782,7 +782,7 @@ the in-flight buffers (a download's and an API call's) + the bsd transfer memory
 baseline, and stream to file rather than buffering whole roms in RAM. The
 baseline is the one item that grows with the library rather than being a fixed
 buffer — its text and then its parsed rows, bounded by `state::kMaxStateBytes`
-and `state::kMaxRecords`, which are sized against the ~1.3 MiB this section
+and `state::kMaxRecords`, which are sized against the ~1.4 MiB this section
 leaves free and have to move with it (`core/include/rommsync/state_db.hpp`).
 Since M1-7 (#126) that budget is written out term by term above
 `kInnerHeapSize` in `sysmodule/source/main.cpp`, and a `static_assert` there

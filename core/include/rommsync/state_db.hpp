@@ -127,7 +127,8 @@ inline constexpr int kSourceSlotVersion = 2;
 /// `Baseline`, whose per-row `std::string`s each exceed the 15-character
 /// small-string buffer and land on the heap, so the map costs more than the text
 /// it came from. At ~214 bytes a row, `kMaxRecords` rows is ~27 KiB of text and
-/// ~33 KiB parsed, under the 32 KiB each the heap table gives them.
+/// ~33 KiB parsed: ~60 KiB at the peak, under the 64 KiB the heap table gives
+/// the two together (`kHeapStateBaseline`).
 ///
 /// **128, and 32 KiB, since M9-20 (#246).** They were 512 and 128 KiB, sized
 /// against the baseline alone -- and a save costs a tick far more than its row

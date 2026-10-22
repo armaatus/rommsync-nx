@@ -357,7 +357,7 @@ auth::Answer AnswerOf(NegotiateError error) {
 auth::Parsed<SyncPlan> ParseNegotiateResponse(std::string_view body) {
   auth::Parsed<SyncPlan> parsed;
   // An operation at a time (`json::ParseEach`): the plan held as one document is
-  // ~10x its text, 1.3 MiB at `kMaxPlanOperations` on aarch64 (M9-20, #246).
+  // ~10x its text, 1.3 MiB at 512 operations on aarch64 (M9-20, #246).
   SyncPlan plan;
   const json::ParseResult document = json::ParseEach(
       body, "operations",

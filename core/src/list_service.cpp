@@ -626,13 +626,17 @@ bool Service::Pump() {
       return false;
     }
     // **One platform snapshot and one built rom page, across every cursor**
-    // (M9-20, #246). Each is ~30 KiB and held beside a sync tick, so at
+    // (M9-20, #246). Each is 40-50 KiB and held beside a sync tick, so at
     // `kMaxCursors` of each they were the heap's largest row nobody had
     // written. The overlay has one list on screen, so the cursor that gives its
     // own up is one nobody is reading -- and it loses nothing but a request: it
     // goes back to `kIdle` at the offset it had, and its next `ListNext` fetches
     // again from there. Dropped *before* the request rather than when its answer
-    // lands, so the old one and the new one are never held at once.
+    // lands, so the old one and the new one are never held at once. Two cursors
+    // of one kind polled in turn still make progress -- each fetch's page is
+    // there for the next `ListNext` of its own cursor -- but one that is polled
+    // much less often than a fetch takes can keep losing its page to the other;
+    // the browser never pages two lists of a kind at once.
     for (Entry& other : cursors_) {
       if (&other == found || other.request.kind != found->request.kind) {
         continue;

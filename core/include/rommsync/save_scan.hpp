@@ -240,7 +240,7 @@ struct Skip {
 ///
 /// `state.db` holds one row per reported save and its writer *refuses* a
 /// baseline with more rows than that (`state_db.hpp` sizes it against the
-/// sysmodule's ~1.3 MiB, and says the two constants and `kInnerHeapSize` move
+/// sysmodule's ~1.4 MiB, and says the two constants and `kInnerHeapSize` move
 /// together). A scanner that emitted more would produce a tick whose baseline
 /// can never be written: the write fails, nothing is stored, and the whole
 /// library is re-hashed on the next tick and every tick after it -- silently,

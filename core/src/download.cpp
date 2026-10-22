@@ -849,7 +849,7 @@ LoadedQueue ParseQueue(std::string_view text) {
 
   if (document.value.Find("entries") == nullptr) {
     Add(&loaded.diagnostics,
-        std::string(kQueueFileName) + ": field entries: expected an array; the queue is discarded");
+        std::string(kQueueFileName) + ": field entries: is missing; the queue is discarded");
     loaded.discarded = true;
     return loaded;
   }
