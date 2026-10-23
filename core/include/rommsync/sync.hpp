@@ -348,12 +348,11 @@ Action ClassifyAction(std::string_view action, bool* recognized = nullptr);
 
 /// Which arbitration produced an operation.
 ///
-/// This is the **complete** set 5.2.0 can emit, tabulated in
-/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete, plus 5.4.0's
-/// two removal reasons -- `delete`'s and `download`'s -- each pinned by a 5.4.0
-/// capture. Only five of the thirteen 5.2.0 ones appear in
-/// server/contract/captures/, so `contract.captures` cannot guard the rest and
-/// `sync.plan` holds this enum to the document instead.
+/// This is the **complete** set 5.4.0 can emit, tabulated in
+/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete. Only nine of
+/// its fifteen appear in server/contract/captures/5.4.0/, so
+/// `contract.captures` cannot guard the rest and `sync.plan` holds this enum to
+/// the document instead.
 ///
 /// The client obeys `action` and not `reason` -- the server is the source of
 /// truth (docs/SYNC_PROTOCOL.md). What the reason is for is everything around

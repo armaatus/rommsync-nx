@@ -23,7 +23,9 @@
 #                                              would use, read from switch.mk;
 #                                              no network, no build
 #
-# It builds nothing in the worktree and leaves nothing behind.
+# Both need scripts/toolchain.sh's pinned image already pulled; it says which
+# `docker pull` when it is not. It builds nothing in the worktree and leaves
+# nothing behind.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

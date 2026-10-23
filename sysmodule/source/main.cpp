@@ -970,15 +970,20 @@ static_assert(kHeapPeak == 0x17F000, "the table above no longer sums to its peak
 // 0x180000 leaves 0x1000 -- 4 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, and the arithmetic gave neither.
-// M9-4 (#208) took 40 KiB of it for the PSC watcher's thread, which is the row
-// above, M10-19 (#245) 8 KiB for the claimed installs, M9-21 (#247) 21 KiB
-// for the download queue, which was always resident and never counted, and
-// M10-21 (#257) 1 KiB for the declines a tick has already said -- the price of a
-// refused save costing one log line a boot rather than one a tick -- and M10-26
-// (#261) 1 KiB for the foreground's sightings, which a play session's title is
-// read from, and M10-20 (#249) 2 KiB for the Keep local choices -- which is why
-// `sync::kMaxKeepLocal` is 4: a choice asks for its tick at once, so more than
-// one waits only while sync is off or held.
+// What has been taken from it, and for what:
+//   - M9-4 (#208), 40 KiB: the PSC watcher's thread, the row above.
+//   - M10-19 (#245), 8 KiB: the claimed installs.
+//   - M9-21 (#247), 21 KiB: the download queue, always resident and never
+//     counted.
+//   - M10-21 (#257), 1 KiB: the declines a tick has already said -- the price
+//     of a refused save costing one log line a boot rather than one a tick.
+//   - M10-26 (#261), 1 KiB: the foreground's sightings, which a play session's
+//     title is read from.
+//   - M10-20 (#249), 2 KiB: the Keep local choices -- which is why
+//     `sync::kMaxKeepLocal` is 4: a choice asks for its tick at once, so more
+//     than one waits only while sync is off or held.
+// The next row held for the boot would come out of the 4 KiB left, so it needs
+// a decision on kInnerHeapSize first.
 //
 // **M9-22 (#248) took 15 KiB more**, and every byte of it is cost that was
 // always there: the conflict history, resident and never counted (35 KiB), and

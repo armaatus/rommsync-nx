@@ -171,7 +171,7 @@ ROMMSYNC_VENDOR_DROPS := -Wextra -Wpedantic -Werror
 #     whole rom to verify a download, it is not a loss.
 #   * -flto=auto (#253): the code is generated once, at the link, over the
 #     whole image, so an inline header function emitted by forty units and a
-#     helper only one caller reaches stop costing a copy or a call each. ~70
+#     helper only one caller reaches stop costing a copy or a call each. ~73
 #     KiB of the sysmodule's .text and ~50 KiB of the overlay's. `=auto` rather
 #     than a bare -flto, which logs "using serial compilation" at the link, and
 #     `switch.builds` refuses any warning in the build log. Every vendored

@@ -159,8 +159,12 @@ jobs:
       # The linked image, measured as `switch-build` measures it -- the same
       # pinned image, the same script -- so its numbers are tracked beside the
       # soak's. Built here rather than read from ci.yml's artifact, which is per
-      # push and expires.
+      # push and expires. Never fails the job: `switch-build` gates the budget,
+      # and a red here would read to `soak-fresh` as a soak that stopped working
+      # -- and skip the soak's own numbers below. The script writes the JSON
+      # before it judges, so a night over a ceiling is still tracked.
       - name: Measure the linked image
+        continue-on-error: true
         run: |
           docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
             bash -lc 'make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)" &&
@@ -214,7 +218,7 @@ jobs:
           summary-always: true
 
       - name: Track the image's numbers
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && hashFiles('image-bench.json') != ''
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: image

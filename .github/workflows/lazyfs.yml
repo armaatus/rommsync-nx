@@ -74,6 +74,10 @@ jobs:
             echo "### The save-overwrite protocol on lazyfs ($LAZYFS_REF)"
             echo
             echo '```'
-            grep -E '^(ok|FAIL|skip):' lazyfs.log 2>/dev/null || echo "(the check wrote no log)"
+            if [ -s lazyfs.log ]; then
+              grep -E '^(ok|FAIL|skip):' lazyfs.log || echo "(no verdict in the log; see the step above)"
+            else
+              echo "(the check wrote no log)"
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

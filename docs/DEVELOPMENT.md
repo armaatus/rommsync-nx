@@ -237,7 +237,7 @@ started. #253, in the same image -- "mapped" is what `scripts/image-budget.sh`
 sums, each LOAD segment rounded up to its page, which is the figure the budget
 holds:
 
-| | before (#252) | `+ -flto=auto` | `+` no fast_float (now) |
+| | before (#252) | `+ -flto=auto` | `+` no fast_float (#253) |
 |---|---|---|---|
 | sysmodule `.text` | 598,352 | 523,952 | **512,496** |
 | sysmodule `.rodata` | 68,384 | 68,224 | 56,440 |
@@ -248,6 +248,9 @@ holds:
 | overlay `.text` | 527,328 | 475,936 | 464,400 |
 | overlay `.rodata` | 59,288 | 57,800 | 46,024 |
 | `.ovl` | 671,804 | 614,460 | **589,884** |
+
+Those are the figures as #253 left them; what has landed since is in neither
+column, and `scripts/image-budget.sh` gives today's.
 
 LTO is ~73 KiB of the sysmodule's `.text` and ~50 KiB of the overlay's;
 fast_float is ~23 KiB in each, half code and half its power-of-five tables.

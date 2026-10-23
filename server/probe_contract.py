@@ -654,8 +654,9 @@ def sync_scenarios_5_4(s, base, cap, rom_id, run, created, devices):
     """What RomM 5.4.0 does that 5.2.0 did not (#227, the R1 list in #226).
 
     Each scenario below proves one 5.4.0 behaviour docs/API_CONTRACT.md cites
-    (its "Since 5.2.0" section lists them), and each is checked rather than merely captured: a capture named
-    for a behaviour the server no longer has would be worse than a red run.
+    (its "Since 5.2.0" section lists them), and each is checked rather than
+    merely captured: a capture named for a behaviour the server no longer has
+    would be worse than a red run.
     Saves and devices go into the caller's `created` and `devices`, so its
     cleanup removes them however this leaves.
     """

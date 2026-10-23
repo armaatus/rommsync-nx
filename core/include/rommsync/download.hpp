@@ -917,7 +917,8 @@ struct WorkerOptions {
   int max_attempts = 3;
 
   /// The first delay before a retry, doubled per consecutive retryable failure
-  /// and capped at `max_backoff`. `sync::CallPolicy`'s curve, walked the same
+  /// up to `max_backoff`, which bounds the doubling and not the jitter on top
+  /// of it (backoff.hpp). `sync::CallPolicy`'s curve, walked the same
   /// way (`sync::WaitToRetry`), and its reasoning: every network call retries
   /// with backoff (CLAUDE.md).
   std::chrono::milliseconds backoff{1'000};
