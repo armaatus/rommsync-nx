@@ -364,10 +364,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// **And which application it is, when `pm` will say** (M10-26, #261). Every
   /// answer that names one is a sighting (`play::Sightings`), and the tick after
   /// the game gives each play session the application seen when its save was
-  /// written -- "unknown" when none was. Only the hold asks, so a game played
-  /// entirely between two ticks is never seen: deliberately, because asking
-  /// between ticks would be a poll on a console with nothing owed, which #242
-  /// keeps at none.
+  /// written -- "unknown" when none was. Only a tick that falls due, its hold
+  /// and a "Sync now" press ask, so a game played entirely between two ticks is
+  /// never seen: deliberately, because asking between ticks would be a poll on
+  /// a console with nothing owed, which #242 keeps at none.
   using ForegroundProbe = std::function<play::Foreground()>;
   void UseForegroundProbe(ForegroundProbe probe,
                           std::chrono::milliseconds poll = kForegroundPollInterval);

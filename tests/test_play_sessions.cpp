@@ -753,6 +753,9 @@ void Titled(rig::Checks& checks) {
   checks.ExpectEq(TitleAt(sightings, kNoon - 298), std::string("0100000000ABC000"),
                   "a save written as the module exited -- after its last sighting, before the "
                   "library's first -- is the module's");
+  checks.ExpectEq(TitleAt(sightings, kNoon - 296), std::string("0100000000ABC000"),
+                  "even a second before the library is first seen: the module was already up, "
+                  "and the library reaches back only for the card's mtime rounding");
   checks.ExpectEq(TitleAt(sightings, kNoon - 450), std::string("0100000000ABC000"),
                   "and so is one written while it was being seen, an autosave");
   checks.ExpectEq(TitleAt(sightings, kNoon - 1000), std::string("unknown"),

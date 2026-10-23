@@ -167,9 +167,10 @@ bool SdEngine::application_running() const {
   // `mutex_` guards what the frame-polled commands read.
   const play::Foreground seen = probe();
   if (seen.program_id.has_value()) {
-    const sync::Timestamp at = std::chrono::system_clock::now();
+    // Stamped under the lock, so the IPC thread and the worker note in the
+    // order they stamp and one stretch is never split by an older answer.
     std::lock_guard<std::mutex> lock(mutex_);
-    sightings_.Note(seen, at);
+    sightings_.Note(seen, std::chrono::system_clock::now());
   }
   return seen.running;
 }

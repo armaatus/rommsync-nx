@@ -344,21 +344,33 @@ std::chrono::seconds SlackFor(std::chrono::milliseconds poll) {
 }
 
 void AttributeTitles(std::vector<sync::PlaySession>* sessions, const Sightings& sightings) {
-  for (sync::PlaySession& session : *sessions) {
-    std::optional<std::uint64_t> found;
-    bool ambiguous = false;
+  // Two passes: stretches already up when the save was stamped, then -- only if
+  // none was -- those that reach it through the mtime's rounding alone. The
+  // application that comes up after another quits is first seen *after* the
+  // quitting one's exit write, so it must not make that write ambiguous.
+  struct Reach {
+    bool any = false;  // some stretch reached the write, even if two did
+    std::optional<std::uint64_t> title;
+  };
+  const auto reaching = [&sightings](sync::Timestamp end, bool rounding) {
+    Reach reach;
     for (const TitleSpan& span : sightings.spans()) {
-      if (session.end_time < span.first_seen - kMtimeGranularity ||
-          session.end_time > span.last_seen + sightings.slack()) {
+      const sync::Timestamp from = rounding ? span.first_seen - kMtimeGranularity : span.first_seen;
+      if (end < from || end > span.last_seen + sightings.slack()) {
         continue;
       }
-      if (found.has_value() && *found != span.program_id) {
-        ambiguous = true;
-        break;
+      if (reach.any && reach.title != span.program_id) {
+        reach.title.reset();
+        return reach;
       }
-      found = span.program_id;
+      reach.any = true;
+      reach.title = span.program_id;
     }
-    session.title_id = ambiguous ? std::nullopt : found;
+    return reach;
+  };
+  for (sync::PlaySession& session : *sessions) {
+    const Reach up = reaching(session.end_time, false);
+    session.title_id = up.any ? up.title : reaching(session.end_time, true).title;
   }
 }
 
@@ -497,7 +509,8 @@ LoadedBuffer ParseBuffer(std::string_view text) {
   // Version 1 is read as well: its rows are this version's without a title
   // (`ParseRow`), and the next write moves the file to this version.
   const std::string prefix = std::string(kFormatMagic) + " " + std::to_string(kFormatVersion) + " ";
-  const std::string first = std::string(kFormatMagic) + " 1 ";
+  const std::string first =
+      std::string(kFormatMagic) + " " + std::to_string(kOldestReadVersion) + " ";
   std::size_t matched = 0;
   for (const std::string* candidate : {&prefix, &first}) {
     if (!lines.empty() && lines.front().size() > candidate->size() &&

@@ -113,6 +113,9 @@ inline constexpr const char* kFormatMagic = "rommsync-play-sessions";
 /// its sessions' titles unknown.
 inline constexpr int kFormatVersion = 2;
 
+/// The oldest version still read: rc1's, whose rows have no title.
+inline constexpr int kOldestReadVersion = 1;
+
 /// How many unsent sessions are kept, and the largest file that will be read.
 ///
 /// Sized the way `conflicts::kMaxEntries` is -- against what is left of the
@@ -266,8 +269,9 @@ Derivation DeriveSessions(const std::vector<SaveObservation>& previous,
 // game's; no Horizon call says which file either loaded. So a title is recorded
 // beside the rom, never used to find one.
 //
-// The console only looks while a tick is held for a running game (#242's poll,
-// every `kForegroundPollInterval`), and never between ticks. A session whose save
+// The console only looks when a tick falls due, while it is held for a running
+// game (#242's poll, every `kForegroundPollInterval`) and at a "Sync now" press
+// -- never between ticks. A session whose save
 // was written while nothing was looking -- a short game between two ticks -- is
 // "unknown", which is the honest answer rather than a gap to fill.
 
@@ -340,9 +344,12 @@ inline constexpr std::chrono::seconds kMtimeGranularity{2};
 /// was written: the one whose stretch holds `end_time`, from
 /// `kMtimeGranularity` before its first sighting to `slack` after its last.
 ///
-/// **One application or none.** A write two could have made -- a module that
-/// quit and the library that came up a poll later, both within reach -- is left
-/// unknown rather than given to either, and so is one no stretch reaches.
+/// **One application or none.** A stretch already seen by `end_time` wins over
+/// one that reaches back to it only through `kMtimeGranularity`: the library a
+/// module quits to is first seen after the module's exit write, and must not
+/// make that write ambiguous. Two applications both up at the write -- seen
+/// either side of it inside `slack` -- leave it unknown rather than given to
+/// either, and so does a write no stretch reaches.
 void AttributeTitles(std::vector<sync::PlaySession>* sessions, const Sightings& sightings);
 
 /// `session.title_id` as sixteen upper-case hex digits -- how Atmosphere names
