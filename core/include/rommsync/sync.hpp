@@ -69,6 +69,7 @@
 
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/backoff.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/token_store.hpp"
@@ -625,9 +626,20 @@ struct CallPolicy {
   int max_attempts = 3;
 
   /// The first delay before a retry, doubled per consecutive retryable failure
-  /// and capped at `max_backoff`.
+  /// and capped at `max_backoff` -- `retry::Backoff`'s curve, walked by
+  /// `WaitToRetry`, so the cap bounds the doubling and the jitter goes on top
+  /// of it (backoff.hpp says why both). A `backoff` above `max_backoff` is read
+  /// as `max_backoff`: the ceiling is the one a caller set on purpose.
   std::chrono::milliseconds backoff{1'000};
   std::chrono::milliseconds max_backoff{8'000};
+
+  /// `retry::BackoffConfig::jitter`: up to a quarter of each delay on top, so
+  /// consoles that failed together do not retry together (#251).
+  double jitter = 0.25;
+
+  /// Where the jitter comes from (`retry::Backoff::Random`). Null is
+  /// `retry::Backoff`'s own generator; a test pins it to state a delay.
+  retry::Backoff::Random random;
 
   /// How the caller waits between attempts.
   ///

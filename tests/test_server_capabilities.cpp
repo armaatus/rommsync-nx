@@ -5,6 +5,7 @@
 // 5.2.0 and 5.4.0. `live` asks the fixture itself -- whichever version
 // `ROMM_VERSION` started -- and `faults` drives the retry through the proxy.
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -274,6 +275,9 @@ void Faults(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   std::vector<std::chrono::milliseconds> waits;
   sync::CallPolicy policy;
   policy.wait = [&waits](std::chrono::milliseconds delay) { waits.push_back(delay); };
+  // The jitter rolled at its top, so the one delay is a number: the default
+  // second and a quarter of it on top (#251).
+  policy.random = [] { return 1.0; };
 
   rig::ArmFault(client, base, R"({"mode":"status","status":503,"path":"/api/heartbeat"})");
   const server::Probe retried = server::ReadServer(client, base, policy);
@@ -281,6 +285,8 @@ void Faults(rig::Checks& checks, http::HttpClient& client, const std::string& ba
                                   retried.message);
   checks.ExpectEq(retried.attempts, 2, "two requests");
   checks.ExpectEq(waits.size(), std::size_t{1}, "with one backoff between them");
+  checks.ExpectEq(waits.empty() ? std::int64_t{0} : waits[0].count(), std::int64_t{1'250},
+                  "of the curve every retry loop shares, with its jitter on top");
 
   waits.clear();
   rig::ArmFault(client, base,
