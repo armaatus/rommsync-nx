@@ -977,7 +977,8 @@ class SdEngine : public ipc::Engine, public power::Sink {
   };
 
   /// A `CallPolicy` whose retries back off on `AwaitBackoff` and stop on
-  /// `cancel`: the heartbeat's and every `install::` exchange's.
+  /// `cancel`: the heartbeat's, every `install::` exchange's, and each page of
+  /// the library's (#251).
   sync::CallPolicy PolicyFor(const http::CancelToken* cancel);
 
   /// A link sent with `PolicyFor(cancel)`.

@@ -2253,15 +2253,21 @@ roms::FetchResult SdEngine::FetchLibraryForTick(const TickInputs& inputs) {
   roms::FetchOptions fetch;
   fetch.base_url = inputs.config->server.url;
   fetch.bearer_token = inputs.token.access_token;
+  // Each page retried on `AwaitBackoff`, and the fetch stopped between pages
+  // by the tick's token, as the heartbeat is (#251).
+  fetch.policy = PolicyFor(inputs.cancel.get());
   roms::FetchResult library = roms::FetchRomIndex(*inputs.client, fetch);
   ObserveAnswer(roms::AnswerOf(library));
   if (!library.ok()) {
     // The common one: a console with no wifi fails this every tick.
     StampPlayWindow();
-    const sync::TickOutcome outcome = StoppedAccepting(library.status)
-                                          ? sync::TickOutcome::kUnauthorized
-                                          : sync::TickOutcome::kOffline;
-    if (StoppedAccepting(library.status)) {
+    sync::TickOutcome outcome = sync::TickOutcome::kOffline;
+    if (library.transport == http::Error::kCanceled) {
+      // A sleep or a shutdown, not the server: neither a failed tick nor a
+      // `net.offline` line, as a cancelled heartbeat is neither (#251).
+      outcome = sync::TickOutcome::kCanceled;
+    } else if (StoppedAccepting(library.status)) {
+      outcome = sync::TickOutcome::kUnauthorized;
       log::Error(log::Event::kAuthRejected,
                  "GET /api/roms answered " + std::to_string(library.status) + "; " +
                      library.message);
@@ -2276,7 +2282,9 @@ roms::FetchResult SdEngine::FetchLibraryForTick(const TickInputs& inputs) {
     LogTickEnd(outcome);
     std::lock_guard<std::mutex> lock(mutex_);
     scheduler_.Finished(outcome, library.transport);
-    RecordFailedTickLocked();
+    if (outcome != sync::TickOutcome::kCanceled) {
+      RecordFailedTickLocked();
+    }
     return library;
   }
   if (!library.message.empty()) {
