@@ -175,8 +175,9 @@ class Placer {
   std::string ReadsBackAs(const roms::Rom& rom, const std::string& sd_path, scan::Folders which,
                           int card = 1);
 
-  /// `scan::PlanFolders` for `which`, planned on first use and kept for the tick.
-  const scan::FolderPlan& PlanOf(scan::Folders which);
+  /// `scan::PlanFolders` for `which`, planned on first use and kept for the
+  /// tick -- with the core folders this tick's placements make added to it.
+  scan::FolderPlan& PlanOf(scan::Folders which);
 
   /// Adds the folder of a placement just made to the plan `PlanOf` keeps, when
   /// it is a core folder the card does not hold yet: the scan counts it against
@@ -185,7 +186,7 @@ class Placer {
   /// `fs::MadeFolders` takes the folder back: the count is one high for the rest
   /// of the tick, which refuses a placement the next tick plans afresh, and
   /// never lets one past the bound.
-  void Claim(const std::string& sd_path, scan::Folders which);
+  void CountMadeFolder(const std::string& sd_path, scan::Folders which);
 
   const config::Config& config_;
   const retroarch::Settings& retroarch_;

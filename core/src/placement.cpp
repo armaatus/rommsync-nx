@@ -278,7 +278,7 @@ Placer::Target Placer::TargetFor(const roms::Rom& rom, std::string_view server_e
   return target;
 }
 
-const scan::FolderPlan& Placer::PlanOf(scan::Folders which) {
+scan::FolderPlan& Placer::PlanOf(scan::Folders which) {
   std::optional<scan::FolderPlan>& plan =
       which == scan::Folders::kSaves ? saves_plan_ : states_plan_;
   if (!plan.has_value()) {
@@ -287,23 +287,23 @@ const scan::FolderPlan& Placer::PlanOf(scan::Folders which) {
   return *plan;
 }
 
-void Placer::Claim(const std::string& sd_path, scan::Folders which) {
+void Placer::CountMadeFolder(const std::string& sd_path, scan::Folders which) {
   std::string directory;
   std::string leaf;
   if (!fs::SplitPath(sd_path, &directory, &leaf)) {
     return;
   }
-  // `PlanOf`'s own copy: placing asked it already, so this plans nothing.
-  scan::FolderPlan& plan = which == scan::Folders::kSaves ? *saves_plan_ : *states_plan_;
+  scan::FolderPlan& plan = PlanOf(which);  // planned already, by `ReadsBackAs`
   const std::string wanted = LowerAscii(directory);
   for (const scan::ScanFolder& folder : plan.folders) {
     if (LowerAscii(folder.directory) == wanted) {
       return;  // planned already: there on the card, or claimed earlier this tick
     }
   }
-  // Not planned, yet read: a core folder this placement makes, which the scan
-  // counts against `kMaxRetroArchFolders` from the next tick on -- and so the
-  // placements after this one in the tick must too (#269).
+  // Not planned, yet read: a core folder this placement makes (#269). Only
+  // this kind's plan is told. Where saves and states share a sorted folder the
+  // states plan still sees the saves' folders, since the engine places and
+  // fetches every save before it makes the states plan, on its first `State`.
   std::optional<scan::ScanFolder> made = scan::FolderIn(plan, directory);
   if (made.has_value()) {
     plan.folders.push_back(std::move(*made));
@@ -435,7 +435,7 @@ Placement Placer::Save(const sync::SyncOperation& operation) {
       !why.empty()) {
     return Refuse(why);
   }
-  Claim(placed.sd_path, scan::Folders::kSaves);
+  CountMadeFolder(placed.sd_path, scan::Folders::kSaves);
   placed.emulator = target.emulator_id;
   return placed;
 }
@@ -487,7 +487,7 @@ Placement Placer::State(std::int64_t rom_id, std::string_view file_name,
       !why.empty()) {
     return Refuse(why);
   }
-  Claim(placed.sd_path, scan::Folders::kStates);
+  CountMadeFolder(placed.sd_path, scan::Folders::kStates);
   return placed;
 }
 

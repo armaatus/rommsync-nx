@@ -719,7 +719,7 @@ void CoreBound(checks::Checks& c) {
     const std::string folder =
         saves ? retroarch::kDefaultSavefileDirectory : retroarch::kDefaultSavestateDirectory;
     const std::string ext = saves ? ".srm" : ".state";
-    const auto place = [&](place::Placer& placer, std::int64_t rom, const std::string& emulator) {
+    const auto place_one = [&](place::Placer& placer, std::int64_t rom, const std::string& emulator) {
       return saves ? placer.Save(Download(rom, ScanSlot("x.srm"), emulator, "x.srm"))
                    : placer.State(rom, index.ById(rom)->fs_name_no_ext + ext, emulator);
     };
@@ -729,13 +729,13 @@ void CoreBound(checks::Checks& c) {
       card.MakeDirs(folder + "/Core" + std::to_string(100 + at));
     }
     place::Placer placer(loaded.value, settings, index, card.files());
-    const place::Placement first = place(placer, 1, "snes9x");
+    const place::Placement first = place_one(placer, 1, "snes9x");
     c.ExpectEq(first.sd_path, folder + "/Snes9x/Super Mario World (USA)" + ext,
                what + ": the last core folder the scan reads is taken: " + first.reason);
-    const place::Placement beside = place(placer, 7, "snes9x");
+    const place::Placement beside = place_one(placer, 7, "snes9x");
     c.ExpectEq(beside.sd_path, folder + "/Snes9x/Game (USA)" + ext,
                what + ": and is there for the next placement into it: " + beside.reason);
-    const place::Placement past = place(placer, 8, "mgba");
+    const place::Placement past = place_one(placer, 8, "mgba");
     c.Expect(!past.ok(), what + ": a second core folder made in the same tick is past the "
                                 "bound, and placed nowhere -- got " + past.sd_path);
 
@@ -743,7 +743,7 @@ void CoreBound(checks::Checks& c) {
     // planned on a card where the first folder is already there says.
     card.MakeDirs(folder + "/Snes9x");
     place::Placer next_tick(loaded.value, settings, index, card.files());
-    const place::Placement full = place(next_tick, 8, "mgba");
+    const place::Placement full = place_one(next_tick, 8, "mgba");
     c.Expect(!full.ok() && !full.reason.empty(),
              what + ": with the bound reached on the card, mGBA's folder is refused -- got " +
                  full.sd_path);
