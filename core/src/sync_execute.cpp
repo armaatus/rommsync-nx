@@ -531,13 +531,17 @@ void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
       return false;  // not in this plan: a later one may name it
     }
     // Only what never reached the server is still owed its override: a
-    // cancelled operation, or an upload whose transfer failed. Anything the
-    // server saw -- or a plan that asked for something other than an upload --
-    // has spent it.
-    const bool unsent = result->outcome == OperationOutcome::kCanceled ||
-                        (result->action == Action::kUpload &&
-                         result->outcome == OperationOutcome::kFailed &&
-                         result->error == OperationError::kTransferFailed);
+    // cancelled operation, or an upload that failed before its request was
+    // made or while it was in flight. Anything the server saw -- or a plan
+    // that asked for something other than an upload -- has spent it.
+    if (result->outcome == OperationOutcome::kCanceled) {
+      return false;
+    }
+    const bool unsent = result->action == Action::kUpload &&
+                        result->outcome == OperationOutcome::kFailed &&
+                        (result->error == OperationError::kTransferFailed ||
+                         result->error == OperationError::kUnreadableCard ||
+                         result->error == OperationError::kNoLocalSave);
     return !unsent;
   };
   keep_local->erase(std::remove_if(keep_local->begin(), keep_local->end(), answered),

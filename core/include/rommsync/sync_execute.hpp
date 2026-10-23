@@ -790,7 +790,8 @@ void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Ba
 /// is the server saying it wants no upload from this save, and a choice left
 /// armed past that would let some later upload, days on, supersede a save
 /// nobody chose to replace. An upload that never reached the server -- a
-/// transfer that failed, a cancellation -- keeps its key for the next plan, as
+/// transfer that failed, a save the card could not read or no longer holds, a
+/// cancellation -- keeps its key for the next plan, as
 /// does a key no operation of `executed` names. A key that is not in `sent` --
 /// the list the plan was executed with -- is kept whatever the plan did: it was
 /// armed after the plan went out, so the plan's upload of it carried no
