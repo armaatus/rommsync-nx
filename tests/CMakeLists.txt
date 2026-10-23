@@ -980,6 +980,7 @@ set(EXECUTE_RIG_SCENARIOS
   truncate        # a clean short body never replaces a save
   corrupted       # ...and neither do the right number of the wrong bytes
   occupied        # #232: the slot guard answers 409, and only Keep local goes over it
+  tie             # #272: a head tied with this device's own row in one second is not downloaded
   dropped         # a TCP reset mid-download costs a tick, not a save
   collision       # two saves of one rom, one second, two backups
   revoked         # M1-4: a 401 stops the plan where it stands, and touches no save

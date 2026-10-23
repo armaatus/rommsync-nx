@@ -2729,6 +2729,136 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   sweep();
 }
 
+// --- tie ------------------------------------------------------------------------
+//
+// #272. RomM 5.4.0 stores `updated_at` to the whole second, and negotiate keeps
+// the first row it meets of a slot's newest second -- the older -- where its own
+// slot guard and `promote_to_slot_head` break the same tie towards the higher
+// id. So a Keep local upload landing in the second another device's did is the
+// head to the guard and *not* to negotiate, and the next negotiation, with no
+// history against the other row, plans a download of it: the player's choice
+// undone (backed up, but undone, and with nothing said).
+//
+// The client's side (`ExecuteOptions::keep_local`): a Keep local upload asks
+// negotiate which row it now names, and a tie is settled by rewriting this
+// device's own row with the bytes it already holds once the second has turned,
+// which makes it the head negotiate names too.
+
+/// Whether two of RomM's timestamps name the same whole second.
+bool SameSecond(const std::string& left, const std::string& right) {
+  const std::optional<sync::Timestamp> a = sync::ParseTimestamp(left);
+  const std::optional<sync::Timestamp> b = sync::ParseTimestamp(right);
+  return a.has_value() && b.has_value() && *a == *b;
+}
+
+void Tie(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+         const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "execute-tie");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string name = "tie.srm";
+  const std::string bytes = "the bytes the player chose to keep\n";
+  sandbox.SeedSave(SavePath(name), bytes);
+  const std::string staged = sandbox.Host("/config/rommsync/other-device.srm");
+  rig::WriteFile(staged, "the copy another device uploaded in the same second\n");
+
+  std::vector<std::int64_t> planted;
+  const auto sweep = [&]() {
+    for (const std::int64_t id : planted) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+    planted.clear();
+  };
+
+  // RomM gives no way to stamp a row, so the tie is arranged by doing the two
+  // uploads back to back -- the plan is negotiated first, into an empty slot --
+  // which loses a second boundary now and then and not five times running.
+  // `created_at` is what says whether it was arranged: the fix moves the
+  // Keep local row's `updated_at` on, and that is what this checks below.
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    const std::string slot = harness::UniqueSlot("m10-32-tie");
+    sync::SyncNegotiatePayload payload;
+    payload.device_id = fixture.device_id;
+    // An mtime older than both rows: what the player kept was restored onto the
+    // card before the tick, and it is what makes the older row read as
+    // `Server save is newer (no sync history)` to the next negotiation.
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, name, slot, "m2-5", crypto::Md5Hex(bytes),
+        std::chrono::system_clock::now() - std::chrono::hours{1},
+        static_cast<std::int64_t>(bytes.size())));
+    sync::SyncPlan plan;
+    if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+      sweep();
+      return;
+    }
+
+    harness::Save occupant;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m2-5", staged, "other.srm",
+                             /*with_device=*/false, &occupant)) {
+      checks.Expect(false, "the other device's upload landed");
+      sweep();
+      return;
+    }
+    planted.push_back(occupant.id);
+    sync::ExecuteOptions keep = OptionsAt(1'757'000'020);
+    keep.keep_local = {{rom.id, slot}};
+    keep.reported = &payload.saves;
+    const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets, keep);
+    if (report.operations.empty() || !report.operations[0].save_id.has_value()) {
+      checks.Expect(false, "the Keep local upload reports the row it wrote");
+      sweep();
+      return;
+    }
+    const sync::OperationResult& done = report.operations[0];
+    planted.push_back(*done.save_id);
+    harness::Save mine;
+    if (!harness::ReadSave(client.Send(harness::Authed(
+                               http::Method::kGet,
+                               base + "/api/saves/" + std::to_string(*done.save_id), fixture)),
+                           &mine)) {
+      checks.Expect(false, "the Keep local row is readable");
+      sweep();
+      return;
+    }
+    if (!SameSecond(occupant.created_at, mine.created_at)) {
+      sweep();
+      continue;
+    }
+
+    checks.Expect(occupant.id < mine.id, "the other device's row is the older");
+    checks.ExpectEq(report.completed, 1,
+                    "the Keep local upload completed" +
+                        (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+    checks.Expect(done.outcome == sync::OperationOutcome::kUploaded,
+                  std::string("as an upload: ") + sync::ToString(done.outcome) + " -- " +
+                      done.message);
+    checks.Expect(!SameSecond(mine.updated_at, occupant.updated_at),
+                  "and its row has moved out of the second it tied in: " + mine.updated_at +
+                      " vs the other device's " + occupant.updated_at);
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "the card still holds the kept bytes");
+    checks.Expect(!sandbox.HasBackupOf(bytes), "and nothing was backed up: nothing was replaced");
+
+    // What the player chose is what the next negotiation names -- not a
+    // download of the other device's row.
+    sync::SyncPlan next;
+    if (PlanFor(checks, client, base, fixture, payload, {slot}, &next)) {
+      checks.Expect(next.operations[0].action == sync::Action::kNoOp &&
+                        next.operations[0].save_id == mine.id,
+                    std::string("the next negotiation names the Keep local row as the head: ") +
+                        sync::ToString(next.operations[0].action) + " save " +
+                        (next.operations[0].save_id.has_value()
+                             ? std::to_string(*next.operations[0].save_id)
+                             : std::string("null")) +
+                        ", \"" + next.operations[0].reason_text + "\"");
+    }
+    sweep();
+    return;
+  }
+  checks.Expect(false, "two uploads landed in one second at least once in five tries");
+}
+
 // --- dropped ------------------------------------------------------------------
 //
 // A real TCP reset mid-download. The save must survive it, and the next tick
@@ -3102,6 +3232,8 @@ int main(int argc, char** argv) {
     Corrupted(checks, *client, base, fixture, rom);
   } else if (scenario == "occupied") {
     Occupied(checks, *client, base, fixture, rom);
+  } else if (scenario == "tie") {
+    Tie(checks, *client, base, fixture, rom);
   } else if (scenario == "dropped") {
     Dropped(checks, *client, base, fixture, rom);
   } else if (scenario == "collision") {
