@@ -252,6 +252,9 @@ ResolveReport ResolveRefusedUploads(http::HttpClient& client, fs::FileSystem& fi
     ++out.resolved;
   }
   executed->warnings.insert(executed->warnings.end(), ran.warnings.begin(), ran.warnings.end());
+  // A head this console will not take is declined here as anywhere (#257), and
+  // said with the rest of the plan's.
+  executed->declines.insert(executed->declines.end(), ran.declines.begin(), ran.declines.end());
   executed->canceled = executed->canceled || ran.canceled;
   executed->unauthorized = executed->unauthorized || ran.unauthorized;
   Recount(executed);

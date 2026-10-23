@@ -39,6 +39,7 @@
 #include "rommsync/md5.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/sync_execute.hpp"
+#include "rommsync/sync_finish.hpp"
 
 namespace {
 
@@ -839,6 +840,160 @@ sync::SyncOperation FetchOf(sync::Action action, std::int64_t rom_id, const std:
   return operation;
 }
 
+// --- declined -----------------------------------------------------------------
+//
+// #257: a save this console will not take -- a pairing across formats, a
+// first-time restore with no placement or onto a file already there -- is
+// declined rather than failed, and said once until either side changes. All of
+// it is decided before a byte moves, which `NeverCalled` asserts.
+// `tick.declined` is the same against a live 5.4.0, with the file moving.
+
+/// Whether `lines` holds the line `done` would be said with.
+bool Said(const std::vector<std::string>& lines, const sync::OperationResult& done) {
+  return std::find(lines.begin(), lines.end(), "declined " + done.message) != lines.end();
+}
+
+void Declined(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-declined");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "this-console";
+
+  const std::string card = "DuckStation's memory card\n";
+  const std::string other = "a file the scan did not pair with this row\n";
+  sandbox.SeedSave(SavePath("Card.mcd"), card);
+  sandbox.SeedSave(SavePath("Taken.mcd"), other);
+  const std::vector<sync::ClientSaveState> reported = {
+      harness::LocalSave(7, "Card.mcd", "card", "tico-duckstation", crypto::Md5Hex(card),
+                         std::chrono::system_clock::now(), 26)};
+  const std::vector<sync::SaveTarget> targets = {
+      {7, std::string("card"), SavePath("Card.mcd"), "Card.mcd"}};
+
+  sync::SyncPlan plan;
+  plan.session_id = 1;
+  // A Beetle save paired with DuckStation's card, a save with nowhere to go,
+  // and one whose place is taken.
+  plan.operations.push_back(FetchOf(sync::Action::kDownload, 7, "card", "mednafen_psx_hw"));
+  plan.operations.push_back(FetchOf(sync::Action::kDownload, 8, "unmapped", "tico-duckstation"));
+  plan.operations.push_back(FetchOf(sync::Action::kDownload, 9, "taken", "tico-duckstation"));
+
+  std::string reason = "psx is not mapped to any folder";
+  sync::ExecuteOptions options = OptionsAt(1'757'000'000);
+  options.reported = &reported;
+  options.place = [&reason](const sync::SyncOperation& operation) {
+    if (*operation.slot == "taken") {
+      return PlacedAt(SavePath("Taken.mcd"), "tico-duckstation");
+    }
+    rommsync::place::Placement nowhere;
+    nowhere.reason = reason;
+    return nowhere;
+  };
+  sync::Declines declines;
+  options.declines = &declines;
+  NeverCalled client(checks);
+
+  const sync::ExecutionReport first =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(first.declined, 3, "all three are declined");
+  checks.ExpectEq(first.failed, 0, "and none of them is a failure");
+  checks.ExpectEq(first.completed, 0, "nor work done");
+  checks.Expect(first.warnings.empty(),
+                "a decline writes no failed save's line" +
+                    (first.warnings.empty() ? std::string() : ": " + first.warnings[0]));
+  checks.ExpectEq(first.declines.size(), std::size_t{3}, "each is said, the first time");
+  if (first.operations.size() == 3) {
+    const sync::OperationError expected[] = {sync::OperationError::kOtherEmulator,
+                                             sync::OperationError::kNoLocalSave,
+                                             sync::OperationError::kNoLocalSave};
+    for (std::size_t at = 0; at < 3; ++at) {
+      const sync::OperationResult& done = first.operations[at];
+      checks.Expect(done.outcome == sync::OperationOutcome::kDeclined &&
+                        done.error == expected[at] && done.warning == sync::kNoWarning,
+                    std::string("operation ") + std::to_string(at) + " is declined as " +
+                        sync::ToString(expected[at]) + ": " + sync::ToString(done.outcome) +
+                        " " + sync::ToString(done.error) + " -- " + done.message);
+      checks.Expect(Said(first.declines, done), "in its own words: " + done.message);
+    }
+  }
+  checks.ExpectEq(std::string(sync::ToString(sync::OperationOutcome::kDeclined)),
+                  std::string("declined"), "named for the log");
+  checks.ExpectEq(sync::CountsFor(first).operations_failed, 3,
+                  "RomM is still told the three did not happen");
+  checks.ExpectEq(sandbox.Read(SavePath("Card.mcd")), card, "the card is untouched");
+  checks.ExpectEq(sandbox.Read(SavePath("Taken.mcd")), other, "and so is the file in the way");
+
+  const sync::ExecutionReport second =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(second.declined, 3, "met again, they are declined again");
+  checks.Expect(second.declines.empty(),
+                "and nothing is said" +
+                    (second.declines.empty() ? std::string() : ": " + second.declines[0]));
+
+  // Either side changing is news: a new server save in the card's slot, and the
+  // placement's reason moving. The file in the way has not moved.
+  plan.operations[0].save_id = 6;
+  reason = "Tico keeps saves for 2 accounts and [tico] account does not say whose";
+  const sync::ExecutionReport changed =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(changed.declines.size(), std::size_t{2}, "the two that changed are said again");
+  if (changed.operations.size() == 3) {
+    checks.Expect(Said(changed.declines, changed.operations[0]), "a new server save is news");
+    checks.Expect(Said(changed.declines, changed.operations[1]), "and a new reason");
+    checks.Expect(!Said(changed.declines, changed.operations[2]), "and the taken path is not");
+  }
+
+  // A tick that met only one of them forgets the others: their saves left the
+  // plan. One no plan asked about -- its rom in `unasked_roms` -- is kept.
+  declines.EndTick({});
+  sync::SyncPlan one;
+  one.session_id = 2;
+  one.operations.push_back(plan.operations[2]);
+  sync::ExecutePlan(client, *files, token, one, targets, options);
+  declines.EndTick({8});
+  checks.ExpectEq(declines.size(), std::size_t{2}, "the one met and the one unasked are kept");
+  const sync::ExecutionReport back =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(back.declines.size(), std::size_t{1}, "only the forgotten one is said again");
+  if (back.operations.size() == 3) {
+    checks.Expect(Said(back.declines, back.operations[0]), "which is the card's");
+  }
+
+  // With nothing to remember them in, every decline is said every time -- and
+  // still is not a failure.
+  {
+    sync::ExecuteOptions forgetful = options;
+    forgetful.declines = nullptr;
+    const sync::ExecutionReport again =
+        sync::ExecutePlan(client, *files, token, plan, targets, forgetful);
+    checks.Expect(again.declines.size() == 3 && again.failed == 0 && again.declined == 3,
+                  "with no memory each is said, and none fails");
+  }
+
+  // Past the bound, the ones remembered stay quiet and the rest are said.
+  {
+    sync::SyncPlan many;
+    many.session_id = 3;
+    for (std::size_t at = 0; at <= sync::kMaxDeclines; ++at) {
+      many.operations.push_back(FetchOf(sync::Action::kDownload,
+                                        100 + static_cast<std::int64_t>(at), "unmapped",
+                                        "tico-duckstation"));
+    }
+    sync::Declines bounded;
+    sync::ExecuteOptions full = options;
+    full.declines = &bounded;
+    const sync::ExecutionReport filled =
+        sync::ExecutePlan(client, *files, token, many, targets, full);
+    checks.ExpectEq(filled.declines.size(), sync::kMaxDeclines + 1, "every one is said once");
+    checks.ExpectEq(bounded.size(), sync::kMaxDeclines, "and the bound's worth is remembered");
+    const sync::ExecutionReport over =
+        sync::ExecutePlan(client, *files, token, many, targets, full);
+    checks.ExpectEq(over.declines.size(), std::size_t{1}, "only the one past it is said again");
+  }
+}
+
 void Isolated(rig::Checks& checks) {
   Sandbox sandbox(checks, "execute-isolated");
   const std::unique_ptr<fs::FileSystem> files =
@@ -896,7 +1051,8 @@ void Isolated(rig::Checks& checks) {
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, plan, targets, options);
 
-    checks.ExpectEq(report.failed, 6, "every write across formats is refused");
+    checks.ExpectEq(report.declined, 6, "every write across formats is declined (#257)");
+    checks.ExpectEq(report.failed, 0, "and none of them is a failure");
     for (const sync::OperationResult& done : report.operations) {
       checks.Expect(done.error == sync::OperationError::kOtherEmulator,
                     std::string("...as another emulator's save: ") + sync::ToString(done.error) +
@@ -931,7 +1087,7 @@ void Isolated(rig::Checks& checks) {
     NeverCalled client(checks);
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, plan, targets, options);
-    checks.Expect(report.failed == 1 && report.operations.size() == 1 &&
+    checks.Expect(report.declined == 1 && report.operations.size() == 1 &&
                       report.operations[0].error == sync::OperationError::kOtherEmulator,
                   "an isolated save is not placed blind");
     checks.Expect(!sandbox.Exists(SavePath("blind.eep")), "and nothing is on the card");
@@ -942,7 +1098,7 @@ void Isolated(rig::Checks& checks) {
     matched.operations.push_back(FetchOf(sync::Action::kDownload, 7, "card", "tico-duckstation"));
     const sync::ExecutionReport unreported = sync::ExecutePlan(
         client, *files, token, matched, targets, OptionsAt(1'757'000'001));
-    checks.Expect(unreported.failed == 1 && unreported.operations.size() == 1 &&
+    checks.Expect(unreported.declined == 1 && unreported.operations.size() == 1 &&
                       unreported.operations[0].error == sync::OperationError::kOtherEmulator,
                   "an isolated save is not written over a card nothing reported");
     checks.ExpectEq(sandbox.Read(SavePath("Card.mcd")), card, "which is untouched");
@@ -1580,7 +1736,8 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
     // loads, and the next tick would upload it back as a second save.
     const sync::ExecutionReport guessing = sync::ExecutePlan(
         client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, OptionsAt(1'757'000'008));
-    checks.ExpectEq(guessing.failed, 1, "with no policy it is a named failure, not a guess");
+    checks.Expect(guessing.declined == 1 && guessing.failed == 0,
+                  "with no policy it is declined, by name, rather than guessed at (#257)");
     if (!guessing.operations.empty()) {
       checks.Expect(guessing.operations[0].error == sync::OperationError::kNoLocalSave,
                     std::string("...named: ") + sync::ToString(guessing.operations[0].error));
@@ -1916,7 +2073,8 @@ void Placed(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     const sync::ExecutionReport report = sync::ExecutePlan(
         client, *files, TokenFor(base, fixture), plan, /*targets=*/{},
         placing(target, 1'757'000'302));
-    checks.ExpectEq(report.failed, 1, "a placement onto a file is a failed operation");
+    checks.Expect(report.declined == 1 && report.failed == 0,
+                  "a placement onto a file is declined, not failed (#257)");
     if (!report.operations.empty()) {
       checks.Expect(report.operations[0].error == sync::OperationError::kNoLocalSave,
                     std::string("...named as having nowhere to go: ") +
@@ -1941,7 +2099,8 @@ void Placed(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     };
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, options);
-    checks.ExpectEq(report.failed, 1, "a refused placement is a failed operation");
+    checks.Expect(report.declined == 1 && report.failed == 0,
+                  "a refused placement is declined, not failed (#257)");
     if (!report.operations.empty()) {
       checks.Expect(report.operations[0].error == sync::OperationError::kNoLocalSave &&
                         report.operations[0].message.find("more than one account") !=
@@ -2873,7 +3032,7 @@ int main(int argc, char** argv) {
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
       scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
       scenario == "delete" || scenario == "crash_delete" || scenario == "isolated" ||
-      scenario == "late_write") {
+      scenario == "late_write" || scenario == "declined") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -2890,6 +3049,8 @@ int main(int argc, char** argv) {
       CrashDelete(checks);
     } else if (scenario == "isolated") {
       Isolated(checks);
+    } else if (scenario == "declined") {
+      Declined(checks);
     } else if (scenario == "late_write") {
       LateWriteDelete(checks);
       LateWriteUnbacked(checks);

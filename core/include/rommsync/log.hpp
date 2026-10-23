@@ -123,7 +123,9 @@ enum class Event {
 
   /// A file in a save folder that matched no rom, matched two, or could not be
   /// used -- `scan::ScanResult::DescribeSkipped()`. Never guessed at, always
-  /// said out loud (docs/SYNC_PROTOCOL.md step 0).
+  /// said out loud (docs/SYNC_PROTOCOL.md step 0). And the other direction: a
+  /// server's save this console will not take (`OperationOutcome::kDeclined`,
+  /// #257), said once rather than every tick.
   kScanSkipped,
 
   /// The server answered, and the answer will not change on a retry: a device

@@ -22,6 +22,7 @@
 // `harness::Sandbox`'s teardown audit is what holds it to it.
 #include "rommsync/sync_execute.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -103,6 +104,52 @@ OperationResult Fail(const SyncOperation& operation, OperationError error, std::
   result.error = error;
   result.message = Describe(operation) + ": " + std::move(message);
   return result;
+}
+
+/// A save this console will not take (`OperationOutcome::kDeclined`, #257):
+/// the shape `Fail` gives a failure, for the two refusals only a file moving
+/// changes.
+OperationResult Decline(const SyncOperation& operation, OperationError error,
+                        std::string message) {
+  OperationResult result = Fail(operation, error, std::move(message));
+  result.outcome = OperationOutcome::kDeclined;
+  return result;
+}
+
+/// Whether `outcome` is the plan obeyed, which `Recount` counts `completed`.
+bool Obeyed(OperationOutcome outcome) {
+  switch (outcome) {
+    case OperationOutcome::kNoOp:
+    case OperationOutcome::kUploaded:
+    case OperationOutcome::kDownloaded:
+    case OperationOutcome::kKeptBoth:
+    case OperationOutcome::kRemoved:
+    case OperationOutcome::kKept:
+      return true;
+    case OperationOutcome::kFailed:
+    case OperationOutcome::kNotUnderstood:
+    case OperationOutcome::kCanceled:
+    case OperationOutcome::kDeclined:
+      break;
+  }
+  return false;
+}
+
+/// FNV-1a, 64-bit, continued from `hash`: what `Declines` keeps of a string.
+/// Its own rather than `std::hash` so the value means the same on every build.
+std::uint64_t Fnv(std::string_view text, std::uint64_t hash = 0xcbf29ce484222325ULL) {
+  for (const char character : text) {
+    hash ^= static_cast<unsigned char>(character);
+    hash *= 0x100000001b3ULL;
+  }
+  return hash;
+}
+
+/// One field of a fingerprint, absent told apart from empty, and each ended so
+/// that two fields cannot run into each other.
+std::uint64_t FnvField(const std::optional<std::string>& field, std::uint64_t hash) {
+  hash = Fnv(field.has_value() ? std::string_view("+") : std::string_view("-"), hash);
+  return Fnv(std::string_view("\0", 1), Fnv(field.value_or(std::string()), hash));
 }
 
 /// The reason an exchange did not produce a usable answer, or empty when it did.
@@ -241,6 +288,8 @@ const char* ToString(OperationOutcome outcome) {
       return "removed";
     case OperationOutcome::kKept:
       return "kept";
+    case OperationOutcome::kDeclined:
+      return "declined";
   }
   return "failed";
 }
@@ -399,10 +448,62 @@ const SaveTarget* MatchTarget(const std::vector<SaveTarget>& targets,
   return FindByKey(targets, KeyOf(operation));
 }
 
+bool Declines::Note(const SyncOperation& operation, const OperationResult& declined) {
+  const std::uint64_t slot = FnvField(operation.slot, Fnv(""));
+  std::uint64_t fingerprint = Fnv(ToString(declined.error));
+  fingerprint = FnvField(operation.save_id.has_value()
+                             ? std::optional<std::string>(std::to_string(*operation.save_id))
+                             : std::nullopt,
+                         fingerprint);
+  fingerprint = FnvField(operation.server_updated_at, fingerprint);
+  fingerprint = FnvField(operation.server_content_hash, fingerprint);
+  fingerprint = FnvField(operation.emulator, fingerprint);
+  fingerprint = Fnv(declined.message, fingerprint);
+
+  for (Entry& entry : entries_) {
+    if (entry.rom_id == operation.rom_id && entry.slot == slot) {
+      entry.met = true;
+      const bool news = entry.fingerprint != fingerprint;
+      entry.fingerprint = fingerprint;
+      return news;
+    }
+  }
+  if (entries_.size() < kMaxDeclines) {
+    // Reserved once, to the bound, so it never doubles past what
+    // `kHeapDeclines` counts.
+    entries_.reserve(kMaxDeclines);
+    entries_.push_back(Entry{operation.rom_id, slot, fingerprint, true});
+  }
+  return true;
+}
+
+void Declines::Forget(const SyncOperation& operation) {
+  const std::uint64_t slot = FnvField(operation.slot, Fnv(""));
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&](const Entry& entry) {
+                                  return entry.rom_id == operation.rom_id && entry.slot == slot;
+                                }),
+                 entries_.end());
+}
+
+void Declines::EndTick(const std::vector<std::int64_t>& unasked_roms) {
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&unasked_roms](const Entry& entry) {
+                                  return !entry.met &&
+                                         !std::binary_search(unasked_roms.begin(),
+                                                             unasked_roms.end(), entry.rom_id);
+                                }),
+                 entries_.end());
+  for (Entry& entry : entries_) {
+    entry.met = false;
+  }
+}
+
 void Recount(ExecutionReport* report) {
   report->completed = 0;
   report->failed = 0;
   report->not_understood = 0;
+  report->declined = 0;
   for (const OperationResult& result : report->operations) {
     // Enumerated rather than defaulted: a `default` here would count whatever
     // outcome is added next as work the client completed, which is the one
@@ -413,6 +514,9 @@ void Recount(ExecutionReport* report) {
         break;
       case OperationOutcome::kNotUnderstood:
         ++report->not_understood;
+        break;
+      case OperationOutcome::kDeclined:
+        ++report->declined;
         break;
       case OperationOutcome::kCanceled:
         // Counted nowhere: the caller stopped this one, and the rest are not
@@ -852,7 +956,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
         options.place != nullptr ? options.place(operation) : place::Placement{};
     const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
-      return Fail(operation, OperationError::kNoLocalSave,
+      return Decline(operation, OperationError::kNoLocalSave,
                   placement.reason.empty()
                       ? "there is no local save for this (rom_id, slot) and nothing said where a "
                         "new one should go"
@@ -870,7 +974,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                   "the save path " + sd_path + " is not a path on this card");
     }
     if (io::Exists(resolved)) {
-      return Fail(operation, OperationError::kNoLocalSave,
+      return Decline(operation, OperationError::kNoLocalSave,
                   "there is no local save for this (rom_id, slot), and " + sd_path +
                       " is already a file this sync did not pair with it; it was not touched");
     }
@@ -880,7 +984,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // A format only one emulator reads is never placed where another reads it
     // (#238) -- asked before the folder is made, so a refusal leaves nothing.
     if (std::string why = OtherEmulator(operation, placed, &placement, options); !why.empty()) {
-      OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+      OperationResult refused = Decline(operation, OperationError::kOtherEmulator, std::move(why));
       refused.sd_path = sd_path;
       return refused;
     }
@@ -904,7 +1008,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
              !why.empty()) {
     // Nor is one written over a save another emulator reads (#238) -- whatever
     // the slot pairing put in the plan.
-    OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+    OperationResult refused = Decline(operation, OperationError::kOtherEmulator, std::move(why));
     refused.sd_path = target->sd_path;
     return refused;
   }
@@ -1291,6 +1395,16 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
         result.outcome == OperationOutcome::kNotUnderstood) {
       result.warning = static_cast<std::int32_t>(report.warnings.size());
       report.warnings.push_back(result.message);
+    }
+    // A decline is said when it is news and not when it is met again (#257);
+    // the plan obeyed for a save makes its next decline news. The line leads
+    // with the word a user searches the log for, as the scan's skips do.
+    if (result.outcome == OperationOutcome::kDeclined) {
+      if (options.declines == nullptr || options.declines->Note(operation, result)) {
+        report.declines.push_back("declined " + result.message);
+      }
+    } else if (options.declines != nullptr && Obeyed(result.outcome)) {
+      options.declines->Forget(operation);
     }
     report.canceled = report.canceled || result.outcome == OperationOutcome::kCanceled;
     // The two failures that are not about one operation. A cancellation was

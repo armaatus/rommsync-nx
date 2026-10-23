@@ -960,6 +960,7 @@ set(EXECUTE_UNIT_SCENARIOS
   crash_delete # M10-7: ...and a power cut at every call of it leaves the save or its backup
   isolated # #238: a tico-* save is never written where another emulator reads, nor over by one
   late_write # #263: a write between a delete's backup and its removal stays on the card
+  declined # #257: a save this console will not take is declined, not failed, and said once
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -1610,6 +1611,7 @@ set(TICK_RIG_SCENARIOS
   migrated         # #236: rc1's v2 row moves to the shared slot; its newer head lands, backed up
   isolated         # #238: a RetroArch save for a tico-* format never lands on the card
   isolated_ids     # #238: psx, n64, dc, nds and saturn upload under their tico-* ids; psp does not
+  declined         # #257: a save this console will not take costs one line, and no partial tick
 )
 
 # M10-2 (#228): which RomM this console is talking to. `versions` and
@@ -2396,6 +2398,7 @@ set(ENGINE_RIG_SCENARIOS
   states_guard       # review: no states half under a game or after a refused saves half; its 401 counts
   install_settle     # review: an install report the link did not carry stops the pass, not each claim
   install_wake       # review: a refused remote-install claim is asked again after a wake
+  declined           # #257: a save the placer will not place costs one line, never a failed save
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

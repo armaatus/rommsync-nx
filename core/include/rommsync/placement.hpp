@@ -27,8 +27,8 @@
 // only a save whose bytes the target emulator reads: an isolated `tico-*`
 // format never goes to RetroArch, nor a RetroArch core's to a Tico module that
 // is not that core (#226 D3). Anything else is placed nowhere, with a sentence
-// saying why -- which is what `sync::ExecuteOptions::place` and
-// `sync::StateSyncOptions::place` turn into a named failure.
+// saying why -- which `sync::ExecuteOptions::place` turns into a named decline
+// (#257) and `sync::StateSyncOptions::place` into a named failure.
 //
 // Placing **creates**. Whether something is already at the path is the
 // executor's question, asked against the card at the moment of the write

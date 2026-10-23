@@ -4774,6 +4774,134 @@ int Placement(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// The lines one slot's save is named in, and how each tick ended -- counted at
+/// the sink, for `TickLines`' reason.
+class SlotLines final : public rlog::Sink {
+ public:
+  explicit SlotLines(std::string slot) : slot_(std::move(slot)), previous_(rlog::GetSink()) {
+    rlog::SetSink(this);
+  }
+  ~SlotLines() override { rlog::SetSink(previous_); }
+
+  void Write(rlog::Level, std::string_view line) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (line.find(" sync.tick ") != std::string_view::npos) {
+      ticks_.emplace_back(line);
+    } else if (line.find(slot_) != std::string_view::npos) {
+      named_.emplace_back(line);
+    }
+  }
+
+  std::vector<std::string> ticks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ticks_;
+  }
+  std::vector<std::string> named() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return named_;
+  }
+
+ private:
+  const std::string slot_;
+  rlog::Sink* previous_;
+  mutable std::mutex mutex_;
+  std::vector<std::string> ticks_;
+  std::vector<std::string> named_;
+};
+
+/// #257, through the real engine: a save the placer will not place -- another
+/// device's, in a slot the scan would not read it back in -- costs one log line
+/// on the first tick that meets it, none on the second, is never written as a
+/// failed save, and neither tick is partial on its account.
+int Declined(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-declined");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  // A `.srm` the scan would read back in `autosave`, kept in a slot of its own:
+  // placed, it would be a second save of the game (`place::Placer::Save`).
+  const std::string slot = harness::UniqueSlot("m10-21");
+  harness::Save server;
+  {
+    harness::Sandbox staging(c, "engine-declined-upload");
+    const std::string staged = staging.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "nova's save, in a slot of its own " + slot + "\n");
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, slot, "fceumm", staged,
+                                 "nova.srm", /*with_device=*/false, &server),
+             "another device's save is on the server");
+  }
+
+  rlog::Reset();
+  const SlotLines lines(slot);
+  Console console(c, "engine-declined");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.sandbox.Write("/tico/roms/nes/nova.nes", "nova's rom\n");
+  console.Boot();
+  console.engine.StartWorker();
+
+  const auto tick = [&console, &lines, &c](std::size_t number) {
+    c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+    const std::chrono::steady_clock::time_point by =
+        std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    while ((lines.ticks().size() < number || console.Status().sync_in_progress) &&
+           std::chrono::steady_clock::now() < by) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    const std::vector<std::string> ended = lines.ticks();
+    c.Expect(ended.size() == number && ended.back().find("outcome=completed") != std::string::npos,
+             "tick " + std::to_string(number) + " completed, not partial: " +
+                 (ended.empty() ? std::string("no tick") : ended.back()) +
+                 Rendered(console.Log()));
+  };
+  const auto failed_lines = [&lines]() {
+    std::size_t failed = 0;
+    for (const std::string& line : lines.named()) {
+      failed += line.find(" save.failed ") != std::string::npos ? 1 : 0;
+    }
+    return failed;
+  };
+
+  tick(1);
+  std::vector<std::string> named = lines.named();
+  c.ExpectEq(named.size(), std::size_t{1},
+             "the first tick says it once" + Rendered(console.Log()));
+  c.Expect(!named.empty() && named[0].find(" warn ") != std::string::npos,
+           "as a warning, not an error: " + (named.empty() ? std::string() : named[0]));
+  c.ExpectEq(failed_lines(), std::size_t{0}, "and never as a failed save");
+  c.ExpectEq(console.Status().failed, std::int64_t{0}, "the status screen counts no failure");
+  c.Expect(!console.sandbox.Exists("/tico/saves/nes/nova.srm"), "and nothing was placed");
+
+  tick(2);
+  c.ExpectEq(lines.named().size(), std::size_t{1},
+             "the second tick says nothing more" + Rendered(console.Log()));
+  c.ExpectEq(console.Status().failed, std::int64_t{0}, "and counts no failure either");
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// #241's acceptance, through the real engine: the server holds a save, the
 /// console downloads the rom, and the save is in the folder the emulator reads
 /// before the next scheduled tick -- of which there is none: `interval_min = 0`
@@ -5585,6 +5713,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"interop", Interop},
       {"upgrade", Upgrade},
       {"placement", Placement},
+      {"declined", Declined},
       {"remote_install", RemoteInstall},
       {"states_guard", StatesGuarded},
       {"install_settle", InstallSettle},

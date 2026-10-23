@@ -250,6 +250,21 @@ enum class OperationOutcome {
   /// exactly as it was, and its baseline row is marked so the next tick does
   /// not offer those bytes again (`state::SaveRecord::deleted_on_server`).
   kKept,
+
+  /// The server's copy is one this console will not take, for a reason only a
+  /// file moving can change (#257): a pairing `scan::Interchangeable` refuses
+  /// (`OperationError::kOtherEmulator`), or a first-time restore with nowhere to
+  /// go -- no placement, or one onto a file already there
+  /// (`OperationError::kNoLocalSave`). `error` says which. **Nothing was fetched
+  /// and nothing local was touched.**
+  ///
+  /// Neither completed nor failed here, because neither is true: nothing went
+  /// wrong, and asking again does not change it. Counted failed, it made every
+  /// tick `kPartial` for as long as the two saves stayed where they were, which
+  /// reads as "something is wrong" when nothing can be done from the console.
+  /// RomM is still told it did not happen (`CountsFor`), as it is of an action
+  /// this build does not know. Its line is said once (`Declines`).
+  kDeclined,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -269,6 +284,10 @@ enum class OperationError {
   /// the rom's platform folder and a name the server cannot supply, which is
   /// `ExecuteOptions::place`'s job -- and a placement that names a file already
   /// on the card has nowhere to put it either. Nothing was written.
+  ///
+  /// The download's two are `OperationOutcome::kDeclined` (#257): the plan asks
+  /// for them every tick until a file moves or the placement's reason does. An
+  /// upload or a `delete` with no local save is still a failure.
   kNoLocalSave,
 
   /// A `download` or `conflict` whose operation carries no `save_id`. The
@@ -338,8 +357,8 @@ enum class OperationError {
   ///
   /// RomM pairs on `(rom_id, slot)` whatever wrote the save, so this is the
   /// client's own guard behind the `emulators` filter rather than a server
-  /// fault, and it is counted failed on purpose: the plan asked for something
-  /// this client will not do, every tick, until one of the two saves moves.
+  /// fault. The plan asks for it every tick until one of the two saves moves,
+  /// so it is `OperationOutcome::kDeclined` rather than a failure (#257).
   kOtherEmulator,
 
   /// The verified bytes could not be moved onto the save, or a save a `delete`
@@ -510,10 +529,15 @@ struct ExecutionReport {
   /// letting them vanish (docs/SYNC_PROTOCOL.md step 3).
   int not_understood = 0;
 
+  /// Operations declined (`OperationOutcome::kDeclined`, #257): a save this
+  /// console will not take until a file moves. Not a failure here; RomM's count
+  /// takes them with `failed` (`CountsFor`), for `not_understood`'s reason.
+  int declined = 0;
+
   /// The `CancelToken` fired: this operation, and every one after it, was not
-  /// attempted. Counted in none of the three totals above, so
-  /// `completed + failed + not_understood` is short of `operations.size()`
-  /// exactly when this is set.
+  /// attempted. Counted in none of the four totals above, so
+  /// `completed + failed + not_understood + declined` is short of
+  /// `operations.size()` exactly when this is set.
   bool canceled = false;
 
   /// The server stopped accepting the token part way through, so the operations
@@ -540,11 +564,75 @@ struct ExecutionReport {
   /// `log::Event::kSaveFailed`, and a unit test of one execution wants them as
   /// data.
   std::vector<std::string> warnings;
+
+  /// One line per declined operation that is news (`Declines::Note`): the
+  /// first time it is met, or met again after either copy changed. The line is
+  /// `declined ` and the operation's message. Apart from
+  /// `warnings` because a decline is not a failed save, and the engine writes
+  /// those as one (#257). Nothing takes one of these back out, so they carry no
+  /// index the way `OperationResult::warning` does.
+  std::vector<std::string> declines;
 };
 
-/// Set `report`'s three totals from its operations' outcomes. **The** mapping
-/// from an outcome to `completed`, `failed` or `not_understood` -- `ExecutePlan`
-/// counts with it as it goes, and a resolution that replaced some results
+/// The declines a console has already said, so each costs one line rather than
+/// one every tick (#257).
+///
+/// Remembered per `(rom_id, slot)`, as a digest of everything that would make
+/// the decline a different one: the server's save id, its timestamp and digest,
+/// the emulator that wrote it, and the operation's message -- which names the
+/// local path, what it is read as, and the placement's reason. So a new server
+/// save, the local file moving, or the placement's answer changing is said again,
+/// and the same decline met again is not.
+///
+/// **In memory, for the boot**: a reboot says each live decline once more, which
+/// is cheaper than a row of `state.db` -- bounded in records and bytes, and for
+/// saves on the card, which a placement's decline is not. Bounded at
+/// `kMaxDeclines` and swept by `EndTick`, so what it holds is what is declined
+/// now; one met past the bound is not remembered, and is said every tick.
+///
+/// Not thread-safe: the engine's tick is its one user, on the worker.
+class Declines {
+ public:
+  /// 32 bytes on aarch64, which `kHeapDeclines` (`sysmodule/source/main.cpp`)
+  /// counts at the bound. Hashes rather than strings: a slot is whatever some
+  /// client chose, and a decline's message is a sentence.
+  struct Entry {
+    std::int64_t rom_id = 0;
+    std::uint64_t slot = 0;
+    std::uint64_t fingerprint = 0;
+    /// Met since the last `EndTick`.
+    bool met = false;
+  };
+
+  /// Whether `declined` -- the result of `operation` -- is to be said: the
+  /// first time it is met, or the first time since either side changed. It is
+  /// remembered either way, unless the bound is reached.
+  bool Note(const SyncOperation& operation, const OperationResult& declined);
+
+  /// `operation` did what the plan asked, so the next decline of its save,
+  /// whatever it is, is news.
+  void Forget(const SyncOperation& operation);
+
+  /// After a tick that ran: what it did not meet again is no longer declined --
+  /// the server's save went, or the rom left the card -- and is forgotten,
+  /// except for a rom in `unasked_roms` (ascending), which no plan asked about.
+  void EndTick(const std::vector<std::int64_t>& unasked_roms);
+
+  std::size_t size() const { return entries_.size(); }
+
+ private:
+  std::vector<Entry> entries_;
+};
+
+/// How many declines `Declines` remembers. Ample for a console's real ones --
+/// a few saves another emulator wrote, a file in the way -- and 1 KiB of a heap
+/// with 7 left over (`kHeapDeclines`). A card that declines more, a Tico with
+/// several accounts and none chosen say, says the ones past it every tick.
+inline constexpr std::size_t kMaxDeclines = 32;
+
+/// Set `report`'s four totals from its operations' outcomes. **The** mapping
+/// from an outcome to `completed`, `failed`, `not_understood` or `declined` --
+/// `ExecutePlan` counts with it as it goes, and a resolution that replaced some results
 /// recounts with it (sync_resolve.hpp) -- so an outcome added later is counted
 /// in one place or in none (#259). A cancelled operation counts nowhere.
 void Recount(ExecutionReport* report);
@@ -571,9 +659,9 @@ struct ExecuteOptions {
   std::function<Timestamp()> now;
 
   /// Where a save the client has no local file for should be written, given the
-  /// operation. A placement with no path -- or leaving this null -- fails that
-  /// operation with `kNoLocalSave` and the placement's reason rather than
-  /// guessing.
+  /// operation. A placement with no path -- or leaving this null -- declines
+  /// that operation (`OperationOutcome::kDeclined`, #257) with `kNoLocalSave`
+  /// and the placement's reason rather than guessing.
   ///
   /// It is injected because the answer is not in the plan and not on the card:
   /// the server's `file_name` is tagged and the folder depends on the emulator
@@ -583,7 +671,7 @@ struct ExecuteOptions {
   ///
   /// **A placement only creates.** A file already at the path is one the scan
   /// did not pair with this `(rom_id, slot)` -- skipped, or another slot's -- and
-  /// the operation fails with `kNoLocalSave` without touching it. The folder is
+  /// the operation is declined with `kNoLocalSave` without touching it. The folder is
   /// made when it is missing: Tico makes a system's folder the first time it
   /// saves one, which for a first-time restore is after.
   std::function<place::Placement(const SyncOperation&)> place;
@@ -654,6 +742,12 @@ struct ExecuteOptions {
   /// reported under one id takes no copy whose format is another's
   /// (`scan::Interchangeable`). Null, a `tico-*` copy is written over nothing.
   const std::vector<ClientSaveState>* reported = nullptr;
+
+  /// The declines already said (#257). Not owned; must outlive the call. A
+  /// declined operation writes its line into `ExecutionReport::declines` only
+  /// when `Declines::Note` says it is news, and one that did what the plan asked
+  /// is forgotten. Null says every decline, every time.
+  Declines* declines = nullptr;
 
   /// Optional, not owned; must outlive the call. Checked between operations and
   /// passed to every request, so a shutdown ends the tick at an operation

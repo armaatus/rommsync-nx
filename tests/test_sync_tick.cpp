@@ -1969,6 +1969,191 @@ void Isolated(rig::Checks& checks, http::HttpClient& client, const std::string& 
   sweep();
 }
 
+/// #257: a save this console will not take -- RetroArch's Beetle save paired
+/// with DuckStation's card, one with nowhere to be placed, one whose place is
+/// taken -- costs one line and no failed operation, and the tick that meets it
+/// again says nothing and is not `kPartial` on its account. Either side
+/// changing asks again: a new server save in the card's slot is said again, and
+/// the file in the way moving lets that save come down.
+void Declined(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+              const Fixture& fixture) {
+  harness::Rom rom;
+  if (!harness::FindRom(client, base, fixture, "Synthetic Nested Game", &rom)) {
+    checks.Expect(false, "the fixture's psx rom is there");
+    return;
+  }
+  Sandbox sandbox(checks, "tick-declined");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string folder = "/tico/saves/psx";
+  sandbox.MakeDirs(folder);
+
+  const std::string matched = harness::UniqueSlot("m10-21-matched");
+  const std::string unmapped = harness::UniqueSlot("m10-21-unmapped");
+  const std::string taken = harness::UniqueSlot("m10-21-taken");
+  const std::string card = "DuckStation's card, the only copy of this progress\n";
+  const std::string beetle = "a Beetle PSX .srm, which is not a DuckStation card\n";
+  const std::string duckstation = "DuckStation's card from another Switch\n";
+  const std::string in_the_way = "a card the scan did not pair with that slot\n";
+
+  const std::string staged_beetle = sandbox.Host("/config/rommsync/beetle.srm");
+  const std::string staged_card = sandbox.Host("/config/rommsync/other.mcd");
+  rig::WriteFile(staged_beetle, beetle);
+  rig::WriteFile(staged_card, duckstation);
+  std::vector<std::int64_t> planted;
+  const auto sweep = [&]() {
+    for (const std::int64_t id : planted) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  };
+  const auto plant = [&](const std::string& slot, const char* emulator, const std::string& staged,
+                         const char* name) {
+    harness::Save stored;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, emulator, staged, name, false,
+                             &stored)) {
+      checks.Expect(false, "the server's save was stored in " + slot);
+      return false;
+    }
+    planted.push_back(stored.id);
+    return true;
+  };
+  if (!plant(matched, "mednafen_psx_hw", staged_beetle, "Synthetic Nested Game.srm") ||
+      !plant(unmapped, "tico-duckstation", staged_card, "Synthetic Nested Game.mcd") ||
+      !plant(taken, "tico-duckstation", staged_card, "Synthetic Nested Game.mcd")) {
+    sweep();
+    return;
+  }
+
+  const std::string matched_path = folder + "/Matched.mcd";
+  const std::string taken_path = folder + "/Taken.mcd";
+  sandbox.SeedSave(matched_path, card);
+  // Written, not seeded: it is moved away below, and the sandbox's audit holds a
+  // seeded save to never being replaced without a backup.
+  rig::WriteFile(sandbox.Host(taken_path), in_the_way);
+  const auto now = std::chrono::system_clock::now();
+  // Older than RetroArch's upload, so the plan is a download over the card.
+  const std::vector<sync::ClientSaveState> reported = {harness::LocalSave(
+      rom.id, "Matched.mcd", matched, "tico-duckstation", crypto::Md5Hex(card),
+      now - std::chrono::hours{1}, static_cast<std::int64_t>(card.size()))};
+  const std::vector<sync::SaveTarget> targets = {{rom.id, matched, matched_path, "Matched.mcd"}};
+
+  sync::TickOptions options = OptionsAt(1'757'000'900);
+  options.recover_dirs = {folder, harness::kBackupDir};
+  options.rom_scope = std::vector<std::int64_t>{rom.id};
+  options.execute.place = [&](const sync::SyncOperation& operation) {
+    rommsync::place::Placement placement;
+    if (operation.slot.has_value() && *operation.slot == taken) {
+      placement.sd_path = taken_path;
+      placement.emulator = "tico-duckstation";
+    } else if (operation.slot.has_value() && *operation.slot == unmapped) {
+      placement.reason = "psx is played in Tico and the folder map lists no Tico folder for it";
+    } else {
+      placement.reason = "another scenario's leftover: not this run's to place";
+    }
+    return placement;
+  };
+  sync::Declines declines;
+  options.execute.declines = &declines;
+
+  // What each tick said, plan by plan, and what became of this run's saves.
+  std::vector<std::string> said;
+  std::vector<sync::OperationResult> ours;
+  options.on_plan = [&](const sync::SyncPlan&, const sync::ExecutionReport& executed) {
+    said.insert(said.end(), executed.declines.begin(), executed.declines.end());
+    for (const sync::OperationResult& done : executed.operations) {
+      if (done.slot == matched || done.slot == unmapped || done.slot == taken) {
+        ours.push_back(done);
+      }
+    }
+  };
+  const auto run = [&]() {
+    said.clear();
+    ours.clear();
+    return sync::RunTick(client, *files, TokenFor(base, fixture), reported, targets, {}, options);
+  };
+  const auto of = [&ours](const std::string& slot) -> const sync::OperationResult* {
+    for (const sync::OperationResult& done : ours) {
+      if (done.slot == slot) {
+        return &done;
+      }
+    }
+    return nullptr;
+  };
+  const auto spoken = [&said](const sync::OperationResult* done) {
+    return done != nullptr &&
+           std::find(said.begin(), said.end(), "declined " + done->message) != said.end();
+  };
+  const auto declined = [&](const std::string& slot, sync::OperationError error) {
+    const sync::OperationResult* done = of(slot);
+    return done != nullptr && done->outcome == sync::OperationOutcome::kDeclined &&
+           done->error == error;
+  };
+  const auto describe = [&](const std::string& slot) {
+    const sync::OperationResult* done = of(slot);
+    return done == nullptr ? std::string("no operation")
+                           : std::string(sync::ToString(done->outcome)) + " " +
+                                 sync::ToString(done->error) + " -- " + done->message;
+  };
+
+  const sync::TickResult first = run();
+  checks.Expect(declined(matched, sync::OperationError::kOtherEmulator),
+                "a Beetle save paired with DuckStation's card is declined: " + describe(matched));
+  checks.Expect(declined(unmapped, sync::OperationError::kNoLocalSave),
+                "a save with nowhere to go is declined: " + describe(unmapped));
+  checks.Expect(declined(taken, sync::OperationError::kNoLocalSave),
+                "and one whose place is taken: " + describe(taken));
+  checks.Expect(spoken(of(matched)) && spoken(of(unmapped)) && spoken(of(taken)),
+                "each costs one line, the first time");
+  checks.Expect(first.outcome == sync::TickOutcome::kCompleted,
+                std::string("and the tick is not partial on their account: ") +
+                    sync::ToString(first.outcome));
+  checks.ExpectEq(first.totals.failed, 0, "nothing failed");
+  checks.Expect(first.totals.declined >= 3, "the tick counts what it declined");
+  checks.ExpectEq(sandbox.Read(matched_path), card, "the card is untouched");
+  checks.ExpectEq(sandbox.Read(taken_path), in_the_way, "and so is the file in the way");
+
+  const sync::TickResult second = run();
+  checks.Expect(declined(matched, sync::OperationError::kOtherEmulator) &&
+                    declined(unmapped, sync::OperationError::kNoLocalSave) &&
+                    declined(taken, sync::OperationError::kNoLocalSave),
+                "met again, all three are declined again");
+  checks.Expect(!spoken(of(matched)) && !spoken(of(unmapped)) && !spoken(of(taken)),
+                "and none of them is said" + (said.empty() ? std::string() : ": " + said[0]));
+  checks.Expect(second.outcome == sync::TickOutcome::kCompleted,
+                std::string("the tick that meets them again is not partial: ") +
+                    sync::ToString(second.outcome));
+
+  // Both sides move: RetroArch writes its save in the card's slot again -- the
+  // row moved forward in place, the one call that reliably does
+  // (`harness::ReplaceSave`) -- and the file in the way is moved off the folder.
+  rig::WriteFile(staged_beetle, "RetroArch's next Beetle .srm, still not a card\n");
+  harness::Save replaced;
+  if (!harness::ReplaceSave(client, base, fixture, planted[0], staged_beetle,
+                            "Synthetic Nested Game.srm", &replaced)) {
+    checks.Expect(false, "RetroArch's save in the card's slot moved forward");
+    sweep();
+    return;
+  }
+  std::error_code moved;
+  std::filesystem::rename(sandbox.Host(taken_path), sandbox.Host("/config/rommsync/moved.mcd"),
+                          moved);
+  checks.Expect(!moved, "the file in the way is moved");
+
+  const sync::TickResult third = run();
+  checks.Expect(declined(matched, sync::OperationError::kOtherEmulator) && spoken(of(matched)),
+                "a new server save in the card's slot is said again: " + describe(matched));
+  checks.Expect(declined(unmapped, sync::OperationError::kNoLocalSave) && !spoken(of(unmapped)),
+                "the one that did not change is not");
+  checks.Expect(of(taken) != nullptr && of(taken)->outcome == sync::OperationOutcome::kDownloaded,
+                "with the file moved, the save it was in the way of comes down: " +
+                    describe(taken));
+  checks.ExpectEq(sandbox.Read(taken_path), duckstation, "into the place that is free now");
+  checks.Expect(third.outcome == sync::TickOutcome::kCompleted,
+                std::string("and that tick is not partial either: ") +
+                    sync::ToString(third.outcome));
+  sweep();
+}
+
 /// #238's first acceptance item: a Tico 0.8 card holding a save for each system
 /// whose format is isolated, scanned by the engine's own scanner and uploaded by
 /// a real tick, lands on RomM under the `tico-*` id that names its module -- and
@@ -4300,6 +4485,8 @@ int main(int argc, char** argv) {
     Isolated(checks, *client, base, fixture);
   } else if (scenario == "isolated_ids") {
     IsolatedIds(checks, *client, base, fixture);
+  } else if (scenario == "declined") {
+    Declined(checks, *client, base, fixture);
   } else if (scenario == "oversized") {
     Oversized(checks, *client, base, fixture);
   } else if (scenario == "held") {

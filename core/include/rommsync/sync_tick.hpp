@@ -430,6 +430,9 @@ struct TickResult {
     std::size_t plans = 0;
     int completed = 0;
     int failed = 0;
+    /// Saves this console will not take (`OperationOutcome::kDeclined`, #257).
+    /// Not in `failed`, and never what makes a tick `kPartial`.
+    int declined = 0;
     /// Every run's baseline reached the card.
     bool stored = true;
   };

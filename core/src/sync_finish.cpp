@@ -247,8 +247,10 @@ CompletionCounts CountsFor(const ExecutionReport& report) {
   // planned and this client did not do, and the only two fields `complete`
   // has are "did it" and "did not" -- so the one that is true is this one.
   // Folding it into `completed` would tell RomM the client did something it
-  // does not even know the name of (docs/SYNC_PROTOCOL.md step 3).
-  counts.operations_failed = report.failed + report.not_understood;
+  // does not even know the name of (docs/SYNC_PROTOCOL.md step 3). A decline
+  // (#257) is the same to RomM: planned, and not done. It is only to the
+  // console that it is not a failure.
+  counts.operations_failed = report.failed + report.not_understood + report.declined;
   return counts;
 }
 
