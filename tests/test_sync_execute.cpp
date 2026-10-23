@@ -773,8 +773,14 @@ void Overwrite(rig::Checks& checks) {
                   "and the rewrite that failed is said: " +
                       (report.warnings.empty() ? std::string("nothing") : report.warnings[0]));
 
-    Rewrites refused(404);
+    // The client's one rule for a status worth asking again, not a copy of it:
+    // a 429 is RomM, or a proxy in front of it, declining *now*.
+    Rewrites throttled(429);
     options.wait = [](std::chrono::milliseconds) {};
+    sync::ExecutePlan(throttled, *files, token, one, targets, options);
+    checks.ExpectEq(throttled.puts, 3, "a 429 is tried three times too");
+
+    Rewrites refused(404);
     const sync::ExecutionReport gone =
         sync::ExecutePlan(refused, *files, token, one, targets, options);
     checks.ExpectEq(refused.puts, 1, "a refusal of the rewrite is not asked again");
