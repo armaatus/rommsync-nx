@@ -5,13 +5,10 @@
 #   ./evals/run.sh
 #
 # There used to be a fifth kind: ~3,000 lines asserting that one document agreed
-# with another -- that CLAUDE.md restated a rule the brief also stated, that a
-# page printing a pipeline printed the one that ran, that the reading an agent
-# does before its first edit stayed under a word ceiling. 43 of 63 open issues
-# were about those assertions rather than about the loop. They are gone with
-# armaatus/autofleet#153. A document that drifts is a review finding on the pull
-# request that drifted it; a guard that stops guarding is not, which is why the
-# selftests below stay.
+# with another. 43 of 63 open issues were about those assertions rather than
+# about the work, and they are gone. A document that drifts is a review finding
+# on the pull request that drifted it; a guard that stops guarding is not, which
+# is why the selftests below stay.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,13 +18,10 @@ fails=0
 step() { printf '== %s\n' "$1"; }
 bad() { printf '   FAIL: %s\n' "$1" >&2; fails=$((fails + 1)); }
 
-# The payload's shell, this repo's own suite, and the seam answers in
-# `.autofleet/` -- which are both this repo's configuration and the template
-# `install.sh` seeds into a host, and which nothing else parses.
+# The worktree provisioning, the hooks, the evals and this repo's own suite.
 scripts=()
 while IFS= read -r f; do scripts+=("$f"); done < <(
-  ls scripts/fleet/*.sh scripts/fleet/runner/*.sh .claude/hooks/*.sh \
-     .github/scripts/*.sh evals/*.sh tests/*.sh .autofleet/*.sh install.sh \
+  ls scripts/orca/*.sh .claude/hooks/*.sh .github/scripts/*.sh evals/*.sh tests/*.sh \
      2>/dev/null
 )
 # An empty list is a lint that checked NOTHING and said it was well-formed,
@@ -37,7 +31,7 @@ while IFS= read -r f; do scripts+=("$f"); done < <(
 # a variable rather than about a payload that is not there.
 [ "${#scripts[@]}" -gt 0 ] || {
   echo "evals/run.sh found no scripts to check. It expects to run from the root" >&2
-  echo "of a repository the autofleet payload is installed in." >&2
+  echo "of the repository." >&2
   exit 2
 }
 
@@ -53,7 +47,7 @@ done
 # none of what they look for.
 #
 # A suppression must carry a reason on the same line, after a second `#`, and a
-# bare one is not an answer (armaatus/autofleet#17).
+# bare one is not an answer.
 step "shellcheck"
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --severity=error --format=gcc "${scripts[@]}" || bad "shellcheck found errors"

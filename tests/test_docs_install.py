@@ -39,8 +39,7 @@ gives a user is read off the code that decides it.
 
   interop        its sections in order, the hardware note, the README and the
                  install guide linking it, the README's status line no longer
-                 saying nothing is built, and CONFIG.md / CONFIGURATION.md each
-                 pointing at the other (two pages called "configuration").
+                 saying nothing is built.
   interop_facts  the oldest RomM, the limits (saves, states, roms, folder
                  entries), the conflict copy's name, the RetroArch keys, the
                  Cloud Sync path and every quoted screen line, each against the
@@ -529,17 +528,8 @@ def phase_interop(args) -> int:
         return fail("docs/INSTALL.md never points at docs/INTEROP.md, and a user who has "
                     "installed the client is the one who next asks about other devices")
 
-    # Two pages called "configuration": the user's config.ini and autofleet's
-    # project config. Each says, before its first section, that it is not the
-    # other one.
-    for page, other in (("CONFIG.md", "CONFIGURATION.md"), ("CONFIGURATION.md", "CONFIG.md")):
-        body = read(os.path.join(repo, "docs", page))
-        opening = body[: re.search(r"^## ", body, re.MULTILINE).start()]
-        if f"]({other})" not in opening:
-            return fail(f"docs/{page} does not point at docs/{other} before its first section")
-
     print(f"{len(found)} sections in order, the hardware note names M8-2, README and INSTALL "
-          "link it, and the two configuration pages point at each other")
+          "link it")
     return 0
 
 

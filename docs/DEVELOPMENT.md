@@ -1188,18 +1188,18 @@ that machinery; the verdict is the script's exit code, and today it is not 0.
 ### Worktree isolation
 
 Agents work in parallel worktrees and sync tests mutate saves by design, so each
-worktree runs **its own** RomM. `scripts/orca/env.sh` wraps the fleet's
-`scripts/fleet/env.sh`: the fleet derives a compose project name and three ports
-from the worktree path (`.autofleet/config` names the bases), and the wrapper
-adds the URLs and shared caches this project's tests read, all into `.env`.
-The fleet's setup hook (`scripts/fleet/setup.sh` → `.autofleet/setup.sh`) runs it
-on worktree creation and `scripts/fleet/archive.sh` tears the stack down on
-removal. Only immutable, expensive things are shared across worktrees — the
+worktree runs **its own** RomM. `scripts/orca/env.sh` derives a compose project
+name and three ports from the worktree path and writes them to `.env`, with the
+URLs and shared caches this project's tests read. `scripts/orca/setup.sh` runs
+it and provisions the rest — fixtures, build, venv, RomM — and is what
+`orca.yaml` runs on worktree creation, or what you run by hand after a
+`git worktree add`; `scripts/orca/archive.sh` tears the stack down on removal.
+Only immutable, expensive things are shared across worktrees — the
 checksum-pinned ROM cache and the content-addressed ccache. Never hardcode a
 port; read `.env`.
 
 Stacks orphaned by a worktree deleted with `rm -rf`, or removed while Docker was
-stopped, are listed by `./scripts/fleet/reap.sh` and removed with `--yes`; it
+stopped, are listed by `./scripts/orca/reap.sh` and removed with `--yes`; it
 errs towards keeping anything it cannot prove stale. See
 [TESTING.md](TESTING.md#worktree-isolation).
 

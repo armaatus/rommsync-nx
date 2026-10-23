@@ -3,17 +3,18 @@
 # Orca will ask you to trust this file before it runs anything, and again after
 # each change -- these scripts execute on your machine.
 #
-# Every worktree created from this repo self-provisions through autofleet's
-# hooks: scripts/fleet/setup.sh derives the isolated ports and compose project
-# into .env, then runs .autofleet/setup.sh -- this project's half: ROM
-# fixtures, the build, the venv, RomM. By the time the agent's tab is live,
-# `ctest` is a meaningful command.
+# Every worktree created from this repo self-provisions: scripts/orca/setup.sh
+# derives the isolated ports and compose project into .env, seeds the ROM
+# fixtures, builds, makes the venv and starts this worktree's own RomM with the
+# fixture provisioned inside it. By the time the agent's tab is live, `ctest` is
+# a meaningful command. The same script works by hand from a plain
+# `git worktree add`.
 
 scripts:
-  setup: ./scripts/fleet/setup.sh
+  setup: ./scripts/orca/setup.sh
   # Tears down that worktree's RomM stack and its volumes, leaving the shared
   # caches alone.
-  archive: ./scripts/fleet/archive.sh
+  archive: ./scripts/orca/archive.sh
 
 # Hold the agent's tab until setup finishes. Without this the agent can run
 # `ctest` before RomM is listening, read the connection error as a code bug, and
@@ -23,7 +24,7 @@ setupAgentStartupPolicy: wait-for-setup
 # The prompt an agent starts with when the workspace is created from a linked
 # issue. Orca substitutes {{issue}} and {{artifact_url}} and nothing else.
 issueCommand: |
-  Run `GH_PAGER=cat ./scripts/fleet/issue-command.sh {{issue}}` first and follow
+  Run `GH_PAGER=cat ./scripts/orca/issue-command.sh {{issue}}` first and follow
   everything it prints. It resolves issue #{{issue}} ({{artifact_url}}) to its
   full body, labels and milestone -- the only place this project's design intent
   is written down -- and then states what to do with it. Nothing about the

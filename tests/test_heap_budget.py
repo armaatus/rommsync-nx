@@ -218,9 +218,8 @@ HEAP_SIZE_MAX = 0x400000
 PROSE_ROOTS = ("core", "sysmodule", "docs", "tests", "host", "scripts")
 PROSE_SUFFIXES = (".hpp", ".cpp", ".md", ".py", ".sh")
 # This file names every value the constant has ever held, one sentence above.
-# `scripts/fleet/` is vendored autofleet, which knows nothing of this heap.
 PROSE_EXCLUDED = ("sysmodule/source/main.cpp", "tests/test_heap_budget.py",
-                  "overlay/lib", "/lib/", "/build/", "scripts/fleet/")
+                  "overlay/lib", "/lib/", "/build/")
 
 # The same size in words: "a 1.4 MiB heap", "the inner heap is 1.4 MiB", "the
 # 768 KiB inner heap". The hex check above never saw these, so when #207 and

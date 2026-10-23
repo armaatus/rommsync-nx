@@ -1,8 +1,5 @@
 # Configuration
 
-> This page is the console's `config.ini`. The agent fleet's own project
-> configuration (`.autofleet/`) is [CONFIGURATION.md](CONFIGURATION.md).
-
 `sdmc:/config/rommsync/config.ini`. The sysmodule reads it at boot and on an
 IPC "reload"; the overlay edits it through the sysmodule (which owns writes).
 

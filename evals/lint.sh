@@ -120,9 +120,9 @@ fi
 # through.
 echo "== guards actually guard"
 # The exhaustive table lives in the hook itself (`guard.py --selftest`): every
-# rule in it has a row, and one without is not shipped (autofleet hard rule 3).
+# rule in it has a row, and one without is not shipped.
 # What this project asks it to protect on top -- the pinned RomM contract, the
-# fixture credentials -- is .autofleet/guard.json, and the selftest reads it.
+# fixture credentials -- is .claude/hooks/guard.json, beside it.
 if [ -x .claude/hooks/guard.py ]; then
   python3 .claude/hooks/guard.py --selftest 2>&1 | sed 's/^/  /'
   [ "${PIPESTATUS[0]}" = 0 ] || fail "the guard selftest does not hold"
@@ -151,9 +151,10 @@ assert_hook "$G" 2 'not json at all' \
   "an unreadable payload blocks rather than failing open"
 
 echo "== the plugins the flow depends on"
-# mattpocock-skills is not decoration: the brief in issue-command.sh tells every
-# agent to run `/mattpocock-skills:code-review` (standards and spec-vs-diff,
-# which the built-in review does not cover) and `/mattpocock-skills:tdd`. It is
+# mattpocock-skills is not decoration: the brief in scripts/orca/issue-command.sh
+# tells every agent to run `/implement`, which drives `/mattpocock-skills:tdd`
+# and `/mattpocock-skills:code-review` (standards and spec-vs-diff, which the
+# built-in review does not cover). It is
 # enabled in the COMMITTED settings.json, which is what makes it present in every
 # worktree; drop the entry and the brief silently asks for a skill nobody has.
 if python3 -c '
@@ -245,7 +246,7 @@ fi
 echo "== the workflows parse as GitHub reads them"
 # An invalid workflow file does not fail loudly: GitHub creates a run with no
 # jobs, named after the file, and the check it was meant to report simply never
-# appears. With `merge-gate` as a required check that reads as "pending forever"
+# appears. For a required check that reads as "pending forever"
 # and nothing can merge. It happened once already --
 # `pull_request_review_thread` is a webhook event, not a workflow trigger, and
 # putting it in `on:` invalidated the whole file.
@@ -334,19 +335,27 @@ else
     || fail "orca.yaml's issueCommand no longer points at scripts/orca/issue-command.sh, so a new worktree's agent starts from a bare URL"
   grep -q 'setupAgentStartupPolicy: wait-for-setup' orca.yaml \
     || fail "orca.yaml no longer holds the agent tab for setup; agents will run ctest against a RomM that is not up"
-  ok "orca.yaml still wires the agent to the spec"
+  # Every script it names has to exist and run. Orca reports a missing hook as
+  # a failed setup in a log nobody opens, and the worktree arrives with no RomM
+  # -- which is what a move of the provisioning scripts (#277) would leave.
+  named="$(grep -oE '\./scripts/[A-Za-z0-9_./-]+\.sh' orca.yaml | sort -u)"
+  [ -n "$named" ] || fail "orca.yaml names no script at all; this check would assert nothing"
+  for script in $named; do
+    [ -x "$script" ] || fail "orca.yaml names $script, which does not exist or is not executable"
+  done
+  ok "orca.yaml still wires the agent to the spec, through scripts that exist"
 fi
 
 
-echo "== the vendored payload"
-# scripts/fleet/, the hooks and the gate are autofleet's; its own scanners
-# (bash -n, shellcheck, the pipefail and stderr traps, the selftests) run here
-# too, so a worktree sees a break in the payload before CI does.
+echo "== the scripts and hooks"
+# The provisioning scripts, the hooks, the suite's shell and the selftests:
+# bash -n, shellcheck, the pipefail and stderr traps. Run here too, so a
+# worktree sees a break before CI does.
 if [ -x evals/run.sh ]; then
   ./evals/run.sh 2>&1 | sed 's/^/  /'
-  [ "${PIPESTATUS[0]}" = 0 ] || fail "evals/run.sh: the vendored payload is not well-formed"
+  [ "${PIPESTATUS[0]}" = 0 ] || fail "evals/run.sh: a script or hook is not well-formed"
 else
-  fail "evals/run.sh is missing; the payload's own checks never run"
+  fail "evals/run.sh is missing; the scripts and hooks are never checked"
 fi
 
 echo "== eval cases"

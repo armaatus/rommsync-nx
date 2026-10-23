@@ -34,12 +34,10 @@ import sys
 # editing a workflow cannot merge itself, so widening the glob here would red
 # the lint on a file the change may not fix.
 PATTERNS = (
-    "scripts/fleet/*.sh",
-    "scripts/fleet/runner/*.sh",
+    "scripts/orca/*.sh",
     "evals/*.sh",
     ".github/scripts/*.sh",
     ".claude/hooks/*.sh",
-    "install.sh",
 )
 
 # An input redirection whose open can FAIL. `<<` and `<<<` are excluded because

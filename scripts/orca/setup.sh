@@ -1,36 +1,34 @@
 #!/usr/bin/env bash
 # What a worktree of rommsync-nx needs before an agent can work in it.
 #
-# The project half of the setup hook: scripts/fleet/setup.sh has already derived
-# the worktree's identity and exported .env by the time this runs, and its exit
-# status is provisioning's. This is the body of what scripts/orca/setup.sh did
-# under Orca, minus the Orca-only parts (the browser tab, the log tab, the
-# autostart watcher): ROM fixtures, the build, the venv the server tooling
+# orca.yaml runs this when Orca creates a worktree, and it is the same command
+# by hand from any fresh `git worktree add`: isolated ports and compose project
+# into .env, submodules, ROM fixtures, the build, the venv the server tooling
 # needs, this worktree's own RomM, and the fixture provisioned inside it. By the
-# time this returns, `ctest` is a meaningful command.
+# time it returns, `ctest` is a meaningful command -- which is why orca.yaml
+# holds the agent's tab until it does: an agent that runs the tests before RomM
+# is listening reads the connection error as a code bug and goes chasing it.
+# Idempotent; re-run it to repair a worktree whose provisioning failed.
 set -euo pipefail
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 . ./scripts/orca/lib.sh
 
-# FIRST, before anything expensive: the interpreter. This hook runs in whatever
-# environment the dispatcher hands it, and that is not an interactive shell --
-# on macOS `python3` can resolve to Apple's 3.9.6 while a terminal finds
-# Homebrew's. server/requirements.txt needs >= 3.10, and pip's report of that is
-# two hundred lines naming neither Python nor the reason. Say it here, in one.
+# FIRST, before anything expensive: the interpreter. This runs in whatever
+# environment Orca hands it, and that is not an interactive shell -- on macOS
+# `python3` can resolve to Apple's 3.9.6 while a terminal finds Homebrew's.
+# server/requirements.txt needs >= 3.10, and pip's report of that is two
+# hundred lines naming neither Python nor the reason. Say it here, in one.
 if ! PYTHON="$(orca_pick_python)"; then
   echo "!! server/requirements.txt needs Python >= ${ORCA_PYTHON_MIN_MAJOR}.${ORCA_PYTHON_MIN_MINOR}" >&2
   echo "   and nothing usable was found. Tried:" >&2
   orca_python_rejections >&2
   echo "   PATH=$PATH" >&2
   echo "   Install one (brew install python@3.13 / apt install python3.13 python3.13-venv)" >&2
-  echo "   and make sure it is on the PATH the fleet runs hooks with, then re-run this script." >&2
+  echo "   and make sure it is on the PATH Orca runs hooks with, then re-run this script." >&2
   exit 1
 fi
 
-# The fleet's env.sh wrote the ports; this project's wrapper adds the BASE_URLs
-# and the shared caches the tests and the build read. Re-derived here rather
-# than trusted, so a hand-run of this script from a plain clone works too.
 echo "==> deriving this worktree's environment"
 ./scripts/orca/env.sh
 set -a; . ./.env; set +a
@@ -39,8 +37,6 @@ set -a; . ./.env; set +a
 # was made from, and CI checks out with `submodules: recursive` -- so a worktree
 # whose issue touches overlay/ would otherwise start by finding the dependency
 # absent and reaching for a clone. Harmless and instant when there are none.
-# scripts/fleet/setup.sh does this too; twice is idempotent and a hand-run of
-# this script alone still gets it.
 if [ -f .gitmodules ]; then
   echo "==> initialising submodules"
   git submodule update --init --recursive

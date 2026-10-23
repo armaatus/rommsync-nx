@@ -33,13 +33,11 @@ import sys
 # host's own suite, and a real hazard there is a real one. Found by the
 # independent review of #165.
 PATTERNS = (
-    "scripts/fleet/*.sh",
-    "scripts/fleet/runner/*.sh",
+    "scripts/orca/*.sh",
     "evals/*.sh",
     "tests/*.sh",
     ".github/scripts/*.sh",
     ".claude/hooks/*.sh",
-    "install.sh",
 )
 
 # A single `|`, and `-q` in any bundle of short flags (`-q`, `-qE`, `-qxF`) or

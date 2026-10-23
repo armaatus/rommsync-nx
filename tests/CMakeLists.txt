@@ -1743,7 +1743,7 @@ add_test(NAME agent.config
          COMMAND "${BASH_PROGRAM}" "${CMAKE_SOURCE_DIR}/evals/lint.sh")
 set_tests_properties(agent.config PROPERTIES TIMEOUT 60)
 
-# --- worktree environment: scripts/orca/env.sh -------------------------------
+# --- worktree environment: scripts/orca/ ------------------------------------
 # setup.sh's first step, and not its only caller -- compose.sh generates a
 # missing .env too, so the romm tab writes one concurrently. Losing that race
 # used to abort setup under `set -e` and leave a worktree with nothing
@@ -1776,9 +1776,20 @@ add_test(NAME orca.env_setup_fails_fast
 add_test(NAME orca.env_romm_version
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" romm_version)
 
+# The stack name and ports, which every running worktree's RomM is filed under:
+# moving provisioning to scripts/orca/ (#277) must not rename one.
+add_test(NAME orca.env_derivation
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" derivation)
+
+# Every compose profile is activated by every teardown path, or `down` leaves
+# that service running and holding this worktree's port (#122).
+add_test(NAME orca.teardown_profiles
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" teardown_profiles)
+
 set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
                      orca.env_picks_python orca.env_replaces_dead_venv
                      orca.env_setup_fails_fast orca.env_romm_version
+                     orca.env_derivation orca.teardown_profiles
                      PROPERTIES TIMEOUT 60)
 
 # --- the Switch targets: sysmodule/, overlay/ and switch.mk ------------------
