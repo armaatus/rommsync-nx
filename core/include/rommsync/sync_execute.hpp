@@ -579,10 +579,14 @@ struct ExecutionReport {
 ///
 /// Remembered per `(rom_id, slot)`, as a digest of everything that would make
 /// the decline a different one: the server's save id, its timestamp and digest,
-/// the emulator that wrote it, and the operation's message -- which names the
-/// local path, what it is read as, and the placement's reason. So a new server
-/// save, the local file moving, or the placement's answer changing is said again,
-/// and the same decline met again is not.
+/// the emulator that wrote it, the digest step 0 reported for the local save,
+/// and the operation's message -- which names the action, the local path, what
+/// it is read as, and the placement's reason. So a new server save, the local
+/// file moving or being played on, or the placement's answer changing is said
+/// again, and the same decline met again is not. Played on matters: a card the
+/// player keeps writing is an upload RomM's slot guard refuses and #232 resolves
+/// into a conflict this console declines, so its progress is going nowhere --
+/// said once per change rather than once.
 ///
 /// **In memory, for the boot**: a reboot says each live decline once more, which
 /// is cheaper than a row of `state.db` -- bounded in records and bytes, and for
@@ -605,9 +609,11 @@ class Declines {
   };
 
   /// Whether `declined` -- the result of `operation` -- is to be said: the
-  /// first time it is met, or the first time since either side changed. It is
+  /// first time it is met, or the first time since either side changed.
+  /// `local_digest` is what step 0 reported for the save, if anything. It is
   /// remembered either way, unless the bound is reached.
-  bool Note(const SyncOperation& operation, const OperationResult& declined);
+  bool Note(const SyncOperation& operation, const OperationResult& declined,
+            const std::optional<std::string>& local_digest);
 
   /// `operation` did what the plan asked, so the next decline of its save,
   /// whatever it is, is news.
@@ -671,9 +677,9 @@ struct ExecuteOptions {
   ///
   /// **A placement only creates.** A file already at the path is one the scan
   /// did not pair with this `(rom_id, slot)` -- skipped, or another slot's -- and
-  /// the operation is declined with `kNoLocalSave` without touching it. The folder is
-  /// made when it is missing: Tico makes a system's folder the first time it
-  /// saves one, which for a first-time restore is after.
+  /// the operation is declined with `kNoLocalSave` without touching it. The
+  /// folder is made when it is missing: Tico makes a system's folder the first
+  /// time it saves one, which for a first-time restore is after.
   std::function<place::Placement(const SyncOperation&)> place;
 
   /// The emulator id a save written at `sd_path` -- the path `place` chose --

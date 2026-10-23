@@ -945,6 +945,25 @@ void Declined(rig::Checks& checks) {
     checks.Expect(!Said(changed.declines, changed.operations[2]), "and the taken path is not");
   }
 
+  // The local side changing in place is news too: the card played on, so what
+  // step 0 reported for it is new bytes -- which, on #232's path, is the
+  // conflict a refused upload resolves to, declined again.
+  {
+    std::vector<sync::ClientSaveState> played = reported;
+    played[0].content_hash = crypto::Md5Hex(card + "and an hour more\n");
+    sync::ExecuteOptions newer = options;
+    newer.reported = &played;
+    const sync::ExecutionReport moved_on =
+        sync::ExecutePlan(client, *files, token, plan, targets, newer);
+    checks.Expect(moved_on.declines.size() == 1 && moved_on.operations.size() == 3 &&
+                      Said(moved_on.declines, moved_on.operations[0]),
+                  "new bytes in the card are said again, and only the card's");
+    const sync::ExecutionReport same =
+        sync::ExecutePlan(client, *files, token, plan, targets, newer);
+    checks.Expect(same.declines.empty(), "once");
+    sync::ExecutePlan(client, *files, token, plan, targets, options);
+  }
+
   // A tick that met only one of them forgets the others: their saves left the
   // plan. One no plan asked about -- its rom in `unasked_roms` -- is kept.
   declines.EndTick({});

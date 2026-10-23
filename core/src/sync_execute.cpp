@@ -137,7 +137,9 @@ bool Obeyed(OperationOutcome outcome) {
 
 /// FNV-1a, 64-bit, continued from `hash`: what `Declines` keeps of a string.
 /// Its own rather than `std::hash` so the value means the same on every build.
-std::uint64_t Fnv(std::string_view text, std::uint64_t hash = 0xcbf29ce484222325ULL) {
+constexpr std::uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
+
+std::uint64_t Fnv(std::string_view text, std::uint64_t hash = kFnvOffset) {
   for (const char character : text) {
     hash ^= static_cast<unsigned char>(character);
     hash *= 0x100000001b3ULL;
@@ -150,6 +152,11 @@ std::uint64_t Fnv(std::string_view text, std::uint64_t hash = 0xcbf29ce484222325
 std::uint64_t FnvField(const std::optional<std::string>& field, std::uint64_t hash) {
   hash = Fnv(field.has_value() ? std::string_view("+") : std::string_view("-"), hash);
   return Fnv(std::string_view("\0", 1), Fnv(field.value_or(std::string()), hash));
+}
+
+/// What `Declines` keys a save's slot by.
+std::uint64_t SlotKey(const SyncOperation& operation) {
+  return FnvField(operation.slot, kFnvOffset);
 }
 
 /// The reason an exchange did not produce a usable answer, or empty when it did.
@@ -448,8 +455,9 @@ const SaveTarget* MatchTarget(const std::vector<SaveTarget>& targets,
   return FindByKey(targets, KeyOf(operation));
 }
 
-bool Declines::Note(const SyncOperation& operation, const OperationResult& declined) {
-  const std::uint64_t slot = FnvField(operation.slot, Fnv(""));
+bool Declines::Note(const SyncOperation& operation, const OperationResult& declined,
+                    const std::optional<std::string>& local_digest) {
+  const std::uint64_t slot = SlotKey(operation);
   std::uint64_t fingerprint = Fnv(ToString(declined.error));
   fingerprint = FnvField(operation.save_id.has_value()
                              ? std::optional<std::string>(std::to_string(*operation.save_id))
@@ -458,6 +466,7 @@ bool Declines::Note(const SyncOperation& operation, const OperationResult& decli
   fingerprint = FnvField(operation.server_updated_at, fingerprint);
   fingerprint = FnvField(operation.server_content_hash, fingerprint);
   fingerprint = FnvField(operation.emulator, fingerprint);
+  fingerprint = FnvField(local_digest, fingerprint);
   fingerprint = Fnv(declined.message, fingerprint);
 
   for (Entry& entry : entries_) {
@@ -478,7 +487,7 @@ bool Declines::Note(const SyncOperation& operation, const OperationResult& decli
 }
 
 void Declines::Forget(const SyncOperation& operation) {
-  const std::uint64_t slot = FnvField(operation.slot, Fnv(""));
+  const std::uint64_t slot = SlotKey(operation);
   entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
                                 [&](const Entry& entry) {
                                   return entry.rom_id == operation.rom_id && entry.slot == slot;
@@ -957,11 +966,11 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
       return Decline(operation, OperationError::kNoLocalSave,
-                  placement.reason.empty()
-                      ? "there is no local save for this (rom_id, slot) and nothing said where a "
-                        "new one should go"
-                      : "there is no local save for this (rom_id, slot), and none was placed: " +
-                            placement.reason);
+                     placement.reason.empty()
+                         ? "there is no local save for this (rom_id, slot) and nothing said "
+                           "where a new one should go"
+                         : "there is no local save for this (rom_id, slot), and none was "
+                           "placed: " + placement.reason);
     }
     // **A placement only creates.** "No local save matched" is not "nothing is
     // at that path": a save the scan skipped, or one it read in another slot,
@@ -975,8 +984,8 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     }
     if (io::Exists(resolved)) {
       return Decline(operation, OperationError::kNoLocalSave,
-                  "there is no local save for this (rom_id, slot), and " + sd_path +
-                      " is already a file this sync did not pair with it; it was not touched");
+                     "there is no local save for this (rom_id, slot), and " + sd_path +
+                         " is already a file this sync did not pair with it; it was not touched");
     }
     placed.rom_id = operation.rom_id;
     placed.slot = operation.slot;
@@ -1400,7 +1409,11 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
     // the plan obeyed for a save makes its next decline news. The line leads
     // with the word a user searches the log for, as the scan's skips do.
     if (result.outcome == OperationOutcome::kDeclined) {
-      if (options.declines == nullptr || options.declines->Note(operation, result)) {
+      const ClientSaveState* local =
+          options.reported != nullptr ? FindByKey(*options.reported, KeyOf(operation)) : nullptr;
+      if (options.declines == nullptr ||
+          options.declines->Note(operation, result,
+                                 local != nullptr ? local->content_hash : std::nullopt)) {
         report.declines.push_back("declined " + result.message);
       }
     } else if (options.declines != nullptr && Obeyed(result.outcome)) {
