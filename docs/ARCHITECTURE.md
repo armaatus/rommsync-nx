@@ -125,7 +125,9 @@ overlay.
   its backup stays on the card. The overlay reads it over `ListConflicts` and
   asks the sysmodule to put bytes back over `RestoreBackup`, which starts the
   copy on the worker and answers at once; the overlay polls `GetRestoreState`
-  for the outcome (M9-6, #209; `core/include/rommsync/conflict_log.hpp`). `[sync] conflict_show` hides the
+  for the outcome (M9-6, #209; `core/include/rommsync/conflict_log.hpp`). A
+  save conflict's Keep local is `KeepLocal`, the same restore, after which the
+  next upload of that save goes with `overwrite=true` (#249). `[sync] conflict_show` hides the
   *screen* and never the recording.
 - `sdmc:/config/rommsync/play.db` — play time this console recorded and has not
   yet handed to RomM (M7-4). `conflicts.db`'s format: a header line carrying the

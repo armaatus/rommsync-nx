@@ -163,8 +163,9 @@ Ultrahand overlay list.
   than sending them whole. See `docs/DEVELOPMENT.md#ipc`.
 - **The overlay writes no save either, and restores no backup.** M7-1 (#36)
   added the one screen with a button that replaces a file on the card, and the
-  button sends `RestoreBackup` -- a restore is a save overwrite that owes a
-  backup first (hard rule 2), so it lives on the service and never here.
+  button sends `RestoreBackup` -- or, for a save conflict's Keep local (#249),
+  `KeepLocal` -- a restore is a save overwrite that owes a backup first (hard
+  rule 2), so it lives on the service and never here.
   `ctest -R conflicts.overlay` greps this directory for `conflicts::Restore` and
   `BackUpFirst` rather than leaving it reviewed.
 - The sysmodule owns writes to `config.ini`; the overlay asks it to change

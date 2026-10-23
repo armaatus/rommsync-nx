@@ -381,8 +381,8 @@ emulator — is newer than this device's last sync of it. That is the protection
 shared slot needs: without it, a RetroArch or Argosy upload landing between this
 tick's negotiate and its upload would be silently superseded. So the guard is
 kept, and only a player's explicit **Keep local** for one save sends
-`overwrite=true` (`ExecuteOptions::keep_local`; #240 split the overlay choice
-that fills it into a later PR, so nothing fills it yet).
+`overwrite=true` (`ExecuteOptions::keep_local`, filled from the conflicts screen
+since #249 -- see [Keep local](#keep-local-249) below).
 
 On 5.4.0 the 409 is not only a race. Every other device's upload is a new row
 and becomes the head, this device has no sync row against it, and negotiate
@@ -421,6 +421,49 @@ bytes it replaces were progress never synced — and those are recorded as a
 conflict, with the guard's own sentence as the reason. `tick.newer_download` and
 `tick.newer_conflict` have a second device upload between negotiate and upload
 against the real RomM, under the crash replay.
+
+### Keep local (#249)
+
+A conflict is resolved **Keep server** as the tick runs, because nobody is there
+to ask: the head on the card, the local bytes under `.backup/` and archived on
+the server. The overlay's conflicts screen then offers each save conflict three
+answers -- **Keep server** (what already happened; it sends nothing), **Keep
+local**, and **Skip** (decide later; nothing changes). A replaced save, a
+deletion and a state keep the plain restore, which overrules nothing.
+
+Keep local is the player overruling the server, explicitly and for one save,
+and it is the only thing that ever sends `overwrite=true`:
+
+1. `KeepLocal` (IPC command 18) restores the conflict's backup onto the card
+   through `conflicts::KeepLocal` -- `Restore` itself, so the server's copy it
+   replaces is backed up first. An entry that is not a save conflict with a slot
+   is refused with `not_a_conflict` before anything is written.
+2. Once the bytes are on the card -- never before -- the sysmodule arms the
+   conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
+   `sync::kMaxKeepLocal`) and asks for a tick.
+3. That tick's upload of the save goes with `overwrite=true`. The plan that
+   answers the key **spends** it (`sync::SpendKeepLocal`): an upload that went or
+   was refused, or any other action -- the server asking for no upload. Only an
+   upload that never reached the server, or a plan that did not name the save,
+   keeps it for the next. So the choice is one upload's: a later upload of the
+   save meets the guard as every upload does.
+
+The choice is held in memory. A reboot before its tick forgets it, and the
+restored bytes then meet the guard like any upload: a 409 is resolved as a
+conflict, backed up and archived, and the player is asked again.
+
+**Over a lineage this console does not load (#236's question): yes.** With the
+`emulators` filter on, a slot head written by another core is never offered,
+but the guard and #232's unfiltered resolution do see it, so it can land on the
+card as a conflict. Keep local goes over it all the same -- the player saw that
+copy land and chose theirs -- and RomM keeps lineages apart: `overwrite=true`
+only lifts the guard and adds a version in this console's lineage, deleting no
+row (pruning is per lineage). The other core's save stays on the server as that
+core's newest, which is what RetroArch keeps being served for it.
+`engine.keep_local` proves it against 5.4.0: a `gpsp` head over the console's
+mGBA save, a second `gpsp` write after the conflict, exactly one upload with
+`overwrite=true`, both `gpsp` rows still there, and the next upload without the
+flag.
 
 ### The order every overwrite goes through
 

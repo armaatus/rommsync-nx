@@ -291,8 +291,10 @@ the file instead and stops offering it
 - **A save from another device reaches the Switch only for a game the card
   has** — a rom in one of the platform's `roms` folders, or one just downloaded
   from the overlay. The Switch is not offered saves for games it does not hold.
-- **No "keep mine" choice yet.** A conflict always puts the server's copy on the
-  card; your bytes are in the backup and on RomM, and the Conflicts screen puts
-  them back.
+- **A conflict puts the server's copy on the card first.** Your bytes are in
+  the backup and on RomM, and the Conflicts screen offers **Keep local**: your
+  bytes back on the card, and the next sync uploads them over the server's copy
+  (which RomM keeps as an older version). **Keep server** and **Skip** change
+  nothing.
 - **PSP saves are not synced**, and the Switch-only systems above sync with no
   other emulator, until #44 has captured real files to build adapters from.

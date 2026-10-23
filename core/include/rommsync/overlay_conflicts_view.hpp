@@ -53,6 +53,19 @@
 // overruled RomM. `RestoreMeaning()` is that sentence, published so the screen,
 // the confirmation and the test cannot each invent their own.
 //
+// ## Keep server, Keep local, Skip (#249)
+//
+// A **save conflict** is the one entry where the player can overrule it, and
+// its confirmation is a choice rather than a restore. The sync has already
+// resolved it Keep server -- nobody was there to ask -- so that is the default
+// and sends nothing. **Keep local** is the override: `KeepLocal` restores the
+// local bytes and the sysmodule sends the next upload of that save with
+// `overwrite=true`, the one route to it. **Skip** decides nothing and goes back
+// to the list; the choice stays on offer. Every other entry -- a replaced
+// save, a deletion, a state -- keeps the plain restore, which overrules
+// nothing. `ChoiceMeaning()` is each choice's sentence, for the reason
+// `RestoreMeaning()` is published.
+//
 // Hard rule 4 applies as it does to the rest of `core/`: no libnx header, no
 // libultrahand type. What crosses is strings and enums, so the renderer picks
 // the colour for a `Tone` and this file names none.
@@ -81,6 +94,8 @@ enum class ConflictsMode {
   /// than a flag because it is what makes the restore a *confirmed* press: the
   /// screen the user is looking at when they press A the second time is the one
   /// naming the file that is about to be replaced.
+  ///
+  /// For a save conflict, the Keep server / Keep local / Skip choice (#249).
   kConfirm,
 };
 const char* ToString(ConflictsMode mode);
@@ -147,6 +162,32 @@ struct ConflictListRow {
   bool selectable = true;
 };
 
+/// What a player can answer a save conflict with (#249), in the order the
+/// screen offers them.
+enum class ConflictChoice {
+  /// What the sync already did: the server's copy is on the card. The default,
+  /// and it sends nothing.
+  kKeepServer,
+
+  /// The override: this console's bytes back on the card, and the next upload
+  /// of them goes over the server's copy -- `KeepLocal`.
+  kKeepLocal,
+
+  /// Decide nothing now. Back to the list; the choice stays on offer.
+  kSkip,
+};
+const char* ToString(ConflictChoice choice);
+
+/// What a choice does, in the words the screen shows before it is pressed.
+std::string_view ChoiceMeaning(ConflictChoice choice);
+
+/// One drawn row of the choice.
+struct ConflictChoiceRow {
+  ConflictChoice choice = ConflictChoice::kKeepServer;
+  std::string label;    ///< "Keep server". Never empty.
+  std::string meaning;  ///< `ChoiceMeaning(choice)`. Never empty.
+};
+
 /// One line of the detail view: a label, a value, and how it should read.
 struct ConflictDetailLine {
   /// Never empty.
@@ -200,6 +241,18 @@ struct ConflictsView {
   /// would be the second place that decision lives. False on the list, on an
   /// entry that cannot be restored, and on one whose restore has already run.
   bool can_restore = false;
+
+  /// What A offers on this entry is the Keep server / Keep local / Skip choice
+  /// rather than a plain restore: a save conflict (#249). `kDetail` and
+  /// `kConfirm`.
+  bool keep_choice = false;
+
+  /// `kConfirm` on a save conflict: the three choices, in order. Empty
+  /// otherwise, which is a plain restore's confirmation.
+  std::vector<ConflictChoiceRow> choices;
+
+  /// Into `choices`, and `-1` exactly when `choices` is empty.
+  int choice = -1;
 };
 
 /// What a confirmation says the restore actually does.
@@ -227,14 +280,16 @@ class ConflictsModel {
  public:
   /// The one command the screen should send this frame.
   struct Command {
-    enum class Kind { kNone, kListConflicts, kRestore, kRestoreState };
+    /// `kKeepLocal` is #249's: a restore, asked for as Keep local, and polled
+    /// with `kRestoreState` like one.
+    enum class Kind { kNone, kListConflicts, kRestore, kRestoreState, kKeepLocal };
 
     Kind kind = Kind::kNone;
 
     /// `kListConflicts`.
     ipc::ConflictQuery query;
 
-    /// `kRestore`.
+    /// `kRestore` and `kKeepLocal`.
     std::int64_t entry_id = 0;
   };
 
@@ -293,10 +348,14 @@ class ConflictsModel {
   /// Move the selection by `delta` rows, clamped at both ends. Also what asks
   /// for the next page: the model fetches ahead of the selection rather than on
   /// a scroll event, so a screen that draws more rows at once still works.
+  ///
+  /// On a save conflict's choice it moves between the three choices instead.
   void MoveSelection(int delta);
 
   /// A. Open the selected entry, or -- from the confirmation -- send the
-  /// restore.
+  /// restore. From a save conflict's choice, do what the selected one says:
+  /// nothing for Keep server, `KeepLocal` for Keep local, and back to the list
+  /// for Skip.
   ///
   /// A press on a confirmation for an entry that is not `kReady` sends nothing
   /// and leaves the reason on the screen, which is `PredictSyncNow`'s shape: the
@@ -376,6 +435,20 @@ class ConflictsModel {
   /// What the last restore produced, and whether there is one to draw.
   bool restored_ = false;
   conflicts::RestoreReport last_restore_;
+
+  /// #249. `restore_wanted_` is a Keep local; `restoring_` is one; the
+  /// outcome in `last_restore_` was one.
+  bool keep_local_wanted_ = false;
+  bool keeping_local_ = false;
+  bool last_kept_local_ = false;
+
+  /// The selected choice on a save conflict's `kConfirm`, into
+  /// `ConflictChoice`'s order.
+  int choice_ = 0;
+
+  /// The entry Keep server was last chosen for, so its detail says so. Zero
+  /// when none.
+  std::int64_t kept_server_ = 0;
 
   /// What `Next()` last handed out, so `OnRefused` knows what was refused.
   Command::Kind issued_ = Command::Kind::kNone;

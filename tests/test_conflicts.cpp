@@ -1244,6 +1244,16 @@ ipc::ConflictRow Row(conflicts::Entry entry, bool backup_present) {
   return row;
 }
 
+/// A save a download replaced, which is what a plain restore is for. A save
+/// *conflict*'s confirmation is the Keep server / Keep local / Skip choice
+/// instead (#249), so the restore's own scenarios use one of these.
+conflicts::Entry ReplacedEntry(std::int64_t rom_id, std::string file_name) {
+  conflicts::Entry entry = SaveEntry(rom_id, std::move(file_name));
+  entry.event = conflicts::Event::kReplaced;
+  entry.reason.clear();
+  return entry;
+}
+
 /// A model with one restorable entry loaded, opened, confirmed and pressed --
 /// so its next `Next()` is the restore.
 overlay::ConflictsModel OneRestorable(std::int64_t entry_id) {
@@ -1252,7 +1262,7 @@ overlay::ConflictsModel OneRestorable(std::int64_t entry_id) {
   ipc::ConflictPage page;
   page.offset = 0;
   page.total = 1;
-  conflicts::Entry entry = SaveEntry(4, "polled.srm");
+  conflicts::Entry entry = ReplacedEntry(4, "polled.srm");
   entry.id = entry_id;
   page.entries = {Row(entry, true)};
   model.OnPage(page);
@@ -1290,7 +1300,7 @@ void Overlay(checks::Checks& c) {
     ipc::ConflictPage page;
     page.offset = 0;
     page.total = 3;
-    conflicts::Entry ready = SaveEntry(4, "game.srm");
+    conflicts::Entry ready = ReplacedEntry(4, "game.srm");
     ready.id = 3;
     conflicts::Entry gone = SaveEntry(5, "gone.srm");
     gone.id = 2;
@@ -1463,6 +1473,157 @@ void Overlay(checks::Checks& c) {
              "and nothing needs re-reading, because a restore changed no entry");
   }
 
+  // #249: a save conflict's confirmation is a choice -- Keep server, which
+  // is what the sync already did and the default; Keep local, which is the one
+  // command here that ends in `overwrite=true`; and Skip, which decides nothing.
+  {
+    const auto conflict_model = [](std::int64_t entry_id) {
+      overlay::ConflictsModel model;
+      model.Next();
+      ipc::ConflictPage page;
+      page.offset = 0;
+      page.total = 1;
+      conflicts::Entry entry = SaveEntry(4, "chosen.srm");
+      entry.id = entry_id;
+      page.entries = {Row(entry, true)};
+      model.OnPage(page);
+      return model;
+    };
+
+    overlay::ConflictsModel model = conflict_model(61);
+    model.Activate();
+    overlay::ConflictsView view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail && view.keep_choice,
+             "a save conflict's detail offers the choice rather than a plain restore");
+    c.Expect(view.can_restore, "while its backup is there to keep");
+    model.Activate();
+    view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kConfirm, "A opens the choice");
+    std::vector<overlay::ConflictChoice> offered;
+    for (const overlay::ConflictChoiceRow& row : view.choices) {
+      offered.push_back(row.choice);
+      c.Expect(!row.label.empty() && !row.meaning.empty(), "every choice has a label and a meaning");
+    }
+    c.Expect(offered == std::vector<overlay::ConflictChoice>{overlay::ConflictChoice::kKeepServer,
+                                                             overlay::ConflictChoice::kKeepLocal,
+                                                             overlay::ConflictChoice::kSkip},
+             "the three choices, in that order");
+    c.ExpectEq(view.choice, 0, "with Keep server -- what the sync already did -- selected");
+    c.Expect(view.hint.find(overlay::ChoiceMeaning(overlay::ConflictChoice::kKeepServer)) !=
+                 std::string::npos,
+             "and the hint says what the selected one means: " + view.hint);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "nothing is sent for opening it");
+
+    // Keep server needs no action: nothing is sent, and the screen says so.
+    model.Activate();
+    view = model.Render();
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "Keep server sends nothing -- the server's copy is already on the card");
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail &&
+                 view.headline.find("server's copy") != std::string::npos,
+             "and says the server's copy stays: " + view.headline);
+
+    // Keep local is the one that is sent.
+    model.Activate();
+    model.MoveSelection(1);
+    view = model.Render();
+    c.ExpectEq(view.choice, 1, "Down moves to Keep local");
+    c.Expect(view.hint.find(overlay::ChoiceMeaning(overlay::ConflictChoice::kKeepLocal)) !=
+                 std::string::npos,
+             "whose meaning is on the screen before the press: " + view.hint);
+    c.Expect(std::string(overlay::ChoiceMeaning(overlay::ConflictChoice::kKeepLocal))
+                     .find("over the server's copy") != std::string::npos,
+             "and says it goes over the server's copy -- the override, named");
+    model.MoveSelection(5);
+    c.ExpectEq(model.Render().choice, 2, "the choice is clamped at the last");
+    model.MoveSelection(-1);
+    model.Activate();
+    const overlay::ConflictsModel::Command keep = model.Next();
+    c.Expect(keep.kind == overlay::ConflictsModel::Command::Kind::kKeepLocal,
+             "Keep local sends KeepLocal, not a plain restore");
+    c.ExpectEq(keep.entry_id, std::int64_t{61}, "for the entry that was open");
+    model.OnRestoreState(Running(61));
+    view = model.Render();
+    c.Expect(view.headline.find("Keeping") != std::string::npos,
+             "a taken Keep local reads as one in progress: " + view.headline);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+             "and is polled like a restore");
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kRestored;
+    model.OnRestoreState(Done(61, report));
+    view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail &&
+                 view.headline.find("next sync") != std::string::npos,
+             "the outcome says the next sync puts it on the server: " + view.headline);
+    c.Expect(view.tone == overlay::Tone::kGood, "as a success");
+
+    // A refusal names itself.
+    {
+      overlay::ConflictsModel refused = conflict_model(62);
+      refused.Activate();
+      refused.Activate();
+      refused.MoveSelection(1);
+      refused.Activate();
+      refused.Next();
+      conflicts::RestoreReport not_one;
+      not_one.outcome = conflicts::RestoreOutcome::kNotAConflict;
+      refused.OnRestoreState(Done(62, not_one));
+      const overlay::ConflictsView drawn = refused.Render();
+      c.Expect(drawn.tone == overlay::Tone::kBad &&
+                   drawn.headline.find("only for a save conflict") != std::string::npos,
+               "a Keep local the sysmodule refused says why: " + drawn.headline);
+    }
+
+    // Slow is not gone, for Keep local as for a restore: asked about, never
+    // sent twice.
+    {
+      overlay::ConflictsModel slow = conflict_model(63);
+      slow.Activate();
+      slow.Activate();
+      slow.MoveSelection(1);
+      slow.Activate();
+      c.Expect(slow.Next().kind == overlay::ConflictsModel::Command::Kind::kKeepLocal,
+               "the Keep local goes out");
+      slow.OnUnreachable(overlay::Link::kNotResponding);
+      slow.OnLinkRestored();
+      c.Expect(slow.Next().kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+               "and one that ran out of budget is asked about, not pressed again");
+    }
+
+    // Skip decides nothing: back to the list, nothing sent.
+    {
+      overlay::ConflictsModel skip = conflict_model(64);
+      skip.Activate();
+      skip.Activate();
+      skip.MoveSelection(2);
+      skip.Activate();
+      c.Expect(skip.Render().mode == overlay::ConflictsMode::kList,
+               "Skip goes back to the list");
+      c.Expect(skip.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+               "and sends nothing");
+    }
+
+    // B on the choice is a cancel, and sends nothing either.
+    {
+      overlay::ConflictsModel back = conflict_model(65);
+      back.Activate();
+      back.Activate();
+      back.MoveSelection(1);
+      c.Expect(back.Back(), "B leaves the choice");
+      c.Expect(back.Render().mode == overlay::ConflictsMode::kDetail, "for the detail");
+      c.Expect(back.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+               "without sending the choice it was on");
+    }
+
+    // A replaced save is not a conflict: its confirmation is the plain restore.
+    {
+      overlay::ConflictsModel plain = OneRestorable(66);
+      c.Expect(plain.Render().choices.empty() && !plain.Render().keep_choice,
+               "a save a download replaced offers a restore, not the choice");
+    }
+  }
+
   // A refused page is a page that failed, and says so with a way out.
   {
     overlay::ConflictsModel model;
@@ -1549,7 +1710,7 @@ void Overlay(checks::Checks& c) {
     first.total = 12;
     first.has_more = true;
     for (int index = 0; index < ipc::kMaxConflictPage; ++index) {
-      conflicts::Entry entry = SaveEntry(4, "first-" + std::to_string(index) + ".srm");
+      conflicts::Entry entry = ReplacedEntry(4, "first-" + std::to_string(index) + ".srm");
       entry.id = 200 + index;
       first.entries.push_back(Row(entry, true));
     }
@@ -1565,7 +1726,7 @@ void Overlay(checks::Checks& c) {
     second.offset = ipc::kMaxConflictPage;
     second.total = 12;
     for (int index = 0; index < 4; ++index) {
-      conflicts::Entry entry = SaveEntry(5, "second-" + std::to_string(index) + ".srm");
+      conflicts::Entry entry = ReplacedEntry(5, "second-" + std::to_string(index) + ".srm");
       entry.id = 300 + index;
       second.entries.push_back(Row(entry, true));
     }
@@ -1602,7 +1763,7 @@ void Overlay(checks::Checks& c) {
     ipc::ConflictPage page;
     page.offset = 0;
     page.total = 1;
-    conflicts::Entry entry = SaveEntry(4, "vanished.srm");
+    conflicts::Entry entry = ReplacedEntry(4, "vanished.srm");
     entry.id = 44;
     page.entries = {Row(entry, true)};
     model.OnPage(page);
