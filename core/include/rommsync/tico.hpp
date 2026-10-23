@@ -94,6 +94,12 @@ std::vector<std::string> Roots(const config::Config& config);
 /// accounts there are). Shown by the overlay beside `config.ini`'s own
 /// diagnostics, which is where a user picks one. Empty while Tico's layout is
 /// the one before 0.8.0.
-std::vector<config::Diagnostic> Notes(const config::Config& config, fs::FileSystem& files);
+///
+/// `accounts`, when given, is set to every account found under any root's
+/// `users/`, sorted and deduplicated, at most `kMaxAccounts`: what the settings
+/// screen offers as the answers to `[tico] account` (#271). Out of the same
+/// listings the notes are made from, so a tick lists `users/` once.
+std::vector<config::Diagnostic> Notes(const config::Config& config, fs::FileSystem& files,
+                                      std::vector<std::string>* accounts = nullptr);
 
 }  // namespace rommsync::tico

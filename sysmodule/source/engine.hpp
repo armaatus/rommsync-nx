@@ -528,6 +528,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   const config::Config& config() const override;
   const std::vector<config::Diagnostic>& config_diagnostics() const override;
   std::vector<config::Diagnostic> source_notes() const override;
+  std::vector<std::string> tico_accounts() const override;
   ipc::EngineSnapshot Snapshot() const override;
   auth::PairingStatus pairing_status() const override;
 
@@ -1149,9 +1150,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// Keep what this tick's `retroarch.cfg` says for `source_notes()`, and what
   /// `tico` says about whose Tico saves are read (#231), logging them when they
-  /// differ from the last tick's. Takes `mutex_`.
+  /// differ from the last tick's, and the accounts it found for
+  /// `tico_accounts()` (#271). Takes `mutex_`.
   void NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
-                   std::vector<config::Diagnostic> tico);
+                   std::vector<config::Diagnostic> tico, std::vector<std::string> accounts);
 
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;
@@ -1212,6 +1214,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// itself" -- as the last tick read them (#230). Under `mutex_`: the sync
   /// thread replaces it and the IPC thread serves it.
   std::vector<config::Diagnostic> source_notes_;
+
+  /// The Tico accounts the last tick found under `users/` (#271). Under
+  /// `mutex_`, for `source_notes_`' reason.
+  std::vector<std::string> tico_accounts_;
 
   /// The download queue as the card holds it. Loaded once and written by every
   /// command that changes it, so the file and this never disagree by more than

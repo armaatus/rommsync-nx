@@ -19,8 +19,11 @@
 // (#30) -- and a row this screen changes in place carries the one assignment a
 // press sends there (`SettingsRow::change`). Since M10-23 (#264) that is the
 // settings that are a choice between a few words: `[sync] on_server_delete` and
-// `[sources]`. Every other row carries `editable` to mark where a value the
-// write path takes *could* become editable, and no way to change it.
+// `[sources]`; since M10-31 (#271) also `[sync] map_state_slots`, a platform's
+// `play_with`, and `[tico] account` -- a picker over the accounts the last tick
+// found, one row each. `[sync] slot` is shown and not offered, the reason in
+// its note. Every other row carries `editable` to mark where a value the write
+// path takes *could* become editable, and no way to change it.
 //
 // **A `Diagnostic` about `server.url` never quotes the URL** (`config.hpp`), and
 // this file may not helpfully re-add it: a URL is the one configured field that
@@ -132,6 +135,10 @@ struct SettingsRow {
   /// three words that are all safe to land on: a press that overshoots is
   /// undone by pressing again, and the sysmodule backs up before any save is
   /// removed whichever `on_server_delete` is in force.
+  ///
+  /// The one exception is `[tico] account` (#271), where a cycle would put
+  /// every account in force on the way to the one wanted: there each account
+  /// the card holds is a row, and its `change` names exactly it.
   std::optional<config::Assignment> change;
 
   /// What the A prompt says over this row -- "Open", "Set to Keep" -- or empty
@@ -143,10 +150,10 @@ struct SettingsRow {
   /// sysmodule owns writes is gone (docs/ARCHITECTURE.md).
   ///
   /// **The renderer deliberately draws nothing for it**, and that is not an
-  /// omission: every row that is not a `kNavigate` is editable, so a marker
-  /// would be on every configuration row on the screen and would separate
-  /// nothing. What separates the rows a press changes is the A prompt drawn
-  /// over them (`press_label`). The flag is the model saying which keys
+  /// omission: every row that is not a `kNavigate` is editable but `[sync]
+  /// slot` (#271), so a marker would be on nearly every configuration row on
+  /// the screen and would separate nothing. What separates the rows a press
+  /// changes is the A prompt drawn over them (`press_label`). The flag is the model saying which keys
   /// `config::ApplyEdit` accepts, held by `overlay.settings` rather than by a
   /// screenshot.
   bool editable = false;

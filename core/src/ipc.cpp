@@ -13,6 +13,7 @@
 #include "rommsync/text.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/sync.hpp"
+#include "rommsync/tico.hpp"
 
 namespace rommsync::ipc {
 namespace {
@@ -415,6 +416,13 @@ std::string EncodePlatformMap(const config::Config& config) {
     out += json::QuoteArray(folders.roms);
     AppendPathArray(&out, "saves", folders.saves);
     AppendPathArray(&out, "states", folders.states);
+    // The platform's own `play_with` line, or "" for none -- not `PlayWithFor`,
+    // whose default the overlay derives from the same table this side would.
+    // Carried in the map rather than beside it so it is dropped with it: a row
+    // for it is drawn in the platform's section and nowhere else (#271).
+    const auto play_with = config.play_with.find(slug);
+    AppendText(&out, "play_with",
+               play_with == config.play_with.end() ? "" : config::ToString(play_with->second));
     out += '}';
   }
   out += '}';
@@ -438,6 +446,17 @@ bool ReadPlatformMap(const json::Value& object, config::Config* config, json::Er
         !ReadPathArray(member.value, "saves", &folders.saves, error) ||
         !ReadPathArray(member.value, "states", &folders.states, error)) {
       return false;
+    }
+    std::string play_with;
+    if (!ReadText(member.value, "play_with", &play_with, error)) {
+      return false;
+    }
+    if (play_with == config::ToString(config::PlayWith::kTico)) {
+      config->play_with[member.key] = config::PlayWith::kTico;
+    } else if (play_with == config::ToString(config::PlayWith::kRetroArch)) {
+      config->play_with[member.key] = config::PlayWith::kRetroArch;
+    } else if (!play_with.empty()) {
+      return Fail(error, "play_with", "is not tico, retroarch or empty: " + play_with);
     }
     config->platforms.emplace(member.key, std::move(folders));
   }
@@ -853,6 +872,15 @@ std::string EncodeConfigView(const ConfigView& view) {
   AppendBool(&out, "states", view.config.sync.states);
   AppendBool(&out, "conflict_show", view.config.sync.conflict_show);
   AppendText(&out, "on_server_delete", config::ToString(view.config.sync.on_server_delete));
+  AppendText(&out, "slot", view.config.sync.slot);
+  AppendBool(&out, "map_state_slots", view.config.sync.map_state_slots);
+  out += '}';
+
+  AppendKey(&out, "tico");
+  out += '{';
+  AppendText(&out, "account", config::AccountText(view.config.tico), /*first=*/true);
+  AppendKey(&out, "accounts");
+  out += json::QuoteArray(view.tico_accounts);
   out += '}';
 
   AppendKey(&out, "sources");
@@ -899,8 +927,47 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
             !ReadBool(*sync_section, "states", &out->config.sync.states, error) ||
             !ReadBool(*sync_section, "conflict_show", &out->config.sync.conflict_show, error) ||
             !ReadEnum(*sync_section, "on_server_delete", kAllOnServerDeletes, config::ToString,
-                      "remove or keep", &out->config.sync.on_server_delete, error)) {
+                      "remove or keep", &out->config.sync.on_server_delete, error) ||
+            !ReadText(*sync_section, "slot", &out->config.sync.slot, error) ||
+            !ReadBool(*sync_section, "map_state_slots", &out->config.sync.map_state_slots,
+                      error)) {
           return;
+        }
+        // The rule `config.ini` holds a slot to, so a slot drawn on the
+        // settings screen is one the file could have said (#271).
+        std::string why;
+        if (!config::ValidSlot(out->config.sync.slot, &why)) {
+          Fail(error, "slot", "is not a slot config.ini could hold");
+          return;
+        }
+
+        const json::Value* tico_section = ReadObject(object, "tico", error);
+        std::string account;
+        if (tico_section == nullptr || !ReadText(*tico_section, "account", &account, error)) {
+          return;
+        }
+        if (account == "legacy") {
+          out->config.tico.account = config::TicoAccount::kLegacy;
+        } else if (config::IsTicoUid(account)) {
+          out->config.tico.account = config::TicoAccount::kNamed;
+          out->config.tico.uid = account;
+        } else if (account != "auto") {
+          Fail(error, "account", "is not auto, legacy or an account's id");
+          return;
+        }
+        // Each one becomes the value of a press, so each has to be one
+        // `[tico] account` takes.
+        const json::Value* accounts =
+            ReadArray(*tico_section, "accounts", tico::kMaxAccounts, error);
+        if (accounts == nullptr) {
+          return;
+        }
+        for (const json::Value& uid : accounts->elements()) {
+          if (!uid.is_string() || !config::IsTicoUid(uid.string())) {
+            Fail(error, "accounts", "holds something that is not an account's id");
+            return;
+          }
+          out->tico_accounts.push_back(uid.string());
         }
 
         const json::Value* sources = ReadObject(object, "sources", error);

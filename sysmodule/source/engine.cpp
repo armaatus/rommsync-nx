@@ -511,8 +511,18 @@ std::vector<config::Diagnostic> SdEngine::source_notes() const {
   return source_notes_;
 }
 
+std::vector<std::string> SdEngine::tico_accounts() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return tico_accounts_;
+}
+
 void SdEngine::NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
-                           std::vector<config::Diagnostic> tico) {
+                           std::vector<config::Diagnostic> tico,
+                           std::vector<std::string> accounts) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tico_accounts_ = std::move(accounts);
+  }
   std::vector<config::Diagnostic> notes = loaded.diagnostics;
   for (config::Diagnostic& note : retroarch::Notes(config, loaded.value)) {
     notes.push_back(std::move(note));
@@ -2343,7 +2353,9 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   found.retroarch = retroarch::Load(files.Resolve(retroarch::kConfigSdPath));
   // Tico's layout is read off the card the same way, every tick: a Tico
   // update or a new account changes it without touching config.ini.
-  NoteSources(config, found.retroarch, tico::Notes(config, files));
+  std::vector<std::string> accounts;
+  std::vector<config::Diagnostic> tico_notes = tico::Notes(config, files, &accounts);
+  NoteSources(config, found.retroarch, std::move(tico_notes), std::move(accounts));
   found.scanned =
       scan::ScanSaves(config, found.retroarch.value, library.index, files, found.loaded.value);
   // One line per file the scan would not report, at the spelling the scanner

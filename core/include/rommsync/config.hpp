@@ -239,6 +239,10 @@ struct TicoConfig {
   std::string uid;
 };
 
+/// `auto`, `legacy` or the named account's id: `[tico] account` as `config.ini`
+/// spells it, which is also what an edit stores (#271).
+std::string AccountText(const TicoConfig& tico);
+
 /// `[platform.<slug>] play_with`: the emulator a platform is played in on this
 /// console, which decides where a save or a state the card has never held is
 /// written (#237, `place::Placer`). A file already on the card stays where it

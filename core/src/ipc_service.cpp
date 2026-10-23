@@ -26,6 +26,7 @@
 #include "rommsync/text.hpp"
 #include "rommsync/pairing.hpp"
 #include "rommsync/server_capabilities.hpp"
+#include "rommsync/tico.hpp"
 
 namespace rommsync::ipc {
 namespace {
@@ -119,6 +120,12 @@ Status ServiceCore::GetStatus() const {
 ConfigView ServiceCore::GetConfig() const {
   ConfigView view;
   view.config = engine_.config();
+  view.tico_accounts = engine_.tico_accounts();
+  // Bounded again here, for `GetStatus`'s reason: this command may not fail,
+  // whatever an `Engine` hands it, and the decoder refuses a longer list.
+  if (view.tico_accounts.size() > tico::kMaxAccounts) {
+    view.tico_accounts.resize(tico::kMaxAccounts);
+  }
 
   std::vector<config::Diagnostic> diagnostics = engine_.config_diagnostics();
   // After the file's own: what is wrong with `config.ini` is what this screen is

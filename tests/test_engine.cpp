@@ -3784,6 +3784,21 @@ int TicoAccounts(http::HttpClient& client, const std::string& base) {
       std::chrono::seconds{120});
   c.Expect(ticked.last_sync_result != ipc::SyncResult::kNever, "and it ran");
   c.Expect(warned(), "the settings screen names both accounts and asks for one");
+  // ...and carries them as the answers its picker offers (#271).
+  const std::vector<std::string> offered = console.Configured().tico_accounts;
+  c.Expect(offered == std::vector<std::string>{kAccounts[0], kAccounts[1]},
+           "GetConfig carries both accounts, sorted, for the settings screen to offer");
+
+  // The picker's press: one of them named through the same edit `SetConfig`
+  // sends. The warning goes, and the accounts are still listed, so the choice
+  // can be changed again from the console.
+  ipc::ConfigEdit pick;
+  pick.assignments.push_back({"tico", "account", kAccounts[1], false});
+  std::vector<config::Diagnostic> notes;
+  c.Expect(console.engine.ApplyConfigEdit(pick, &notes) == ipc::Error::kOk,
+           "naming one account is an edit the sysmodule takes");
+  c.ExpectEq(config::AccountText(console.Configured().config.tico), kAccounts[1],
+             "and it is the account in force");
   return c.failures();
 }
 

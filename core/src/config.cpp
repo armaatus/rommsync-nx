@@ -854,6 +854,18 @@ const char* ToString(PlayWith play_with) {
   return "tico";
 }
 
+std::string AccountText(const TicoConfig& tico) {
+  switch (tico.account) {
+    case TicoAccount::kAuto:
+      break;
+    case TicoAccount::kLegacy:
+      return "legacy";
+    case TicoAccount::kNamed:
+      return tico.uid;
+  }
+  return "auto";
+}
+
 const char* ToString(OnServerDelete on_server_delete) {
   switch (on_server_delete) {
     case OnServerDelete::kRemove:

@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "rommsync/auth.hpp"
@@ -42,6 +43,9 @@ class FakeEngine : public ipc::Engine {
   /// What the last tick said about the emulators' folders (#230).
   std::vector<config::Diagnostic> sources;
 
+  /// The Tico accounts the last tick found under `users/` (#271).
+  std::vector<std::string> accounts;
+
   bool sync_accepted = true;
   int sync_requests = 0;
 
@@ -64,6 +68,7 @@ class FakeEngine : public ipc::Engine {
   const config::Config& config() const override { return settings; }
   const std::vector<config::Diagnostic>& config_diagnostics() const override { return notes; }
   std::vector<config::Diagnostic> source_notes() const override { return sources; }
+  std::vector<std::string> tico_accounts() const override { return accounts; }
   ipc::EngineSnapshot Snapshot() const override { return snapshot; }
   auth::PairingStatus pairing_status() const override { return pairing; }
 

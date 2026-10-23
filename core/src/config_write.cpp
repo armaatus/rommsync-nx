@@ -319,6 +319,8 @@ enum class ValueKind {
   kEmulator,
   kOnServerDelete,  ///< `[sync] on_server_delete`: remove | keep
   kSourceMode,      ///< `[sources] retroarch`: auto | on | off
+  kTicoAccount,     ///< `[tico] account`: auto | legacy | an account's 32-digit id
+  kPlayWith,        ///< `[platform.<slug>] play_with`: tico | retroarch | empty
 };
 
 const bool* BoolField(const Config& config, const std::string& section, const std::string& key);
@@ -336,14 +338,23 @@ ValueKind KindOf(const std::string& section, const std::string& key) {
   if (section == "sources" && key == "retroarch") {
     return ValueKind::kSourceMode;
   }
-  // Still refused, each for a reason (#264): `[sync] slot` moves every save to
-  // a new slot on the server, and `[tico]` names a Switch account by a 32-digit
-  // id the overlay has no way to pick -- both are a decision taken at a PC with
-  // docs/CONFIG.md open, not a switch flipped on a console. `play_with` and a
-  // platform's `enabled` are not M10-23's and have no row to send them from.
+  // Taken since #271, which gave the settings screen a picker over the account
+  // folders the last tick found under `users/`: the overlay sends one of those,
+  // never an id typed in.
+  if (section == "tico" && key == "account") {
+    return ValueKind::kTicoAccount;
+  }
+  // Still refused, on purpose: `[sync] slot` moves every save to a new slot on
+  // the server and leaves the old one behind -- a decision taken at a PC with
+  // docs/CONFIG.md open, not a value stepped through on a console (#264, #271).
+  // The settings screen shows it and says so. A platform's `enabled` has no row
+  // to send it from.
   if (section.rfind("platform.", 0) == 0) {
     if (key == "emulator") {
       return ValueKind::kEmulator;
+    }
+    if (key == "play_with") {
+      return ValueKind::kPlayWith;
     }
     return key == "roms" || key == "saves" || key == "states" ? ValueKind::kPathList
                                                               : ValueKind::kUnknown;
@@ -580,6 +591,31 @@ bool NormalizeValue(const Resolved& target, std::string_view raw, std::string* o
       *out = config::ToString(flag ? SourceMode::kOn : SourceMode::kOff);
       return true;
     }
+    case ValueKind::kTicoAccount: {
+      // The parser's three spellings, lowercased: the id becomes a folder name
+      // under `users/`, and Tico writes its folders lowercase.
+      const std::string word = LowerAscii(Trim(raw));
+      if (word != "auto" && word != "legacy" && !IsTicoUid(word)) {
+        Complain(diagnostics, Severity::kError, target.section, target.key,
+                 "expected auto, legacy or an account's 32-digit id, got '" +
+                     Redact(Trim(raw)) + "'");
+        return false;
+      }
+      *out = word;
+      return true;
+    }
+    case ValueKind::kPlayWith: {
+      // Empty is a value here, the way `emulator =` is: it puts the default back.
+      const std::string word = LowerAscii(Trim(raw));
+      if (!word.empty() && word != config::ToString(PlayWith::kTico) &&
+          word != config::ToString(PlayWith::kRetroArch)) {
+        Complain(diagnostics, Severity::kError, target.section, target.key,
+                 "expected tico or retroarch, got '" + Redact(Trim(raw)) + "'");
+        return false;
+      }
+      *out = word;
+      return true;
+    }
     case ValueKind::kUnknown:
       break;
   }
@@ -607,6 +643,14 @@ bool ReadsBackAs(const Config& config, const Resolved& target) {
       return config::ToString(config.sync.on_server_delete) == target.value;
     case ValueKind::kSourceMode:
       return config::ToString(config.sources.retroarch) == target.value;
+    case ValueKind::kTicoAccount:
+      return AccountText(config.tico) == target.value;
+    case ValueKind::kPlayWith: {
+      const auto found = config.play_with.find(
+          std::string_view(target.section).substr(std::string_view("platform.").size()));
+      return found == config.play_with.end() ? target.value.empty()
+                                             : config::ToString(found->second) == target.value;
+    }
     case ValueKind::kUnknown:
       break;
   }

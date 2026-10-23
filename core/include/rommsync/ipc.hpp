@@ -156,7 +156,12 @@ inline constexpr const char* kServiceName = "rommsync";
 /// `conflicts::RestoreOutcome::kChangedSinceBackup`: a restore that stood down
 /// over a file written after its backup, which a v9 overlay would refuse to
 /// decode in a `RestoreState` for the same reason.
-inline constexpr std::uint32_t kVersion = 10;
+///
+/// **11** since M10-31 (#271), which added `slot` and `map_state_slots` to
+/// `ConfigView`'s `sync`, a `tico` object beside it, and `play_with` to each
+/// platform of the folder map -- required fields, so a v11 overlay reading a
+/// v10 sysmodule's `GetConfig` fails to decode it.
+inline constexpr std::uint32_t kVersion = 11;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -508,6 +513,16 @@ struct ConfigView {
   /// and a `kNotice`. The overlay says "too large to show here"; it does not
   /// render an empty map as though the user had configured none.
   bool platforms_truncated = false;
+
+  /// The Tico accounts the last tick found under a `users/` folder, sorted and
+  /// lowercase, at most `tico::kMaxAccounts` (#271). Not a setting: what the
+  /// card holds, so the settings screen can offer them as the answers to
+  /// `[tico] account` -- the one question it asks that the player could
+  /// otherwise answer only from a PC. Empty before the first tick, and under
+  /// `account = legacy`, for which `tico::Resolve` never lists `users/`.
+  /// **Not whose saves are read**: that is `tico::Resolve`'s per-root answer,
+  /// and arrives as `tico::Notes`' line among `diagnostics`.
+  std::vector<std::string> tico_accounts;
 };
 
 /// The longest `server.url` this contract carries.
@@ -1149,6 +1164,11 @@ class Engine {
   /// it. Empty by default: an engine that never reads `retroarch.cfg` has
   /// nothing to say about it.
   virtual std::vector<config::Diagnostic> source_notes() const { return {}; }
+
+  /// The Tico accounts the last tick found under `users/` -- `ConfigView`'s
+  /// `tico_accounts`, served by `GetConfig` (#271). A value for
+  /// `source_notes()`'s reason, and empty by default for the same one.
+  virtual std::vector<std::string> tico_accounts() const { return {}; }
 
   virtual EngineSnapshot Snapshot() const = 0;
 

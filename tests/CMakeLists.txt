@@ -252,6 +252,7 @@ set(CONFIG_WRITE_SCENARIOS
   removes    # `remove` drops every occurrence and the default comes back
   emulator   # the [platform.x] emulator override, and the folders it must not unmap
   sources    # [sync] on_server_delete and [sources], the overlay's M10 settings (#264)
+  tico       # [tico] account and play_with from the overlay; [sync] slot still refused (#271)
 )
 foreach(scenario IN LISTS CONFIG_WRITE_SCENARIOS)
   add_test(NAME config.write_${scenario} COMMAND test_config_write ${scenario})
