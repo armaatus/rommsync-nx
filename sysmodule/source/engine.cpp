@@ -100,6 +100,10 @@ std::string SdEngine::PathTo(const char* file_name) const { return config_dir_ +
 /// whole `Config` on the IPC thread (`ConfigSnapshot`).
 SdEngine::SdEngine() : lists_([this] { return ConfigSnapshot(); }, queue_) {}
 
+const Clock SdEngine::kRealClock;
+
+void SdEngine::UseClock(const Clock* clock) { clock_ = clock != nullptr ? clock : &kRealClock; }
+
 SdEngine::~SdEngine() {
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1105,11 +1109,12 @@ void SdEngine::RunWorker() {
       // command and costs nothing in between (scheduler.hpp).
       wake_.wait(lock, woken);
     } else if (decision.parked) {
-      wake_.wait_for(lock, drained.retry_in, woken);
+      wake_.wait_for(lock, clock_->RealFor(drained.retry_in), woken);
     } else {
       // Whichever is sooner. A parked schedule with a drain backing off still
       // has a deadline, and a drain with none must not stretch the tick's.
-      wake_.wait_for(lock, std::min(decision.sleep_for, drained.retry_in), woken);
+      wake_.wait_for(lock, clock_->RealFor(std::min(decision.sleep_for, drained.retry_in)),
+                     woken);
     }
   }
   // Nothing waits for a worker that has left. A `Quiesce` racing the destructor
@@ -1120,7 +1125,7 @@ void SdEngine::RunWorker() {
 }
 
 SdEngine::DrainStep SdEngine::RunOneDrain() {
-  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  const std::chrono::steady_clock::time_point now = clock_->Steady();
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stopping_ || suspended_) {
@@ -1275,7 +1280,7 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
       download_backoff_ = download_backoff_ == std::chrono::milliseconds{0}
                               ? kDownloadRetryBackoff
                               : std::min(download_backoff_ * 2, kMaxDownloadRetryBackoff);
-      download_due_ = std::chrono::steady_clock::now() + download_backoff_;
+      download_due_ = clock_->Steady() + download_backoff_;
       break;
   }
   return {true, download_backoff_};
@@ -1283,7 +1288,7 @@ SdEngine::DrainStep SdEngine::RunOneDrain() {
 
 void SdEngine::AwaitBackoff(std::chrono::milliseconds delay) {
   std::unique_lock<std::mutex> lock(mutex_);
-  wake_.wait_for(lock, delay, [this] {
+  wake_.wait_for(lock, clock_->RealFor(delay), [this] {
     return stopping_ || suspended_ ||
            (download_cancel_ != nullptr && download_cancel_->canceled());
   });

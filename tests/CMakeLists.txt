@@ -2620,12 +2620,28 @@ endforeach()
 # shared fixture device and download its roms.
 add_test(NAME alloc.steady COMMAND test_heap_steady steady 16)
 add_test(NAME soak.smoke COMMAND test_heap_steady soak 4)
-foreach(name alloc.steady soak.smoke)
+# M9-23 (#250): the schedule on its own clock, run 4000x fast -- six hours of it
+# per stretch, five stretches and an hour between, ~30 s real. The nightly runs
+# two days per stretch.
+add_test(NAME soak.schedule COMMAND test_heap_steady schedule 6)
+foreach(name alloc.steady soak.smoke soak.schedule)
   if(NOT ROMMSYNC_REQUIRE_RIG)
     set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   set_tests_properties(${name} PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 endforeach()
+# `soak.smoke` writes the numbers the nightly tracks (#250), and `soak.bench`
+# holds them to benchmark-action's shape, so a malformed file is found on a push
+# and not on the first night the action refuses it.
+set(SOAK_BENCH_JSON "${CMAKE_CURRENT_BINARY_DIR}/soak-bench.json")
+set_tests_properties(soak.smoke PROPERTIES
+  ENVIRONMENT "ROMMSYNC_BENCH_JSON=${SOAK_BENCH_JSON}"
+  FIXTURES_SETUP soak_bench)
+add_test(NAME soak.bench COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_soak.sh"
+         bench "${SOAK_BENCH_JSON}")
+set_tests_properties(soak.bench PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+                     FIXTURES_REQUIRED soak_bench
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
 
 # --- M9-23 (#250): an allocation failing at every point --------------------------
 # curl's OOM injection over a tick and a rom download: count the allocations,
@@ -2670,7 +2686,7 @@ endforeach()
 # own bound on a GitHub API call that never answers (#256). None needs a network
 # or a token, so none skips.
 set(SOAK_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_soak.sh")
-foreach(phase workflow fresh bounded)
+foreach(phase workflow fresh bounded tracked)
   add_test(NAME soak.${phase} COMMAND "${BASH_PROGRAM}" "${SOAK_TEST}" ${phase})
   set_tests_properties(soak.${phase} PROPERTIES TIMEOUT 60)
 endforeach()

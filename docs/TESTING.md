@@ -977,6 +977,37 @@ ctest --test-dir build --output-on-failure
   and replayed in every child, because a tick that completed would change the
   next one's plan and allocation *N* has to be the same allocation every run.
   A tick is a few hundred allocations, so every one is failed on every push.
+- **The schedule on its own clock, run fast** (M9-23, #250). The soak asks for
+  each tick; `soak.schedule` asks for none. `SdEngine::UseClock` gives the
+  engine a `sysmodule::Clock` -- the scheduler's steady and wall clocks, and how
+  long the worker really blocks for a span of them -- and the test's
+  `FastClock` runs both 4000 times fast with the wall clock movable on its own,
+  which is libfaketime's `FAKETIME_DONT_FAKE_MONOTONIC` without a preload: a
+  thirty-minute interval is 450 ms. The engine is configured as a console is,
+  a thirty-minute interval and a boot tick, and run for stretches of that
+  clock: online, where it ticks about twice an hour and every tick completes;
+  offline, with the proxy resetting every connection, where the backoff climbs
+  to its cap and the schedule neither gives up nor storms, then completes
+  within a capped backoff of the network coming back; the wall clock a year
+  ahead and then two years back, where it neither catches up a year of ticks
+  nor stalls waiting for the wall clock -- monotonic drives; and a token the
+  server answers 401 to, where the gate blocks within its three rejections and
+  from then on no request reaches the server while `auth.rejected` is still
+  said once an interval. The server's own clock is real, so a token's expiry is
+  the server refusing it, which is all a client ever sees of one. The
+  transport's timeouts are real time too, so a tick costs minutes of the fast
+  clock -- which is why the online bound is "about twice an hour, and never
+  more", not exactly twice. `ctest` runs six hours a stretch (~30 s); the
+  nightly soak runs two days a stretch.
+- **The numbers, over time** (#250). The nightly soak writes what it held
+  between rounds, a round's peak over that and its allocations
+  (`ROMMSYNC_BENCH_JSON`), measures the linked image in the pinned devkitPro
+  image (`IMAGE_BUDGET_JSON` to `scripts/image-budget.sh`), and hands both to
+  benchmark-action, which keeps them on the `benchmarks` branch -- made by the
+  workflow on its first night if it is not there. Tracked, not gated: each
+  number has its gate already, and an alert (10% on the soak, 2% on the image)
+  goes to the run's summary. `soak.tracked` holds the workflow to that, and
+  `soak.bench` holds the file `soak.smoke` writes to benchmark-action's shape.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two

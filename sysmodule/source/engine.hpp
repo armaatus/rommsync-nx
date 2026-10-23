@@ -241,6 +241,38 @@ struct PairingBackend {
 /// holding. So the worker never calls it: it takes a `ConfigSnapshot` at an
 /// operation boundary and reads it to the end, never swapped mid-sync or
 /// mid-download (M7-2, #37).
+/// The engine's clocks, and how long its worker really blocks to see a span of
+/// them pass (#250).
+///
+/// **The console's is the default and the only one it uses**: `steady_clock`,
+/// `system_clock`, and a wait that is the span itself. What this exists for is
+/// the soak, which has to see days of the schedule -- an interval of thirty
+/// minutes, a backoff that climbs to its cap over a day offline, a token that
+/// stops working on day two -- in minutes of a test run. A clock that runs a
+/// thousand times fast has to make the *waits* a thousand times shorter too, or
+/// the worker sleeps thirty real minutes on a fast clock's say-so; so the wait
+/// is part of the interface rather than something the worker works out.
+///
+/// What it does **not** reach: the transport's own timeouts, which are real
+/// time on a real socket; the pairing poll, which `pairing.hpp` clocks itself;
+/// the boot-time network wait; and `Quiesce`'s budget, which PSC enforces in
+/// real time whatever this says. A save's `updated_at` comes from
+/// `ExecuteOptions::now`, as it always has.
+class Clock {
+ public:
+  virtual ~Clock() = default;
+  virtual std::chrono::steady_clock::time_point Steady() const {
+    return std::chrono::steady_clock::now();
+  }
+  virtual std::chrono::system_clock::time_point Wall() const {
+    return std::chrono::system_clock::now();
+  }
+  /// The real time to block for `span` of `Steady()` to pass.
+  virtual std::chrono::milliseconds RealFor(std::chrono::milliseconds span) const {
+    return span;
+  }
+};
+
 class SdEngine : public ipc::Engine, public power::Sink {
  public:
   SdEngine();
@@ -405,6 +437,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// It is also what a **tick** reads and writes every save through, so a
   /// console with none never gets past the scan.
   void UseCard(fs::FileSystem* filesystem);
+
+  /// The clock the schedule, the worker's waits and the drain's backoff run on
+  /// (`Clock`). **A test seam**: `main.cpp` never calls it, and null puts the
+  /// real one back. Before `StartWorker`, because the worker reads it without a
+  /// lock; it must outlive the engine.
+  void UseClock(const Clock* clock);
 
   /// The oldest RomM a tick will sync with. `server::kMinimumVersion` unless
   /// this is called, and the console never calls it (M10-2, #228).
@@ -1242,7 +1280,14 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// When a tick may run at all, and how long to wait after one that did not
   /// work (M7-2, #37). Driven only by the worker thread and by the commands that
   /// wake it, both under `mutex_`.
-  sync::Scheduler scheduler_;
+  sync::Scheduler scheduler_{sync::SchedulerConfig{}, [this] { return clock_->Steady(); },
+                             [this] { return clock_->Wall(); }};
+
+  /// What `scheduler_`, the worker's waits and `download_due_` read the time
+  /// from (`UseClock`). Never null. Read only at call time, so its place among
+  /// the members does not matter to `scheduler_` above.
+  const Clock* clock_ = &kRealClock;
+  static const Clock kRealClock;
 
   /// The tick in flight, or null. Passed to every stage of one, so a shutdown or
   /// a sleep ends it at an operation boundary rather than mid-write

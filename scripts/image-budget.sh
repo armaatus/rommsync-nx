@@ -187,6 +187,21 @@ report() {
   echo "| overlay \`.ovl\` (file) | $ovl_bytes | $OVL_BUDGET |"
 }
 report
+# The same numbers as benchmark-action's `customSmallerIsBetter` JSON, for the
+# nightly soak to track over time (#250): growth that stays under every ceiling
+# above is still growth, and it is visible there before it trips one. An
+# environment variable rather than a flag, because the `switch-build` job may
+# pass this script none (`switch.ci_requires_artifacts`).
+if [ -n "${IMAGE_BUDGET_JSON:-}" ]; then
+  {
+    echo "["
+    echo "  {\"name\": \"sysmodule mapped image\", \"unit\": \"bytes\", \"value\": $mapped, \"extra\": \"budget $IMAGE_BUDGET\"},"
+    echo "  {\"name\": \"sysmodule .bss\", \"unit\": \"bytes\", \"value\": $bss, \"extra\": \"heap $heap\"},"
+    echo "  {\"name\": \"sysmodule .text\", \"unit\": \"bytes\", \"value\": $text, \"extra\": \"ceiling $TEXT_CEILING\"},"
+    echo "  {\"name\": \"overlay .ovl\", \"unit\": \"bytes\", \"value\": $ovl_bytes, \"extra\": \"budget $OVL_BUDGET\"}"
+    echo "]"
+  } >"$IMAGE_BUDGET_JSON"
+fi
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   { echo "### sys-rommsync image budget"; echo; report; } >>"$GITHUB_STEP_SUMMARY"
 fi

@@ -15,6 +15,18 @@ name: soak
 # A schedule can stop without a word -- GitHub disables one after 60 days of
 # repository inactivity -- so nothing trusts it: ci.yml's `soak-fresh` job goes
 # red on main when this has not passed for three days (scripts/soak-fresh.sh).
+#
+# Two more things run here since #250, because both want nights rather than
+# pushes:
+#
+#   * the schedule on its own clock, 4000x fast (`test_heap_steady schedule`):
+#     two days of each of online, offline under a backoff, the wall clock a year
+#     ahead and two back, and a token the server stops accepting -- the
+#     scheduler deciding every tick, where the soak above asks for each one;
+#   * the numbers, kept from one night to the next by benchmark-action on the
+#     `benchmarks` branch: what the soak holds between rounds and what the
+#     linked image maps. A floor or an image that creeps up a little each PR
+#     never trips a ceiling in any one run; the trend is where it shows.
 
 on:
   schedule:
@@ -42,6 +54,10 @@ jobs:
   soak:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # Write, for the one thing that writes: benchmark-action pushing the night's
+    # numbers to the `benchmarks` branch. Nothing else here pushes anything.
+    permissions:
+      contents: write
     env:
       ROUNDS: ${{ github.event.inputs.rounds || '1000' }}
     steps:
@@ -96,8 +112,15 @@ jobs:
       - name: Soak
         run: |
           set -o pipefail
-          ROMMSYNC_ALLOC_REPORT="$PWD/soak.csv" ./build/tests/test_heap_steady soak "$ROUNDS" \
-            | tee soak.log
+          ROMMSYNC_ALLOC_REPORT="$PWD/soak.csv" ROMMSYNC_BENCH_JSON="$PWD/soak-bench.json" \
+            ./build/tests/test_heap_steady soak "$ROUNDS" | tee soak.log
+
+      # Two days of the clock per stretch, ~4 minutes of the runner's: the
+      # `soak.schedule` ctest entry runs six hours of each on every push.
+      - name: The schedule, on a fast clock
+        run: |
+          set -o pipefail
+          ./build/tests/test_heap_steady schedule 48 | tee schedule.log
 
       # Observable whether it passed or not: the headline in the run's summary,
       # the per-round samples as an artifact.
@@ -110,6 +133,12 @@ jobs:
             echo '```'
             grep -v '^  round ' soak.log 2>/dev/null || echo "(the soak wrote no log)"
             echo '```'
+            echo
+            echo "### The schedule, two days a stretch on a fast clock"
+            echo
+            echo '```'
+            cat schedule.log 2>/dev/null || echo "(the schedule wrote no log)"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep the samples
@@ -120,7 +149,71 @@ jobs:
           path: |
             soak.csv
             soak.log
+            soak-bench.json
+            schedule.log
           if-no-files-found: error
+
+      # The linked image, measured as `switch-build` measures it -- the same
+      # pinned image, the same script -- so its numbers are tracked beside the
+      # soak's. Built here rather than read from ci.yml's artifact, which is per
+      # push and expires.
+      - name: Measure the linked image
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
+            bash -lc 'make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)" &&
+                      IMAGE_BUDGET_JSON=image-bench.json bash scripts/image-budget.sh'
+
+      # benchmark-action writes to a branch that has to exist before its first
+      # run. Made here, empty, on the first night, rather than left as a step
+      # for a person to remember.
+      - name: The benchmarks branch exists
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # One empty commit, made without touching the checkout: its working
+          # tree holds tonight's numbers, which the steps below still read.
+          if ! git ls-remote --exit-code --heads origin benchmarks >/dev/null; then
+            empty="$(git hash-object -t tree /dev/null)"
+            first="$(git -c user.name='github-actions[bot]' \
+                         -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+                       commit-tree "$empty" \
+                         -m 'benchmarks: the soak and the image, night by night (#250)')"
+            git push origin "$first:refs/heads/benchmarks"
+          fi
+
+      # Tracked, not gated: each number already has its gate -- `Judge` for the
+      # floor, scripts/image-budget.sh for the image -- and what this adds is the
+      # trend. An alert goes to the run's summary and does not fail the run: a
+      # soak red over a drift nobody has looked at yet would read to
+      # `soak-fresh` as a soak that stopped working.
+      - name: Track the soak's numbers
+        if: github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: soak
+          tool: customSmallerIsBetter
+          output-file-path: soak-bench.json
+          gh-pages-branch: benchmarks
+          benchmark-data-dir-path: soak
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '110%'
+          fail-on-alert: false
+          summary-always: true
+
+      - name: Track the image's numbers
+        if: github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: image
+          tool: customSmallerIsBetter
+          output-file-path: image-bench.json
+          gh-pages-branch: benchmarks
+          benchmark-data-dir-path: image
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '102%'
+          fail-on-alert: false
+          summary-always: true
 
       - name: RomM logs on failure
         if: failure()

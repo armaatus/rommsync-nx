@@ -41,6 +41,12 @@
 //                  sized by its argument. `ctest` runs a few rounds as
 //                  `soak.smoke`, so the nightly is never the first time this
 //                  code runs; .github/workflows/soak.yml runs hundreds.
+//   schedule       the engine on a clock four thousand times fast, with a real
+//                  thirty-minute interval and nobody asking for a tick: online,
+//                  offline under a backoff, the wall clock jumped a year either
+//                  way, and a token the server stops accepting -- each stretch
+//                  as many hours of that clock as its argument (#250).
+//                  `soak.schedule` runs six; the nightly runs two days.
 //
 // **Host numbers, not console numbers.** These are counted on the host's
 // standard library, where a `std::string` or a node is not exactly the size
@@ -188,14 +194,16 @@ class TickCounter final : public rlog::Sink {
 class Console {
  public:
   Console(checks::Checks& c, std::string_view name, const std::string& base,
-          const harness::Fixture& fixture, http::HttpClient& client)
+          const harness::Fixture& fixture, http::HttpClient& client,
+          std::string_view sync = "enabled = true\ninterval_min = 0\non_boot = false\n",
+          const sysmodule::Clock* clock = nullptr)
       : sandbox(c, name), directory(sandbox.Host(harness::kConfigDir) + "/") {
     for (const char* folder : {"/tico/roms/nes", "/tico/roms/gba"}) {
       sandbox.MakeDirs(folder);
     }
+    engine.UseClock(clock);
     ok = sandbox.Write("/config/rommsync/config.ini",
-                       "[server]\nurl = " + base +
-                           "\n\n[sync]\nenabled = true\ninterval_min = 0\non_boot = false\n");
+                       "[server]\nurl = " + base + "\n\n[sync]\n" + std::string(sync));
     auth::StoredToken token;
     token.server_url = base;
     token.access_token = fixture.token;
@@ -356,6 +364,21 @@ void Report(const std::string& what, const Run& run, const char* path) {
     for (std::size_t at = 0; at < run.samples.size(); ++at) {
       out << at << "," << run.samples[at].blocks << "," << run.samples[at].bytes << "\n";
     }
+  }
+  // The headline numbers in benchmark-action's `customSmallerIsBetter` shape,
+  // for the soak workflow to track from one night to the next (#250): a floor
+  // that creeps up across months, a little each PR, never trips `Judge` in any
+  // one run.
+  if (const char* bench = std::getenv("ROMMSYNC_BENCH_JSON"); bench != nullptr && *bench != '\0') {
+    std::ofstream out(bench);
+    out << "[\n"
+        << "  {\"name\": \"" << what << ": held between rounds\", \"unit\": \"bytes\", \"value\": "
+        << run.floor_bytes << "},\n"
+        << "  {\"name\": \"" << what << ": a round's peak over that\", \"unit\": \"bytes\", "
+        << "\"value\": " << run.peak_over_floor << "},\n"
+        << "  {\"name\": \"" << what << ": allocations a round\", \"unit\": \"allocations\", "
+        << "\"value\": " << run.allocations_per_round << "}\n"
+        << "]\n";
   }
 }
 
@@ -836,6 +859,241 @@ void Soak(checks::Checks& c, http::HttpClient& client, const std::string& base,
               return arrived;
             };
           });
+}
+
+// --- the schedule's own clock, run fast (#250) ----------------------------------
+
+/// `steady_clock` and `system_clock`, both running `scale` times fast from the
+/// moment this is made, with the wall clock movable on its own: the divergence
+/// a console's clock being set -- or reset -- produces, and the one libfaketime's
+/// `FAKETIME_DONT_FAKE_MONOTONIC` exists to make.
+class FastClock final : public sysmodule::Clock {
+ public:
+  explicit FastClock(std::int64_t scale) : scale_(scale) {}
+
+  std::chrono::steady_clock::time_point Steady() const override {
+    return origin_steady_ + Elapsed();
+  }
+  std::chrono::system_clock::time_point Wall() const override {
+    return origin_wall_ +
+           std::chrono::duration_cast<std::chrono::system_clock::duration>(
+               Elapsed() + std::chrono::milliseconds{wall_offset_ms_.load(std::memory_order_relaxed)});
+  }
+  std::chrono::milliseconds RealFor(std::chrono::milliseconds span) const override {
+    if (span <= std::chrono::milliseconds::zero()) {
+      return span;
+    }
+    // At least a millisecond, so a short backoff is still a wait and not a spin.
+    return std::max(std::chrono::milliseconds{1}, span / scale_);
+  }
+
+  /// Move the wall clock and only the wall clock.
+  void JumpWall(std::chrono::milliseconds by) {
+    wall_offset_ms_.fetch_add(by.count(), std::memory_order_relaxed);
+  }
+
+  /// Real time for `span` of this clock to pass.
+  std::chrono::milliseconds Real(std::chrono::milliseconds span) const { return span / scale_; }
+
+  std::int64_t scale() const { return scale_; }
+
+ private:
+  std::chrono::steady_clock::duration Elapsed() const {
+    return (std::chrono::steady_clock::now() - origin_real_) * scale_;
+  }
+
+  std::int64_t scale_;
+  std::chrono::steady_clock::time_point origin_real_ = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point origin_steady_ = origin_real_;
+  std::chrono::system_clock::time_point origin_wall_ = std::chrono::system_clock::now();
+  std::atomic<std::int64_t> wall_offset_ms_{0};
+};
+
+/// The lines a run on the fast clock is judged by, counted as they are written.
+/// Allocates nothing, for `TickCounter`'s reason.
+class ScheduleWatch final : public rlog::Sink {
+ public:
+  void Write(rlog::Level, std::string_view line) override {
+    if (line.find("sync.tick") != std::string_view::npos) {
+      ticks.fetch_add(1, std::memory_order_relaxed);
+      if (line.find("outcome=completed") != std::string_view::npos) {
+        completed.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    if (line.find("auth.rejected") != std::string_view::npos) {
+      rejected.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  std::atomic<std::int64_t> ticks{0};
+  std::atomic<std::int64_t> completed{0};
+  std::atomic<std::int64_t> rejected{0};
+};
+
+/// The real client, counting what reaches it.
+class CountingClient final : public http::HttpClient {
+ public:
+  explicit CountingClient(http::HttpClient& inner) : inner_(inner) {}
+  http::Result Send(const http::Request& request) override {
+    requests.fetch_add(1, std::memory_order_relaxed);
+    return inner_.Send(request);
+  }
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    requests.fetch_add(1, std::memory_order_relaxed);
+    return inner_.Download(request, target);
+  }
+  std::atomic<std::int64_t> requests{0};
+
+ private:
+  http::HttpClient& inner_;
+};
+
+/// One stretch of simulated time, and what happened in it.
+struct Stretch {
+  std::int64_t ticks = 0;
+  std::int64_t completed = 0;
+  std::int64_t rejected = 0;
+  std::int64_t requests = 0;
+};
+
+/// The schedule running on its own clock, a thousand-odd times fast, for days
+/// of it (#204's "not done", #250): what the console does between two presses
+/// of nothing at all.
+///
+/// The engine is configured as a console is -- a thirty-minute interval and a
+/// boot tick -- and nothing asks it for a tick: every tick here is one the
+/// scheduler decided was due. Each stretch is `hours` of the fast clock:
+///
+///   online     about two ticks an hour, every one completed;
+///   offline    the proxy resets every connection. The scheduler backs off from
+///              thirty seconds to its thirty-minute cap and stays there: it
+///              keeps trying, and it does not storm. Then the network comes
+///              back and the next tick completes within one capped backoff;
+///   wall +1y   the console's clock jumps a year ahead and monotonic does not:
+///              one catch-up tick, not a year of them, and the interval holds;
+///   wall -2y   and two years back, to before the last tick: no storm, and no
+///              stall waiting for a wall clock to catch up -- monotonic drives;
+///   expired    the server starts answering 401 to every request, as it does to
+///              a token that has expired or been revoked. The gate blocks within
+///              its three rejections and from then on nothing reaches the
+///              server at all, while the log still says why once an interval.
+void Schedule(checks::Checks& c, http::HttpClient& client, const std::string& base,
+              const harness::Fixture& fixture, std::int64_t hours) {
+  // ~4000x: a thirty-minute interval is 450 ms, a day 21.6 s. A tick against the
+  // fixture is ~100 ms real, which is ~7 minutes of this clock -- well inside an
+  // interval, so a tick's own length does not crowd the schedule it is judged on.
+  FastClock clock(4000);
+  ScheduleWatch watch;
+  rlog::Sink* const previous = rlog::GetSink();
+  rlog::SetSink(&watch);
+  CountingClient counted(client);
+  const auto snapshot = [&] {
+    return Stretch{watch.ticks.load(), watch.completed.load(), watch.rejected.load(),
+                   counted.requests.load()};
+  };
+  const auto stretch = [&](std::int64_t span_hours) {
+    const Stretch start = snapshot();
+    std::this_thread::sleep_for(clock.Real(std::chrono::hours{span_hours}));
+    const Stretch end = snapshot();
+    return Stretch{end.ticks - start.ticks, end.completed - start.completed,
+                   end.rejected - start.rejected, end.requests - start.requests};
+  };
+  const auto say = [&](const char* what, const Stretch& s) {
+    std::cout << "  " << what << " (" << hours << "h of the clock): " << s.ticks << " ticks, "
+              << s.completed << " completed, " << s.rejected << " auth.rejected, " << s.requests
+              << " requests\n";
+  };
+  // Two ticks an hour at the interval, at most. The interval runs from the end
+  // of a tick, and a tick is minutes of this clock -- more on a slow runner -- so
+  // fewer is the tick's own length, and half is the floor: a schedule that has
+  // stalled makes none. Past a quarter over, plus a tick either side of a
+  // stretch's edge, is a schedule that is not waiting out its interval.
+  const std::int64_t expected = 2 * hours;
+  const auto about = [&](std::int64_t ticks) {
+    return ticks >= expected / 2 && ticks <= expected * 5 / 4 + 2;
+  };
+
+  {
+    Console console(c, "schedule", base, fixture, counted,
+                    "enabled = true\ninterval_min = 30\non_boot = true\n", &clock);
+    c.Expect(console.ok, "a console configured for, and paired with, the fixture RomM");
+    console.engine.StartWorker();
+
+    const Stretch online = stretch(hours);
+    say("online", online);
+    c.Expect(about(online.ticks) && online.completed == online.ticks,
+             "online, the schedule ticks twice an hour and every tick completes: " +
+                 std::to_string(online.ticks) + " ticks, " + std::to_string(online.completed) +
+                 " completed, for " + std::to_string(expected) + " intervals");
+
+    Stretch offline;
+    {
+      harness::Fault down(c, client, base, R"({"mode":"drop","bytes":0,"count":1000000})");
+      offline = stretch(hours);
+    }
+    say("offline", offline);
+    // The backoff climbs 30 s, 1, 2, 4, 8, 16 minutes before it reaches the cap:
+    // six attempts more than the interval would make, and then the interval's
+    // rate. Past half as many again is a storm. The floor is lower than online's,
+    // because an offline tick spends real time on a socket being reset and its
+    // retries -- a few hundred milliseconds, which is most of an hour of this
+    // clock -- so one every three hours is the line between backing off and
+    // having given up.
+    c.Expect(offline.completed == 0, "offline, no tick completes");
+    c.Expect(offline.ticks >= hours / 3,
+             "offline, the schedule keeps trying at its capped backoff: " +
+                 std::to_string(offline.ticks) + " ticks for " + std::to_string(expected) +
+                 " intervals");
+    c.Expect(offline.ticks <= expected * 3 / 2 + 8,
+             "...and does not storm a server that is not there: " +
+                 std::to_string(offline.ticks) + " ticks for " + std::to_string(expected) +
+                 " intervals");
+    // Back: the next tick is at most one capped backoff away, and the backoff's
+    // jitter can stretch that by a quarter.
+    const Stretch back = stretch(1);
+    say("back online", back);
+    c.Expect(back.completed >= 1,
+             "the network back, a tick completes within the hour of a capped backoff");
+
+    clock.JumpWall(std::chrono::hours{24 * 365});
+    const Stretch ahead = stretch(hours);
+    say("wall +1y", ahead);
+    c.Expect(about(ahead.ticks) && ahead.completed == ahead.ticks,
+             "a wall clock a year ahead is one catch-up tick, not a year of them: " +
+                 std::to_string(ahead.ticks) + " ticks for " + std::to_string(expected) +
+                 " intervals");
+
+    clock.JumpWall(-std::chrono::hours{2 * 24 * 365});
+    const Stretch behind = stretch(hours);
+    say("wall -2y", behind);
+    c.Expect(about(behind.ticks) && behind.completed == behind.ticks,
+             "a wall clock set back two years neither storms nor stalls -- monotonic drives: " +
+                 std::to_string(behind.ticks) + " ticks for " + std::to_string(expected) +
+                 " intervals");
+
+    Stretch expiring;
+    Stretch expired;
+    {
+      harness::Fault revoked(c, client, base,
+                             R"({"mode":"status","status":401,"count":1000000})");
+      expiring = stretch(hours / 2);
+      expired = stretch(hours - hours / 2);
+    }
+    say("token expiring", expiring);
+    say("token expired", expired);
+    c.Expect(expiring.completed == 0 && expired.completed == 0,
+             "a token the server refuses completes nothing");
+    c.Expect(expired.requests == 0,
+             "once the gate has blocked, nothing reaches the server at all: " +
+                 std::to_string(expired.requests) + " requests in the second half");
+    c.Expect(expired.rejected >= (hours - hours / 2),
+             "...and the log still says why, about once an interval: " +
+                 std::to_string(expired.rejected) + " auth.rejected lines");
+    c.Expect(console.Status().auth == ipc::AuthState::kUnauthenticated,
+             "and the status screen says the pairing is gone");
+  }
+  rlog::SetSink(previous);
 }
 
 }  // namespace
@@ -1485,7 +1743,7 @@ int main(int argc, char** argv) {
     }
     return checks.failures() == 0 ? 0 : 1;
   }
-  if (scenario != "steady" && scenario != "soak") {
+  if (scenario != "steady" && scenario != "soak" && scenario != "schedule") {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;
   }
@@ -1508,6 +1766,9 @@ int main(int argc, char** argv) {
 
   if (scenario == "steady") {
     Steady(checks, *client, base, fixture, rounds, report);
+  } else if (scenario == "schedule") {
+    // The second argument is the hours of the fast clock each stretch lasts.
+    Schedule(checks, *client, base, fixture, rounds);
   } else {
     Soak(checks, *client, base, fixture, rounds, report);
   }
