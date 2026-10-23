@@ -441,10 +441,11 @@ what the client requests, and it is exactly the unconditional list in
 the `auth.scopes` test, so the two cannot drift. Every `.write` in it is one the
 client performs; don't request a `*.write` you don't use. `me.write` is
 documented and **not** requested, and the reason is worth stating because the
-obvious guess is wrong: it is not the play-session scope. It guards
-`PUT /api/users/{id}`, the `/api/client-tokens` family and
-`/api/auth/device/{approve,deny}` in 5.4.0's snapshot, none of which this client
-calls. M7-4 (#39) records play sessions and needed **no new scope**:
+obvious guess is wrong: it is not the play-session scope. In 5.4.0's snapshot
+it guards `PUT /api/users/{id}` and `POST /api/users/{id}/ra/refresh`, the
+writes of the `/api/client-tokens`, `/api/notifications` and
+`/api/notification-channels` families, and `/api/auth/device/{approve,deny}` --
+none of which this client calls. M7-4 (#39) records play sessions and needed **no new scope**:
 `POST /api/play-sessions` declares `roms.user.write` and
 `POST /api/sync/sessions/{id}/complete` declares `devices.write`, both already on
 the list.

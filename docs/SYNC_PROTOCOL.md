@@ -366,7 +366,8 @@ Three traps in the operation itself:
   ([`captures/5.4.0/saves-post-identical.json`](../server/contract/captures/5.4.0/saves-post-identical.json)),
   and `overwrite=true` turns that off as well (`add_save`, `endpoints/saves.py`),
   which is why `execute.occupied`'s Keep local, re-posting the same bytes a
-  second later, gets a second row. RomM prunes what a slot accretes
+  second later, gets a second row. What a slot accretes is pruned only under
+  `MAX_SAVES_PER_SLOT` or a request's `autocleanup`
   ([API_CONTRACT.md](API_CONTRACT.md#every-slotted-upload-is-a-new-version)).
   5.2.0 decided it by the clock instead — a second-granularity tag and a lookup
   by that tagged name, so two uploads in one wall-clock second shared a row —
