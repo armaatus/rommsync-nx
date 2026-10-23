@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <string>
+#include <utility>
 
 #include "conflicts_screen.hpp"
 #include "ipc_client.hpp"
@@ -105,6 +106,11 @@ bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAn
       // prompt for A is only drawn over a row that answers it.
       return false;
     }
+    if (row->change.has_value()) {
+      // Copied out: the poll after the write rebuilds the view `row` points into.
+      PressChange(*row->change);
+      return true;
+    }
     switch (row->destination) {
       case Destination::kSync:
         tsl::changeTo<SyncScreen>(client_);
@@ -143,6 +149,36 @@ bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAn
   return false;
 }
 
+void SettingsScreen::PressChange(config::Assignment assignment) {
+  // A half-pressed "Re-pair" does not survive another press: its second press
+  // would otherwise land after the user has moved on to something else.
+  repair_ = RepairState{};
+
+  const Link link = frame_.Ready();
+  if (link != Link::kOk) {
+    ShowUnreachable(link);
+    return;
+  }
+
+  // The sysmodule writes the card and re-reads it (M5-3, #30); this screen
+  // sends the one assignment and draws the answer. A failing `Result` means the
+  // call did not happen, and a refused edit is a successful call carrying
+  // `kInvalid` -- `ipc::WriteOutcome` says why it has to be that way round.
+  ipc::ConfigEdit edit;
+  edit.assignments.push_back(assignment);
+  ipc::ConfigResult result;
+  const Result rc = client_.SetConfig(edit, &result);
+  if (R_FAILED(rc)) {
+    ShowUnreachable(frame_.Diagnose(rc));
+    return;
+  }
+  change_ = ChangeState{true, std::move(assignment), std::move(result)};
+
+  // Asked again rather than assumed: the row shows what the sysmodule now has in
+  // force, and a refused or failed write leaves it showing the value it had.
+  Poll();
+}
+
 void SettingsScreen::Poll() {
   // The port and the version handshake, both of which every screen needs and
   // none of which is this screen's own (`screen_frame.hpp`).
@@ -178,12 +214,13 @@ void SettingsScreen::ShowUnreachable(Link link) {
   // the first press after it came back. Every caller of this owes that reset,
   // which is most of why it is one function rather than five copies.
   repair_ = RepairState{};
+  change_ = ChangeState{};
   view_ = RenderSettingsUnreachable(link, frame_.sysmodule_interface());
   Rebuild();
 }
 
 void SettingsScreen::Refresh() {
-  view_ = RenderSettings(config_, repair_);
+  view_ = RenderSettings(config_, repair_, change_);
   Rebuild();
 }
 
@@ -234,6 +271,8 @@ void SettingsScreen::PressRepair() {
     // greyed prompt. The same rule the sync screen keeps for a blocked button.
     return;
   }
+  // The answer to an earlier setting press is not what this button did.
+  change_ = ChangeState{};
   if (!repair_.confirming) {
     // The first press only asks. The action discards a working pairing and this
     // console has no dialog to put in front of it.
@@ -457,7 +496,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   clipped = false;
   const SettingsRow* cursor_row = CursorRow();
   if (cursor_row != nullptr && cursor_row->selectable) {
-    line(Prompt(kGlyphA, "Open"), kBodyFont, plain, kRowHeight);
+    line(Prompt(kGlyphA, cursor_row->action), kBodyFont, plain, kRowHeight);
   }
   if (view_.repair.state != ControlState::kInert) {
     line(Prompt(kGlyphX, view_.repair.label), kBodyFont,

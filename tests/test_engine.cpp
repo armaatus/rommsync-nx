@@ -552,6 +552,26 @@ void ConfigWrites(checks::Checks& c) {
              "and config.ini is byte-identical");
   c.ExpectEq(console.Configured().config.sync.interval_min, 45, "as is the running engine");
 
+  // The edits the settings screen's rows send (#264), through the same path:
+  // each lands on the running engine and on the card, `[sources]` in a section
+  // of its own because the file had none.
+  ipc::ConfigEdit m10;
+  m10.assignments.push_back({"sync", "on_server_delete", "keep", false});
+  m10.assignments.push_back({"sources", "retroarch", "off", false});
+  m10.assignments.push_back({"sources", "retroarch_content_dir", "true", false});
+  c.Expect(console.Set(m10).outcome == ipc::WriteOutcome::kApplied,
+           "on_server_delete and [sources] are edits SetConfig applies");
+  const ipc::ConfigView live = console.Configured();
+  c.Expect(live.config.sync.on_server_delete == config::OnServerDelete::kKeep,
+           "on_server_delete = keep is in force with no restart");
+  c.Expect(live.config.sources.retroarch == config::SourceMode::kOff,
+           "so is [sources] retroarch = off");
+  c.Expect(live.config.sources.retroarch_content_dir, "and retroarch_content_dir");
+  c.Expect(console.sandbox.Read("/config/rommsync/config.ini")
+                   .find("[sources]\nretroarch = off\nretroarch_content_dir = true\n") !=
+               std::string::npos,
+           "and the card holds them");
+
   // A `config.ini` this console cannot read is not one to replace: the user's
   // settings are probably still in it. A directory where the file should be
   // gives `fopen` EISDIR, which is `kUnreadable` rather than `kMissing`.
