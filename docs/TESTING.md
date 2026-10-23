@@ -565,7 +565,7 @@ ctest --test-dir build --output-on-failure
   `no_op`, flagged and logged rather than guessed at. That last body is the only
   one in the file no server sent.
 - The `sync.*` rig scenarios ask the running server what the snapshot cannot.
-  `accepted` proves a live 5.2.0 takes the encoded body and echoes the entry's
+  `accepted` proves the live fixture takes the encoded body and echoes the entry's
   `file_name`, `slot` and `emulator` back. `required` proves a renamed *required*
   field is a 422 that names it. `understood` is the one worth reading: it uploads
   one save and negotiates it twice, changing nothing but `content_hash` →

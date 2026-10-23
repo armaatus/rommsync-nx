@@ -183,7 +183,7 @@ def device_auth(s, base, cap, approver):
     cap.record("auth-device-init", init)
     print(json.dumps(cap.redacted(init), indent=2)[:800])
 
-    # 5.2.0 returns `verification_path` / `verification_path_complete` -- a path,
+    # RomM returns `verification_path` / `verification_path_complete` -- a path,
     # not the absolute `verification_uri` the OAuth spec names and AUTH.md drew.
     verify = init.get("verification_path_complete") or init.get("verification_path") or ""
     if verify.startswith("/"):
@@ -228,7 +228,8 @@ def device_auth(s, base, cap, approver):
     hr("device auth: poll token")
     token = None
     paired_device_id = None
-    # Bounded well below the code's own lifetime (5.2.0 sends expires_in: 600).
+    # Bounded well below the code's own lifetime (expires_in: 600 in
+    # captures/5.4.0/auth-device-init.json).
     # tests/test_contract_captures.py runs under a CTest timeout, and a script
     # that outlives it is killed with a bare "Timeout" instead of printing the
     # diagnostic below -- the one line that says approval never arrived.
@@ -290,7 +291,7 @@ def register_device(s, base, cap, name="probe device", capture_as="devices-creat
     dev = dev.json()
     if capture_as:
         cap.record(capture_as, dev)
-    # `device_id`, not `id` -- verified against a live 5.2.0 (docs/API_CONTRACT.md).
+    # `device_id`, not `id` -- captures/5.4.0/devices-create.json (docs/API_CONTRACT.md).
     return dev.get("device_id") or dev.get("id"), dev
 
 
