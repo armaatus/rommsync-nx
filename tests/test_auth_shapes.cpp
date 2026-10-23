@@ -266,7 +266,7 @@ void PartialsAreRejected(checks::Checks& c) {
 }
 
 /// The poll error shapes, which the OpenAPI snapshot does not declare at all.
-/// Every body below was observed against a live 5.2.0 -- see docs/AUTH.md.
+/// Every body below is one RomM 5.4.0 answers -- docs/AUTH.md says what pins each.
 void PollStates(checks::Checks& c) {
   struct Case {
     int status;

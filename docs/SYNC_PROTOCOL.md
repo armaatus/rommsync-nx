@@ -4,8 +4,10 @@ How `sys-rommsync` implements RomM's negotiate → execute → complete loop (5.
 or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#since-520)
 says so).
 Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md). The payload and
-response shapes below are the ones captured from a live 5.2.0 under
-`server/contract/captures/` (issue M0-4), not a reading of the OpenAPI snapshot.
+response shapes below are the ones captured from a live 5.4.0 under
+`server/contract/captures/5.4.0/` (#260), not a reading of the OpenAPI snapshot.
+The set at the root of `server/contract/captures/` is 5.2.0's, from issue M0-4,
+and is kept as history; nothing here cites it.
 
 ## Principle: the server is the source of truth
 
@@ -345,23 +347,32 @@ history for this device -- that case is #232's 409 (`tick.baseline_other_row`).
 Three traps in the operation itself:
 
 - **`file_name` is the server's name, not yours.** RomM renames a save on ingest:
-  `probe.srm` is stored as `probe [2026-09-04_11-12-27].srm`, and every later
-  operation echoes that. Match the operation back to your local file on
-  `(rom_id, slot)` and keep your own path; writing the server's name to the SD
-  produces a file no emulator will load.
-- **`overwrite` decides the 409 and nothing else. It does not stop a slot
-  accreting a row per upload.** This page has now had this wrong twice, in both
-  directions, so here is the mechanism rather than the conclusion: RomM stamps a
-  slot upload with a **second-granularity** datetime tag and then looks the
-  existing row up *by that tagged name* (`_apply_datetime_tag` and
-  `get_save_by_filename`, `endpoints/saves.py` in 5.2.0). Two uploads therefore
-  land on the same row only when they share a base file name **and the same
-  wall-clock second**; one second later the name RomM computes matches nothing
-  and it writes a **second** row, flag or no flag. Verified directly against the
-  live 5.2.0, and `execute.occupied` pins the deterministic half.
-  The revision that said `overwrite=true` "replaces the row in place, tag and id
-  included" was reading a same-second run — which is what made that assertion
-  pass on a fast machine and fail in CI (issue #85).
+  `probe.srm` is stored as `probe [2026-10-21_09-02-11].srm`
+  ([`captures/5.4.0/saves-post.json`](../server/contract/captures/5.4.0/saves-post.json)),
+  and every later operation echoes that. Match the operation back to your local
+  file on `(rom_id, slot)` and keep your own path; writing the server's name to
+  the SD produces a file no emulator will load.
+- **`overwrite` decides the 409s and whether identical bytes add a version, and
+  nothing else. It does not stop a slot accreting a row per upload.** This page
+  has now had this wrong twice, in both directions, so here is the mechanism
+  rather than the conclusion: every slotted upload reserves a fresh datetime-tagged name —
+  moving a second forward when the tag is taken — so it never lands on an
+  existing row, flag or no flag (`reserve_version_name`,
+  `handler/asset_store.py`).
+  [`captures/5.4.0/saves-post-new-version.json`](../server/contract/captures/5.4.0/saves-post-new-version.json)
+  is a second upload to a slot by the device that wrote the first, under a new
+  `id`. The one exception is bytes the slot already holds: they promote that row
+  to head instead of writing another
+  ([`captures/5.4.0/saves-post-identical.json`](../server/contract/captures/5.4.0/saves-post-identical.json)),
+  and `overwrite=true` turns that off as well (`add_save`, `endpoints/saves.py`),
+  which is why `execute.occupied`'s Keep local, re-posting the same bytes a
+  second later, gets a second row. RomM prunes what a slot accretes
+  ([API_CONTRACT.md](API_CONTRACT.md#every-slotted-upload-is-a-new-version)).
+  5.2.0 decided it by the clock instead — a second-granularity tag and a lookup
+  by that tagged name, so two uploads in one wall-clock second shared a row —
+  and the revision that said `overwrite=true` "replaces the row in place, tag and
+  id included" was reading such a same-second run, which passed on a fast
+  machine and failed in CI (issue #85).
   `PUT /api/saves/{id}` is the call that really does move one row forward, and is
   what `harness.conflict` uses to arrange "the server's copy changed" without
   touching this device's history at all.
@@ -1051,18 +1062,23 @@ sync: a lost baseline costs time, not correctness.
 **Not the same flow.** This section used to say "same flow via `/api/states`",
 and that was wrong in the way that matters: there is no negotiation for a state,
 so the server decides nothing and the client has to. Verified against a live
-5.2.0 and pinned by `server/contract/captures/states-post.json` and
-`states-list.json` — see [API_CONTRACT.md](API_CONTRACT.md#save-states) for the
-endpoints.
+5.4.0 and pinned by
+[`captures/5.4.0/states-post.json`](../server/contract/captures/5.4.0/states-post.json)
+and
+[`captures/5.4.0/states-list.json`](../server/contract/captures/5.4.0/states-list.json)
+— see [API_CONTRACT.md](API_CONTRACT.md#save-states) for the endpoints.
 
-What 5.2.0 actually offers:
+What 5.4.0 actually offers:
 
-- `SyncNegotiatePayload` carries **only** `saves`. A state never appears in a
-  negotiate request or in a plan.
+- `SyncNegotiatePayload` has no field for a state: its one list is `saves`, and
+  the rest (`rom_ids`, `emulators`, `restore_unlisted`) only scope it. A state
+  never appears in a negotiate request or in a plan.
 - `StateSchema` has no `slot`, no `content_hash`, no `origin_device_id` and no
   `device_syncs`. There is no per-device sync history for a state and no digest
-  to verify a download against.
-- There is no `POST /api/states/{id}/downloaded`.
+  to verify a download against. What it gained since 5.2.0 — `core`,
+  `is_favorite`, `labels` — is none of those
+  ([`captures/5.4.0/states-post.json`](../server/contract/captures/5.4.0/states-post.json)).
+- There is no `POST /api/states/{id}/downloaded` (`romm-openapi-5.4.0.json`).
 - `POST /api/states` takes `rom_id` and `emulator` and a multipart `stateFile`
   (plus an optional `screenshotFile`). No `slot`, no `device_id`, no
   `session_id`, no `overwrite`.
@@ -1072,14 +1088,16 @@ What 5.2.0 actually offers:
 - **`POST /api/states` is an upsert keyed on `(rom_id, file_name)` alone.** A
   second POST under a name the rom already has replaces that row's bytes in
   place, keeps its `id`, and *moves* its `emulator` to whatever the new request
-  said. It does not create a second row the way `POST /api/saves` does. So a POST
-  **is an overwrite of somebody's state**, and the emulator is not part of the
-  key.
+  said (`store_state_file`, `handler/asset_store.py`; `states.upsert` asserts it
+  against the fixture). It does not create a second row the way `POST /api/saves`
+  does. So a POST **is an overwrite of somebody's state**, and the emulator is
+  not part of the key.
 - **RomM does not rename a state on ingest.** A save sent as `probe.srm` is
-  stored as `probe [2026-09-04_11-12-27].srm`; a state sent as `probe.state` is
-  stored as `probe.state`. The server's name and the client's are the same
-  string, which is what makes `(rom_id, file_name)` a usable pairing key on both
-  sides.
+  stored as `probe [2026-10-21_09-02-11].srm`; a state sent as
+  `probe-89654803.state` is stored under exactly that name
+  ([`captures/5.4.0/states-post.json`](../server/contract/captures/5.4.0/states-post.json)).
+  The server's name and the client's are the same string, which is what makes
+  `(rom_id, file_name)` a usable pairing key on both sides.
 
 ### The policy
 
