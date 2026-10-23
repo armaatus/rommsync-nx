@@ -854,6 +854,28 @@ const char* ToString(PlayWith play_with) {
   return "tico";
 }
 
+const char* ToString(OnServerDelete on_server_delete) {
+  switch (on_server_delete) {
+    case OnServerDelete::kRemove:
+      return "remove";
+    case OnServerDelete::kKeep:
+      return "keep";
+  }
+  return "remove";
+}
+
+const char* ToString(SourceMode mode) {
+  switch (mode) {
+    case SourceMode::kAuto:
+      return "auto";
+    case SourceMode::kOn:
+      return "on";
+    case SourceMode::kOff:
+      return "off";
+  }
+  return "auto";
+}
+
 std::optional<PlayWith> Config::PlayWithFor(std::string_view slug) const {
   const auto found = play_with.find(slug);
   if (found != play_with.end()) {

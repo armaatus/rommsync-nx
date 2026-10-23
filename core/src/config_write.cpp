@@ -310,7 +310,16 @@ void AppendSection(Document* doc, const std::string& section,
 
 // --- what a value is allowed to be --------------------------------------------
 
-enum class ValueKind { kUnknown, kBool, kMinutes, kUrl, kPathList, kEmulator };
+enum class ValueKind {
+  kUnknown,
+  kBool,
+  kMinutes,
+  kUrl,
+  kPathList,
+  kEmulator,
+  kOnServerDelete,  ///< `[sync] on_server_delete`: remove | keep
+  kSourceMode,      ///< `[sources] retroarch`: auto | on | off
+};
 
 const bool* BoolField(const Config& config, const std::string& section, const std::string& key);
 
@@ -321,6 +330,17 @@ ValueKind KindOf(const std::string& section, const std::string& key) {
   if (section == "sync" && key == "interval_min") {
     return ValueKind::kMinutes;
   }
+  if (section == "sync" && key == "on_server_delete") {
+    return ValueKind::kOnServerDelete;
+  }
+  if (section == "sources" && key == "retroarch") {
+    return ValueKind::kSourceMode;
+  }
+  // Still refused, each for a reason (#264): `[sync] slot` moves every save to
+  // a new slot on the server, and `[tico]` names a Switch account by a 32-digit
+  // id the overlay has no way to pick -- both are a decision taken at a PC with
+  // docs/CONFIG.md open, not a switch flipped on a console. `play_with` and a
+  // platform's `enabled` are not M10-23's and have no row to send them from.
   if (section.rfind("platform.", 0) == 0) {
     if (key == "emulator") {
       return ValueKind::kEmulator;
@@ -335,7 +355,7 @@ ValueKind KindOf(const std::string& section, const std::string& key) {
   return BoolField(unused, section, key) != nullptr ? ValueKind::kBool : ValueKind::kUnknown;
 }
 
-/// The `[sync]`/`[downloads]` flag `key` names, or nullptr.
+/// The `[sync]`/`[downloads]`/`[sources]` flag `key` names, or nullptr.
 ///
 /// **This is the only list of which keys are booleans.** `KindOf` asks it the
 /// same question against a throwaway `Config` rather than keeping a second copy
@@ -357,6 +377,10 @@ const bool* BoolField(const Config& config, const std::string& section,
     if (key == "enabled") return &config.downloads.enabled;
     if (key == "verify_hash") return &config.downloads.verify_hash;
     if (key == "resume") return &config.downloads.resume;
+    return nullptr;
+  }
+  if (section == "sources") {
+    if (key == "retroarch_content_dir") return &config.sources.retroarch_content_dir;
   }
   return nullptr;
 }
@@ -526,6 +550,36 @@ bool NormalizeValue(const Resolved& target, std::string_view raw, std::string* o
       *out = std::string(id);
       return true;
     }
+    case ValueKind::kOnServerDelete: {
+      // The parser's two words and nothing else: a boolean would leave a reader
+      // guessing which of the two a deleted save gets (#233).
+      const std::string word = LowerAscii(Trim(raw));
+      if (word != config::ToString(OnServerDelete::kRemove) &&
+          word != config::ToString(OnServerDelete::kKeep)) {
+        Complain(diagnostics, Severity::kError, target.section, target.key,
+                 "expected remove or keep, got '" + Redact(Trim(raw)) + "'");
+        return false;
+      }
+      *out = word;
+      return true;
+    }
+    case ValueKind::kSourceMode: {
+      // The parser takes `auto` or any boolean. What is stored is the word the
+      // setting documents, so `no` becomes `off` the way `YES` becomes `true`.
+      const std::string word = LowerAscii(Trim(raw));
+      bool flag = false;
+      if (word == config::ToString(SourceMode::kAuto)) {
+        *out = word;
+        return true;
+      }
+      if (!ParseBool(word, &flag)) {
+        Complain(diagnostics, Severity::kError, target.section, target.key,
+                 "expected auto, on or off, got '" + Redact(Trim(raw)) + "'");
+        return false;
+      }
+      *out = config::ToString(flag ? SourceMode::kOn : SourceMode::kOff);
+      return true;
+    }
     case ValueKind::kUnknown:
       break;
   }
@@ -549,6 +603,10 @@ bool ReadsBackAs(const Config& config, const Resolved& target) {
       return config.EmulatorOverride(std::string_view(target.section)
                                          .substr(std::string_view("platform.").size())) ==
              target.value;
+    case ValueKind::kOnServerDelete:
+      return config::ToString(config.sync.on_server_delete) == target.value;
+    case ValueKind::kSourceMode:
+      return config::ToString(config.sources.retroarch) == target.value;
     case ValueKind::kUnknown:
       break;
   }
