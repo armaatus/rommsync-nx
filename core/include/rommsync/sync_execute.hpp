@@ -717,9 +717,17 @@ struct ExecuteOptions {
   /// the same bytes (`PUT /api/saves/{id}`, #272): RomM breaks a tie between two
   /// rows of one second by query order, and the other device's row could
   /// otherwise be the head the next negotiation names. That costs the upload
-  /// ~1.1 s on the calling thread; a rewrite that fails is a line in
-  /// `ExecutionReport::warnings`, never a failed upload.
+  /// ~1.1 s on the calling thread (`wait`). The rewrite is the one call here
+  /// that is retried, with backoff: it is idempotent -- the same bytes onto the
+  /// same row -- where a re-posted upload is a second row, and the choice it
+  /// completes is spent by the time a next tick could try. One that still fails
+  /// is a line in `ExecutionReport::warnings`, never a failed upload.
   std::vector<state::Baseline::Key> keep_local;
+
+  /// How the executor waits: the second a Keep local's rewrite waits out, and
+  /// the backoff between its attempts. Null sleeps, waking to check `cancel` --
+  /// not "do not wait", `NegotiateOptions::wait`'s contract.
+  std::function<void(std::chrono::milliseconds)> wait;
 
   /// Whether an upload and a `/downloaded` carry `content_hash`: the MD5 of the
   /// file as it is uploaded, and of the verified bytes a download put on the

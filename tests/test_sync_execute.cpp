@@ -700,6 +700,7 @@ void Overwrite(rig::Checks& checks) {
     Scripted accepted(201, R"({"id":41})");
     sync::ExecuteOptions options = OptionsAt(1'757'000'000);
     options.keep_local = {{8, std::string("kept")}};
+    options.wait = [](std::chrono::milliseconds) {};
     const sync::ExecutionReport report =
         sync::ExecutePlan(accepted, *files, token, plan, targets, options);
     checks.ExpectEq(report.completed, 2, "both uploads are accepted");
@@ -726,13 +727,18 @@ void Overwrite(rig::Checks& checks) {
   }
 
   // A rewrite that does not happen leaves the upload standing -- it landed --
-  // and is said, because the next tick may then undo the choice (#272).
+  // and is said, because the next tick may then undo the choice (#272). It is
+  // the one call here that is retried: the same bytes onto the same row.
   {
-    class RefusesTheRewrite final : public http::HttpClient {
+    // Answers the upload, and the rewrite with `rewrite_status`.
+    class Rewrites final : public http::HttpClient {
      public:
+      explicit Rewrites(int rewrite_status) : rewrite_status_(rewrite_status) {}
       http::Result Send(const http::Request& request) override {
         http::Result result;
-        result.response.status = request.method == http::Method::kPut ? 503 : 201;
+        const bool put = request.method == http::Method::kPut;
+        puts += put ? 1 : 0;
+        result.response.status = put ? rewrite_status_ : 201;
         result.response.body = R"({"id":41,"updated_at":"2026-10-23T18:00:00.250000+00:00"})";
         return result;
       }
@@ -741,18 +747,55 @@ void Overwrite(rig::Checks& checks) {
         result.error = http::Error::kConnectFailed;
         return result;
       }
-    } refuses;
+      int puts = 0;
+
+     private:
+      int rewrite_status_;
+    };
     sync::SyncPlan one = plan;
     one.operations.erase(one.operations.begin());
+
+    Rewrites unavailable(503);
+    std::vector<std::chrono::milliseconds> waited;
     sync::ExecuteOptions options = OptionsAt(1'757'000'002);
     options.keep_local = {{8, std::string("kept")}};
+    options.wait = [&waited](std::chrono::milliseconds delay) { waited.push_back(delay); };
     const sync::ExecutionReport report =
-        sync::ExecutePlan(refuses, *files, token, one, targets, options);
+        sync::ExecutePlan(unavailable, *files, token, one, targets, options);
     checks.ExpectEq(report.completed, 1, "the Keep local upload still counts as done");
+    checks.ExpectEq(unavailable.puts, 3, "a 503 is tried three times");
+    checks.Expect(waited.size() == 3 && waited[0] == std::chrono::milliseconds{1'100} &&
+                      waited[1] > waited[0] && waited[2] > waited[1],
+                  "the first past the second the upload landed in, each after a longer wait");
     checks.Expect(report.warnings.size() == 1 &&
-                      report.warnings[0].find("not moved past it (HTTP 503)") != std::string::npos,
+                      report.warnings[0].find("not moved past it (the rewrite was refused: "
+                                              "HTTP 503)") != std::string::npos,
                   "and the rewrite that failed is said: " +
                       (report.warnings.empty() ? std::string("nothing") : report.warnings[0]));
+
+    Rewrites refused(404);
+    options.wait = [](std::chrono::milliseconds) {};
+    const sync::ExecutionReport gone =
+        sync::ExecutePlan(refused, *files, token, one, targets, options);
+    checks.ExpectEq(refused.puts, 1, "a refusal of the rewrite is not asked again");
+    checks.ExpectEq(gone.warnings.size(), static_cast<std::size_t>(1), "and is said too");
+
+    // The player writes the save in the second the rewrite waits out: those are
+    // new bytes, not the ones the Keep local sent, and they are not put up as if
+    // they were.
+    Rewrites moved(200);
+    options.wait = [&sandbox](std::chrono::milliseconds) {
+      sandbox.Write(SavePath("kept.srm"), "progress made in the meantime\n");
+    };
+    const sync::ExecutionReport changed =
+        sync::ExecutePlan(moved, *files, token, one, targets, options);
+    checks.ExpectEq(moved.puts, 0, "a save that changed on the card is not rewritten");
+    checks.Expect(changed.warnings.size() == 1 &&
+                      changed.warnings[0].find("the save changed on the card since") !=
+                          std::string::npos,
+                  "and that is said: " + (changed.warnings.empty() ? std::string("nothing")
+                                                                    : changed.warnings[0]));
+    sandbox.Write(SavePath("kept.srm"), bytes);
   }
 
   // Refused with the guard's own answer.
@@ -2776,17 +2819,18 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
 // --- tie ------------------------------------------------------------------------
 //
 // #272. RomM 5.4.0 stores `updated_at` to the whole second, and negotiate keeps
-// the first row it meets of a slot's newest second -- the older -- where its own
-// slot guard and `promote_to_slot_head` break the same tie towards the higher
-// id. So a Keep local upload landing in the second another device's did is the
-// head to the guard and *not* to negotiate, and the next negotiation, with no
-// history against the other row, plans a download of it: the player's choice
-// undone (backed up, but undone, and with nothing said).
+// whichever row of a slot's newest second its unordered query meets first --
+// the older one without `rom_ids`, the newer with them, on this fixture -- where
+// its own slot guard and `promote_to_slot_head` order by `updated_at`, then id.
+// So a Keep local upload landing in the second another device's did can lose
+// the head to it, and the next negotiation, with no history against the other
+// row, plans a download of it: the player's choice undone (backed up, but
+// undone, and with nothing said).
 //
-// The client's side (`ExecuteOptions::keep_local`): a Keep local upload asks
-// negotiate which row it now names, and a tie is settled by rewriting this
-// device's own row with the bytes it already holds once the second has turned,
-// which makes it the head negotiate names too.
+// The client's side (`ExecuteOptions::keep_local`): every Keep local upload
+// rewrites its own row with the bytes it already holds once the second has
+// turned, which makes it the slot's newest by a whole second, however a query
+// orders the slot.
 
 /// Whether two of RomM's timestamps name the same whole second.
 bool SameSecond(const std::string& left, const std::string& right) {
@@ -2885,12 +2929,21 @@ void Tie(rig::Checks& checks, http::HttpClient& client, const std::string& base,
     checks.Expect(!sandbox.HasBackupOf(bytes), "and nothing was backed up: nothing was replaced");
 
     // What the player chose is what the next negotiation names -- not a
-    // download of the other device's row.
-    sync::SyncPlan next;
-    if (PlanFor(checks, client, base, fixture, payload, {slot}, &next)) {
+    // download of the other device's row -- in both of the shapes measured to
+    // break the tie differently: unscoped, and scoped as a tick is.
+    for (const bool scoped : {false, true}) {
+      sync::SyncNegotiatePayload asked = payload;
+      if (scoped) {
+        asked.rom_ids = std::vector<std::int64_t>{rom.id};
+      }
+      sync::SyncPlan next;
+      if (!PlanFor(checks, client, base, fixture, asked, {slot}, &next)) {
+        continue;
+      }
       checks.Expect(next.operations[0].action == sync::Action::kNoOp &&
                         next.operations[0].save_id == mine.id,
-                    std::string("the next negotiation names the Keep local row as the head: ") +
+                    std::string("the next negotiation") + (scoped ? ", scoped," : "") +
+                        " names the Keep local row as the head: " +
                         sync::ToString(next.operations[0].action) + " save " +
                         (next.operations[0].save_id.has_value()
                              ? std::to_string(*next.operations[0].save_id)

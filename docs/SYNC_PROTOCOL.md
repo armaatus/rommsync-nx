@@ -448,6 +448,14 @@ and it is the only thing that ever sends `overwrite=true`:
    keeps it for the next, as does a choice armed after the plan went out. So
    the choice is one upload's: a later upload of the save meets the guard as
    every upload does.
+4. Once that upload has landed, the tick waits for the second to turn and
+   rewrites the row it wrote with the same bytes (`PUT /api/saves/{id}`, #272).
+   RomM stores `updated_at` to the whole second and negotiate breaks a
+   same-second tie by query order, so a Keep local landing in the second another
+   device uploaded the save could lose the head to the other row -- and the next
+   tick would download that over the player's choice. Rewritten, it is the
+   newest by a whole second. A rewrite that does not happen is a warning, not a
+   failed upload.
 
 The choice is held in memory. A reboot before its tick forgets it, and the
 restored bytes then meet the guard like any upload: a 409 is resolved as a

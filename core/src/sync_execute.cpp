@@ -733,35 +733,52 @@ const ClientSaveState* ReportedFor(const ExecuteOptions& options, const SaveTarg
 
 /// How long a Keep local upload waits before rewriting its row: past the second
 /// it landed in by the server's clock, which a whole second after the server
-/// answered is, with a margin for the phase of the two clocks.
+/// answered is, with a margin for the phase of the two clocks. Also the first
+/// step of the rewrite's backoff, doubled per attempt.
 constexpr std::chrono::milliseconds kTieWait{1'100};
+
+/// Attempts at the rewrite. Bounded like every `CallPolicy`'s three.
+constexpr int kRewriteAttempts = 3;
+
+/// `options.wait`, or a sleep that wakes to check `options.cancel`, so a
+/// shutdown is not held up by a second nobody needs any more.
+void Wait(const ExecuteOptions& options, std::chrono::milliseconds delay) {
+  if (options.wait != nullptr) {
+    options.wait(delay);
+    return;
+  }
+  constexpr std::chrono::milliseconds kSlice{100};
+  while (delay.count() > 0 && (options.cancel == nullptr || !options.cancel->canceled())) {
+    const std::chrono::milliseconds step = std::min(delay, kSlice);
+    std::this_thread::sleep_for(step);
+    delay -= step;
+  }
+}
 
 /// After a Keep local upload wrote `own_id` in the second `landed`: rewrite that
 /// row with the bytes it already holds once the second has turned, so it is the
 /// slot's newest by a whole second (#272).
 ///
-/// RomM 5.4.0 stores `updated_at` to the whole second and breaks a tie between
-/// two rows of one second by nothing at all: its slot guard and
-/// `promote_to_slot_head` order by id, and negotiate keeps whichever row its
-/// unordered query meets first -- **which differs with the query's shape**.
-/// Measured on the fixture: the same tied slot negotiated with `rom_ids` names
-/// the Keep local row, and without them names the other device's. So whether a
-/// Keep local that landed in the second another device's upload did survives
-/// the next tick is up to MariaDB's plan for that tick's query, and when it does
-/// not, the next tick downloads the other row over the player's choice -- backed
-/// up, but undone without a word. No negotiation this client could send to
-/// check would be the one that tick sends, and the other rows of the slot are a
-/// listing that grows by a row per upload; so the tie is not looked for. It is
-/// made impossible: one rewrite, a second later, of the row this device already
-/// owns. Nothing else is touched, and nothing goes over the guard that the
-/// upload had not already.
+/// RomM 5.4.0 stores `updated_at` to the whole second. Its slot guard and
+/// `promote_to_slot_head` order a slot by `updated_at`, then id, but negotiate
+/// keeps whichever row of the newest second its unordered query meets first --
+/// **which differs with the query's shape**. Measured on the fixture: one tied
+/// slot negotiated with `rom_ids` names the Keep local row, and without them
+/// names the other device's. So whether a Keep local that landed in the second
+/// another device's upload did survives is up to MariaDB's plan for the next
+/// tick's query, and when it does not, that tick downloads the other row over
+/// the player's choice -- backed up, but undone without a word. No negotiation
+/// this client could send to check would be the one that tick sends, and the
+/// slot's other rows are a listing that grows by a row per upload; so the tie is
+/// not looked for. It is made impossible: one rewrite, a second later, of the row
+/// this device already owns. No other row is touched.
 ///
 /// Only a Keep local pays this. Every other upload meets the guard, which
 /// refuses it over a row this device has not synced, so it cannot land beside
 /// one in the same second (#232).
 ///
 /// Never a reason to fail the upload, which landed. A rewrite that did not
-/// happen is a line in `warnings`, because that next tick may then undo the
+/// happen is a line in `warnings`, because the next tick may then undo the
 /// choice.
 void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
                       const SyncOperation& operation, const SaveTarget& target,
@@ -769,52 +786,66 @@ void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
                       std::int64_t own_id, std::optional<Timestamp> landed,
                       const ExecuteOptions& options, OperationResult* uploaded,
                       std::vector<std::string>* warnings) {
-  const std::string unsettled =
+  const std::string not_moved =
       Describe(operation) + ": the Keep local upload may share its second with another "
                             "device's upload of this save, and was not moved past it ";
-  std::this_thread::sleep_for(kTieWait);
-  if (options.cancel != nullptr && options.cancel->canceled()) {
-    warnings->push_back(unsettled + "(the tick was cancelled)");
-    return;
-  }
-  const state::HashOutcome digest = state::HashFile(source);
-  if (!digest.ok() || (!sent_digest.empty() && digest.content_hash != sent_digest)) {
-    // The card moved since the upload. Those are new bytes, and the next tick
-    // offers them like any -- in a later second.
-    warnings->push_back(unsettled + "(the save changed on the card since)");
-    return;
-  }
+  std::string last_failure;
+  for (int attempt = 1; attempt <= kRewriteAttempts; ++attempt) {
+    Wait(options, kTieWait * (1 << (attempt - 1)));
+    if (options.cancel != nullptr && options.cancel->canceled()) {
+      warnings->push_back(not_moved + "(the tick was cancelled)");
+      return;
+    }
+    const state::HashOutcome digest = state::HashFile(source);
+    if (!digest.ok() || digest.content_hash != sent_digest) {
+      // The card moved since the upload. Those are new bytes, and the next tick
+      // offers them like any -- in a later second.
+      warnings->push_back(not_moved + "(the save changed on the card since)");
+      return;
+    }
 
-  // `device_id` and `content_hash` keep this device's history against the row
-  // as the upload left it.
-  std::string url = http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
-                                                        std::to_string(own_id)) +
-                    "?device_id=" + http::EncodeQueryValue(token.device_id);
-  if (options.send_content_hash) {
-    url += "&content_hash=" + digest.content_hash;
-  }
-  http::Request request =
-      Authed(http::Method::kPut, std::move(url), token, options.timeout, options.cancel);
-  http::FormPart part;
-  part.name = "saveFile";
-  part.file_path = source;
-  part.file_name = target.file_name;
-  part.content_type = "application/octet-stream";
-  request.form.push_back(std::move(part));
-  const http::Result rewritten = client.Send(request);
-  if (!rewritten.successful()) {
-    warnings->push_back(unsettled + "(" +
-                        (rewritten.ok() ? "HTTP " + std::to_string(rewritten.response.status)
-                                        : std::string(http::ToString(rewritten.error))) +
-                        ")");
+    // `device_id` and `content_hash` keep this device's history against the row
+    // as the upload left it.
+    std::string url = http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
+                                                          std::to_string(own_id)) +
+                      "?device_id=" + http::EncodeQueryValue(token.device_id);
+    if (options.send_content_hash) {
+      url += "&content_hash=" + digest.content_hash;
+    }
+    http::Request request =
+        Authed(http::Method::kPut, std::move(url), token, options.timeout, options.cancel);
+    http::FormPart part;
+    part.name = "saveFile";
+    part.file_path = source;
+    part.file_name = target.file_name;
+    part.content_type = "application/octet-stream";
+    request.form.push_back(std::move(part));
+    const http::Result rewritten = client.Send(request);
+
+    if (const auto refused = Refused(rewritten, "the rewrite")) {
+      last_failure = refused->second;
+      // The link, or RomM having a bad minute, is worth another attempt; a
+      // refusal of this request is not.
+      const bool transient = refused->first == OperationError::kTransferFailed ||
+                             (rewritten.ok() && rewritten.response.status >= 500);
+      if (!transient) {
+        break;
+      }
+      continue;
+    }
+    const std::optional<Timestamp> moved_to = UpdatedAtOf(rewritten.response.body);
+    if (landed.has_value() && moved_to.has_value() && *moved_to <= *landed) {
+      // The two clocks' phase was off by more than the margin: still the same
+      // second, and the next attempt waits longer.
+      last_failure = "it is still in that second";
+      continue;
+    }
+    uploaded->message += landed.has_value() && moved_to.has_value()
+                             ? ", and rewritten a second later to be the slot's newest"
+                             : ", and rewritten a second later";
     return;
   }
-  const std::optional<Timestamp> moved_to = UpdatedAtOf(rewritten.response.body);
-  if (landed.has_value() && (!moved_to.has_value() || *moved_to <= *landed)) {
-    warnings->push_back(unsettled + "(it is still in that second)");
-    return;
-  }
-  uploaded->message += ", and rewritten a second later to be the slot's newest";
+  warnings->push_back(not_moved + "(" + last_failure + ")");
 }
 
 /// `POST /api/saves?...&content_hash=<md5>&overwrite=false` with the local file
@@ -847,8 +878,10 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   }
   url += "&session_id=" + std::to_string(plan.session_id);
   url += "&device_id=" + http::EncodeQueryValue(token.device_id);
+  // A Keep local is hashed whether or not the server is told: its rewrite
+  // (`OutlastTheSecond`) sends the same bytes again, and has to know they are.
   std::string sent_digest;
-  if (options.send_content_hash) {
+  if (options.send_content_hash || KeepsLocal(options, operation)) {
     // Hashed here, just before the transport streams the file, rather than
     // taken from the scan: the card may have moved on since step 0, and RomM
     // keeps this digest as proof of what this device holds. A report matching
@@ -864,7 +897,9 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                   "the local save " + target->sd_path +
                       " could not be hashed to upload: " + digest.message);
     }
-    url += "&content_hash=" + digest.content_hash;
+    if (options.send_content_hash) {
+      url += "&content_hash=" + digest.content_hash;
+    }
     sent_digest = digest.content_hash;
   }
   // `overwrite=false` is RomM's slot guard, asked for by name: a slot that holds

@@ -346,8 +346,9 @@ captured.
 
 "Newest" is the strictly newest `updated_at` (`negotiate_sync` replaces a slot's
 head only on `>`), and the timestamps it compares are second-granular, so a
-version written in the same second as the one before it does not become the
-head — the older row is compared and reported instead. Not captured: the probe
+version written in the same second as the one before it may not become the
+head — which of the two is compared and reported depends on the query's shape
+(#272, below). Not captured: the probe
 waits 1.1 s between versions so that its own captures never meet it.
 
 The client does not build this body by hand: `core/include/rommsync/sync.hpp`
@@ -495,8 +496,16 @@ newer than last sync"`, where without the baseline both sides changed and it
 would be `conflict`. A baseline belongs to a save *row*, though, and negotiate
 only reads syncs against each slot's newest row — newest by an `updated_at`
 stored to the whole second, so two rows written in one second tie, and the tie
-goes to whichever the unordered query returns first, observed on the fixture to
-be the older (#265, #272). Another device's upload is a new row, so the device
+goes to whichever the unordered query returns first — **which depends on the
+query's shape** (#265, #272). Measured on the 5.4.0 fixture, one tied slot: a
+negotiation without `rom_ids` names the older row, the same negotiation with
+`rom_ids` names the newer. The slot guard and `promote_to_slot_head` order by
+`updated_at, id` and so always take the newer. RomM truncates the fraction
+(MariaDB), and a POST's own answer still carries it. The client's side is that
+a Keep local — the one upload that does not meet the guard, and so the one that
+can land beside another device's row in its second — rewrites its row with
+`PUT /api/saves/{id}` once the second has turned (`OutlastTheSecond`,
+sync_execute.cpp; `execute.tie`). Another device's upload is a new row, so the device
 that uploaded before it has no history against the head and falls back to
 timestamps: `captures/sync-negotiate-other-device-version.json` is `upload`,
 `"Client save is newer (no sync history)"` — for bytes the server has already
@@ -825,7 +834,12 @@ writes a new version even for identical bytes (`add_save`).
 
 `PUT /api/saves/{id}` replaces a row's bytes in place and, unlike either POST,
 takes no `slot`, so it is what a test uses to change the server's copy without
-touching a device's history.
+touching a device's history. It also moves the row's `updated_at` to now, even
+for the bytes the row already holds, and records the calling device's sync row
+against it when `device_id` is given — which is the one thing the client sends
+it for: a Keep local upload rewritten a second later so it is its slot's newest
+by a whole second (#272, below). Verified live on 5.4.0; not captured. The
+answer's `file_name` carries a fresh datetime tag, but the `id` is the same row.
 
 **`emulator` is a folder name.** At most 50 characters, and unchanged by
 filename sanitising, or the upload is refused before anything is written:
