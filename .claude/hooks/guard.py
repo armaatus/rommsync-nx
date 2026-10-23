@@ -324,7 +324,7 @@ def _check_merge(words):
     sub = _gh_rest(words)
     if sub[:2] == ["pr", "merge"]:
         # `--auto` included. It asks GitHub to merge once the required checks
-        # pass, and with merge-gate retired (#277) none of them stands for the
+        # pass, and with merge-gate deleted (#277) none of them stands for the
         # maintainer's review: arming it is merging on green.
         deny(MERGE_REFUSAL)
     if sub[:1] == ["api"] and any(

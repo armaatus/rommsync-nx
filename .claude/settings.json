@@ -21,7 +21,6 @@
       "Bash(./scripts/orca/setup.sh:*)",
       "Bash(./scripts/orca/reap.sh:*)",
       "Bash(./scripts/orca/issue-command.sh:*)",
-      "Bash(python3 .github/scripts/merge_gate.py:*)",
       "Bash(orca worktree set:*)",
       "Bash(cmake:*)",
       "Bash(ctest:*)",

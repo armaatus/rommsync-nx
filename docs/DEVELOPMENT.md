@@ -557,16 +557,10 @@ commits since the previous tag, and those checksums.
 
 Eight things are worth knowing before you do it:
 
-- **That pull request meets `merge-gate` like any other, and `--fill` does not
-  satisfy it.** `.github/scripts/merge_gate.py` is a required check on `main`,
-  and it exempts neither a release nor whoever opened it: the body has to carry
-  a `Closes #N` line (file a release issue if there is none), an approving
-  review of the current head has to exist — a person's, now that the
-  dispatcher that posted one is gone (#277) — and no review thread may be left open
-  (`required_conversation_resolution` is on). `gh pr create --fill` writes the
-  body from the commit message, so a `Release 0.2.0` commit produces a body with
-  no closing line. `enforce_admins` is off, so an admin *can* merge it with the
-  check red — that is the escape hatch for a broken review, not the route.
+- **That pull request is an ordinary one.** It needs the required checks green
+  and no review thread left open (`required_conversation_resolution` is on);
+  give it a `Closes #N` line if a release issue exists, so the issue closes with
+  it.
 
 - **The tag and `VERSION` must agree**, or the build is red rather than a release
   labelled with a version nothing inside it reports. `ctest -R version.tag` is

@@ -18,8 +18,7 @@ import sys
 
 # The SHELL of the payload. `.github/workflows/*.yml` is payload too and carries
 # `run:` blocks with the same hazard -- claude-review.yml has a live one -- but a
-# PR that edits a workflow cannot merge itself (merge_gate.py's human-only
-# prefixes), so widening this glob here would red the lint on a file this change
+# PR that edits a workflow is merged by a person, not on green, so widening this glob here would red the lint on a file this change
 # may not fix. It is armaatus/autofleet#90 instead, and CLAUDE.md says what is
 # scanned rather than claiming the payload has none. Found by the independent
 # review.
@@ -97,8 +96,7 @@ def selftest():
 
     Two of them shipped: the sourced helper with no `pipefail` of its own
     (lib.sh, round 2 of the review) and the flag bundle `-Eq` (fleet.sh, found
-    by the scan's own first run). `guard.py`, `merge_gate.py` and `issue_refs.py`
-    all carry one of these and `evals/lint.sh` runs it; a detector that has
+    by the scan's own first run). `guard.py` carries one of these and `evals/lint.sh` runs it; a detector that has
     shipped blind twice has the least claim to be the exception.
     """
     cases = [

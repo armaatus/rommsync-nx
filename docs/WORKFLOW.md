@@ -282,10 +282,9 @@ shellcheck does not know, and the `--selftest`s.
 
 The default branch is protected, with `host-tests`, `switch-build` and the lint
 as required checks and no required approving review — the maintainer merges.
-`merge-gate` belonged to the retired dispatcher: its review rule wants a verdict
-nobody posts any more. It comes off the required checks (a settings step) and
-its workflow and `.github/scripts/` go with it — a removal #277 leaves to the
-maintainer. Until then a pull request merges past it, as #276 did.
+`merge-gate` belonged to the retired dispatcher and was deleted with it (#277);
+if branch protection still lists it as required, take it off (a settings step),
+or every pull request waits on a check that never reports.
 
 ## Working in parallel
 

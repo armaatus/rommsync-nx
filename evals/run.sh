@@ -85,21 +85,11 @@ for scanner in piped_quiet_grep late_stderr_silence continuation_comment; do
     || { printf '%s\n' "$out"; bad "evals/$scanner.py found something"; }
 done
 
-# The guards that decide things, each asked to prove it still does. Both
-# print their own assertion count, and both are the reason hard rule 3 exists:
+# The guard that decides things, asked to prove it still does. It
+# prints its own assertion count, and it is the reason hard rule 3 exists:
 # a rule that stops matching stops blocking, in silence.
 step "the guard still guards"
 python3 .claude/hooks/guard.py --selftest >/dev/null || bad "guard.py --selftest"
-
-step "the merge gate still gates"
-python3 .github/scripts/merge_gate.py --selftest >/dev/null || bad "merge_gate.py --selftest"
-
-# ...and the two readers of `Blocked by #N` still agree. `unblock.yml` is
-# JavaScript inside YAML and cannot import the module `fleet.sh` uses, so the
-# module's own selftest compares the literals. A drift between them is the fleet
-# opening a worktree for an issue whose foundation is still open.
-step "the blocker patterns still agree"
-python3 .github/scripts/issue_refs.py --selftest >/dev/null || bad "issue_refs.py --selftest"
 
 echo
 [ "$fails" = 0 ] || { echo "$fails check(s) failed" >&2; exit 1; }
