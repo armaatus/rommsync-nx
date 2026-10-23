@@ -400,13 +400,15 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
 /// that writes the save after that -- a game launched mid-tick, which #242's
 /// hold is asked too coarsely to stop -- is in no copy anywhere, and the commit
 /// or removal that follows would take it. So the save is compared with its
-/// backup by digest (saves are small, and a size-and-mtime check misses a
-/// same-size rewrite inside FAT32's two-second mtime), and anything but a match
-/// stands the operation down with both files left where they are:
+/// backup by digest, and anything but a match stands the operation down with
+/// both files left where they are. A digest because a size-and-mtime check
+/// misses a same-size rewrite inside FAT32's two-second mtime, and because what
+/// `ExecutePlan` replaces is a save file, kilobytes; a state's tens of megabytes
+/// do not come through here (state_sync.hpp).
 ///
 ///   - `backup_sd_path` empty means `BackUpFirst` found nothing to protect, so
 ///     there must still be nothing -- a file that appeared since has no copy.
-///     Only ENOENT is nothing, for `BackUpFirst`'s reason.
+///     Only ENOENT or ENOTDIR is nothing, for `BackUpFirst`'s reason.
 ///   - A save that differs, or that cannot be read back, is `kUnverified`.
 ///   - A backup that cannot be read back is `kUnreadableCard`.
 ///

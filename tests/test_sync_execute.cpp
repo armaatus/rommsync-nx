@@ -1621,15 +1621,16 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
 /// One late write against one plan: the server's copy must not land, and the
 /// write must still be the save. Returns the operation's result, if there was one.
 std::optional<sync::OperationResult> ExecuteUnderLateWrite(
-    rig::Checks& checks, Sandbox& sandbox, fs::FileSystem& files, http::HttpClient& client,
-    const std::string& base, const Fixture& fixture, const sync::SyncPlan& plan, const std::vector<sync::SaveTarget>& targets,
+    rig::Checks& checks, Sandbox& sandbox, http::HttpClient& client, const std::string& base,
+    const Fixture& fixture, const sync::SyncPlan& plan, const sync::SaveTarget& target,
     const sync::ExecuteOptions& options, const std::string& late, const std::string& what) {
-  const std::string save = targets[0].sd_path;
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string& save = target.sd_path;
   sync::ExecutionReport report;
   {
     LateWrite game([&] { sandbox.Reseed(save, late); });
-    report = sync::ExecutePlan(client, files, TokenFor(base, fixture), plan,
-                               targets, options);
+    report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, {target}, options);
     checks.Expect(game.fired(), what + ": the game wrote between the backup and the commit");
   }
   checks.ExpectEq(sandbox.Read(save), late,
@@ -1678,9 +1679,9 @@ void LateWriteFetch(rig::Checks& checks, http::HttpClient& client, const std::st
       checks.Expect(plan.operations[0].action == sync::Action::kDownload,
                     std::string("the plan is a download: ") +
                         sync::ToString(plan.operations[0].action));
-      const auto done = ExecuteUnderLateWrite(
-          checks, sandbox, *rommsync::host::MakeNativeFileSystem(sandbox.root().string()), client, base, fixture, plan, {{rom.id, slot, SavePath(name), name}},
-          OptionsAt(1'757'000'710), late, "download");
+      const auto done = ExecuteUnderLateWrite(checks, sandbox, client, base, fixture, plan,
+                                              {rom.id, slot, SavePath(name), name},
+                                              OptionsAt(1'757'000'710), late, "download");
       if (done.has_value()) {
         checks.Expect(!done->backup_sd_path.empty() &&
                           sandbox.Read(done->backup_sd_path) == previous,
@@ -1727,11 +1728,9 @@ void LateWriteFetch(rig::Checks& checks, http::HttpClient& client, const std::st
                         sync::ToString(plan.operations[0].action));
       sync::ExecuteOptions options = OptionsAt(1'757'000'711);
       options.reported = &payload.saves;
-      const auto done =
-          ExecuteUnderLateWrite(checks, sandbox,
-                                *rommsync::host::MakeNativeFileSystem(sandbox.root().string()),
-                                client, base, fixture, plan,
-                                {{rom.id, slot, SavePath(name), name}}, options, late, "conflict");
+      const auto done = ExecuteUnderLateWrite(checks, sandbox, client, base, fixture, plan,
+                                              {rom.id, slot, SavePath(name), name}, options,
+                                              late, "conflict");
       if (done.has_value()) {
         checks.Expect(!done->backup_sd_path.empty() &&
                           sandbox.Read(done->backup_sd_path) == previous,

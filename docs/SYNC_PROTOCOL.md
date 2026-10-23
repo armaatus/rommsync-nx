@@ -569,11 +569,11 @@ stop: per chunk and before a 409, not per operation — has written bytes that a
 in no copy anywhere, and the commit or removal that follows would take them. A
 conflict holds that window open longest, across its archival upload (#240).
 
-So immediately before the call that replaces or removes a save — the
-`io::CommitStaged` of a `download` or `conflict`, the `io::Remove` of a
-`delete` — `sync::UnchangedSinceBackup` compares the save with its backup by
-MD5. Saves are small enough to read twice, and a size-and-mtime comparison
-misses a same-size rewrite within FAT32's two-second mtime. Anything but a
+So immediately before the call by which `sync::ExecutePlan` replaces or removes
+a save — the `io::CommitStaged` of a `download` or `conflict`, the `io::Remove`
+of a `delete` — `sync::UnchangedSinceBackup` compares the save with its backup
+by MD5. A save file is kilobytes, cheap to read twice, and a size-and-mtime
+comparison misses a same-size rewrite within FAT32's two-second mtime. Anything but a
 match fails the operation `kUnverified` and leaves both files: the save, which
 is newer than any ruling about it, and the backup. Where nothing was backed up
 because nothing was there, there must still be nothing; a file that appeared is
@@ -588,6 +588,10 @@ instant between them is still lost. The guarantee is that no write is lost
 that landed before the comparison — which takes the window from a network round
 trip and a backup's worth of I/O down to one hash of the save. The hold
 narrows it further; nothing here closes it.
+
+**Nor is every overwrite covered yet.** A conflict restore (M7-1, from the
+overlay, over a running game) and a save state's download back up and then
+overwrite with no comparison between; #270 extends the check to both.
 
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
@@ -1064,7 +1068,9 @@ A state that is replaced goes through the same four steps as a save, using the
 same two `io` primitives: fetch to `io::TempPathFor(<state>)`, check it, back it
 up with `io::CopyAtomically` into `.backup/`, then `io::CommitStaged` it into
 place. The `harness::Sandbox` teardown audit covers a state exactly as it covers
-a `.srm`.
+a `.srm`. One difference for now: a state is not compared with its backup
+before the commit, so a write between the two is lost
+([A write after the backup](#a-write-after-the-backup-263), #270).
 
 The backup name carries a discriminator built from the state's own name —
 `<rom_id>-state-<name>-<unix seconds>[-<n>].<ext>` — because a state has no slot.
