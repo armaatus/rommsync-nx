@@ -277,9 +277,9 @@ $out"
     "the file that defines the helper" "$build"
   no_backup_call_fails core/src/state_sync.cpp 's/^      BackUpFirst(/      NoBackupAtAll(/' \
     "the save-state path" "$build"
-  # M7-1's restore, which lands on a save through CopyAtomically rather than
-  # CommitStaged -- the census names the landing call per row for exactly this
-  # reason, since a check hardcoded to CommitStaged would not see this path.
+  # M7-1's restore, the third save path. It landed through CopyAtomically until
+  # #270 split its copy from its commit, which is why the census names the
+  # landing call per row rather than hardcoding one.
   no_backup_call_fails core/src/conflict_record.cpp \
     's/      sync::BackUpFirst(/      sync::NoBackupAtAll(/' \
     "the conflict restore" "$build"

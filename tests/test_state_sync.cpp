@@ -20,6 +20,7 @@
 //   upsert    -- POST /api/states replaces the row with that name, in place
 //   roundtrip -- local -> server -> a second sandbox -> identical bytes
 //   overwrite -- the server's copy moved: back up first, then replace
+//   late_write -- ...and a state saved between that backup and the commit stays
 //   truncate  -- a clean short body never replaces a local state
 //   keeps_both -- both sides moved: nothing is transferred, both survive
 #include <algorithm>
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "crash_disk.hpp"
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/host/native_file_system.hpp"
@@ -1440,6 +1442,84 @@ void Overwrite(rig::Checks& checks, http::HttpClient& client, const std::string&
   harness::DeleteState(client, base, fixture, state_id);
 }
 
+/// #270: `overwrite`, with the game saving a state between the download's backup
+/// and its commit -- what RetroArch does on a save-state hotkey. That write is in
+/// no copy anywhere, so the server's copy must not land over it.
+void LateWrite(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+               const Fixture& fixture, std::int64_t rom_id, const std::string& rom_base) {
+  Sandbox sandbox(checks, "states-late-write");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const auth::StoredToken token = TokenFor(base, fixture);
+  const roms::RomIndex index = IndexOf(rom_id, rom_base, "gb");
+  const std::string name = rom_base + ".state";
+  const std::string mine = "the session this console had";
+  const std::string theirs = "the session the other console pushed, which would replace it";
+  const std::string late = "the session saved on a hotkey after the backup was taken";
+
+  sandbox.SeedState(StatePath(name), mine);
+  state::Baseline baseline;
+  const sync::StateSyncReport first =
+      sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+  checks.ExpectEq(first.failed, 0, "the first run uploaded this console's state");
+  const state::StateRecord* row = baseline.FindState(rom_id, name);
+  if (row == nullptr) {
+    checks.Expect(false, "the first run recorded a row");
+    return;
+  }
+  const std::int64_t state_id = row->server_state_id;
+
+  PassASecond();
+  const std::string elsewhere = sandbox.Host("/elsewhere.state");
+  rig::WriteFile(elsewhere, theirs);
+  sync::ServerState replaced;
+  if (!harness::UploadState(checks, client, base, fixture, rom_id, "gambatte", elsewhere, name,
+                            &replaced)) {
+    harness::DeleteState(client, base, fixture, state_id);
+    return;
+  }
+
+  sync::StateSyncReport second;
+  {
+    // `Reseed`: from here on the late bytes are the state, and the teardown
+    // audit holds the download to them.
+    faulty::LateWrite game([&] { sandbox.Reseed(StatePath(name), late); });
+    second = sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline,
+                              OptionsAt(kStamp));
+    checks.Expect(game.fired(), "the game wrote between the backup and the commit");
+  }
+  checks.ExpectEq(sandbox.Read(StatePath(name)), late,
+                  "the write that landed after the backup is still the state");
+  checks.ExpectEq(second.completed, 0, "nothing was replaced");
+  checks.ExpectEq(second.failed, 1, "and the download is counted failed, not done");
+  if (second.operations.size() == 1) {
+    const sync::StateOperationResult& done = second.operations.front();
+    checks.ExpectEq(std::string(sync::ToString(done.error)), std::string("changed_since_backup"),
+                    "named as a state that moved since its backup -- " + done.message);
+    checks.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == mine,
+                  "the backup is left, holding the bytes it was taken of: " +
+                      done.backup_sd_path);
+  }
+  checks.Expect(!io::Exists(io::TempPathFor(sandbox.Host(StatePath(name)))),
+                "and the server's copy is not left staged beside it");
+
+  // The next tick meets a local state that moved and a server row that moved:
+  // both survive, which is what a state no one arbitrates gets.
+  const sync::StateSyncReport third =
+      sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, OptionsAt(kStamp));
+  if (third.operations.size() == 1) {
+    checks.Expect(third.operations.front().outcome == sync::StateOutcome::kKeptBoth,
+                  std::string("the next run keeps both: ") +
+                      sync::ToString(third.operations.front().outcome) + " -- " +
+                      third.operations.front().message);
+  } else {
+    checks.Expect(false, "the next run decided about the state once");
+  }
+  checks.ExpectEq(sandbox.Read(StatePath(name)), late, "and the late write is still the state");
+
+  harness::DeleteState(client, base, fixture, state_id);
+}
+
 /// M9-14 (#203): `overwrite`, with a power cut at every call the second run
 /// makes. A state is a save (hard rule 2) and arrives through the same `.part`
 /// staging, so it is held to the same replay.
@@ -1795,6 +1875,8 @@ int main(int argc, char** argv) {
     RoundTrip(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "overwrite") {
     Overwrite(checks, *client, base, fixture, rom.id, rom_base);
+  } else if (scenario == "late_write") {
+    LateWrite(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "crash") {
     Crash(checks, *client, base, fixture, rom.id, rom_base);
   } else if (scenario == "truncate") {

@@ -288,21 +288,27 @@ void CheckHalfMappedPlatform(Checks& checks) {
   if (snes == nullptr) {
     return;
   }
-  checks.ExpectEq(snes->rows.size(), static_cast<std::size_t>(4),
-                  "two roms folders, and one row each for the two keys that map nowhere");
+  // `play_with` first (#271), then the folders.
+  checks.ExpectEq(snes->rows.size(), static_cast<std::size_t>(5),
+                  "play_with, two roms folders, and one row each for the two keys that map "
+                  "nowhere");
+  if (snes->rows.size() != 5) {
+    return;
+  }
+  checks.ExpectEq(snes->rows[0].label, std::string("play_with"), "play_with heads the section");
 
-  checks.ExpectEq(snes->rows[0].value, std::string("/tico/roms/snes"), "the first roms folder");
-  checks.Expect(Contains(snes->rows[0].note, "write target"),
+  checks.ExpectEq(snes->rows[1].value, std::string("/tico/roms/snes"), "the first roms folder");
+  checks.Expect(Contains(snes->rows[1].note, "write target"),
                 "the first roms entry is marked as the one that gets written to");
-  checks.ExpectEq(snes->rows[1].value, std::string("/old/snes"), "the second roms folder");
-  checks.Expect(!Contains(snes->rows[1].note, "write target"),
+  checks.ExpectEq(snes->rows[2].value, std::string("/old/snes"), "the second roms folder");
+  checks.Expect(!Contains(snes->rows[2].note, "write target"),
                 "a later roms entry is not a write target -- it is only checked");
 
-  checks.ExpectEq(snes->rows[2].label, std::string("saves"), "the saves key is drawn");
-  checks.ExpectEq(snes->rows[2].value, std::string("nowhere"),
+  checks.ExpectEq(snes->rows[3].label, std::string("saves"), "the saves key is drawn");
+  checks.ExpectEq(snes->rows[3].value, std::string("nowhere"),
                   "a key that maps nowhere says so rather than drawing a blank");
-  checks.Expect(Contains(snes->rows[2].note, "skipped"), "and says what that costs");
-  checks.ExpectEq(snes->rows[3].label, std::string("states"), "the states key is drawn");
+  checks.Expect(Contains(snes->rows[3].note, "skipped"), "and says what that costs");
+  checks.ExpectEq(snes->rows[4].label, std::string("states"), "the states key is drawn");
 }
 
 /// A folder map too large to have been sent.
@@ -658,6 +664,255 @@ void CheckM10SettingsAreShownAndChanged(Checks& checks) {
   }
 }
 
+/// `ViewFor`, with the Tico accounts the last tick found beside it.
+ipc::ConfigView ViewWithAccounts(Checks& checks, const std::string& text,
+                                 std::vector<std::string> accounts) {
+  const config::LoadResult parsed = config::ParseConfig(text);
+  ipc::ConfigView sent;
+  sent.config = parsed.value;
+  sent.diagnostics = ipc::TrimDiagnostics(parsed.diagnostics);
+  sent.tico_accounts = std::move(accounts);
+  const ipc::Decoded<ipc::ConfigView> decoded = ipc::DecodeConfigView(ipc::EncodeConfigView(sent));
+  checks.Expect(decoded.ok(), "the config view round-trips through the wire");
+  return decoded.ok() ? decoded.value : sent;
+}
+
+/// Every row of `section` labelled `label`, in draw order.
+std::vector<const overlay::SettingsRow*> RowsNamed(const overlay::SettingsView& view,
+                                                   const std::string& title,
+                                                   const std::string& label) {
+  std::vector<const overlay::SettingsRow*> rows;
+  const overlay::SettingsSection* section = SectionNamed(view, title);
+  if (section != nullptr) {
+    for (const overlay::SettingsRow& row : section->rows) {
+      if (row.label == label) {
+        rows.push_back(&row);
+      }
+    }
+  }
+  return rows;
+}
+
+/// True when `ApplyEdit` takes `change` over `text`.
+bool Takes(const std::string& text, const config::Assignment& change) {
+  config::Edit edit;
+  edit.assignments.push_back(change);
+  std::string after;
+  std::vector<config::Diagnostic> diagnostics;
+  return config::ApplyEdit(text, edit, &after, &diagnostics);
+}
+
+/// #271: `[sync] slot` is shown and not offered, and says why.
+void CheckSlotIsShownAndNotOffered(Checks& checks) {
+  const overlay::SettingsView defaults = overlay::RenderSettings(ViewFor(checks, kMinimal));
+  const overlay::SettingsRow* slot = RowNamed(defaults, "[sync]", "slot");
+  checks.Expect(slot != nullptr, "[sync] slot is on the settings screen");
+  if (slot == nullptr) {
+    return;
+  }
+  checks.ExpectEq(slot->value, std::string("autosave"), "with the slot in force");
+  checks.Expect(!slot->selectable && !slot->change.has_value() && slot->press_label.empty(),
+                "and no press changes it");
+  checks.Expect(!slot->editable, "the write path refuses it, so it is not marked as a setting");
+  checks.Expect(Contains(slot->note, "config.ini") && Contains(slot->note, "every save"),
+                "the row says why: " + slot->note);
+
+  const overlay::SettingsView own =
+      overlay::RenderSettings(ViewFor(checks, std::string(kMinimal) + "[sync]\nslot = mine\n"));
+  const overlay::SettingsRow* mine = RowNamed(own, "[sync]", "slot");
+  checks.Expect(mine != nullptr && mine->value == "mine", "a slot of the user's own is shown");
+}
+
+/// #271: `[sync] map_state_slots` is a press, like #264's rows.
+void CheckMapStateSlotsIsChanged(Checks& checks) {
+  const overlay::SettingsView defaults = overlay::RenderSettings(ViewFor(checks, kMinimal));
+  ExpectChange(checks, defaults, "[sync]", "map_state_slots", "Off", "true");
+  const overlay::SettingsView on = overlay::RenderSettings(
+      ViewFor(checks, std::string(kMinimal) + "[sync]\nmap_state_slots = true\n"));
+  ExpectChange(checks, on, "[sync]", "map_state_slots", "On", "false");
+  const overlay::SettingsRow* row = RowNamed(on, "[sync]", "map_state_slots");
+  checks.Expect(row != nullptr && Contains(row->note, "RetroArch") &&
+                    Contains(row->note, "every Switch"),
+                "on says whose slot names, and that every Switch has to agree");
+}
+
+/// #271: `[tico] account`, and a picker over the accounts the last tick found.
+void CheckTicoAccountIsPicked(Checks& checks) {
+  const std::string kA = "0123456789abcdef0123456789abcdef";
+  const std::string kB = "fedcba9876543210fedcba9876543210";
+
+  // Two accounts and none named: nothing synced, and each is a press away.
+  {
+    const std::string text = kMinimal;
+    const overlay::SettingsView view =
+        overlay::RenderSettings(ViewWithAccounts(checks, text, {kA, kB}));
+    const overlay::SettingsRow* account = RowNamed(view, "[tico]", "account");
+    checks.Expect(account != nullptr, "[tico] account is on the settings screen");
+    if (account != nullptr) {
+      checks.ExpectEq(account->value, std::string("Auto"), "auto is the value in force");
+      checks.Expect(!account->selectable, "auto is already in force; nothing to press");
+      checks.Expect(account->editable, "and it is a setting the write path takes");
+    }
+    const std::vector<const overlay::SettingsRow*> found = RowsNamed(view, "[tico]", "found");
+    checks.ExpectEq(found.size(), std::size_t{2}, "one row per account found under users/");
+    for (const overlay::SettingsRow* row : found) {
+      checks.Expect(row->selectable && row->change.has_value(), "each is a press: " + row->value);
+      if (!row->change.has_value()) {
+        continue;
+      }
+      checks.Expect(row->change->section == "tico" && row->change->key == "account" &&
+                        row->change->value == row->value && !row->change->remove,
+                    "which names that account: " + row->value);
+      checks.Expect(Takes(text, *row->change), "and is an edit SetConfig takes");
+      checks.Expect(!row->press_label.empty() && !row->note.empty(),
+                    "the prompt and the note say what a press does");
+    }
+    if (found.size() == 2) {
+      checks.Expect(found[0]->value == kA && found[1]->value == kB, "in the order they came");
+    }
+  }
+
+  // One named: it is synced, the other is still offered, and auto is the way
+  // back.
+  {
+    const std::string text = std::string(kMinimal) + "[tico]\naccount = " + kB + "\n";
+    const overlay::SettingsView view =
+        overlay::RenderSettings(ViewWithAccounts(checks, text, {kA, kB}));
+    const overlay::SettingsRow* account = RowNamed(view, "[tico]", "account");
+    checks.Expect(account != nullptr && account->value == kB, "the named account is in force");
+    checks.Expect(account != nullptr && account->change.has_value() &&
+                      account->change->value == "auto" && Contains(account->press_label, "Auto"),
+                  "and a press sets it back to auto");
+    if (account != nullptr && account->change.has_value()) {
+      checks.Expect(Takes(text, *account->change), "an edit SetConfig takes");
+    }
+    for (const overlay::SettingsRow* row : RowsNamed(view, "[tico]", "found")) {
+      if (row->value == kB) {
+        checks.Expect(!row->selectable && !row->change.has_value(),
+                      "the account already named is not offered again");
+      } else {
+        checks.Expect(row->selectable && row->change.has_value() && row->change->value == kA,
+                      "the other one is");
+      }
+    }
+  }
+
+  // Whose saves are read is `tico::Resolve`'s answer, per root, and reaches the
+  // screen as `tico::Notes`' line among the complaints. The rows never work out
+  // a second answer: one account under auto is still a press (naming it), and a
+  // named account with no folder is not drawn as a warning here.
+  {
+    const overlay::SettingsView view =
+        overlay::RenderSettings(ViewWithAccounts(checks, kMinimal, {kA}));
+    const std::vector<const overlay::SettingsRow*> found = RowsNamed(view, "[tico]", "found");
+    checks.Expect(found.size() == 1 && found[0]->selectable,
+                  "under auto every account found is offered, even the only one");
+    const std::string text = std::string(kMinimal) + "[tico]\naccount = " + kB + "\n";
+    const overlay::SettingsView named =
+        overlay::RenderSettings(ViewWithAccounts(checks, text, {kA}));
+    const overlay::SettingsRow* account = RowNamed(named, "[tico]", "account");
+    checks.Expect(account != nullptr && account->tone == overlay::Tone::kNeutral &&
+                      !Contains(account->note, "synced"),
+                  "the account row describes the setting, not what the card is in");
+  }
+
+  // Legacy: no listing is made, and auto is a press away.
+  {
+    const std::string text = std::string(kMinimal) + "[tico]\naccount = legacy\n";
+    const overlay::SettingsView view = overlay::RenderSettings(ViewWithAccounts(checks, text, {}));
+    const overlay::SettingsRow* account = RowNamed(view, "[tico]", "account");
+    checks.Expect(account != nullptr && account->value == "Legacy", "legacy is shown");
+    checks.Expect(account != nullptr && account->change.has_value() &&
+                      account->change->value == "auto",
+                  "and a press sets auto");
+    checks.Expect(RowsNamed(view, "[tico]", "found").empty(), "no account is listed under legacy");
+  }
+}
+
+/// A platform Tico does not run by default, mapped to a folder Tico keeps
+/// saves in.
+constexpr const char* kPico8InTico =
+    "[platform.pico8]\nroms = /roms/pico8\nsaves = /tico/saves/pico8\n";
+
+/// #271: a platform's `play_with` is shown beside its folders and steps like
+/// #264's rows.
+void CheckPlayWithIsChanged(Checks& checks) {
+  const overlay::SettingsView defaults = overlay::RenderSettings(ViewFor(checks, kMinimal));
+  ExpectChange(checks, defaults, "[platform.snes]", "play_with", "Tico", "retroarch");
+  const overlay::SettingsSection* snes = SectionNamed(defaults, "[platform.snes]");
+  checks.Expect(snes != nullptr && !snes->rows.empty() && snes->rows.front().label == "play_with",
+                "first in the platform's section, above its folders");
+
+  const overlay::SettingsView set = overlay::RenderSettings(
+      ViewFor(checks, std::string(kMinimal) + "[platform.snes]\nplay_with = retroarch\n"));
+  ExpectChange(checks, set, "[platform.snes]", "play_with", "RetroArch", "tico");
+  const overlay::SettingsRow* row = RowNamed(set, "[platform.snes]", "play_with");
+  checks.Expect(row != nullptr && Contains(row->note, "RetroArch"), "the note names the emulator");
+
+  // A platform Tico does not run has no default, and says so.
+  const std::string own = std::string(kMinimal) + "[platform.pico8]\nroms = /roms/pico8\n";
+  const overlay::SettingsView none = overlay::RenderSettings(ViewFor(checks, own));
+  ExpectChange(checks, none, "[platform.pico8]", "play_with", "Not set", "retroarch");
+  const overlay::SettingsRow* unset = RowNamed(none, "[platform.pico8]", "play_with");
+  checks.Expect(unset != nullptr && Contains(unset->note, "not placed"),
+                "with no emulator named, a save new to the card is not placed");
+
+  // Tico places nothing for a platform whose map lists no Tico folder
+  // (`place::Placer`), so it is not a value the press offers there...
+  checks.Expect(unset != nullptr && unset->change.has_value() &&
+                    unset->change->value == "retroarch",
+                "Not set steps to RetroArch");
+  const overlay::SettingsView retro = overlay::RenderSettings(
+      ViewFor(checks, own + "play_with = retroarch\n"));
+  ExpectChange(checks, retro, "[platform.pico8]", "play_with", "RetroArch", "");
+  // ...and one written by hand is shown as the nothing it places.
+  const overlay::SettingsView hand = overlay::RenderSettings(
+      ViewFor(checks, own + "play_with = tico\n"));
+  const overlay::SettingsRow* tico = RowNamed(hand, "[platform.pico8]", "play_with");
+  checks.Expect(tico != nullptr && tico->value == "Tico" && Contains(tico->note, "no Tico folder"),
+                "a hand-written tico with no Tico folder says it places nothing: " +
+                    (tico == nullptr ? std::string("no row") : tico->note));
+  // Where the map does list one, Tico is the third value.
+  const overlay::SettingsView mapped =
+      overlay::RenderSettings(ViewFor(checks, std::string(kMinimal) + kPico8InTico +
+                                                  "play_with = retroarch\n"));
+  ExpectChange(checks, mapped, "[platform.pico8]", "play_with", "RetroArch", "tico");
+}
+
+/// #271's rows walk every value and come round, through the write path.
+void CheckM10RestCycles(Checks& checks) {
+  for (const auto& [base, section, label, values] :
+       {std::tuple<std::string, std::string, std::string, std::size_t>{
+            kMinimal, "[sync]", "map_state_slots", 2},
+        {kMinimal, "[platform.snes]", "play_with", 2},
+        {std::string(kMinimal) + "[platform.pico8]\nroms = /roms/pico8\n", "[platform.pico8]",
+         "play_with", 2},
+        {std::string(kMinimal) + kPico8InTico, "[platform.pico8]", "play_with", 3}}) {
+    std::string text = base;
+    std::vector<std::string> seen;
+    for (std::size_t press = 0; press <= values; ++press) {
+      const overlay::SettingsView view = overlay::RenderSettings(ViewFor(checks, text));
+      const overlay::SettingsRow* row = RowNamed(view, section, label);
+      if (row == nullptr || !row->change.has_value()) {
+        checks.Expect(false, section + " " + label + " has a change to press");
+        break;
+      }
+      seen.push_back(row->value);
+      config::Edit edit;
+      edit.assignments.push_back(*row->change);
+      std::string after;
+      std::vector<config::Diagnostic> diagnostics;
+      checks.Expect(config::ApplyEdit(text, edit, &after, &diagnostics),
+                    section + " " + label + " = " + row->change->value + " is an edit SetConfig takes");
+      text = after;
+    }
+    checks.ExpectEq(seen.size(), values + 1, section + " " + label + ": every press was drawn");
+    if (seen.size() == values + 1) {
+      checks.ExpectEq(seen.back(), seen.front(), section + " " + label + ": the cycle comes round");
+    }
+  }
+}
+
 /// What a press on a setting row produced, said under the headline.
 void CheckEveryChangeOutcomeIsDrawn(Checks& checks) {
   const ipc::ConfigView sent = ViewFor(checks, kMinimal);
@@ -671,6 +926,14 @@ void CheckEveryChangeOutcomeIsDrawn(Checks& checks) {
   checks.Expect(Contains(saved.notice, "on_server_delete") && Contains(saved.notice, "keep"),
                 "an applied change names the setting and its value: " + saved.notice);
   checks.Expect(saved.notice_tone == overlay::Tone::kGood, "and reads good");
+
+  // An empty value is `play_with`'s way back to its default (#271), and the
+  // notice says that rather than "is now" and nothing.
+  overlay::ChangeState reset = applied;
+  reset.assignment = {"platform.pico8", "play_with", "", false};
+  const overlay::SettingsView back = overlay::RenderSettings(sent, {}, reset);
+  checks.Expect(Contains(back.notice, "play_with") && Contains(back.notice, "default"),
+                "a change to an empty value says the default is back: " + back.notice);
 
   overlay::ChangeState refused = applied;
   refused.result.outcome = ipc::WriteOutcome::kInvalid;
@@ -1130,6 +1393,11 @@ int main() {
   CheckMenuReachesEveryScreen(checks);
   CheckEditableRowsAreMarked(checks);
   CheckM10SettingsAreShownAndChanged(checks);
+  CheckSlotIsShownAndNotOffered(checks);
+  CheckMapStateSlotsIsChanged(checks);
+  CheckTicoAccountIsPicked(checks);
+  CheckPlayWithIsChanged(checks);
+  CheckM10RestCycles(checks);
   CheckEveryChangeOutcomeIsDrawn(checks);
   CheckRepairConfirmsBeforeItAsks(checks);
   CheckEveryRepairOutcomeIsDrawn(checks);

@@ -377,8 +377,9 @@ A custom root follows the same rule: a Tico folder `<root>/<folder>` is read at
 `<root>/users/<account>/<folder>` once `<root>/users/` exists. The map's folders
 themselves never change, so a file written by v1.0.0-rc1 means what it meant.
 An `account` that is not `auto`, `legacy` or 32 hex digits is a `warning`, and
-`auto` stays in force. `[tico]` is edited by hand; v1.0.0-rc1 ignores it with a
-warning.
+`auto` stays in force. The settings screen lists the accounts it found and names
+the one you press ([Editing from the overlay](#editing-from-the-overlay));
+v1.0.0-rc1 ignores `[tico]` with a warning.
 
 **What is never synced**, in any folder: Tico's `backups/` folders (the scan
 reads no subfolder), PSP saves — PPSSPP keeps each game's as a folder in Tico's
@@ -408,7 +409,7 @@ reads: letters, digits, `-` and `_`, up to 24 of them — every `state.db` row
 carries it, and that file is bounded. Anything else is a `warning` and
 `autosave` stays in force. Changing it moves every save to the new
 slot on the next tick, as a first meeting with whatever is there; the old slot
-is left on the server. The overlay does not edit it.
+is left on the server. The overlay shows it and does not edit it.
 
 ### `states` and `map_state_slots`: save states
 
@@ -659,11 +660,26 @@ rewrites the file and re-reads it, so the change is in force before the call
 comes back. No restart, and no second copy of the settings anywhere.
 
 The settings screen offers this for the settings that are a choice between a
-few words — `[sync] on_server_delete` and `[sources]` — where a press steps the
-row to its next value and pressing again undoes it. The sync switch is on the
-**Sync** screen. Every other key is still set in this file: `[sync] slot` and
-`[tico]` are refused from the overlay on purpose, since the one moves every save
-to a new slot on the server and the other names an account by a 32-digit id.
+few words — `[sync] on_server_delete`, `[sync] map_state_slots`, `[sources]` and
+each platform's `play_with` — where a press steps the row to its next value and
+pressing again sets it back. What a sync did in between stays done: states
+uploaded under `map_state_slots`' other names stay on the server (see
+[above](#states-and-map_state_slots-save-states)), and a save placed by one
+`play_with` stays where it was placed. `play_with` heads its platform's section;
+on a platform Tico does not run it steps through *Not set* as well, which writes
+`play_with =`, and offers Tico only when the platform's folder map lists a Tico
+folder -- without one, Tico has nowhere to place a save new to the card.
+
+`[tico] account` is a list rather than a step: under the row showing the value
+in force, every account folder the last sync found under Tico's `users/` is a
+row of its own, and a press on one names that account. Stepping would put each
+account in force on the way to the next, and a sync in between would upload the
+saves of an account nobody chose. Only accounts on the card are offered;
+`legacy` is not, and a press on the `account` row sets it back to `auto`.
+
+The sync switch is on the **Sync** screen. Every other key is still set in this
+file. `[sync] slot` is shown and refused on purpose, since a new slot moves
+every save to it on the server and leaves the old one behind.
 
 **Your file survives the edit.** One line changes; every other byte is the byte
 you typed. Comments, blank lines, the order of your `[platform.x]` sections, a

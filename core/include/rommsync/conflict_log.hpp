@@ -451,7 +451,7 @@ enum class RestoreOutcome {
   kBackupFailed,
 
   /// The backup was made and the restore did not land. Whatever is at `sd_path`
-  /// is what was there before -- `io::CopyAtomically` stages and commits, so
+  /// is what was there before -- the copy is staged and then committed, so
   /// there is no third state.
   kWriteFailed,
 
@@ -463,6 +463,39 @@ enum class RestoreOutcome {
   /// outcome by name and an older overlay refuses one it does not know --
   /// which is why it bumped `ipc::kVersion` to 9.
   kNotAConflict,
+
+  /// **The file was written after the restore backed it up** (#270): a game
+  /// running under the overlay saved between the restore's backup and its copy.
+  /// Those bytes are in no copy anywhere, so nothing was written over them: the
+  /// file holds the game's write, `backup_sd_path` what it held before, and the
+  /// entry's own backup is untouched -- the restore can simply be asked again.
+  /// Appended, and it bumped `ipc::kVersion` to 10 for `kNotAConflict`'s reason.
+  kChangedSinceBackup,
+
+  /// **Keep local was asked of a conflict a newer entry of the same save has
+  /// replaced** (#273): another conflict, a download over it or a deletion,
+  /// recorded since for the same `(rom_id, slot)`. Its backup holds bytes the
+  /// card has moved on from twice, and the override would put them over a
+  /// server copy nobody chose to replace. Only the save's newest entry is Keep
+  /// local's. Nothing was written.
+  kSuperseded,
+
+  /// **Keep local was asked while a game is in the foreground** (#273). The
+  /// game holds its save in memory and writes it on close, over the kept bytes
+  /// -- and #242's hold would then send *those* with `overwrite=true`, bytes the
+  /// player never chose. Nothing was written; the press can be repeated once
+  /// the game is closed.
+  kGameRunning,
+
+  /// **Keep local was asked while `sync::kMaxKeepLocal` choices already wait
+  /// for their upload** (#273), sync being off or held. Refused rather than
+  /// letting the oldest go: that one's bytes are already on the card, and its
+  /// upload without the override would meet the slot guard and resolve as Keep
+  /// server -- the player's answer undone without a word. Nothing was written.
+  ///
+  /// The three are appended together, and bumped `ipc::kVersion` to 12 for
+  /// `kNotAConflict`'s reason.
+  kKeepLocalFull,
 };
 const char* ToString(RestoreOutcome outcome);
 

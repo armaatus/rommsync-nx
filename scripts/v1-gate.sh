@@ -253,7 +253,7 @@ T
 # serves is the one that says there are only these.
 SAVE_SITE_CENSUS='core/src/auth_gate.cpp|0|0|1||not a save: the auth backoff record
 core/src/conflict_log.cpp|0|0|1||not a save: the conflict log M7-1 writes
-core/src/conflict_record.cpp|0|1|0|io::CopyAtomically|SAVE (M7-1 restore): putting a backup back IS an overwrite, so sync::BackUpFirst runs first
+core/src/conflict_record.cpp|1|0|0|io::CommitStaged|SAVE (M7-1 restore): putting a backup back IS an overwrite, so sync::BackUpFirst runs first; staged with io::CopyStaged so the #270 check sits between the copy and the commit
 core/src/device_identity.cpp|0|0|2||not a save: device.dat
 core/src/download.cpp|1|0|1||not a save: rom bytes, and the queue record
 core/src/play_sessions.cpp|0|0|1||not a save: the play-session buffer M7-4 writes

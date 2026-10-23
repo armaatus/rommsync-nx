@@ -323,6 +323,14 @@ const char* ToString(RestoreOutcome outcome) {
       return "write_failed";
     case RestoreOutcome::kNotAConflict:
       return "not_a_conflict";
+    case RestoreOutcome::kChangedSinceBackup:
+      return "changed_since_backup";
+    case RestoreOutcome::kSuperseded:
+      return "superseded";
+    case RestoreOutcome::kGameRunning:
+      return "game_running";
+    case RestoreOutcome::kKeepLocalFull:
+      return "keep_local_full";
   }
   return "no_such_entry";
 }

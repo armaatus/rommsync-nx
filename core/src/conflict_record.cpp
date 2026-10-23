@@ -219,7 +219,7 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
     return report;
   }
 
-  // **Step 3 of the four, and it is not optional.** A restore is a save
+  // **Step 3 of the six, and it is not optional.** A restore is a save
   // overwrite, so the bytes it is about to replace go under `.backup/` first,
   // through the same call M2-5 makes -- with the save's slot or the state's name
   // as the discriminator, so one rom's save and its state never share a name.
@@ -242,12 +242,41 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 
   // Streamed and staged: a save state is tens of megabytes and the sysmodule's
   // inner heap is 1.5 MiB, and the two-rename commit is what makes an
-  // interruption leave the old bytes or the new ones and never a splice.
-  const io::CopyResult copied = io::CopyAtomically(backup, destination);
+  // interruption leave the old bytes or the new ones and never a splice. Staged
+  // apart from the commit so the check below comes after the slow part.
+  io::StagedFile staged(io::TempPathFor(destination));
+  const io::CopyResult copied = io::CopyStaged(backup, destination);
   if (!copied.ok()) {
     report.outcome = RestoreOutcome::kWriteFailed;
     report.message = "the backup could not be written back over " + entry->sd_path + ": " +
                      copied.message;
+    return report;
+  }
+
+  // **And the file is still what step 3 copied** (#270, #263's check). A restore
+  // runs from the overlay over a game that may be running, and nothing holds the
+  // game off the file: a save it wrote since the backup is in no copy anywhere,
+  // so the restore stands down, its staged copy goes with the guard, and the
+  // file is left. Last before the commit, so the window left is this read.
+  const sync::OperationError unchanged =
+      sync::UnchangedSinceBackup(files, entry->sd_path, report.backup_sd_path, &message);
+  if (unchanged != sync::OperationError::kNone) {
+    // A backup that cannot be read back is not one this restore may lean on,
+    // which is `kBackupFailed`'s promise: nothing was written.
+    report.outcome = unchanged == sync::OperationError::kUnverified
+                         ? RestoreOutcome::kChangedSinceBackup
+                         : RestoreOutcome::kBackupFailed;
+    report.message = "nothing was restored: " + message;
+    return report;
+  }
+
+  // Consumed by the commit whether it succeeds or fails, so the guard is done.
+  staged.Release();
+  const io::WriteResult committed = io::CommitStaged(io::TempPathFor(destination), destination);
+  if (!committed.ok()) {
+    report.outcome = RestoreOutcome::kWriteFailed;
+    report.message = "the backup could not be written back over " + entry->sd_path + ": " +
+                     committed.message;
     return report;
   }
 
@@ -263,15 +292,43 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 }
 
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
+                        const std::vector<state::Baseline::Key>& armed,
                         state::Baseline::Key* key, const RestoreOptions& options) {
   const Entry* entry = history.Find(entry_id);
-  if (entry != nullptr && !entry->save_conflict()) {
+  const auto refuse = [entry](RestoreOutcome outcome, const std::string& why) {
     RestoreReport refused;
-    refused.outcome = RestoreOutcome::kNotAConflict;
-    refused.message = entry->file_name +
-                      ": not a save conflict, so there is no server copy to keep this console's "
-                      "over -- nothing was written";
+    refused.outcome = outcome;
+    refused.message = entry->file_name + ": " + why + " -- nothing was written";
     return refused;
+  };
+  if (entry != nullptr && !entry->save_conflict()) {
+    return refuse(RestoreOutcome::kNotAConflict,
+                  "not a save conflict, so there is no server copy to keep this console's over");
+  }
+  if (entry != nullptr) {
+    // Ids only grow, so a later entry of the same save is one with a larger id
+    // -- of any event: a download or a deletion moved the card on as surely as
+    // a second conflict did.
+    for (const Entry& other : history.entries()) {
+      if (other.id > entry->id && other.kind == EntryKind::kSave &&
+          other.rom_id == entry->rom_id && other.slot == entry->slot) {
+        return refuse(RestoreOutcome::kSuperseded,
+                      "a newer entry of this save is in the history, so these bytes are not the "
+                      "ones on the card to keep; choose on the newest one");
+      }
+    }
+    const state::Baseline::Key wanted{entry->rom_id, entry->slot};
+    if (armed.size() >= sync::kMaxKeepLocal && sync::FindByKey(armed, wanted) == nullptr) {
+      return refuse(RestoreOutcome::kKeepLocalFull,
+                    std::to_string(sync::kMaxKeepLocal) +
+                        " Keep local choices are already waiting for a sync to send them, and "
+                        "this would be one more");
+    }
+    if (options.game_running) {
+      return refuse(RestoreOutcome::kGameRunning,
+                    "a game is running, and would save over the kept bytes when it closes; "
+                    "close it and choose Keep local again");
+    }
   }
   // A missing entry falls through: `Restore` names that refusal itself.
   RestoreReport report = Restore(files, history, entry_id, options);

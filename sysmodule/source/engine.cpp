@@ -66,6 +66,21 @@ log::Level LevelFor(config::Severity severity) {
 /// in consecutive statements, and two copies is how they come to disagree.
 bool StoppedAccepting(int status) { return status == 401 || status == 403; }
 
+/// How a log line names a rom -- `Tetris (World) (rom 812)`, with `, slot S`
+/// inside the parentheses when one is given: its file name when the index has
+/// it, and its id always, so a line about a rom the index has lost can still be
+/// traced.
+std::string RomLabel(const roms::RomIndex& index, std::int64_t rom_id,
+                     const std::optional<std::string>* slot = nullptr) {
+  const roms::Rom* rom = index.ById(rom_id);
+  std::string label = (rom != nullptr ? rom->fs_name_no_ext : std::string("rom")) + " (rom " +
+                      std::to_string(rom_id);
+  if (slot != nullptr) {
+    label += ", slot " + slot->value_or("none");
+  }
+  return label + ")";
+}
+
 /// The one line every tick ends with, whatever ended it.
 ///
 /// **Every path out of `RunOneTick` writes one**, including the four that return
@@ -511,8 +526,18 @@ std::vector<config::Diagnostic> SdEngine::source_notes() const {
   return source_notes_;
 }
 
+std::vector<std::string> SdEngine::tico_accounts() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return tico_accounts_;
+}
+
 void SdEngine::NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
-                           std::vector<config::Diagnostic> tico) {
+                           std::vector<config::Diagnostic> tico,
+                           std::vector<std::string> accounts) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tico_accounts_ = std::move(accounts);
+  }
   std::vector<config::Diagnostic> notes = loaded.diagnostics;
   for (config::Diagnostic& note : retroarch::Notes(config, loaded.value)) {
     notes.push_back(std::move(note));
@@ -2343,7 +2368,9 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   found.retroarch = retroarch::Load(files.Resolve(retroarch::kConfigSdPath));
   // Tico's layout is read off the card the same way, every tick: a Tico
   // update or a new account changes it without touching config.ini.
-  NoteSources(config, found.retroarch, tico::Notes(config, files));
+  std::vector<std::string> accounts;
+  std::vector<config::Diagnostic> tico_notes = tico::Notes(config, files, &accounts);
+  NoteSources(config, found.retroarch, std::move(tico_notes), std::move(accounts));
   found.scanned =
       scan::ScanSaves(config, found.retroarch.value, library.index, files, found.loaded.value);
   // One line per file the scan would not report, at the spelling the scanner
@@ -2493,14 +2520,26 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
   // a tick runs each chunk's plan on its own and frees it before the next
   // (#246), so `tick.executed` is the last plan's alone (`TickOptions::on_plan`).
   const std::vector<state::Baseline::Key>* sent = &options->execute.keep_local;
-  options->on_plan = [this, found, &record, tally, sent](const sync::SyncPlan& plan,
-                                                        const sync::ExecutionReport& executed) {
+  options->on_plan = [this, found, &record, tally, sent, &library](
+                         const sync::SyncPlan& plan, const sync::ExecutionReport& executed) {
     // A Keep local this plan answered has had its one upload (#249). Only one
     // this tick *sent*: a restore that lands while the tick runs arms a choice
     // this plan never carried.
+    std::vector<sync::OvertakenKeepLocal> overtaken;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      sync::SpendKeepLocal(&keep_local_, *sent, executed);
+      overtaken = sync::SpendKeepLocal(&keep_local_, *sent, executed);
+    }
+    // And one the server answered with something other than an upload is spent
+    // with nothing sent -- another device wrote since, and its copy is what
+    // this plan put on the card, the kept bytes under `.backup/` -- which the
+    // player is told rather than left to find (#273).
+    for (const sync::OvertakenKeepLocal& choice : overtaken) {
+      log::Warn(log::Event::kSyncRefused,
+                RomLabel(library.index, choice.key.first, &choice.key.second) +
+                    ": Keep local was overtaken -- the server asked for a " +
+                    sync::ToString(choice.action) +
+                    ", not an upload, so nothing went over its copy and the choice is spent");
     }
     TallyPlan(plan, executed, found->reported, record, tally);
   };
@@ -2546,10 +2585,8 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
   // out of this tick (#246): its saves were not offered and nothing of it was
   // touched. Named, so the one game that is not syncing can be found.
   for (const std::int64_t rom_id : tick.oversized_roms) {
-    const roms::Rom* rom = library.index.ById(rom_id);
     log::Warn(log::Event::kSyncRefused,
-              (rom != nullptr ? rom->fs_name_no_ext : std::string("rom")) + " (rom " +
-                  std::to_string(rom_id) + "): the server holds more saves for it than the " +
+              RomLabel(library.index, rom_id) + ": the server holds more saves for it than the " +
                   std::to_string(sync::kMaxPlanOperations) +
                   " one plan can carry, so it was left out of this sync");
   }
@@ -3255,11 +3292,28 @@ ipc::RestoreState SdEngine::restore_state() const {
 void SdEngine::RunRestore(std::int64_t entry_id) {
   conflicts::RestoreReport report;
   bool keep_local = false;
+  std::vector<state::Baseline::Key> armed;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     keep_local = restore_keeps_local_;
+    if (keep_local) {
+      // For `conflicts::KeepLocal`'s bound. Only a restore arms, and one runs
+      // at a time, so the list can only shrink before the arm below.
+      armed = keep_local_;
+    }
   }
   state::Baseline::Key kept{0, std::nullopt};
+  // **Never under a running game** (#273). The game holds its save in memory
+  // and writes it when it closes, over the bytes Keep local puts back -- and
+  // the tick #242 holds for it would then upload *that* write with
+  // `overwrite=true`, bytes the player never chose. Asked of any application:
+  // `pm` names a title, not the save it holds, and RetroArch runs every rom
+  // under one, so "the save's own game" cannot be told from another. Asked
+  // before the locks below, since on a console it is a service call; `KeepLocal`
+  // refuses on it after the entry's own refusals. A plain restore is not asked:
+  // it overrules nothing, and the next sync arbitrates whatever the card holds.
+  conflicts::RestoreOptions restore_options;
+  restore_options.game_running = keep_local && application_running();
   {
     // **Held for the whole check-and-act**, which on the worker is the same
     // thread as every tick and so cannot contend with one; it is taken anyway
@@ -3282,13 +3336,14 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
       report.outcome = conflicts::RestoreOutcome::kBackupFailed;
       report.message = "this build cannot open the SD card, so nothing was written";
     } else if (keep_local) {
-      report = conflicts::KeepLocal(*card_, history_, entry_id, &kept);
+      report = conflicts::KeepLocal(*card_, history_, entry_id, armed, &kept, restore_options);
     } else {
       report = conflicts::Restore(*card_, history_, entry_id);
     }
   }
 
-  bool armed = false;
+  bool woken = false;
+  bool unarmed = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (restore_.entry_id != entry_id) {
@@ -3302,15 +3357,26 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
       // copy. A tick is asked for at once, so the choice goes up while the
       // player is still looking at it rather than at the next interval --
       // under a switched-off sync, the scheduler drops the ask and the choice
-      // waits for the next tick that runs.
-      sync::ArmKeepLocal(&keep_local_, kept);
-      scheduler_.RequestNow();
-      armed = true;
+      // waits for the next tick that runs. `KeepLocal` refused a fifth before
+      // writing (#273), so there is room -- and if that ever stops being true,
+      // the bytes are on the card with no override, which is said.
+      if (sync::ArmKeepLocal(&keep_local_, kept)) {
+        scheduler_.RequestNow();
+        woken = true;
+      } else {
+        unarmed = true;
+      }
     }
     restore_.phase = ipc::RestorePhase::kDone;
     restore_.report = std::move(report);
   }
-  if (armed) {
+  if (unarmed) {
+    log::Warn(log::Event::kSyncRefused,
+              "rom " + std::to_string(kept.first) +
+                  ": Keep local restored the bytes but could not arm their upload, so the next "
+                  "sync meets the slot guard with them as any upload does");
+  }
+  if (woken) {
     Wake();
   }
 }

@@ -17,6 +17,8 @@
 //              scan reads the file back
 //   retroarch_folder -- #258: where RetroArch writes, one rule the placer and
 //              the scan both ask
+//   core_bound -- #269: a core folder one placement makes counts against the
+//              scan's bound for the rest of the tick
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -700,6 +702,55 @@ void RetroArchFolder(checks::Checks& c) {
              std::string(retroarch::kDefaultSavestateDirectory), "a state folder by the same rule");
 }
 
+/// #269: the scan reads `scan::kMaxRetroArchFolders` core folders, and the
+/// placer holds its plan of them for the tick -- so a core folder one placement
+/// makes counts against the next. At one short of the bound, the first
+/// placement that makes a core folder takes the last place, a second one into
+/// that same folder still fits, and one that makes another is refused for the
+/// reason any folder past the bound is: the scan would not read it.
+void CoreBound(checks::Checks& c) {
+  const roms::RomIndex index = Library();
+  config::LoadResult loaded = config::ParseConfig(
+      "[platform.snes]\nplay_with = retroarch\n\n[platform.gba]\nplay_with = retroarch\n");
+  loaded.value.sync.states = true;
+  const retroarch::Settings settings;
+  for (const bool saves : {true, false}) {
+    const std::string what = saves ? "saves" : "states";
+    const std::string folder =
+        saves ? retroarch::kDefaultSavefileDirectory : retroarch::kDefaultSavestateDirectory;
+    const std::string ext = saves ? ".srm" : ".state";
+    const auto place_one = [&](place::Placer& placer, std::int64_t rom, const std::string& emulator) {
+      return saves ? placer.Save(Download(rom, ScanSlot("x.srm"), emulator, "x.srm"))
+                   : placer.State(rom, index.ById(rom)->fs_name_no_ext + ext, emulator);
+    };
+
+    Card card("core-bound-" + what);
+    for (std::size_t at = 0; at + 1 < scan::kMaxRetroArchFolders; ++at) {
+      card.MakeDirs(folder + "/Core" + std::to_string(100 + at));
+    }
+    place::Placer placer(loaded.value, settings, index, card.files());
+    const place::Placement first = place_one(placer, 1, "snes9x");
+    c.ExpectEq(first.sd_path, folder + "/Snes9x/Super Mario World (USA)" + ext,
+               what + ": the last core folder the scan reads is taken: " + first.reason);
+    const place::Placement beside = place_one(placer, 7, "snes9x");
+    c.ExpectEq(beside.sd_path, folder + "/Snes9x/Game (USA)" + ext,
+               what + ": and is there for the next placement into it: " + beside.reason);
+    const place::Placement past = place_one(placer, 8, "mgba");
+    c.Expect(!past.ok(), what + ": a second core folder made in the same tick is past the "
+                                "bound, and placed nowhere -- got " + past.sd_path);
+
+    // The reason is the one the bound gives any folder past it, as a placer
+    // planned on a card where the first folder is already there says.
+    card.MakeDirs(folder + "/Snes9x");
+    place::Placer next_tick(loaded.value, settings, index, card.files());
+    const place::Placement full = place_one(next_tick, 8, "mgba");
+    c.Expect(!full.ok() && !full.reason.empty(),
+             what + ": with the bound reached on the card, mGBA's folder is refused -- got " +
+                 full.sd_path);
+    c.ExpectEq(past.reason, full.reason, what + ": for the same reason in both ticks");
+  }
+}
+
 /// The state scan's answer for `sd_path`, written and removed again: read back
 /// as `rom_id` under the same name.
 /// `as` is the name the state must pair on once read back: its own file name
@@ -1029,6 +1080,8 @@ int main(int argc, char** argv) {
     RomFolder(c);
   } else if (scenario == "retroarch_folder") {
     RetroArchFolder(c);
+  } else if (scenario == "core_bound") {
+    CoreBound(c);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

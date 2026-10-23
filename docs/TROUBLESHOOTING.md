@@ -839,8 +839,9 @@ installed before 0.8.0 keeps writing there until it is reinstalled.
 folder is not the one you play as — you have never saved under yours yet — so
 that one is synced.
 
-**The fix.** Name the account in `config.ini`, using an id from the settings
-screen's list:
+**The fix.** Name the account. On the console: the settings screen's `[tico]`
+section lists every account it found under `users/`, one row each — press **A**
+on yours. Or in `config.ini`, with an id from that list:
 
 ```ini
 [tico]

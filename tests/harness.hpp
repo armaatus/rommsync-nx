@@ -675,6 +675,7 @@ struct Save {
   std::string file_name;
   std::string content_hash;
   std::string updated_at;
+  std::string created_at;  // never moved by a rewrite of the row (#272)
   std::int64_t file_size_bytes = 0;
 
   /// `GET` path for the bytes. No `device_id` on it: that parameter writes this
@@ -695,6 +696,7 @@ inline bool ReadSave(const http::Result& result, Save* out) {
   out->file_name = Field(document.value, "file_name");
   out->content_hash = Field(document.value, "content_hash");
   out->updated_at = Field(document.value, "updated_at");
+  out->created_at = Field(document.value, "created_at");
   out->file_size_bytes = Number(document.value, "file_size_bytes");
   return true;
 }

@@ -69,6 +69,10 @@
 //   install_wake -- a refused claim is asked again after a wake, not only a boot
 //   keep_local -- #249: Keep local on the conflicts screen is the one upload
 //                with overwrite=true, over another lineage's head, and only once
+//   keep_local_overtaken -- #273: Keep local refused under a game and on a
+//                superseded conflict, and a download that spends it unsent, said
+//   keep_local_guards -- #273: refused under a game and past four waiting, with
+//                nothing written and nothing armed (no server)
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -1953,6 +1957,100 @@ void RestoreDuringBootWait(checks::Checks& c) {
              "the bytes are back on the card");
 }
 
+/// #273, through the engine and over the wire: Keep local is refused under a
+/// running game and past `sync::kMaxKeepLocal` waiting choices, each before a
+/// byte is written -- and the refusal under the game arms nothing, which is
+/// what keeps the game's write on close from going up with `overwrite=true`.
+///
+/// Sync is switched off, so nothing spends a choice: the four that land wait,
+/// as they would on a console whose sync is off or held.
+void KeepLocalGuards(checks::Checks& c) {
+  Console console(c, "engine-keep-local-guards");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[sync]\nenabled = false\n"),
+           "a card with sync switched off");
+  const std::size_t saves = rommsync::sync::kMaxKeepLocal + 1;
+  const auto file = [](std::size_t n) { return "game" + std::to_string(n) + ".srm"; };
+  const auto kept = [](std::size_t n) { return "the bytes kept for save " + std::to_string(n); };
+  const auto server = [](std::size_t n) { return "the server's copy of " + std::to_string(n); };
+  std::vector<std::int64_t> ids;
+  {
+    conflicts::History history(console.directory + conflicts::kHistoryFileName);
+    history.Load();
+    for (std::size_t n = 1; n <= saves; ++n) {
+      const std::string backup = std::string(harness::kBackupDir) + "/" + std::to_string(n) +
+                                 "-retroarch-srm-1757000000.srm";
+      c.Expect(console.sandbox.SeedSave(harness::SavePath(file(n)), server(n)) &&
+                   console.sandbox.Write(backup, kept(n)),
+               "a save conflict's two sides are on the card");
+      conflicts::Entry entry;
+      entry.kind = conflicts::EntryKind::kSave;
+      entry.event = conflicts::Event::kConflict;
+      entry.rom_id = static_cast<std::int64_t>(n);
+      entry.rom_name = "Game";
+      entry.file_name = file(n);
+      entry.slot = "retroarch-srm";
+      entry.when = 1'757'000'000;
+      entry.sd_path = harness::SavePath(file(n));
+      entry.backup_sd_path = backup;
+      ids.push_back(history.Append(entry).id);
+    }
+  }
+
+  std::atomic<bool> running{true};
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  console.engine.UseForegroundProbe([&running] {
+    play::Foreground foreground;
+    foreground.running = running.load();
+    return foreground;
+  });
+  console.engine.StartWorker();
+
+  const auto keep_local = [&console](std::int64_t id) {
+    std::string response;
+    console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(id), &response);
+    return console.AwaitRestore(id);
+  };
+
+  // Under a game: refused, and the card is as it was.
+  const ipc::RestoreState under_game = keep_local(ids[0]);
+  c.Expect(under_game.phase == ipc::RestorePhase::kDone &&
+               under_game.report.outcome == conflicts::RestoreOutcome::kGameRunning,
+           std::string("Keep local under a running game is refused: ") +
+               conflicts::ToString(under_game.report.outcome) + " -- " +
+               under_game.report.message);
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), server(1),
+             "and nothing was written: the game's copy is the one it will save over");
+
+  // The game closes. Four choices land -- the first among them, so the refusal
+  // armed nothing, or the fourth here would be a fifth.
+  running = false;
+  for (std::size_t n = 1; n < saves; ++n) {
+    const ipc::RestoreState done = keep_local(ids[n - 1]);
+    c.Expect(done.report.ok(), "Keep local " + std::to_string(n) + " lands once the game is " +
+                                   "closed: " + conflicts::ToString(done.report.outcome) +
+                                   " -- " + done.report.message);
+    c.ExpectEq(console.sandbox.Read(harness::SavePath(file(n))), kept(n),
+               "with its bytes on the card");
+  }
+
+  // The fifth, with four waiting: refused, not the first let go.
+  const ipc::RestoreState fifth = keep_local(ids[saves - 1]);
+  c.Expect(fifth.report.outcome == conflicts::RestoreOutcome::kKeepLocalFull,
+           std::string("a fifth Keep local while four wait is refused: ") +
+               conflicts::ToString(fifth.report.outcome) + " -- " + fifth.report.message);
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(saves))), server(saves),
+             "and nothing was written");
+
+  // One already waiting is chosen again freely: it takes no new place.
+  const ipc::RestoreState again = keep_local(ids[0]);
+  c.Expect(again.report.ok(), std::string("a waiting choice may be made again: ") +
+                                  conflicts::ToString(again.report.outcome) + " -- " +
+                                  again.report.message);
+}
+
 /// M9-6 (#209): a restore that takes as long as the card does holds no IPC
 /// call for that long.
 ///
@@ -3784,6 +3882,21 @@ int TicoAccounts(http::HttpClient& client, const std::string& base) {
       std::chrono::seconds{120});
   c.Expect(ticked.last_sync_result != ipc::SyncResult::kNever, "and it ran");
   c.Expect(warned(), "the settings screen names both accounts and asks for one");
+  // ...and carries them as the answers its picker offers (#271).
+  const std::vector<std::string> offered = console.Configured().tico_accounts;
+  c.Expect(offered == std::vector<std::string>{kAccounts[0], kAccounts[1]},
+           "GetConfig carries both accounts, sorted, for the settings screen to offer");
+
+  // The picker's press: one of them named through the same edit `SetConfig`
+  // sends. The warning goes, and the accounts are still listed, so the choice
+  // can be changed again from the console.
+  ipc::ConfigEdit pick;
+  pick.assignments.push_back({"tico", "account", kAccounts[1], false});
+  std::vector<config::Diagnostic> notes;
+  c.Expect(console.engine.ApplyConfigEdit(pick, &notes) == ipc::Error::kOk,
+           "naming one account is an edit the sysmodule takes");
+  c.ExpectEq(config::AccountText(console.Configured().config.tico), kAccounts[1],
+             "and it is the account in force");
   return c.failures();
 }
 
@@ -5925,6 +6038,197 @@ int KeepLocalChoice(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #273, through the real engine against RomM 5.4.0: the ways a Keep local is
+/// spent without the override going up.
+///
+///   1. a conflict, as `keep_local` makes one: gpsp's head on the card, the
+///      console's bytes under `.backup/`;
+///   2. Keep local under a running game is refused, and the game's own write on
+///      close then goes up as an ordinary upload -- never with
+///      `overwrite=true`, because nothing was armed;
+///   3. a second conflict of the same save, after which Keep local on the first
+///      is refused as superseded;
+///   4. Keep local on the second while sync is off, so the choice waits; another
+///      device writes the slot in the console's own lineage after the restore,
+///      so the next plan is a download. That plan spends the choice with
+///      nothing sent: the other device's bytes land, the kept ones are backed
+///      up, and the log says the choice was overtaken;
+///   5. and the next upload of the save goes without the override.
+int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee_mb.gba", &rom),
+           "the fixture library has 240pee_mb.gba");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-keep-local-overtaken");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::string stamp = harness::UniqueSlot("keep-local-overtaken");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Intercepting wire(client);
+  Console console(c, "engine-keep-local-overtaken");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::string save = "/tico/saves/gba/240pee_mb.srm";
+  console.sandbox.MakeDirs("/tico/saves/gba");
+  const std::string first = "the switch's save, first synced " + stamp + "\n";
+  console.sandbox.SeedSave(save, first);
+
+  std::atomic<bool> running{false};
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.Boot();
+  console.engine.UseForegroundProbe(
+      [&running] {
+        play::Foreground foreground;
+        foreground.running = running.load();
+        return foreground;
+      },
+      std::chrono::milliseconds{50});
+  console.engine.UseServer(&wire, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  harness::Sandbox staging(c, "engine-keep-local-overtaken-other");
+  // Under `gpsp` a conflict is the slot guard's alone (#236); under `mgba`, the
+  // console's own lineage, the filtered negotiate sees the write and plans it.
+  const auto other_device = [&](const std::string& bytes, const std::string& what,
+                                const char* emulator = "gpsp") {
+    const std::string staged = staging.Host("/config/rommsync/other.srm");
+    rig::WriteFile(staged, bytes);
+    harness::Save written;
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", emulator, staged,
+                                 "240pee_mb.srm", /*with_device=*/false, &written),
+             what + ": another device writes the slot under " + emulator);
+  };
+  const auto overrides = [&wire] { return wire.Asked(http::Method::kPost, "overwrite=true"); };
+  const auto newest_conflict = [&]() {
+    std::string response;
+    console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
+                 &response);
+    // Newest first, so the first conflict of the rom is the newest.
+    for (const ipc::ConflictRow& row : ipc::DecodeConflictPage(response).value.entries) {
+      if (row.entry.rom_id == rom.id && row.entry.event == conflicts::Event::kConflict) {
+        return row.entry.id;
+      }
+    }
+    return std::int64_t{0};
+  };
+  const auto keep_local = [&console](std::int64_t id) {
+    std::string response;
+    console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(id), &response);
+    return console.AwaitRestore(id);
+  };
+  // One conflict: another device writes the slot, the console's save moves on,
+  // and the tick's upload meets the guard.
+  const auto conflict = [&](const std::string& theirs, const std::string& mine,
+                            const std::string& what) {
+    harness::PassASecond();
+    other_device(theirs, what);
+    harness::PassASecond();
+    console.sandbox.Reseed(save, mine);
+    TickOnce(console, ticks, c, what);
+    c.ExpectEq(console.sandbox.Read(save), theirs,
+               what + ": Keep server, the default -- the slot's head is on the card" +
+                   Rendered(console.Log()));
+    c.Expect(console.sandbox.HasBackupOf(mine), what + ": and the console's bytes are backed up");
+  };
+
+  // 1.
+  TickOnce(console, ticks, c, "the first tick");
+  const std::string theirs = "the other device's progress " + stamp + "\n";
+  const std::string mine = "the switch's progress, at the first conflict " + stamp + "\n";
+  conflict(theirs, mine, "the first conflict");
+  const std::int64_t first_conflict = newest_conflict();
+  c.Expect(first_conflict != 0, "the conflict is on the conflicts screen");
+
+  // 2. Under a game: refused, and nothing is armed for the write it makes on
+  // close.
+  running = true;
+  const ipc::RestoreState under_game = keep_local(first_conflict);
+  c.Expect(under_game.report.outcome == conflicts::RestoreOutcome::kGameRunning,
+           std::string("Keep local under a running game is refused: ") +
+               conflicts::ToString(under_game.report.outcome) + " -- " +
+               under_game.report.message);
+  c.ExpectEq(console.sandbox.Read(save), theirs, "and the card is as the game found it");
+  harness::PassASecond();
+  const std::string on_close = "what the game wrote as it closed " + stamp + "\n";
+  console.sandbox.Reseed(save, on_close);
+  running = false;
+  TickOnce(console, ticks, c, "the tick after the game");
+  c.Expect(overrides().empty(),
+           "the game's write on close did not go up with overwrite=true -- the player never "
+           "chose those bytes");
+
+  // 3. A second conflict of the save supersedes the first.
+  const std::string theirs_again = "the other device, at the second conflict " + stamp + "\n";
+  const std::string mine_again = "the switch's progress, at the second conflict " + stamp + "\n";
+  conflict(theirs_again, mine_again, "the second conflict");
+  const std::int64_t second_conflict = newest_conflict();
+  c.Expect(second_conflict > first_conflict, "the second conflict is the save's newest entry");
+  // Asked under a game too: the refusal that holds whatever the player does is
+  // the one said, not "close the game" and then this one after they have.
+  running = true;
+  const ipc::RestoreState stale = keep_local(first_conflict);
+  running = false;
+  c.Expect(stale.report.outcome == conflicts::RestoreOutcome::kSuperseded,
+           std::string("Keep local on the first conflict is refused as superseded, game or "
+                       "none: ") +
+               conflicts::ToString(stale.report.outcome) + " -- " + stale.report.message);
+  c.ExpectEq(console.sandbox.Read(save), theirs_again, "and wrote nothing");
+
+  // 4. The choice waits behind a switched-off sync while another device writes.
+  c.Expect(console.SetEnabled(false).enabled == false, "sync is switched off");
+  const ipc::RestoreState kept = keep_local(second_conflict);
+  c.Expect(kept.report.ok(), std::string("Keep local on the newest conflict lands: ") +
+                                 conflicts::ToString(kept.report.outcome) + " -- " +
+                                 kept.report.message);
+  c.ExpectEq(console.sandbox.Read(save), mine_again, "with the console's bytes on the card");
+  harness::PassASecond();
+  const std::string overtaking = "the other device, after the restore " + stamp + "\n";
+  other_device(overtaking, "after Keep local", "mgba");
+  harness::PassASecond();
+  c.Expect(console.SetEnabled(true).enabled, "sync is switched back on");
+  TickOnce(console, ticks, c, "the tick the choice waited for");
+  const ipc::LogTail log = console.Log();
+  c.Expect(overrides().empty(),
+           "the plan was a download, so nothing went up with overwrite=true" + Rendered(log));
+  c.ExpectEq(console.sandbox.Read(save), overtaking,
+             "the other device's bytes are on the card" + Rendered(log));
+  c.Expect(console.sandbox.HasBackupOf(mine_again), "and the kept bytes are under .backup/");
+  bool said = false;
+  for (const std::string& line : log.lines) {
+    said = said || (line.find("sync.refused") != std::string::npos &&
+                    line.find("Keep local was overtaken") != std::string::npos);
+  }
+  c.Expect(said, "the log says the choice was overtaken, not dropped:" + Rendered(log));
+
+  // 5. Spent: the next upload of the save meets the guard as any does.
+  harness::PassASecond();
+  const std::string later = "the switch's next save, an ordinary upload " + stamp + "\n";
+  console.sandbox.Reseed(save, later);
+  TickOnce(console, ticks, c, "the tick after");
+  c.Expect(overrides().empty(), "the spent choice sends no overwrite=true later");
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -5962,6 +6266,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"install_settle", InstallSettle},
       {"install_wake", InstallWake},
       {"keep_local", KeepLocalChoice},
+      {"keep_local_overtaken", KeepLocalOvertaken},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -6011,6 +6316,8 @@ int main(int argc, char** argv) {
     RestoreIsPolled(checks);
   } else if (scenario == "restore_boot_wait") {
     RestoreDuringBootWait(checks);
+  } else if (scenario == "keep_local_guards") {
+    KeepLocalGuards(checks);
   } else if (scenario == "syncnow") {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {

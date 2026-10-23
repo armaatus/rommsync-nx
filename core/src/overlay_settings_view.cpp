@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -12,6 +13,8 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "rommsync/overlay_sync_actions.hpp"
+#include "rommsync/save_source.hpp"
+#include "rommsync/tico.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -31,8 +34,8 @@ SettingsRow Value(std::string label, std::string value) {
   row.label = std::move(label);
   row.value = std::move(value);
   // Every scalar in `[server]`, `[sync]` and `[downloads]` is a key
-  // `config::ApplyEdit` accepts, so every one of them is marked. Only
-  // `Changeable` offers the edit -- see the header note.
+  // `config::ApplyEdit` accepts but `[sync] slot`, which `SlotRow` unmarks.
+  // Only a row with a `change` offers the edit -- see the header note.
   row.editable = true;
   return row;
 }
@@ -73,7 +76,7 @@ struct Choice {
 /// found by the word `config.ini` stores -- `config::ToString`'s, the one
 /// `ApplyEdit` reads back -- rather than by a position kept in step by hand.
 template <std::size_t N>
-SettingsRow Changeable(const char* section, const char* key, const Choice (&values)[N],
+SettingsRow Changeable(std::string section, const char* key, const Choice (&values)[N],
                        std::string_view in_force) {
   std::size_t current = 0;
   for (std::size_t index = 0; index < N; ++index) {
@@ -86,7 +89,7 @@ SettingsRow Changeable(const char* section, const char* key, const Choice (&valu
   SettingsRow row = Value(key, now.shown);
   row.note = now.note;
   row.selectable = true;
-  row.change = config::Assignment{section, key, next.stored, /*remove=*/false};
+  row.change = config::Assignment{std::move(section), key, next.stored, /*remove=*/false};
   row.press_label = std::string("Set to ") + next.shown;
   return row;
 }
@@ -99,6 +102,157 @@ SettingsRow OnServerDeleteRow(config::OnServerDelete in_force) {
       {"Keep", "keep", "a save deleted in RomM stays on the card and is not uploaded again"},
   };
   return Changeable("sync", "on_server_delete", kValues, config::ToString(in_force));
+}
+
+/// `[sync] slot` (#236, #271): shown, and **not offered**. `config::ApplyEdit`
+/// refuses it, and that is the screen's reason too: a new slot moves every
+/// save to it on the next tick and leaves the old one on the server, which is
+/// not a value to step through with a thumb. The note is the reason, because a
+/// row that does nothing on a press has to say why.
+SettingsRow SlotRow(const std::string& slot) {
+  SettingsRow row = Value("slot", slot);
+  row.editable = false;
+  row.note = "edited in config.ini only: a new slot moves every save on the server";
+  return row;
+}
+
+/// `[sync] map_state_slots` (#239, #271). Offered: either value is safe to land
+/// on -- a state never touches a save, a local one is backed up before it is
+/// written over, and a renamed state that meets another's row is kept apart
+/// rather than uploaded over it (docs/CONFIG.md). What it costs is a resume on
+/// another device whose setting differs, so the note says to match them.
+SettingsRow MapStateSlotsRow(bool in_force) {
+  static constexpr Choice kValues[] = {
+      {"Off", "false", "Tico's states keep Tico's slot names; set alike on every Switch"},
+      {"On", "true", "Tico's states sync under RetroArch's slot names; set alike on every Switch"},
+  };
+  return Changeable("sync", "map_state_slots", kValues, in_force ? "true" : "false");
+}
+
+/// `[tico] account` (#231, #271), and the accounts the last tick found under
+/// `users/` as the answers to it.
+///
+/// **A picker rather than a cycle.** Stepping through accounts would put each
+/// one in force on the way to the next, and a tick in between would sync the
+/// saves of an account nobody chose -- the one thing `tico.hpp` says is never
+/// done. So each account is a row of its own and a press names exactly it.
+/// Only accounts the card holds are offered; an id is never typed on a console.
+/// `legacy` is not offered either: it is the layout before 0.8.0, chosen at a
+/// PC for a card Tico has not moved, and `auto` is the way back from it.
+///
+/// **The rows say what the setting means, never what the card is in.** Whose
+/// saves are read is `tico::Resolve`'s answer, per root and off a listing this
+/// screen does not have -- one root with one account and another with a
+/// different one, an unreadable `users/`, a card with no `users/` at all -- and
+/// it reaches this screen already, as `tico::Notes`' line on `[tico] account`
+/// among the complaints. A second answer worked out here from the accounts of
+/// every root together would be one that can contradict it on the same screen.
+SettingsSection TicoSection(const config::TicoConfig& tico,
+                            const std::vector<std::string>& accounts) {
+  SettingsSection section;
+  section.title = "[tico]";
+  {
+    SettingsRow row;
+    switch (tico.account) {
+      case config::TicoAccount::kAuto:
+        row = Value("account", "Auto");
+        row.note = "the only account under users/; with several, none until one is chosen";
+        break;
+      case config::TicoAccount::kLegacy:
+        row = Value("account", "Legacy");
+        row.note = "saves are read where Tico kept them before 0.8, even beside users/";
+        break;
+      case config::TicoAccount::kNamed:
+        row = Value("account", tico.uid);
+        row.note = "only this account's folder under users/ is read";
+        break;
+    }
+    if (tico.account != config::TicoAccount::kAuto) {
+      row.selectable = true;
+      row.change = config::Assignment{"tico", "account", "auto", /*remove=*/false};
+      row.press_label = "Set to Auto";
+    }
+    section.rows.push_back(std::move(row));
+  }
+  for (const std::string& uid : accounts) {
+    SettingsRow row = Value("found", uid);
+    if (tico.account == config::TicoAccount::kNamed && uid == tico.uid) {
+      row.note = "the account named above";
+    } else {
+      // A first meeting for every save of this account, which the server
+      // arbitrates (docs/SYNC_PROTOCOL.md): a card save it replaces is backed
+      // up first, and the note says so because this press is where it starts.
+      row.note = "press to sync this account's saves; any one replaced is backed up first";
+      row.selectable = true;
+      row.change = config::Assignment{"tico", "account", uid, /*remove=*/false};
+      row.press_label = "Sync this account";
+    }
+    section.rows.push_back(std::move(row));
+  }
+  return section;
+}
+
+/// Whether `slug`'s map lists a folder Tico keeps its saves or states in --
+/// what `place::Placer` needs before it can place anything in Tico.
+bool MapsTicoFolder(const config::Config& config, const std::string& slug) {
+  const config::PlatformFolders* folders = config.Platform(slug);
+  if (folders == nullptr) {
+    return false;
+  }
+  for (const std::vector<std::string>* list : {&folders->saves, &folders->states}) {
+    for (const std::string& folder : *list) {
+      if (scan::SourceOf(folder).source == scan::Source::kTico && !tico::RootOf(folder).empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// `[platform.<slug>] play_with` (#237, #258, #271): where a save new to the
+/// card is placed, and whose copy syncs when Tico and RetroArch both hold one.
+/// Offered: neither placement writes over a file, and a copy that starts
+/// syncing meets the server's save the way any first meeting does, backed up
+/// before anything is written over it.
+SettingsRow PlayWithRow(const config::Config& config, const std::string& slug) {
+  const std::optional<config::PlayWith> in_force = config.PlayWithFor(slug);
+  const std::string word = in_force.has_value() ? config::ToString(*in_force) : "";
+  const std::string section = "platform." + slug;
+  // A platform Tico runs has Tico as its default, so the cycle is the two
+  // emulators. Any other has none, and "not set" -- an empty value, which puts
+  // the default back -- is one of the values a press visits.
+  if (config::DefaultPlayWith(slug).has_value()) {
+    static constexpr Choice kValues[] = {
+        {"Tico", "tico", "a save new to the card goes to Tico; its copy syncs if both have one"},
+        {"RetroArch", "retroarch",
+         "a save new to the card goes to RetroArch; its copy syncs if both have one"},
+    };
+    return Changeable(section, "play_with", kValues, word);
+  }
+  if (MapsTicoFolder(config, slug)) {
+    static constexpr Choice kValues[] = {
+        {"Not set", "", "no emulator named: a save new to the card is not placed"},
+        {"RetroArch", "retroarch",
+         "a save new to the card goes to RetroArch; its copy syncs if both have one"},
+        {"Tico", "tico", "a save new to the card goes to Tico; its copy syncs if both have one"},
+    };
+    return Changeable(section, "play_with", kValues, word);
+  }
+  // With no Tico folder in the map, Tico is a value `place::Placer` refuses
+  // every placement under, so it is not offered. A `tico` already written in
+  // config.ini is shown for what it does, and a press leaves it.
+  static constexpr Choice kValues[] = {
+      {"Not set", "", "no emulator named: a save new to the card is not placed"},
+      {"RetroArch", "retroarch",
+       "a save new to the card goes to RetroArch; its copy syncs if both have one"},
+  };
+  if (in_force != config::PlayWith::kTico) {
+    return Changeable(section, "play_with", kValues, word);
+  }
+  SettingsRow row = Changeable(section, "play_with", kValues, "");
+  row.value = "Tico";
+  row.note = "the folder map lists no Tico folder for it: a save new to the card is not placed";
+  return row;
 }
 
 /// `[sources]` (#230, #264).
@@ -184,7 +338,9 @@ SettingsSection SyncSection(const config::SyncConfig& sync) {
   section.rows.push_back(Value("interval_min", FormatInterval(sync.interval_min)));
   section.rows.push_back(Value("on_boot", BoolText(sync.on_boot)));
   section.rows.push_back(Value("saves", BoolText(sync.saves)));
+  section.rows.push_back(SlotRow(sync.slot));
   section.rows.push_back(Value("states", BoolText(sync.states)));
+  section.rows.push_back(MapStateSlotsRow(sync.map_state_slots));
   {
     // Said next to the value, because the value is the only explanation a user
     // gets for a menu row that is not there.
@@ -268,6 +424,9 @@ void AddPlatformSections(SettingsView* view, const ipc::ConfigView& config) {
       view->sections.push_back(std::move(section));
       continue;
     }
+    // Above the folders, because it says which of them a save new to the card
+    // goes to -- and the folder rows run long enough to push it off the panel.
+    section.rows.push_back(PlayWithRow(config.config, slug));
     AddFolderRows(&section, "roms", folders.roms, "downloads are skipped for this platform");
     AddFolderRows(&section, "saves", folders.saves, "saves are skipped for this platform");
     AddFolderRows(&section, "states", folders.states, "states are skipped for this platform");
@@ -451,7 +610,10 @@ void SetChange(SettingsView* view, const ChangeState& change) {
       "[" + change.assignment.section + "] " + change.assignment.key;
   switch (change.result.outcome) {
     case ipc::WriteOutcome::kApplied:
-      view->notice = setting + " is now " + change.assignment.value;
+      // An empty value is `play_with`'s way back to its default (#271).
+      view->notice = change.assignment.value.empty()
+                         ? setting + " is back to its default"
+                         : setting + " is now " + change.assignment.value;
       view->notice_tone = Tone::kGood;
       return;
     case ipc::WriteOutcome::kInvalid:
@@ -564,6 +726,7 @@ SettingsView RenderSettings(const ipc::ConfigView& config, const RepairState& re
   view.sections.push_back(SyncSection(config.config.sync));
   view.sections.push_back(DownloadsSection(config.config.downloads));
   view.sections.push_back(SourcesSection(config.config.sources));
+  view.sections.push_back(TicoSection(config.config.tico, config.tico_accounts));
   AddPlatformSections(&view, config);
 
   // A change first, so a re-pair's sentence -- set after it -- is the one that

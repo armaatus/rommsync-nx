@@ -151,7 +151,21 @@ inline constexpr const char* kServiceName = "rommsync";
 /// `conflicts::RestoreOutcome::kNotAConflict`. The command alone would not bump
 /// it -- an older sysmodule answers `kUnknownCommand` -- but the outcome is a
 /// value a v8 overlay refuses to decode in a `RestoreState`.
-inline constexpr std::uint32_t kVersion = 9;
+///
+/// **10** since M9-32 (#270), which added
+/// `conflicts::RestoreOutcome::kChangedSinceBackup`: a restore that stood down
+/// over a file written after its backup, which a v9 overlay would refuse to
+/// decode in a `RestoreState` for the same reason.
+///
+/// **11** since M10-31 (#271), which added `slot` and `map_state_slots` to
+/// `ConfigView`'s `sync`, a `tico` object beside it, and `play_with` to each
+/// platform of the folder map -- required fields, so a v11 overlay reading a
+/// v10 sysmodule's `GetConfig` fails to decode it.
+///
+/// **12** since M10-33 (#273), which added Keep local's three refusals,
+/// `kSuperseded`, `kGameRunning` and `kKeepLocalFull`: outcomes a v11 overlay
+/// would refuse to decode in a `RestoreState`.
+inline constexpr std::uint32_t kVersion = 12;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -503,6 +517,16 @@ struct ConfigView {
   /// and a `kNotice`. The overlay says "too large to show here"; it does not
   /// render an empty map as though the user had configured none.
   bool platforms_truncated = false;
+
+  /// The Tico accounts the last tick found under a `users/` folder, sorted and
+  /// lowercase, at most `tico::kMaxAccounts` (#271). Not a setting: what the
+  /// card holds, so the settings screen can offer them as the answers to
+  /// `[tico] account` -- the one question it asks that the player could
+  /// otherwise answer only from a PC. Empty before the first tick, and under
+  /// `account = legacy`, for which `tico::Resolve` never lists `users/`.
+  /// **Not whose saves are read**: that is `tico::Resolve`'s per-root answer,
+  /// and arrives as `tico::Notes`' line among `diagnostics`.
+  std::vector<std::string> tico_accounts;
 };
 
 /// The longest `server.url` this contract carries.
@@ -1145,6 +1169,11 @@ class Engine {
   /// nothing to say about it.
   virtual std::vector<config::Diagnostic> source_notes() const { return {}; }
 
+  /// The Tico accounts the last tick found under `users/` -- `ConfigView`'s
+  /// `tico_accounts`, served by `GetConfig` (#271). A value for
+  /// `source_notes()`'s reason, and empty by default for the same one.
+  virtual std::vector<std::string> tico_accounts() const { return {}; }
+
   virtual EngineSnapshot Snapshot() const = 0;
 
   /// The live pairing attempt, or an idle status when there is none.
@@ -1229,8 +1258,11 @@ class Engine {
   /// The player's Keep local for a save conflict (#249): `RequestRestore`'s
   /// shape, answered the same way and polled through the same
   /// `restore_state()`, with two differences an implementation owes the wire.
-  /// It is refused with `conflicts::RestoreOutcome::kNotAConflict`, before
-  /// anything is written, for an entry that is not a save conflict; and once
+  /// It is refused, before anything is written, for an entry that is not a
+  /// save conflict (`kNotAConflict`), one a newer entry of the same save
+  /// replaced (`kSuperseded`), while a game is in the foreground
+  /// (`kGameRunning`), and while `sync::kMaxKeepLocal` choices already wait
+  /// (`kKeepLocalFull`, #273); and once
   /// the bytes are back on the card, the conflict's `(rom_id, slot)` goes into
   /// the next tick's `sync::ExecuteOptions::keep_local` -- the one upload sent
   /// with `overwrite=true` -- and a tick is asked for, so the choice goes up

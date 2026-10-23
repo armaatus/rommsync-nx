@@ -120,6 +120,13 @@ ipc::ConfigView LoadedConfigView() {
   view.config.sync.on_server_delete = config::OnServerDelete::kKeep;
   view.config.sources.retroarch = config::SourceMode::kOff;
   view.config.sources.retroarch_content_dir = true;
+  // ...and the four #271 put on the settings screen.
+  view.config.sync.slot = "mine";
+  view.config.sync.map_state_slots = true;
+  view.config.tico.account = config::TicoAccount::kNamed;
+  view.config.tico.uid = "fedcba9876543210fedcba9876543210";
+  view.tico_accounts = {"0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"};
+  view.config.play_with["snes"] = config::PlayWith::kRetroArch;
   config::Diagnostic note;
   note.severity = config::Severity::kWarning;
   note.line = 9;
@@ -203,9 +210,13 @@ int Version() {
   // since M10-23 (#264): `ConfigView` gained `on_server_delete` and `sources`,
   // required fields a v7 decoder never reads and a v8 one will not do without.
   // 9 since M10-20 (#249): a restore's outcome gained `not_a_conflict`, which a
-  // v8 decoder refuses. What is frozen is command 0's *encoding*, asserted
-  // above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{9},
+  // v8 decoder refuses. 10 since M9-32 (#270): and `changed_since_backup`, which
+  // a v9 decoder refuses. 11 since M10-31 (#271): `ConfigView` gained `slot`,
+  // `map_state_slots`, a `tico` object and a platform's `play_with`. 12 since
+  // M10-33 (#273): a restore's outcome gained Keep local's `superseded`,
+  // `game_running` and `keep_local_full`. What is frozen is command 0's
+  // *encoding*, asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{12},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -429,6 +440,17 @@ int RoundTrip() {
                   "[sources] retroarch survives");
     checks.ExpectEq(back.value.config.sources.retroarch_content_dir, true,
                     "[sources] retroarch_content_dir survives");
+    checks.ExpectEq(back.value.config.sync.slot, std::string("mine"), "[sync] slot survives");
+    checks.ExpectEq(back.value.config.sync.map_state_slots, true, "map_state_slots survives");
+    checks.ExpectEq(config::AccountText(back.value.config.tico),
+                    std::string("fedcba9876543210fedcba9876543210"), "[tico] account survives");
+    checks.Expect(back.value.tico_accounts == sent.tico_accounts,
+                  "and so do the accounts the last tick found");
+    checks.Expect(back.value.config.PlayWithFor("snes") == config::PlayWith::kRetroArch,
+                  "a platform's play_with survives");
+    checks.Expect(back.value.config.play_with.find("gba") == back.value.config.play_with.end() &&
+                      back.value.config.PlayWithFor("gba") == config::PlayWith::kTico,
+                  "and a platform with no play_with line keeps its default");
     checks.Expect(SamePlatforms(sent.config, back.value.config), "the whole folder map survives");
     checks.Expect(SameDiagnostics(sent.diagnostics, back.value.diagnostics),
                   "and every diagnostic with it");
@@ -831,6 +853,28 @@ int Refuses() {
     checks.Expect(!ipc::DecodeStatus(broken).ok(), "a status is refused when " + replace);
   }
 
+  // The settings #271 added are values the overlay offers a press on, so a
+  // value config.ini could not hold is refused rather than drawn (#271).
+  const std::string config_good = ipc::EncodeConfigView(LoadedConfigView());
+  for (const auto& [find, replace] : std::vector<std::pair<std::string, std::string>>{
+           {"\"slot\":\"mine\"", "\"slot\":\"../mine\""},
+           {"\"slot\":\"mine\"", "\"slot\":\"\""},
+           {"\"map_state_slots\":true", "\"map_state_slots\":\"true\""},
+           {"\"account\":\"fedcba9876543210fedcba9876543210\"", "\"account\":\"someone\""},
+           {"\"accounts\":[\"0123456789abcdef0123456789abcdef\"",
+            "\"accounts\":[\"../../saves\""},
+           {"\"play_with\":\"retroarch\"", "\"play_with\":\"mgba\""},
+       }) {
+    const std::size_t at = config_good.find(find);
+    checks.Expect(at != std::string::npos, "the config fixture still holds " + find);
+    if (at == std::string::npos) {
+      continue;
+    }
+    std::string broken = config_good;
+    broken.replace(at, find.size(), replace);
+    checks.Expect(!ipc::DecodeConfigView(broken).ok(), "a config is refused when " + replace);
+  }
+
   // A missing field is refused rather than defaulted. Nothing here has a
   // sensible default: a `Status` whose `enabled` fell back to `false` is a
   // switch drawn in the wrong position.
@@ -1069,6 +1113,16 @@ int Secrets() {
     checks.Expect(view.diagnostics.size() == 2 && view.diagnostics[0].key == "states" &&
                       view.diagnostics[1].message.find("RetroArch syncs itself") == 0,
                   "config.ini's first, then RetroArch's");
+  }
+
+  // #271: the Tico accounts the last tick found reach the settings screen, which
+  // offers them as the answers to `[tico] account`.
+  {
+    FakeEngine engine;
+    engine.accounts = {"0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"};
+    ipc::ServiceCore core(engine);
+    checks.Expect(core.GetConfig().tico_accounts == engine.accounts,
+                  "GetConfig serves the accounts the last tick found under users/");
   }
   return checks.failures();
 }

@@ -225,6 +225,23 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
       return "The backup was made and the restore did not land. The file is as it was.";
     case conflicts::RestoreOutcome::kNotAConflict:
       return "Nothing was written: Keep local is only for a save conflict";
+    case conflicts::RestoreOutcome::kChangedSinceBackup:
+      // Almost always a game saving mid-restore (#270), though a file the card
+      // would not read back lands here too, so the sentence claims no more than
+      // that it changed. The press can be repeated once the game is closed.
+      return "Nothing was written: the file changed while this ran. Close the game and try "
+             "again.";
+    case conflicts::RestoreOutcome::kSuperseded:
+      // #273: only the save's newest entry is Keep local's, and the screen
+      // lists that one too -- higher up, since the list is newest first.
+      return "Nothing was written: a newer entry of this save replaced this one. Choose on "
+             "that one.";
+    case conflicts::RestoreOutcome::kGameRunning:
+      return "Nothing was written: a game is running, and would save over the kept bytes. "
+             "Close the game and try again.";
+    case conflicts::RestoreOutcome::kKeepLocalFull:
+      return "Nothing was written: too many Keep local choices are waiting for a sync. Let "
+             "one run and try again.";
   }
   return "The restore did not happen";
 }
@@ -240,6 +257,10 @@ Tone RestoreOutcomeTone(conflicts::RestoreOutcome outcome) {
     case conflicts::RestoreOutcome::kBackupFailed:
     case conflicts::RestoreOutcome::kWriteFailed:
     case conflicts::RestoreOutcome::kNotAConflict:
+    case conflicts::RestoreOutcome::kChangedSinceBackup:
+    case conflicts::RestoreOutcome::kSuperseded:
+    case conflicts::RestoreOutcome::kGameRunning:
+    case conflicts::RestoreOutcome::kKeepLocalFull:
       return Tone::kBad;
   }
   return Tone::kBad;

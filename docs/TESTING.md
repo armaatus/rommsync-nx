@@ -565,7 +565,7 @@ ctest --test-dir build --output-on-failure
   `no_op`, flagged and logged rather than guessed at. That last body is the only
   one in the file no server sent.
 - The `sync.*` rig scenarios ask the running server what the snapshot cannot.
-  `accepted` proves a live 5.2.0 takes the encoded body and echoes the entry's
+  `accepted` proves the live fixture takes the encoded body and echoes the entry's
   `file_name`, `slot` and `emulator` back. `required` proves a renamed *required*
   field is a 422 that names it. `understood` is the one worth reading: it uploads
   one save and negotiates it twice, changing nothing but `content_hash` →
@@ -764,20 +764,27 @@ ctest --test-dir build --output-on-failure
   formats; it reads no artifact, so it never skips — the fixtures are chosen so
   that a parser reading the wrong offset gets a wrong answer rather than a lucky
   one.
-- The `stack.*` group is the main thread's stack: the one the npdm sizes, and
-  the one that parses `queue.json` off the card at boot and every IPC payload
-  after it (M9-18, #216). `json::kMaxDepth` and `main_thread_stack_size` were
-  never held against each other, and a max-depth document cost ~33 KiB of a
-  32 KiB stack. `stack.fit` holds the npdm to `sysmodule/source/stack_budget.hpp`
-  and the deepest parse to half the stack; `stack.contract` holds `kMaxDepth`
-  to at least twice the deepest response shape a pinned RomM OpenAPI snapshot
-  describes; `stack.walk` is the call-graph arithmetic on hand-built graphs.
-  Those three read the tree and never skip. `stack.measured` cross-compiles the
-  sysmodule with `-fcallgraph-info=su`, walks the deepest chain from `main` in
-  the graph the LTO link writes (named by the toolchain's `c++filt`, #253), and
-  fails when a frame outgrows the header's ceilings; it needs the devkitPro
-  image, so it skips where `npdm.svcs` does and runs in the `switch-build` job
-  beside it, under the same `toolchain` label.
+- The `stack.*` group is every thread's stack, first the main thread's: the
+  one the npdm sizes, and the one that parses `queue.json` off the card at
+  boot and every IPC payload after it (M9-18, #216). `json::kMaxDepth` and
+  `main_thread_stack_size` were never held against each other, and a max-depth
+  document cost ~33 KiB of a 32 KiB stack. `stack.fit` holds the npdm to
+  `sysmodule/source/stack_budget.hpp` and the deepest parse to half the stack;
+  `stack.contract` holds `kMaxDepth` to at least twice the deepest response
+  shape a pinned RomM OpenAPI snapshot describes; `stack.walk` is the
+  call-graph arithmetic on hand-built graphs. Those three read the tree and
+  never skip. `stack.measured` cross-compiles the sysmodule with
+  `-fcallgraph-info=su`, walks the deepest chain from `main` in the graph the
+  LTO link writes (named by the toolchain's `c++filt`, #253), and fails when a
+  frame outgrows the header's ceilings. Since M9-31 (#268) it walks the
+  worker, pairing and PSC watcher threads too, each from its
+  `SizedThread::Enter` and held to half its own stack, fails on any recursion
+  it cannot bound and on an `Enter` nobody listed, and proves the check bites
+  by re-running against a worker stack shrunk to 0x2000; `stack.fit` holds the
+  worker's and pairing thread's rest ceilings inside their stacks and fails on
+  a thread started other than through `SizedThread`. `stack.measured` needs
+  the devkitPro image, so it skips where `npdm.svcs` does and runs in the
+  `switch-build` job beside it, under the same `toolchain` label.
 - The `toolchain.*` group holds the two pins the Switch build rests on and
   nothing here produces (M9-8, #199). `toolchain.pins` reads every file in the
   tree: each one naming the devkitPro image names the dated tag

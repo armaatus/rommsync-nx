@@ -794,8 +794,10 @@ constexpr size_t kHeapTitleSightings =
 // Resident for the boot, beside everything: the Keep local choices waiting for
 // their upload (`SdEngine::keep_local_`, #249), at their bound -- and, while a
 // plan runs, the three copies a tick holds of them: the tick's options, and
-// `RunTick`'s per-plan options and its resolution's. A key's slot is budgeted
-// at a name's chunk; `autosave` itself fits the string and allocates nothing.
+// `RunTick`'s per-plan options and its resolution's. A Keep local's restore
+// holds one copy too, for its bound (#273), but runs on the worker between
+// ticks, so it never stands beside those three. A key's slot is budgeted at a
+// name's chunk; `autosave` itself fits the string and allocates nothing.
 constexpr size_t kHeapKeepLocal = RoundUpToKiB(
     4 * rommsync::sync::kMaxKeepLocal *
     (sizeof(rommsync::state::Baseline::Key) + kHeapNameBytes));

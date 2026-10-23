@@ -4,8 +4,10 @@ How `sys-rommsync` implements RomM's negotiate → execute → complete loop (5.
 or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#since-520)
 says so).
 Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md). The payload and
-response shapes below are the ones captured from a live 5.2.0 under
-`server/contract/captures/` (issue M0-4), not a reading of the OpenAPI snapshot.
+response shapes below are the ones captured from a live 5.4.0 under
+`server/contract/captures/5.4.0/` (#260), not a reading of the OpenAPI snapshot.
+The set at the root of `server/contract/captures/` is 5.2.0's, from issue M0-4,
+and is kept as history; nothing here cites it.
 
 ## Principle: the server is the source of truth
 
@@ -345,23 +347,33 @@ history for this device -- that case is #232's 409 (`tick.baseline_other_row`).
 Three traps in the operation itself:
 
 - **`file_name` is the server's name, not yours.** RomM renames a save on ingest:
-  `probe.srm` is stored as `probe [2026-09-04_11-12-27].srm`, and every later
-  operation echoes that. Match the operation back to your local file on
-  `(rom_id, slot)` and keep your own path; writing the server's name to the SD
-  produces a file no emulator will load.
-- **`overwrite` decides the 409 and nothing else. It does not stop a slot
-  accreting a row per upload.** This page has now had this wrong twice, in both
-  directions, so here is the mechanism rather than the conclusion: RomM stamps a
-  slot upload with a **second-granularity** datetime tag and then looks the
-  existing row up *by that tagged name* (`_apply_datetime_tag` and
-  `get_save_by_filename`, `endpoints/saves.py` in 5.2.0). Two uploads therefore
-  land on the same row only when they share a base file name **and the same
-  wall-clock second**; one second later the name RomM computes matches nothing
-  and it writes a **second** row, flag or no flag. Verified directly against the
-  live 5.2.0, and `execute.occupied` pins the deterministic half.
-  The revision that said `overwrite=true` "replaces the row in place, tag and id
-  included" was reading a same-second run — which is what made that assertion
-  pass on a fast machine and fail in CI (issue #85).
+  `probe.srm` is stored as `probe [2026-10-21_09-02-11].srm`
+  ([`captures/5.4.0/saves-post.json`](../server/contract/captures/5.4.0/saves-post.json)),
+  and every later operation echoes that. Match the operation back to your local
+  file on `(rom_id, slot)` and keep your own path; writing the server's name to
+  the SD produces a file no emulator will load.
+- **`overwrite` decides the 409s and whether identical bytes add a version, and
+  nothing else. It does not stop a slot accreting a row per upload.** This page
+  has now had this wrong twice, in both directions, so here is the mechanism
+  rather than the conclusion: every slotted upload reserves a fresh datetime-tagged name —
+  moving a second forward when the tag is taken — so it never lands on an
+  existing row, flag or no flag (`reserve_version_name`,
+  `handler/asset_store.py`).
+  [`captures/5.4.0/saves-post-new-version.json`](../server/contract/captures/5.4.0/saves-post-new-version.json)
+  is a second upload to a slot by the device that wrote the first, under a new
+  `id`. The one exception is bytes the slot already holds: they promote that row
+  to head instead of writing another
+  ([`captures/5.4.0/saves-post-identical.json`](../server/contract/captures/5.4.0/saves-post-identical.json)),
+  and `overwrite=true` turns that off as well (`add_save`, `endpoints/saves.py`),
+  which is why `execute.occupied`'s Keep local, re-posting the same bytes a
+  second later, gets a second row. What a slot accretes is pruned only under
+  `MAX_SAVES_PER_SLOT` or a request's `autocleanup`
+  ([API_CONTRACT.md](API_CONTRACT.md#every-slotted-upload-is-a-new-version)).
+  5.2.0 decided it by the clock instead — a second-granularity tag and a lookup
+  by that tagged name, so two uploads in one wall-clock second shared a row —
+  and the revision that said `overwrite=true` "replaces the row in place, tag and
+  id included" was reading such a same-second run, which passed on a fast
+  machine and failed in CI (issue #85).
   `PUT /api/saves/{id}` is the call that really does move one row forward, and is
   what `harness.conflict` uses to arrange "the server's copy changed" without
   touching this device's history at all.
@@ -436,8 +448,24 @@ and it is the only thing that ever sends `overwrite=true`:
 
 1. `KeepLocal` (IPC command 18) restores the conflict's backup onto the card
    through `conflicts::KeepLocal` -- `Restore` itself, so the server's copy it
-   replaces is backed up first. An entry that is not a save conflict with a slot
-   is refused with `not_a_conflict` before anything is written.
+   replaces is backed up first. It is refused before anything is written
+   (#273), in this order, so a choice that can never be taken says why before
+   it says "close the game":
+   - `not_a_conflict`: the entry is not a save conflict with a slot;
+   - `superseded`: a newer entry of the same `(rom_id, slot)` -- another
+     conflict, a download over it, a deletion -- has moved the card on since.
+     Only a save's newest entry is Keep local's;
+   - `keep_local_full`: `sync::kMaxKeepLocal` choices already wait (sync off or
+     held). Refused rather than letting the oldest go, because that one's bytes
+     are already on the card and its upload without the override would resolve
+     as Keep server without a word;
+   - `game_running`: an application is in the foreground. It holds its save in
+     memory and writes it on close, over the kept bytes, and the tick #242
+     holds would then send *that* with `overwrite=true`. Asked at the write, of
+     any application: `pm` names a title, not the save it holds, and RetroArch
+     runs every rom under one, so the save's own game cannot be told apart. A
+     game started after the restore lands loads the kept bytes, so what it
+     saves on close is play on top of the player's choice.
 2. Once the bytes are on the card -- never before -- the sysmodule arms the
    conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
    `sync::kMaxKeepLocal`) and asks for a tick.
@@ -448,6 +476,21 @@ and it is the only thing that ever sends `overwrite=true`:
    keeps it for the next, as does a choice armed after the plan went out. So
    the choice is one upload's: a later upload of the save meets the guard as
    every upload does.
+
+   A plan that answers with anything but an upload -- most often a download,
+   because another device wrote the slot after the restore -- spends the choice
+   with nothing sent: the server asked for no upload, so its copy lands, backed
+   up like any, and the kept bytes are under `.backup/`. The log says so, as a
+   `sync.refused` warning naming the save and the action, rather than letting
+   the choice vanish (#273, `engine.keep_local_overtaken`).
+4. Once that upload has landed, the tick waits for the second to turn and
+   rewrites the row it wrote with the same bytes (`PUT /api/saves/{id}`, #272).
+   RomM stores `updated_at` to the whole second and negotiate breaks a
+   same-second tie by query order, so a Keep local landing in the second another
+   device uploaded the save could lose the head to the other row -- and the next
+   tick would download that over the player's choice. Rewritten, it is the
+   newest by a whole second. A rewrite that does not happen is a warning, not a
+   failed upload.
 
 The choice is held in memory. A reboot before its tick forgets it, and the
 restored bytes then meet the guard like any upload: a 409 is resolved as a
@@ -573,8 +616,8 @@ durable before the next one can be:
    power cut could keep it and lose the backup's name — the one gap the call
    order hid, found by the replay below.
 3. The new bytes are staged beside the save and **synced** — by
-   `io::WriteAtomically`/`CopyAtomically` for a restore, by the HTTP backend
-   before it renames its `.part` for a download.
+   `io::CopyStaged` for a restore, by the HTTP backend before it renames its
+   `.part` for a download.
 4. `io::CommitStaged`: the save to `<save>.old`, the staged file onto the save,
    `<save>.old` removed, and the save's directory synced. A cut between the two
    renames leaves `.old` and no save, which the boot sweep renames back.
@@ -641,9 +684,33 @@ that landed before the comparison — which takes the window from a network roun
 trip and a backup's worth of I/O down to one hash of the save. The hold
 narrows it further; nothing here closes it.
 
-**Nor is every overwrite covered yet.** A conflict restore (M7-1, from the
-overlay, over a running game) and a save state's download back up and then
-overwrite with no comparison between; #270 extends the check to both.
+**Every overwrite asks it, not only the plan's (#270).** The other two paths
+that back up and then overwrite make the same comparison last:
+
+- **A conflict restore** (M7-1, [below](#finding-the-backup-again-and-putting-it-back)),
+  between its staged copy and its `io::CommitStaged`. It is the likelier of the
+  two to meet a late write: it starts from the overlay, over a game that may be
+  running, and `SdEngine::RunRestore` takes the save-write lock but not #242's
+  hold -- only Keep local asks whether a game is running, and is refused under
+  one ([Keep local](#keep-local-249), #273). A file written since stops it with
+  `changed_since_backup` and nothing written — the file holds the game's write,
+  the restore's own backup what was there before, and the entry's backup is
+  untouched, so the press can be repeated once the game is closed. Keep local
+  arms nothing for a restore that did not land.
+- **A save state's download** ([below](#backups-and-verification)), between its
+  backup and its `io::CommitStaged`: RetroArch writes a state on a hotkey. A
+  state written since fails the download `changed_since_backup`, its staged
+  bytes are discarded, and the next tick, finding both sides moved, keeps both.
+
+A state is tens of megabytes, so for it the comparison is two full streamed
+reads of the card, 4 KiB at a time and nothing buffered. Hashing the state
+against a digest taken while the backup was copied would save one of them, and
+was weighed and not taken: the backup is hashed *before* the state, so the
+window left is the state's own hash either way, and re-reading the backup is
+what proves it is on the card as copied. A state download is a moved server row
+over an unchanged local file — rare, and nobody waits on it.
+`conflicts.late_write` (a save, a Keep local and a state) and `states.late_write`
+force each with the same `io::Disk` (`faulty::LateWrite`, `tests/faulty_disk.hpp`).
 
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
@@ -820,9 +887,11 @@ to prevent.
 
 `conflicts::Restore` puts those bytes back, and it is **a save overwrite in its
 own right**: it copies the file it is about to replace under `.backup/` first,
-through the same `sync::BackUpFirst`, and then commits with
-`io::CopyAtomically`. A restore that ate the server's copy would be this rule
-broken one level up.
+through the same `sync::BackUpFirst`, stages the backup's bytes beside the file
+with `io::CopyStaged`, checks the file is still what it copied
+([A write after the backup](#a-write-after-the-backup-263), #270), and only then
+commits with `io::CommitStaged`. A restore that ate the server's copy, or a save
+the game wrote after that copy, would be this rule broken one level up.
 
 It writes the local file and nothing else. **The server stays the source of
 truth**: the next negotiation arbitrates, and will most likely plan an `upload`.
@@ -995,18 +1064,23 @@ sync: a lost baseline costs time, not correctness.
 **Not the same flow.** This section used to say "same flow via `/api/states`",
 and that was wrong in the way that matters: there is no negotiation for a state,
 so the server decides nothing and the client has to. Verified against a live
-5.2.0 and pinned by `server/contract/captures/states-post.json` and
-`states-list.json` — see [API_CONTRACT.md](API_CONTRACT.md#save-states) for the
-endpoints.
+5.4.0 and pinned by
+[`captures/5.4.0/states-post.json`](../server/contract/captures/5.4.0/states-post.json)
+and
+[`captures/5.4.0/states-list.json`](../server/contract/captures/5.4.0/states-list.json)
+— see [API_CONTRACT.md](API_CONTRACT.md#save-states) for the endpoints.
 
-What 5.2.0 actually offers:
+What 5.4.0 actually offers:
 
-- `SyncNegotiatePayload` carries **only** `saves`. A state never appears in a
-  negotiate request or in a plan.
+- `SyncNegotiatePayload` has no field for a state: its one list is `saves`, and
+  the rest (`rom_ids`, `emulators`, `restore_unlisted`) only scope it. A state
+  never appears in a negotiate request or in a plan.
 - `StateSchema` has no `slot`, no `content_hash`, no `origin_device_id` and no
   `device_syncs`. There is no per-device sync history for a state and no digest
-  to verify a download against.
-- There is no `POST /api/states/{id}/downloaded`.
+  to verify a download against. What it gained since 5.2.0 — `core`,
+  `is_favorite`, `labels` — is none of those
+  ([`captures/5.4.0/states-post.json`](../server/contract/captures/5.4.0/states-post.json)).
+- There is no `POST /api/states/{id}/downloaded` (`romm-openapi-5.4.0.json`).
 - `POST /api/states` takes `rom_id` and `emulator` and a multipart `stateFile`
   (plus an optional `screenshotFile`). No `slot`, no `device_id`, no
   `session_id`, no `overwrite`.
@@ -1016,14 +1090,16 @@ What 5.2.0 actually offers:
 - **`POST /api/states` is an upsert keyed on `(rom_id, file_name)` alone.** A
   second POST under a name the rom already has replaces that row's bytes in
   place, keeps its `id`, and *moves* its `emulator` to whatever the new request
-  said. It does not create a second row the way `POST /api/saves` does. So a POST
-  **is an overwrite of somebody's state**, and the emulator is not part of the
-  key.
+  said (`store_state_file`, `handler/asset_store.py`; `states.upsert` asserts it
+  against the fixture). It does not create a second row the way `POST /api/saves`
+  does. So a POST **is an overwrite of somebody's state**, and the emulator is
+  not part of the key.
 - **RomM does not rename a state on ingest.** A save sent as `probe.srm` is
-  stored as `probe [2026-09-04_11-12-27].srm`; a state sent as `probe.state` is
-  stored as `probe.state`. The server's name and the client's are the same
-  string, which is what makes `(rom_id, file_name)` a usable pairing key on both
-  sides.
+  stored as `probe [2026-10-21_09-02-11].srm`; a state sent as
+  `probe-89654803.state` is stored under exactly that name
+  ([`captures/5.4.0/states-post.json`](../server/contract/captures/5.4.0/states-post.json)).
+  The server's name and the client's are the same string, which is what makes
+  `(rom_id, file_name)` a usable pairing key on both sides.
 
 ### The policy
 
@@ -1120,8 +1196,9 @@ A state that is replaced goes through the same four steps as a save, using the
 same two `io` primitives: fetch to `io::TempPathFor(<state>)`, check it, back it
 up with `io::CopyAtomically` into `.backup/`, then `io::CommitStaged` it into
 place. The `harness::Sandbox` teardown audit covers a state exactly as it covers
-a `.srm`. One difference for now: a state is not compared with its backup
-before the commit, so a write between the two is lost
+a `.srm`. Like a save, a state is compared with its backup immediately before
+the commit, and one written between the two is left with the backup beside it
+and the download failed `changed_since_backup`
 ([A write after the backup](#a-write-after-the-backup-263), #270).
 
 The backup name carries a discriminator built from the state's own name —

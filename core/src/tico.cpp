@@ -140,10 +140,13 @@ std::vector<std::string> Roots(const config::Config& config) {
   return roots;
 }
 
-std::vector<config::Diagnostic> Notes(const config::Config& config, fs::FileSystem& files) {
+std::vector<config::Diagnostic> Notes(const config::Config& config, fs::FileSystem& files,
+                                      std::vector<std::string>* accounts) {
   std::vector<config::Diagnostic> notes;
+  std::set<std::string> found;
   for (const std::string& root : Roots(config)) {
     const Resolution resolved = Resolve(config.tico, files, root);
+    found.insert(resolved.accounts.begin(), resolved.accounts.end());
     switch (resolved.layout) {
       case Layout::kLegacy:
         break;
@@ -173,6 +176,15 @@ std::vector<config::Diagnostic> Notes(const config::Config& config, fs::FileSyst
                              Listed(resolved.accounts, resolved.accounts_dropped))));
         }
         break;
+    }
+  }
+  if (accounts != nullptr) {
+    // A Switch holds at most eight, and saves and states roots name the same
+    // ones; a card past that is one something else wrote, and the rest stay a
+    // count in the notes.
+    accounts->assign(found.begin(), found.end());
+    if (accounts->size() > kMaxAccounts) {
+      accounts->resize(kMaxAccounts);
     }
   }
   return notes;

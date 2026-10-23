@@ -252,6 +252,7 @@ set(CONFIG_WRITE_SCENARIOS
   removes    # `remove` drops every occurrence and the default comes back
   emulator   # the [platform.x] emulator override, and the folders it must not unmap
   sources    # [sync] on_server_delete and [sources], the overlay's M10 settings (#264)
+  tico       # [tico] account and play_with from the overlay; [sync] slot still refused (#271)
 )
 foreach(scenario IN LISTS CONFIG_WRITE_SCENARIOS)
   add_test(NAME config.write_${scenario} COMMAND test_config_write ${scenario})
@@ -979,6 +980,7 @@ set(EXECUTE_RIG_SCENARIOS
   truncate        # a clean short body never replaces a save
   corrupted       # ...and neither do the right number of the wrong bytes
   occupied        # #232: the slot guard answers 409, and only Keep local goes over it
+  tie             # #272: a head tied with this device's own row in one second is not downloaded
   dropped         # a TCP reset mid-download costs a tick, not a save
   collision       # two saves of one rom, one second, two backups
   revoked         # M1-4: a 401 stops the plan where it stands, and touches no save
@@ -1106,6 +1108,7 @@ set(PLACE_SCENARIOS
   state_slots  # #239: a state placed only where its emulator loads it, under that frontend's name
   rom_folder   # #258: a rom folder, cut or not, is placed in exactly when the scan reads it back
   retroarch_folder # #258: where RetroArch writes is one rule the placer and the scan both ask
+  core_bound   # #269: two core folders made in one tick at one short of the bound: one placed
 )
 foreach(scenario IN LISTS PLACE_SCENARIOS)
   add_test(NAME place.${scenario} COMMAND test_placement ${scenario})
@@ -1249,6 +1252,7 @@ set(CONFLICT_UNIT_SCENARIOS
   interrupted  # a restore killed mid-write leaves old or new, never a splice, and no .tmp
   crash        # M9-14: a power cut at every call of a restore, and one the card would not confirm
   keep_local   # #249: Keep local restores a save conflict's bytes and arms its key; the plan spends it
+  late_write   # #270: a write between a restore's backup and its copy stays on the card
   service      # both commands through ipc::Dispatch over a real SdEngine
   overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
 )
@@ -1385,6 +1389,7 @@ set(STATES_RIG_SCENARIOS
   roundtrip  # local -> server -> a second sandbox -> identical bytes
   overwrite  # the server's copy moved: back up first, then replace
   crash      # M9-14: ...and a power cut at every call of it loses nothing
+  late_write # #270: ...and a write between its backup and its commit stays on the card
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
   mapped     # #239: Tico's Auto up as .state.auto with its screenshot, down as Tico's and RetroArch's
@@ -1717,9 +1722,10 @@ endif()
 # test reading the same library.
 set_tests_properties(contract.captures PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
-# The other half: docs/API_CONTRACT.md against the floor it claims to describe.
-# contract.captures compares captures with a server and cannot see a page that
-# quotes another version's (#260). Reads three paths, so it never skips.
+# The other half: docs/API_CONTRACT.md, SYNC_PROTOCOL.md and AUTH.md against the
+# floor they describe. contract.captures compares captures with a server and
+# cannot see a page that quotes another version's (#260, #266). Reads files
+# only, so it never skips.
 add_test(NAME contract.page
          COMMAND ${Python3_EXECUTABLE}
                  "${CMAKE_CURRENT_SOURCE_DIR}/test_contract_page.py"
@@ -2339,6 +2345,7 @@ set(ENGINE_SCENARIOS
   restore_race  # M7-2: a restore pressed while a tick is writing saves waits its turn, not interleaved
   restore_polled  # M9-6: a restore on a slow card holds no IPC call while it copies
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
+  keep_local_guards  # #273: Keep local refused under a game and past four waiting, nothing written
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
@@ -2402,6 +2409,7 @@ set(ENGINE_RIG_SCENARIOS
   install_wake       # review: a refused remote-install claim is asked again after a wake
   declined           # #257: a save the placer will not place costs one line, never a failed save
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
+  keep_local_overtaken  # #273: a game, a newer conflict and a download each spend or refuse it unsent
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

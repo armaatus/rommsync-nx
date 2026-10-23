@@ -107,9 +107,10 @@ first draft of this file — would have you write:
 3. **The token response carries no `token_type`, no `refresh_token` and no
    `expires_in`.** There is nothing to refresh; M1-4 is `401` handling and
    re-pairing, not a refresh flow.
-4. **`expires_at` is `null`** — this token does not expire on its own. Persist
-   the field anyway (RomM may start setting it), but never treat "no expiry" as
-   an error, and never pre-emptively re-pair on it.
+4. **`expires_at` is `null`** — this token does not expire on its own, unless
+   whoever approved the code chose an `expires_in` (`approve`, `parse_expiry`,
+   `endpoints/device/auth.py`). Persist the field either way, but never treat
+   "no expiry" as an error, and never pre-emptively re-pair on it.
 5. **The error is not an OAuth error object.** RFC 8628 says the pending poll
    answers `{"error": "authorization_pending"}`; RomM answers FastAPI's
    `{"detail": "..."}`. Reading `error` finds nothing, and a client that treats
@@ -133,10 +134,19 @@ discovering it as a `403` mid-sync.
 
 ## Polling the token endpoint
 
-Every `400` state below was observed against a live 5.2.0, and four different
-meanings share that one status. `auth::ClassifyTokenPoll(status, body)` maps a
-response to one of them and `auth::ShouldKeepPolling()` says whether the loop
-continues; nothing else in the engine branches on the raw string.
+Every `400` state below is one 5.4.0 answers, and four different meanings share
+that one status. `authorization_pending` is captured
+([`captures/5.4.0/auth-device-token-pending.json`](../server/contract/captures/5.4.0/auth-device-token-pending.json));
+`access_denied`, and `expired_token` for a code already redeemed, are what
+`pair.denied`, `pair.expired` and `pair.lost_grant` get from the fixture. The
+rest are branches a test cannot reach without waiting out a code or breaking the
+rule the table exists for, so they rest on 5.4.0's source: `token` in
+`endpoints/device/auth.py` (`expired_token` for a code `load_pending` no longer
+holds), with `polled_too_fast` and `check_token_poll_rate_limit` in
+`utils/device_auth.py` (`slow_down`, and the `429` past 60 polls a minute).
+`auth::ClassifyTokenPoll(status, body)` maps a response to one of them and
+`auth::ShouldKeepPolling()` says whether the loop continues; nothing else in the
+engine branches on the raw string.
 
 | Status | `detail` | Means | Poll again? |
 |---|---|---|---|
@@ -154,7 +164,8 @@ Four of those matter more than they look:
 - **Never poll faster than `interval`, whatever it says.** RomM restarts its
   pacing window on *every* poll it answers, `slow_down` included — so a client
   that undercuts the interval gets `slow_down` for every poll after the first
-  and never recovers, until the code expires under it. That is why
+  and never recovers, until the code expires under it (`polled_too_fast`
+  records the time of every poll it is asked about). That is why
   `DeviceInitResponse::poll_interval()` has a floor and no ceiling below the
   code's own lifetime: clamping the server's value *down* is the one adjustment
   that can stop a pairing from ever completing.
@@ -270,22 +281,23 @@ limiter answered.
 
 ## Where the OpenAPI snapshot and the running server disagree
 
-`server/contract/romm-openapi-5.2.0.json` is what RomM *declares*; the captures
-are what it *does*. Both were checked field by field against a 5.2.0 fixture
-(5.4.0's snapshot, `romm-openapi-5.4.0.json`, is the one `sync.payload` now
-pins), and on the **response bodies they agree exactly**: no field the
-snapshot declares is missing from a live response, and no live response carries
-a field the snapshot does not declare. Where they part company is everything the
+`server/contract/romm-openapi-5.4.0.json` is what RomM *declares*; the captures
+under `server/contract/captures/5.4.0/` are what it *does*, and
+`contract.captures` re-checks them against the 5.4.0 fixture. On the **response
+bodies they agree exactly**: for `auth-device-init.json`,
+`auth-device-token.json`, `devices-create.json` and `devices-get.json`, no field
+the snapshot declares is missing from the capture, and the capture carries no
+field the snapshot does not declare. Where they part company is everything the
 snapshot does not model.
 
 | The snapshot | The server | What we do |
 |---|---|---|
-| declares only `200` and `422` on `POST /api/auth/device/token` | also answers `400` with a `detail` string, and `429` when rate-limited | Table above; captured as `auth-device-token-pending.json`; typed as `auth::TokenPoll`. |
-| declares `expires_at` as `string \| null` and says no more | sends `null` on every response 5.2.0 produces | `std::optional<std::string>`, persisted either way. Empty is "no expiry", never an error, and never a reason to re-pair. |
-| says nothing about the order of `scopes` | returns them sorted alphabetically, not in the order requested | Read as a set (`DeviceTokenResponse::HasScope`), never by index. |
+| declares only `200` and `422` on `POST /api/auth/device/token` | also answers `400` with a `detail` string, and `429` when rate-limited | Table above; captured as [`captures/5.4.0/auth-device-token-pending.json`](../server/contract/captures/5.4.0/auth-device-token-pending.json); typed as `auth::TokenPoll`. |
+| declares `expires_at` as `string \| null` and says no more | sends `null` unless the approval chose an `expires_in` (`parse_expiry`); every approval the fixture makes leaves it `null` ([`captures/5.4.0/auth-device-token.json`](../server/contract/captures/5.4.0/auth-device-token.json)) | `std::optional<std::string>`, persisted either way. Empty is "no expiry", never an error, and never a reason to re-pair. |
+| says nothing about the order of `scopes` | returns them sorted alphabetically, not in the order requested (`approve` stores `sorted(approved_set)`) | Read as a set (`DeviceTokenResponse::HasScope`), never by index. |
 | says nothing about `scopes` being a subset | really does return only the subset that was approved | Read back and used to disable features, per the note above. |
-| says nothing about the `user_code` alphabet | draws from `ABCDEFGHJKMNPQRSTUVWXYZ23456789` | Displayed verbatim. The confusable characters are already excluded upstream, so nothing "corrects" them. |
-| gives `DeviceCreatePayload.allow_existing` a default of `true` and no other description, and declares only `200` and `422` on `POST /api/devices` | deduplicates on a *fingerprint* that is `hostname` or `mac_address` and never `client_device_identifier`; answers `201` when it creates, `200` when it matches, and `409 device_exists` when it matches under `allow_existing: false` | The client does not call `POST /api/devices` at all — a console has no stable hostname or MAC, and its identifier is not consulted. [Device registration](#device-registration). |
+| says nothing about the `user_code` alphabet | draws from `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (`PAIR_ALPHABET`, `utils/client_tokens.py`) | Displayed verbatim. The confusable characters are already excluded upstream, so nothing "corrects" them. |
+| gives `DeviceCreatePayload.allow_existing` a default of `true` and no other description, and declares only `200` and `422` on `POST /api/devices` | deduplicates on a *fingerprint* that is `mac_address`, or else `hostname` together with `platform`, and never `client_device_identifier` (`get_device_by_fingerprint`); answers `201` when it creates, `200` when it matches, and `409 device_exists` when it matches under `allow_existing: false` | The client does not call `POST /api/devices` at all — a console has no stable hostname or MAC, and its identifier is not consulted. [Device registration](#device-registration). |
 
 One thing the snapshot got right and an earlier draft of this page got wrong:
 `POST /api/auth/device/init` answers **`201`**, which the snapshot declares and
@@ -349,8 +361,8 @@ Every sync call is scoped by a `device_id`, and pairing is what produces one.
 There is no separate registration step: RomM creates the device row from the
 `client_device_identifier` in `POST /api/auth/device/init`, and the token
 response hands back its id. `POST /api/devices` would create a *second* device —
-it matches on `hostname` or `mac_address` and on nothing else, not even for the
-device-bound token of the device it is describing
+it matches on `mac_address`, or on `hostname` together with `platform`, and on
+nothing else, not even for the device-bound token of the device it is describing
 ([API_CONTRACT.md](API_CONTRACT.md#why-post-apidevices-is-the-wrong-call)).
 [`device_registration.hpp`](../core/include/rommsync/device_registration.hpp) is
 the module, and it only ever reads.
@@ -429,10 +441,11 @@ what the client requests, and it is exactly the unconditional list in
 the `auth.scopes` test, so the two cannot drift. Every `.write` in it is one the
 client performs; don't request a `*.write` you don't use. `me.write` is
 documented and **not** requested, and the reason is worth stating because the
-obvious guess is wrong: it is not the play-session scope. It guards
-`PUT /api/users/{id}`, the `/api/client-tokens` family and
-`/api/auth/device/{approve,deny}` in 5.2.0's snapshot, none of which this client
-calls. M7-4 (#39) records play sessions and needed **no new scope**:
+obvious guess is wrong: it is not the play-session scope. In 5.4.0's snapshot
+it guards `PUT /api/users/{id}` and `POST /api/users/{id}/ra/refresh`, the
+writes of the `/api/client-tokens`, `/api/notifications` and
+`/api/notification-channels` families, and `/api/auth/device/{approve,deny}` --
+none of which this client calls. M7-4 (#39) records play sessions and needed **no new scope**:
 `POST /api/play-sessions` declares `roms.user.write` and
 `POST /api/sync/sessions/{id}/complete` declares `devices.write`, both already on
 the list.

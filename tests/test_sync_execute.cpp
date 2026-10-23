@@ -22,7 +22,6 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -31,6 +30,7 @@
 #include <vector>
 
 #include "crash_disk.hpp"
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/disk.hpp"
@@ -654,6 +654,7 @@ class Scripted final : public http::HttpClient {
 
   http::Result Send(const http::Request& request) override {
     urls.push_back(request.url);
+    methods.push_back(request.method);
     http::Result result;
     result.response.status = status_;
     result.response.body = body_;
@@ -667,6 +668,7 @@ class Scripted final : public http::HttpClient {
   }
 
   std::vector<std::string> urls;
+  std::vector<http::Method> methods;
 
  private:
   int status_;
@@ -698,18 +700,108 @@ void Overwrite(rig::Checks& checks) {
     Scripted accepted(201, R"({"id":41})");
     sync::ExecuteOptions options = OptionsAt(1'757'000'000);
     options.keep_local = {{8, std::string("kept")}};
+    options.wait = [](std::chrono::milliseconds) {};
     const sync::ExecutionReport report =
         sync::ExecutePlan(accepted, *files, token, plan, targets, options);
     checks.ExpectEq(report.completed, 2, "both uploads are accepted");
-    if (accepted.urls.size() == 2) {
+    checks.Expect(report.warnings.empty(),
+                  "with nothing to say" +
+                      (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+    // A POST per upload, and the Keep local's row rewritten in place after it
+    // (#272): the second has to turn under it, so the row is its slot's newest
+    // however RomM's negotiate breaks a tie.
+    if (accepted.urls.size() == 3) {
       checks.Expect(accepted.urls[0].find("overwrite=false") != std::string::npos &&
                         accepted.urls[0].find("overwrite=true") == std::string::npos,
                     "an upload the plan asked for respects the slot guard: " + accepted.urls[0]);
       checks.Expect(accepted.urls[1].find("overwrite=true") != std::string::npos,
                     "and only an explicit Keep local overrides it: " + accepted.urls[1]);
+      checks.Expect(accepted.methods[2] == http::Method::kPut &&
+                        accepted.urls[2].find("/api/saves/41?") != std::string::npos &&
+                        accepted.urls[2].find("device_id=this-console") != std::string::npos,
+                    "which then rewrites the row it wrote, as this device: " + accepted.urls[2]);
     } else {
-      checks.Expect(false, "one request per upload, got " + std::to_string(accepted.urls.size()));
+      checks.Expect(false, "a request per upload and the Keep local's rewrite, got " +
+                               std::to_string(accepted.urls.size()));
     }
+  }
+
+  // A rewrite that does not happen leaves the upload standing -- it landed --
+  // and is said, because the next tick may then undo the choice (#272). It is
+  // the one call here that is retried: the same bytes onto the same row.
+  {
+    // Answers the upload, and the rewrite with `rewrite_status`.
+    class Rewrites final : public http::HttpClient {
+     public:
+      explicit Rewrites(int rewrite_status) : rewrite_status_(rewrite_status) {}
+      http::Result Send(const http::Request& request) override {
+        http::Result result;
+        const bool put = request.method == http::Method::kPut;
+        puts += put ? 1 : 0;
+        result.response.status = put ? rewrite_status_ : 201;
+        result.response.body = R"({"id":41,"updated_at":"2026-10-23T18:00:00.250000+00:00"})";
+        return result;
+      }
+      http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+        http::Result result;
+        result.error = http::Error::kConnectFailed;
+        return result;
+      }
+      int puts = 0;
+
+     private:
+      int rewrite_status_;
+    };
+    sync::SyncPlan one = plan;
+    one.operations.erase(one.operations.begin());
+
+    Rewrites unavailable(503);
+    std::vector<std::chrono::milliseconds> waited;
+    sync::ExecuteOptions options = OptionsAt(1'757'000'002);
+    options.keep_local = {{8, std::string("kept")}};
+    options.wait = [&waited](std::chrono::milliseconds delay) { waited.push_back(delay); };
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(unavailable, *files, token, one, targets, options);
+    checks.ExpectEq(report.completed, 1, "the Keep local upload still counts as done");
+    checks.ExpectEq(unavailable.puts, 3, "a 503 is tried three times");
+    checks.Expect(waited.size() == 3 && waited[0] == std::chrono::milliseconds{1'100} &&
+                      waited[1] > waited[0] && waited[2] > waited[1],
+                  "the first past the second the upload landed in, each after a longer wait");
+    checks.Expect(report.warnings.size() == 1 &&
+                      report.warnings[0].find("not moved past it (the rewrite was refused: "
+                                              "HTTP 503)") != std::string::npos,
+                  "and the rewrite that failed is said: " +
+                      (report.warnings.empty() ? std::string("nothing") : report.warnings[0]));
+
+    // The client's one rule for a status worth asking again, not a copy of it:
+    // a 429 is RomM, or a proxy in front of it, declining *now*.
+    Rewrites throttled(429);
+    options.wait = [](std::chrono::milliseconds) {};
+    sync::ExecutePlan(throttled, *files, token, one, targets, options);
+    checks.ExpectEq(throttled.puts, 3, "a 429 is tried three times too");
+
+    Rewrites refused(404);
+    const sync::ExecutionReport gone =
+        sync::ExecutePlan(refused, *files, token, one, targets, options);
+    checks.ExpectEq(refused.puts, 1, "a refusal of the rewrite is not asked again");
+    checks.ExpectEq(gone.warnings.size(), static_cast<std::size_t>(1), "and is said too");
+
+    // The player writes the save in the second the rewrite waits out: those are
+    // new bytes, not the ones the Keep local sent, and they are not put up as if
+    // they were.
+    Rewrites moved(200);
+    options.wait = [&sandbox](std::chrono::milliseconds) {
+      sandbox.Write(SavePath("kept.srm"), "progress made in the meantime\n");
+    };
+    const sync::ExecutionReport changed =
+        sync::ExecutePlan(moved, *files, token, one, targets, options);
+    checks.ExpectEq(moved.puts, 0, "a save that changed on the card is not rewritten");
+    checks.Expect(changed.warnings.size() == 1 &&
+                      changed.warnings[0].find("the save changed on the card since") !=
+                          std::string::npos,
+                  "and that is said: " + (changed.warnings.empty() ? std::string("nothing")
+                                                                    : changed.warnings[0]));
+    sandbox.Write(SavePath("kept.srm"), bytes);
   }
 
   // Refused with the guard's own answer.
@@ -1466,51 +1558,9 @@ void CrashDelete(rig::Checks& checks) {
 // #263: a game writing its save while the sync acts on it. Hard rule 2's backup
 // is a copy of the bytes the save held *at the copy*; a write that lands after it
 // and before the save is replaced or removed is in no copy anywhere, so the
-// replacement or removal has to see it and stand down. `LateWrite` is that
-// game, timed to the one call that separates the two.
-
-/// A `Disk` that writes the save the moment a backup's name is published under
-/// `.backup/` -- after the copy is complete, before anything replaces or removes
-/// the save. `write` is the game; it runs once.
-class LateWrite final : public io::Disk {
- public:
-  explicit LateWrite(std::function<void()> write) : write_(std::move(write)) {
-    previous_ = io::SetDisk(this);
-  }
-  ~LateWrite() override { io::SetDisk(previous_); }
-
-  LateWrite(const LateWrite&) = delete;
-  LateWrite& operator=(const LateWrite&) = delete;
-
-  std::FILE* Open(const std::string& path, const char* mode) override {
-    return Inner().Open(path, mode);
-  }
-  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
-    return Inner().Write(file, data, size);
-  }
-  int Rename(const std::string& from, const std::string& to) override {
-    const int renamed = Inner().Rename(from, to);
-    // The backup's own commit: its staged copy onto its name, in `.backup/`.
-    if (renamed == 0 && !fired_ && to.find("/.backup/") != std::string::npos &&
-        from == io::TempPathFor(to)) {
-      fired_ = true;
-      write_();
-    }
-    return renamed;
-  }
-  int Remove(const std::string& path) override { return Inner().Remove(path); }
-  bool Sync(const std::string& path) override { return Inner().Sync(path); }
-
-  /// Whether the write happened, so a scenario cannot pass on one that never ran.
-  bool fired() const { return fired_; }
-
- private:
-  io::Disk& Inner() const { return previous_ != nullptr ? *previous_ : io::StdioDisk(); }
-
-  std::function<void()> write_;
-  io::Disk* previous_ = nullptr;
-  bool fired_ = false;
-};
+// replacement or removal has to see it and stand down. `faulty::LateWrite`
+// (tests/faulty_disk.hpp) is that game, timed to the one call that separates the
+// two.
 
 void LateWriteDelete(rig::Checks& checks) {
   Sandbox sandbox(checks, "execute-late-delete");
@@ -1534,7 +1584,7 @@ void LateWriteDelete(rig::Checks& checks) {
   {
     // `Reseed` rather than `Write`: from here on the late bytes are the save,
     // and the teardown audit holds the executor to *them*.
-    LateWrite game([&] { sandbox.Reseed(SavePath(name), late); });
+    faulty::LateWrite game([&] { sandbox.Reseed(SavePath(name), late); });
     report = sync::ExecutePlan(client, *files, token, DeletePlan(41, "late"),
                                {{41, "late", SavePath(name), name}}, options);
     checks.Expect(game.fired(), "the game wrote between the backup and the removal");
@@ -1815,7 +1865,7 @@ std::optional<sync::OperationResult> ExecuteUnderLateWrite(
   const std::string& save = target.sd_path;
   sync::ExecutionReport report;
   {
-    LateWrite game([&] { sandbox.Reseed(save, late); });
+    faulty::LateWrite game([&] { sandbox.Reseed(save, late); });
     report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, {target}, options);
     checks.Expect(game.fired(), what + ": the game wrote between the backup and the commit");
   }
@@ -2594,9 +2644,9 @@ void Corrupted(rig::Checks& checks, http::HttpClient& client, const std::string&
 // anything.
 //
 // It also pins what the flag does *not* do. It does not stop a slot accreting a
-// row per upload: RomM matches the existing row by a second-granularity datetime
-// tag it computes at ingest, so only an upload inside the same second as the
-// previous one lands on the same row (issue #85, and docs/API_CONTRACT.md).
+// row per upload: RomM 5.4.0 reserves a fresh name for every slotted upload, and
+// `overwrite=true` even turns off the promotion that would otherwise answer
+// identical bytes with the row already holding them (docs/API_CONTRACT.md).
 
 void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& base,
               const Fixture& fixture, const harness::Rom& rom) {
@@ -2662,8 +2712,9 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   // to the whole second, and a tie goes to whichever row its unordered query
   // returns first -- the occupant. Arbitrating against the occupant, this device
   // has no history, and the sync-history check below would fail for a reason
-  // that has nothing to do with whether the upload recorded one (#265; the
-  // product's side of the tie is #272).
+  // that has nothing to do with whether the upload recorded one (#265). The
+  // executor now settles that tie itself (#272, `tie` below); the wait keeps
+  // this scenario about the guard rather than about the tie.
   harness::PassASecond();
   sync::ExecuteOptions keep = OptionsAt(1'757'000'011);
   keep.keep_local = {{rom.id, slot}};
@@ -2685,20 +2736,14 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   // assumed -- and **this scenario asserted the wrong thing until it went red in
   // CI**. It does not reliably replace the occupying row.
   //
-  // RomM stamps a slot upload with a second-granularity datetime tag and then
-  // looks the existing row up *by that tagged name*
-  // (`_apply_datetime_tag` and `get_save_by_filename` in `endpoints/saves.py`,
-  // 5.2.0). So a POST replaces the row in place only when it lands in the same
-  // wall-clock second as the ingest that created it, with the same base file
-  // name; one second later the name it computes matches nothing and RomM writes
-  // a **second** row. That is a race, and it is the one this scenario used to
-  // win on a fast laptop and lose in CI (issue #85).
-  //
-  // So the identity assertion is made in the only direction that is
-  // deterministic: after a second has certainly passed, a new row appears and
-  // the occupant is left alone. The same-second case is real and is what made
-  // the old assertion pass; it is deliberately not asserted, because a test that
-  // has to win a race is a test that reports the machine's speed.
+  // 5.2.0 looked the existing row up by a second-granularity datetime tag, so a
+  // POST replaced the row in place only inside the second of the ingest that
+  // created it -- a race this scenario used to win on a fast laptop and lose in
+  // CI (issue #85). 5.4.0 reserves a fresh tagged name for every slotted upload
+  // (`reserve_version_name`, `handler/asset_store.py`), so the re-post below is
+  // a second row however fast it lands, and under `overwrite=true` that holds
+  // even for the same bytes. The wait before it stays: it costs two seconds and
+  // keeps the assertion from resting on which release the fixture runs.
   // Every row this scenario leaves on the fixture, removed on the way out
   // however it exits. `save_id` is best-effort on an `OperationResult` -- it is
   // parsed for the report and decides nothing -- so an upload can succeed and
@@ -2769,6 +2814,146 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
                   "with its own bytes, untouched by the second");
 
   sweep();
+}
+
+// --- tie ------------------------------------------------------------------------
+//
+// #272. RomM 5.4.0 stores `updated_at` to the whole second, and negotiate keeps
+// whichever row of a slot's newest second its unordered query meets first --
+// the older one without `rom_ids`, the newer with them, on this fixture -- where
+// its own slot guard and `promote_to_slot_head` order by `updated_at`, then id.
+// So a Keep local upload landing in the second another device's did can lose
+// the head to it, and the next negotiation, with no history against the other
+// row, plans a download of it: the player's choice undone (backed up, but
+// undone, and with nothing said).
+//
+// The client's side (`ExecuteOptions::keep_local`): every Keep local upload
+// rewrites its own row with the bytes it already holds once the second has
+// turned, which makes it the slot's newest by a whole second, however a query
+// orders the slot.
+
+/// Whether two of RomM's timestamps name the same whole second.
+bool SameSecond(const std::string& left, const std::string& right) {
+  const std::optional<sync::Timestamp> a = sync::ParseTimestamp(left);
+  const std::optional<sync::Timestamp> b = sync::ParseTimestamp(right);
+  return a.has_value() && b.has_value() && *a == *b;
+}
+
+void Tie(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+         const Fixture& fixture, const harness::Rom& rom) {
+  Sandbox sandbox(checks, "execute-tie");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string name = "tie.srm";
+  const std::string bytes = "the bytes the player chose to keep\n";
+  sandbox.SeedSave(SavePath(name), bytes);
+  const std::string staged = sandbox.Host("/config/rommsync/other-device.srm");
+  rig::WriteFile(staged, "the copy another device uploaded in the same second\n");
+
+  std::vector<std::int64_t> planted;
+  const auto sweep = [&]() {
+    for (const std::int64_t id : planted) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+    planted.clear();
+  };
+
+  // RomM gives no way to stamp a row, so the tie is arranged by doing the two
+  // uploads back to back -- the plan is negotiated first, into an empty slot --
+  // which loses a second boundary now and then and not five times running.
+  // `created_at` is what says whether it was arranged: the fix moves the
+  // Keep local row's `updated_at` on, and that is what this checks below.
+  for (int attempt = 0; attempt < 5; ++attempt) {
+    const std::string slot = harness::UniqueSlot("m10-32-tie");
+    sync::SyncNegotiatePayload payload;
+    payload.device_id = fixture.device_id;
+    // An mtime older than both rows: what the player kept was restored onto the
+    // card before the tick, and it is what makes the older row read as
+    // `Server save is newer (no sync history)` to the next negotiation.
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, name, slot, "m2-5", crypto::Md5Hex(bytes),
+        std::chrono::system_clock::now() - std::chrono::hours{1},
+        static_cast<std::int64_t>(bytes.size())));
+    sync::SyncPlan plan;
+    if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+      sweep();
+      return;
+    }
+
+    harness::Save occupant;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m2-5", staged, "other.srm",
+                             /*with_device=*/false, &occupant)) {
+      checks.Expect(false, "the other device's upload landed");
+      sweep();
+      return;
+    }
+    planted.push_back(occupant.id);
+    sync::ExecuteOptions keep = OptionsAt(1'757'000'020);
+    keep.keep_local = {{rom.id, slot}};
+    keep.reported = &payload.saves;
+    const std::vector<sync::SaveTarget> targets = {{rom.id, slot, SavePath(name), name}};
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, targets, keep);
+    if (report.operations.empty() || !report.operations[0].save_id.has_value()) {
+      checks.Expect(false, "the Keep local upload reports the row it wrote");
+      sweep();
+      return;
+    }
+    const sync::OperationResult& done = report.operations[0];
+    planted.push_back(*done.save_id);
+    harness::Save mine;
+    if (!harness::ReadSave(client.Send(harness::Authed(
+                               http::Method::kGet,
+                               base + "/api/saves/" + std::to_string(*done.save_id), fixture)),
+                           &mine)) {
+      checks.Expect(false, "the Keep local row is readable");
+      sweep();
+      return;
+    }
+    if (!SameSecond(occupant.created_at, mine.created_at)) {
+      sweep();
+      continue;
+    }
+
+    checks.Expect(occupant.id < mine.id, "the other device's row is the older");
+    checks.ExpectEq(report.completed, 1,
+                    "the Keep local upload completed" +
+                        (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+    checks.Expect(done.outcome == sync::OperationOutcome::kUploaded,
+                  std::string("as an upload: ") + sync::ToString(done.outcome) + " -- " +
+                      done.message);
+    checks.Expect(!SameSecond(mine.updated_at, occupant.updated_at),
+                  "and its row has moved out of the second it tied in: " + mine.updated_at +
+                      " vs the other device's " + occupant.updated_at);
+    checks.ExpectEq(sandbox.Read(SavePath(name)), bytes, "the card still holds the kept bytes");
+    checks.Expect(!sandbox.HasBackupOf(bytes), "and nothing was backed up: nothing was replaced");
+
+    // What the player chose is what the next negotiation names -- not a
+    // download of the other device's row -- in both of the shapes measured to
+    // break the tie differently: unscoped, and scoped as a tick is.
+    for (const bool scoped : {false, true}) {
+      sync::SyncNegotiatePayload asked = payload;
+      if (scoped) {
+        asked.rom_ids = std::vector<std::int64_t>{rom.id};
+      }
+      sync::SyncPlan next;
+      if (!PlanFor(checks, client, base, fixture, asked, {slot}, &next)) {
+        continue;
+      }
+      checks.Expect(next.operations[0].action == sync::Action::kNoOp &&
+                        next.operations[0].save_id == mine.id,
+                    std::string("the next negotiation") + (scoped ? ", scoped," : "") +
+                        " names the Keep local row as the head: " +
+                        sync::ToString(next.operations[0].action) + " save " +
+                        (next.operations[0].save_id.has_value()
+                             ? std::to_string(*next.operations[0].save_id)
+                             : std::string("null")) +
+                        ", \"" + next.operations[0].reason_text + "\"");
+    }
+    sweep();
+    return;
+  }
+  checks.Expect(false, "two uploads landed in one second at least once in five tries");
 }
 
 // --- dropped ------------------------------------------------------------------
@@ -3144,6 +3329,8 @@ int main(int argc, char** argv) {
     Corrupted(checks, *client, base, fixture, rom);
   } else if (scenario == "occupied") {
     Occupied(checks, *client, base, fixture, rom);
+  } else if (scenario == "tie") {
+    Tie(checks, *client, base, fixture, rom);
   } else if (scenario == "dropped") {
     Dropped(checks, *client, base, fixture, rom);
   } else if (scenario == "collision") {

@@ -422,9 +422,12 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
 /// or removal that follows would take it. So the save is compared with its
 /// backup by digest, and anything but a match stands the operation down with
 /// both files left where they are. A digest because a size-and-mtime check
-/// misses a same-size rewrite inside FAT32's two-second mtime, and because what
-/// `ExecutePlan` replaces is a save file, kilobytes; a state's tens of megabytes
-/// do not come through here (state_sync.hpp).
+/// misses a same-size rewrite inside FAT32's two-second mtime.
+///
+/// Every overwrite asks it: `ExecutePlan`'s three actions, a state download
+/// (`state_sync.cpp`) and a conflict restore (`conflicts::Restore`), the last
+/// two since #270. Both files are streamed through `state::HashFile`, so a
+/// state's tens of megabytes cost two reads of the card and no heap.
 ///
 ///   - `backup_sd_path` empty means `BackUpFirst` found nothing to protect, so
 ///     there must still be nothing -- a file that appeared since has no copy.
@@ -709,7 +712,22 @@ struct ExecuteOptions {
   /// that answers it (`SpendKeepLocal`), so it is one upload's and no more.
   /// Empty on every other tick: a conflict is resolved Keep server (with the
   /// local copy archived on the server) unless the player says otherwise.
+  ///
+  /// A Keep local upload that landed is rewritten in place a second later with
+  /// the same bytes (`PUT /api/saves/{id}`, #272): RomM breaks a tie between two
+  /// rows of one second by query order, and the other device's row could
+  /// otherwise be the head the next negotiation names. That costs the upload
+  /// ~1.1 s on the calling thread (`wait`). The rewrite is the one call here
+  /// that is retried, with backoff: it is idempotent -- the same bytes onto the
+  /// same row -- where a re-posted upload is a second row, and the choice it
+  /// completes is spent by the time a next tick could try. One that still fails
+  /// is a line in `ExecutionReport::warnings`, never a failed upload.
   std::vector<state::Baseline::Key> keep_local;
+
+  /// How the executor waits: the second a Keep local's rewrite waits out, and
+  /// the backoff between its attempts. Null sleeps, waking to check `cancel` --
+  /// not "do not wait", `NegotiateOptions::wait`'s contract.
+  std::function<void(std::chrono::milliseconds)> wait;
 
   /// Whether an upload and a `/downloaded` carry `content_hash`: the MD5 of the
   /// file as it is uploaded, and of the verified bytes a download put on the
@@ -767,10 +785,13 @@ struct ExecuteOptions {
 /// How many Keep local choices wait for their upload at once (#249).
 ///
 /// A choice is armed when the overlay's restore lands and spent by the next plan
-/// that names its save, so the list is normally one long. It is bounded because
-/// a save whose rom has left the card is never named again: the oldest choice is
-/// let go first, which costs that save its override and nothing else -- its
-/// next upload meets the slot guard like any other.
+/// that names its save, so the list is normally one long. At the bound a fifth
+/// is **refused before its restore writes anything** (`conflicts::KeepLocal`,
+/// `kKeepLocalFull`, #273) rather than the oldest let go: that one's bytes are
+/// already on the card, and its upload without the override would meet the
+/// slot guard and resolve as Keep server -- an explicit answer undone with no
+/// word said. The list is in memory, so a reboot empties it; a choice whose
+/// save has left the card holds its place until then.
 ///
 /// Four, because the sysmodule's heap pays for it four times over -- the list
 /// and the three copies a tick holds (`kHeapKeepLocal`, sysmodule main.cpp) --
@@ -779,8 +800,21 @@ struct ExecuteOptions {
 inline constexpr std::size_t kMaxKeepLocal = 4;
 
 /// Arm Keep local for `key`: once, however often it is chosen, and at most
-/// `kMaxKeepLocal` of them, the oldest let go first.
-void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Baseline::Key& key);
+/// `kMaxKeepLocal` of them. False, with nothing changed, for a key that would
+/// be one past the bound -- which `conflicts::KeepLocal` refuses before its
+/// restore, so a caller that asked it first never sees this.
+bool ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Baseline::Key& key);
+
+/// A Keep local a plan spent without sending it (#273): the plan asked for
+/// `action` -- a download, a conflict, a deletion -- rather than an upload of
+/// the save, so its override never went. A no-op is not one: after a restore
+/// it is the server already holding the kept bytes. Answered so the caller can
+/// say so: a choice the player made that the server overtook is worth a line,
+/// not a silent drop.
+struct OvertakenKeepLocal {
+  state::Baseline::Key key;
+  Action action = Action::kNoOp;
+};
 
 /// Drop every Keep local `executed` answered, and keep the rest (#249).
 ///
@@ -796,9 +830,12 @@ void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Ba
 /// the list the plan was executed with -- is kept whatever the plan did: it was
 /// armed after the plan went out, so the plan's upload of it carried no
 /// override.
-void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
-                    const std::vector<state::Baseline::Key>& sent,
-                    const ExecutionReport& executed);
+///
+/// Answers the choices spent by an action other than an upload (#273): the
+/// server overtook them, and nothing went over its copy.
+std::vector<OvertakenKeepLocal> SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                                               const std::vector<state::Baseline::Key>& sent,
+                                               const ExecutionReport& executed);
 
 /// Execute `plan`, one operation at a time, in the order the server sent them.
 ///

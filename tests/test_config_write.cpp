@@ -567,6 +567,87 @@ void Sources(checks::Checks& c) {
   c.Expect(!Parsed(reset).sources.retroarch_content_dir, "removing it turns it back off");
 }
 
+/// #271: the settings screen's account picker and `play_with`. `[sync] slot`
+/// stays refused -- it moves every save to a new slot on the server -- and
+/// `map_state_slots` is the flag the write path already took.
+void TicoAndPlayWith(checks::Checks& c) {
+  const std::string before = Busy();
+  const std::string kUid = "0123456789abcdef0123456789abcdef";
+
+  // `[tico]` is not in the file: the section is appended, and an account id in
+  // either case is stored lowercase, the way Tico names its folder.
+  const std::string named = Applied(
+      c, before, One("tico", "account", " 0123456789ABCDEF0123456789abcdef "), "account = <uid>");
+  c.Expect(Parsed(named).tico.account == config::TicoAccount::kNamed &&
+               Parsed(named).tico.uid == kUid,
+           "a named account reads back");
+  c.Expect(named.find("[tico]\r\naccount = " + kUid) != std::string::npos,
+           "in a [tico] section of its own, lowercase");
+  const std::string automatic = Applied(c, named, One("tico", "account", "AUTO"), "account = auto");
+  c.Expect(Parsed(automatic).tico.account == config::TicoAccount::kAuto, "auto reads back");
+  c.Expect(automatic.find("account = auto") != std::string::npos,
+           "stored as the word the setting documents");
+  const std::string legacy =
+      Applied(c, automatic, One("tico", "account", "legacy"), "account = legacy");
+  c.Expect(Parsed(legacy).tico.account == config::TicoAccount::kLegacy, "legacy reads back");
+
+  // `play_with` lands in the platform's section, and its folders stay.
+  const std::string retro = Applied(c, before, One("platform.snes", "play_with", "RetroArch"),
+                                    "[platform.snes] play_with = retroarch");
+  const config::Config retro_config = Parsed(retro);
+  c.Expect(retro_config.PlayWithFor("snes") == config::PlayWith::kRetroArch,
+           "play_with = retroarch reads back");
+  c.Expect(retro.find("play_with = retroarch\r\n") != std::string::npos, "stored lowercase");
+  const config::PlatformFolders* snes = retro_config.Platform("snes");
+  c.Expect(snes != nullptr && snes->roms == std::vector<std::string>{"/tico/roms/snes"},
+           "and the platform's folders are the ones it had");
+  const std::string tico =
+      Applied(c, retro, One("platform.snes", "play_with", "tico"), "play_with = tico");
+  c.Expect(Parsed(tico).PlayWithFor("snes") == config::PlayWith::kTico, "and back to tico");
+
+  // A platform with no section yet: one line, and the built-in folders stay in
+  // force -- a section that sets only `play_with` is not a folder map.
+  const std::string gb = Applied(c, before, One("platform.gb", "play_with", "retroarch"),
+                                 "[platform.gb] play_with");
+  const config::Config gb_config = Parsed(gb);
+  c.Expect(gb_config.PlayWithFor("gb") == config::PlayWith::kRetroArch, "gb plays in RetroArch");
+  c.Expect(gb_config.Platform("gb") != nullptr && !gb_config.Platform("gb")->roms.empty(),
+           "and keeps its built-in folders");
+
+  // Empty is a value, the way `emulator =` is: the default is back.
+  const std::string unset =
+      Applied(c, retro, One("platform.snes", "play_with", ""), "play_with = (empty)");
+  const config::Config unset_config = Parsed(unset);
+  c.Expect(unset_config.play_with.find("snes") == unset_config.play_with.end(),
+           "an empty play_with reads back as no line");
+  c.Expect(unset_config.PlayWithFor("snes") == config::PlayWith::kTico,
+           "and the default is in force again");
+
+  // Refused, with nothing written.
+  const std::pair<config::Edit, const char*> refused[] = {
+      {One("tico", "account", "0123456789abcdef"), "account"},
+      {One("tico", "account", "../../saves"), "account"},
+      {One("tico", "uid", kUid), "uid"},
+      {One("platform.snes", "play_with", "mgba"), "play_with"},
+      {One("sync", "slot", "mine"), "slot"},
+  };
+  for (const auto& [edit, key] : refused) {
+    std::string after = "untouched";
+    std::vector<config::Diagnostic> diagnostics;
+    c.Expect(!config::ApplyEdit(before, edit, &after, &diagnostics),
+             std::string("refused: [") + edit.assignments[0].section + "] " + key + " = " +
+                 edit.assignments[0].value);
+    c.ExpectEq(after, std::string("untouched"), std::string("nothing written for ") + key);
+    c.Expect(!diagnostics.empty() && diagnostics.back().key == key,
+             std::string("and the refusal names ") + key);
+  }
+
+  // `map_state_slots` is the flag it already was.
+  const std::string mapped =
+      Applied(c, before, One("sync", "map_state_slots", "on"), "map_state_slots = true");
+  c.Expect(Parsed(mapped).sync.map_state_slots, "map_state_slots reads back");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -585,6 +666,8 @@ int main(int argc, char** argv) {
     Emulator(checks);
   } else if (scenario == "sources") {
     Sources(checks);
+  } else if (scenario == "tico") {
+    TicoAndPlayWith(checks);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

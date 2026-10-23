@@ -130,7 +130,8 @@ enum class Event {
 
   /// The server answered, and the answer will not change on a retry: a device
   /// deleted in the web UI, sync switched off for it, or a 2xx this client
-  /// cannot read as a plan.
+  /// cannot read as a plan. And a player's Keep local the server overtook --
+  /// it planned a download or a conflict for the save, not the upload (#273).
   kSyncRefused,
 
   /// How one tick ended, and what it moved. The line a user is asked for first.

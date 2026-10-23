@@ -16,21 +16,30 @@
 // deep (`stack.contract`) -- and puts the same chain at ~12.5 KiB.
 //
 // The worker, pairing and PSC threads do not get this number; their stacks are
-// `kThreadStackBytes` and `kWatcherStackBytes` (`sized_thread.hpp`).
+// `kThreadStackBytes` and `kWatcherStackBytes` (`sized_thread.hpp`). They are
+// held the same way, from their own `SizedThread::Enter` (M9-31, #268): the
+// worker and pairing threads parse too, so each has a rest ceiling at the
+// bottom of this file and the same half-the-stack rule; the PSC watcher parses
+// nothing, which `stack.measured` asserts, and its whole deepest chain is held
+// to half its stack there.
 //
 // **The margin is half the stack.** The figures below are what GCC reports for
-// every frame on the deepest *direct* chain, and that is a floor on the truth:
+// every frame on the deepest *direct* chain -- the worker's and pairing
+// thread's ceilings are recorded without them, for the reason `sized_thread.hpp`
+// gives -- and that is a floor on the truth:
 // an indirect call has no target a static walk can follow (`fs::FileSystem`
 // and `http::HttpClient` are interfaces), and newlib's and libnx's frames
 // count as zero. `scripts/stack-budget.py` says which edges it does resolve.
 //
 // What holds each number:
 //
-//   * `stack.fit` (every push): the npdm says `kMainThreadStackBytes`, and the
-//     `static_assert` below holds with today's `kMaxDepth`.
+//   * `stack.fit` (every push): the npdm says `kMainThreadStackBytes`, the
+//     `static_assert`s below hold with today's `kMaxDepth`, and nothing in the
+//     tree starts a thread except through `SizedThread`.
 //   * `stack.measured` (every push, in the `switch-build` job): a
-//     cross-compile with `-fcallgraph-info=su`, walked from `main`, stays
-//     under both ceilings.
+//     cross-compile with `-fcallgraph-info=su`, walked from `main` and from
+//     each `SizedThread::Enter`, stays under every ceiling here and inside
+//     half of each thread's stack.
 //   * `stack.contract` (every push): `kMaxDepth` stays at least twice the
 //     deepest shape a pinned RomM snapshot promises, so lowering it again is
 //     caught where it would start refusing real responses.
@@ -39,6 +48,7 @@
 #include <cstddef>
 
 #include "rommsync/json.hpp"
+#include "sized_thread.hpp"
 
 namespace rommsync::sysmodule::stack {
 
@@ -75,5 +85,28 @@ static_assert(kDeepestParseBytes <= kMainThreadStackBytes / 2,
               "the deepest JSON document json::kMaxDepth accepts no longer fits in half the "
               "main thread's stack; the other half is the margin for what no static walk sees "
               "(#216)");
+
+/// What `kMainRestBytes` is for the main thread, for the worker: everything on
+/// its deepest parsing chain beside the levels, from
+/// `SizedThread::Enter<&SdEngine::RunWorker>` down through the tick to
+/// whichever response it parses (#268). A ceiling, not a measurement --
+/// `stack.measured` prints the figure it holds this above, and a quoted figure
+/// here would be one more number to go stale.
+inline constexpr std::size_t kWorkerRestBytes = 0x5000;
+
+/// The same for the pairing thread, from
+/// `SizedThread::Enter<&SdEngine::DrivePairing>` through
+/// `auth::PairingSession` to the pairing endpoints' responses (#268).
+inline constexpr std::size_t kPairingRestBytes = 0x1000;
+
+static_assert((static_cast<std::size_t>(json::kMaxDepth) + 1) * kJsonLevelBytes +
+                      kWorkerRestBytes <=
+                  kThreadStackBytes / 2,
+              "the deepest JSON document no longer fits in half the worker's stack (#268)");
+static_assert((static_cast<std::size_t>(json::kMaxDepth) + 1) * kJsonLevelBytes +
+                      kPairingRestBytes <=
+                  kThreadStackBytes / 2,
+              "the deepest JSON document no longer fits in half the pairing thread's stack "
+              "(#268)");
 
 }  // namespace rommsync::sysmodule::stack

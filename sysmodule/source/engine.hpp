@@ -396,10 +396,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// **And which application it is, when `pm` will say** (M10-26, #261). Every
   /// answer that names one is a sighting (`play::Sightings`), and the tick after
   /// the game gives each play session the application seen when its save was
-  /// written -- "unknown" when none was. Only a tick that falls due, its hold
-  /// and a "Sync now" press ask, so a game played entirely between two ticks is
-  /// never seen: deliberately, because asking between ticks would be a poll on
-  /// a console with nothing owed, which #242 keeps at none.
+  /// written -- "unknown" when none was. Only a tick that falls due, its hold,
+  /// a "Sync now" press and a Keep local's restore (#273) ask, so a game played
+  /// entirely between two ticks is never seen: deliberately, because asking
+  /// between ticks would be a poll on a console with nothing owed, which #242
+  /// keeps at none.
   using ForegroundProbe = std::function<play::Foreground()>;
   void UseForegroundProbe(ForegroundProbe probe,
                           std::chrono::milliseconds poll = kForegroundPollInterval);
@@ -528,6 +529,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   const config::Config& config() const override;
   const std::vector<config::Diagnostic>& config_diagnostics() const override;
   std::vector<config::Diagnostic> source_notes() const override;
+  std::vector<std::string> tico_accounts() const override;
   ipc::EngineSnapshot Snapshot() const override;
   auth::PairingStatus pairing_status() const override;
 
@@ -645,7 +647,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// #249: `RequestRestore`, taken and run the same way, through
   /// `conflicts::KeepLocal`. Once the bytes are back, the conflict's
   /// `(rom_id, slot)` is armed in `keep_local_` and a tick is asked for, whose
-  /// upload of that save is the one sent with `overwrite=true`.
+  /// upload of that save is the one sent with `overwrite=true`. Refused with
+  /// nothing written while a game is in the foreground (`application_running`,
+  /// asked at the write), and by `conflicts::KeepLocal` for a superseded entry
+  /// or with `sync::kMaxKeepLocal` already waiting (#273).
   ipc::RestoreState RequestKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
 
@@ -1149,9 +1154,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// Keep what this tick's `retroarch.cfg` says for `source_notes()`, and what
   /// `tico` says about whose Tico saves are read (#231), logging them when they
-  /// differ from the last tick's. Takes `mutex_`.
+  /// differ from the last tick's, and the accounts it found for
+  /// `tico_accounts()` (#271). Takes `mutex_`.
   void NoteSources(const config::Config& config, const retroarch::LoadResult& loaded,
-                   std::vector<config::Diagnostic> tico);
+                   std::vector<config::Diagnostic> tico, std::vector<std::string> accounts);
 
   /// One of this client's files, under the directory `Load` was given.
   std::string PathTo(const char* file_name) const;
@@ -1212,6 +1218,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// itself" -- as the last tick read them (#230). Under `mutex_`: the sync
   /// thread replaces it and the IPC thread serves it.
   std::vector<config::Diagnostic> source_notes_;
+
+  /// The Tico accounts the last tick found under `users/` (#271). Under
+  /// `mutex_`, for `source_notes_`' reason.
+  std::vector<std::string> tico_accounts_;
 
   /// The download queue as the card holds it. Loaded once and written by every
   /// command that changes it, so the file and this never disagree by more than

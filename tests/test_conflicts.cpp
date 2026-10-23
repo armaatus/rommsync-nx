@@ -21,7 +21,11 @@
 //                   which the sandbox audit checks rather than this file
 //   keep_local   -- #249: a save conflict's Keep local restores the local bytes
 //                   and arms its (rom_id, slot); anything else is refused, and a
-//                   plan that answered the key spends it
+//                   plan that answered the key spends it -- one that did not
+//                   upload it reported as overtaken (#273); a superseded
+//                   conflict and a fifth choice are refused (#273)
+//   late_write   -- #270: a write landing between a restore's backup and its
+//                   copy stays on the card, and the restore stands down
 //   interrupted  -- a restore killed mid-write leaves the old bytes, never a
 //                   splice, and no `.tmp` after the sweep
 //   service      -- both commands through `ipc::Dispatch` over a real `SdEngine`
@@ -40,6 +44,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -49,6 +54,7 @@
 
 #include "crash_disk.hpp"
 #include "engine.hpp"
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rig.hpp"
 #include "rommsync/atomic_file.hpp"
@@ -770,6 +776,102 @@ void Restore(checks::Checks& c) {
   }
 }
 
+// --- late_write ---------------------------------------------------------------
+//
+// #270: #263's guarantee, held to the restore. A restore starts from the overlay
+// over a game that may be running, and `SdEngine::RunRestore` does not ask #242's
+// hold -- so a game can write the file after the restore has backed it up and
+// before the backup it restores from is copied over it. That write is in no copy
+// anywhere, and the restore has to see it and stand down.
+
+/// When the game writes: as the restore's own backup is published, or once the
+/// backup's bytes have been staged beside the file -- after the slow part, where
+/// a check placed before the copy would already have passed.
+enum class Late { kAfterBackup, kDuringCopy };
+
+/// One restore of `entry` with the game writing `late` over `sd_path` at `when`.
+/// `keep` routes it through Keep local instead, which must arm nothing for a
+/// restore that did not land.
+void RestoreUnderLateWrite(checks::Checks& c, const std::string& label, conflicts::Entry entry,
+                           bool keep, Late when = Late::kAfterBackup) {
+  Sandbox sandbox(c, "conflicts-late-" + label);
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string previous = "the bytes this console had, and wants back\n";
+  const std::string server = "the server's copy, which the sync put here\n";
+  const std::string late = "progress the game wrote after the restore's backup\n";
+
+  sandbox.SeedSave(entry.sd_path, server);
+  c.Expect(sandbox.Write(entry.backup_sd_path, previous), label + ": the backup is on the card");
+  conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+  history.Load();
+  const std::int64_t id = history.Append(entry).id;
+
+  conflicts::RestoreOptions options;
+  options.backup_dir = harness::kBackupDir;
+  options.now = []() { return Moment(kWhen + 500); };
+
+  conflicts::RestoreReport done;
+  state::Baseline::Key key{0, std::nullopt};
+  {
+    // `Reseed`: from here on the late bytes are the file, and the teardown audit
+    // holds the restore to them.
+    const auto write = [&] { sandbox.Reseed(entry.sd_path, late); };
+    std::optional<faulty::LateWrite> game;
+    if (when == Late::kAfterBackup) {
+      game.emplace(write);
+    } else {
+      game.emplace(write, io::TempPathFor(sandbox.Host(entry.sd_path)));
+    }
+    done = keep ? conflicts::KeepLocal(*files, history, id, {}, &key, options)
+                : conflicts::Restore(*files, history, id, options);
+    c.Expect(game->fired(), label + ": the game wrote between the backup and the commit");
+  }
+
+  c.ExpectEq(sandbox.Read(entry.sd_path), late,
+             label + ": the write that landed after the backup is still on the card");
+  c.Expect(!done.ok(), label + ": and the restore did not claim to have run: " + done.message);
+  c.ExpectEq(std::string(conflicts::ToString(done.outcome)), std::string("changed_since_backup"),
+             label + ": named as a file that moved since its backup -- " + done.message);
+  c.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == server,
+           label + ": the restore's own backup is left, holding what it was taken of: " +
+               done.backup_sd_path);
+  c.ExpectEq(sandbox.Read(entry.backup_sd_path), previous,
+             label + ": and the backup it would have restored from is untouched");
+  c.Expect(!std::filesystem::exists(io::TempPathFor(sandbox.Host(entry.sd_path))),
+           label + ": with nothing staged left beside the file");
+  if (keep) {
+    c.Expect(key.first == 0 && !key.second.has_value(),
+             label + ": and Keep local armed nothing, so no upload overrides the server for it");
+  }
+}
+
+void LateWrite(checks::Checks& c) {
+  conflicts::Entry save = SaveEntry(4, "game.srm");
+  RestoreUnderLateWrite(c, "save", save, /*keep=*/false);
+
+  // Keep local is the restore plus an armed key; the key is what would send the
+  // file over the server's copy, so it must not be armed over a write it skipped.
+  RestoreUnderLateWrite(c, "keep-local", save, /*keep=*/true);
+
+  // The same write landing while the backup's bytes stream into place beside
+  // the file: for a state that copy is the long part, so the check has to come
+  // after it rather than before.
+  RestoreUnderLateWrite(c, "during-copy", save, /*keep=*/false, Late::kDuringCopy);
+
+  // A state: tens of megabytes on a console, and what RetroArch writes on a
+  // hotkey -- the likelier of the two to be written mid-restore.
+  conflicts::Entry state_entry = SaveEntry(9, "nine.state");
+  state_entry.kind = conflicts::EntryKind::kState;
+  state_entry.event = conflicts::Event::kReplaced;
+  state_entry.slot.reset();
+  state_entry.reason.clear();
+  state_entry.server_content_hash.reset();
+  state_entry.sd_path = StatePath("nine.state");
+  state_entry.backup_sd_path = std::string(harness::kBackupDir) + "/9-state-nine-1757000000.state";
+  RestoreUnderLateWrite(c, "state", state_entry, /*keep=*/false);
+}
+
 // --- keep_local ---------------------------------------------------------------
 //
 // #249: the player's Keep local on a save conflict. The local bytes go back on
@@ -816,7 +918,8 @@ void KeepLocal(checks::Checks& c) {
     const std::int64_t id = history.Append(entry).id;
 
     state::Baseline::Key key{0, std::nullopt};
-    const conflicts::RestoreReport kept = conflicts::KeepLocal(*files, history, id, &key, options);
+    const conflicts::RestoreReport kept =
+        conflicts::KeepLocal(*files, history, id, {}, &key, options);
     c.Expect(kept.ok(), std::string("Keep local restored the local bytes: ") +
                             conflicts::ToString(kept.outcome) + " -- " + kept.message);
     c.ExpectEq(sandbox.Read(SavePath("game.srm")), previous, "the local bytes are back, exactly");
@@ -858,7 +961,7 @@ void KeepLocal(checks::Checks& c) {
           {"a conflict with no slot", slotless}}) {
       state::Baseline::Key key{0, std::nullopt};
       const conflicts::RestoreReport refused =
-          conflicts::KeepLocal(*files, history, history.Append(entry).id, &key, options);
+          conflicts::KeepLocal(*files, history, history.Append(entry).id, {}, &key, options);
       c.Expect(refused.outcome == conflicts::RestoreOutcome::kNotAConflict,
                what + " is not a conflict Keep local applies to: " +
                    conflicts::ToString(refused.outcome));
@@ -871,26 +974,183 @@ void KeepLocal(checks::Checks& c) {
     orphan.backup_sd_path = std::string(harness::kBackupDir) + "/4-retroarch-srm-9.srm";
     state::Baseline::Key key{0, std::nullopt};
     const conflicts::RestoreReport missing =
-        conflicts::KeepLocal(*files, history, history.Append(orphan).id, &key, options);
+        conflicts::KeepLocal(*files, history, history.Append(orphan).id, {}, &key, options);
     c.Expect(missing.outcome == conflicts::RestoreOutcome::kBackupMissing,
              std::string("a conflict whose backup is gone is named: ") +
                  conflicts::ToString(missing.outcome));
     c.Expect(key.first == 0, "and arms nothing");
   }
 
-  // Armed once per save, and bounded: the oldest falls off.
+  // Armed once per save.
   {
     std::vector<state::Baseline::Key> keep;
     sync::ArmKeepLocal(&keep, {4, std::string("autosave")});
     sync::ArmKeepLocal(&keep, {4, std::string("autosave")});
     c.ExpectEq(keep.size(), std::size_t{1}, "a second Keep local of one save arms it once");
+  }
+
+  // #273: Keep local acts on the save's current conflict only. An older entry
+  // for the same `(rom_id, slot)` -- a later conflict, a download over it --
+  // names bytes the card has since moved on from, and arming the override for
+  // them would put a stale copy over a server head nobody chose to replace.
+  // Refused before a byte is written; the newest entry still works.
+  {
+    Sandbox sandbox(c, "conflicts-keep-local-superseded");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    const std::string older_backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+    const std::string newer_backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000600.srm";
+    const std::string newer = "this console's bytes at the second conflict\n";
+    c.Expect(sandbox.Write(older_backup, previous) && sandbox.Write(newer_backup, newer),
+             "both conflicts' backups are on the card");
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+    conflicts::Entry first = SaveEntry(4, "game.srm");
+    first.backup_sd_path = older_backup;
+    const std::int64_t older = history.Append(first).id;
+    // Another rom's save, and the same rom's other slot, are not this save:
+    // neither supersedes it.
+    conflicts::Entry other_rom = SaveEntry(5, "other.srm");
+    other_rom.sd_path = SavePath("other.srm");
+    history.Append(other_rom);
+    conflicts::Entry other_slot = SaveEntry(4, "game.srm");
+    other_slot.slot = "autosave";
+    history.Append(other_slot);
+    state::Baseline::Key key{0, std::nullopt};
+    {
+      std::vector<state::Baseline::Key> unused;
+      // Asked against a history whose only later entries are other saves', the
+      // older conflict is still current -- so what refuses it below is the
+      // second conflict and nothing else. Checked without writing: a full list
+      // stops it right after the supersession test.
+      for (std::int64_t rom = 100; rom < 100 + static_cast<std::int64_t>(sync::kMaxKeepLocal);
+           ++rom) {
+        sync::ArmKeepLocal(&unused, {rom, std::string("autosave")});
+      }
+      const conflicts::RestoreReport current =
+          conflicts::KeepLocal(*files, history, older, unused, &key, options);
+      c.Expect(current.outcome == conflicts::RestoreOutcome::kKeepLocalFull,
+               std::string("other saves' later entries do not supersede it: ") +
+                   conflicts::ToString(current.outcome));
+    }
+
+    conflicts::Entry second = SaveEntry(4, "game.srm");
+    second.backup_sd_path = newer_backup;
+    const std::int64_t newest = history.Append(second).id;
+
+    const conflicts::RestoreReport refused =
+        conflicts::KeepLocal(*files, history, older, {}, &key, options);
+    c.Expect(refused.outcome == conflicts::RestoreOutcome::kSuperseded,
+             std::string("Keep local on a conflict a newer one replaced is refused: ") +
+                 conflicts::ToString(refused.outcome) + " -- " + refused.message);
+    c.ExpectEq(std::string(conflicts::ToString(refused.outcome)), std::string("superseded"),
+               "and named on the wire as superseded");
+    c.Expect(refused.message.find("newer") != std::string::npos,
+             "with the reason in its sentence: " + refused.message);
+    c.Expect(key.first == 0, "no key is armed");
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and nothing was written");
+
+    // A later download over the save supersedes it the same way: the card holds
+    // a server copy no conflict was ever weighed against.
+    conflicts::Entry downloaded = SaveEntry(4, "game.srm");
+    downloaded.event = conflicts::Event::kReplaced;
+    downloaded.backup_sd_path = newer_backup;
+    history.Append(downloaded);
+    const conflicts::RestoreReport overtaken =
+        conflicts::KeepLocal(*files, history, newest, {}, &key, options);
+    c.Expect(overtaken.outcome == conflicts::RestoreOutcome::kSuperseded,
+             std::string("a conflict a download has since gone over is superseded too: ") +
+                 conflicts::ToString(overtaken.outcome));
+    c.Expect(key.first == 0, "and arms nothing");
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and writes nothing");
+
+    // Under a game, a superseded entry is still refused as superseded: that
+    // holds whatever the player does, where the game is theirs to close.
+    conflicts::RestoreOptions under_game = options;
+    under_game.game_running = true;
+    const conflicts::RestoreReport stale =
+        conflicts::KeepLocal(*files, history, newest, {}, &key, under_game);
+    c.Expect(stale.outcome == conflicts::RestoreOutcome::kSuperseded,
+             std::string("superseded comes before a running game: ") +
+                 conflicts::ToString(stale.outcome));
+
+    // The newest conflict of a save is still Keep local's to take -- but not
+    // under a game, which would save over the kept bytes when it closes.
+    conflicts::Entry third = SaveEntry(4, "game.srm");
+    third.backup_sd_path = newer_backup;
+    const std::int64_t third_id = history.Append(third).id;
+    const conflicts::RestoreReport running =
+        conflicts::KeepLocal(*files, history, third_id, {}, &key, under_game);
+    c.Expect(running.outcome == conflicts::RestoreOutcome::kGameRunning,
+             std::string("the newest conflict under a game is refused: ") +
+                 conflicts::ToString(running.outcome) + " -- " + running.message);
+    c.Expect(key.first == 0, "and arms nothing");
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and writes nothing");
+    const conflicts::RestoreReport kept =
+        conflicts::KeepLocal(*files, history, third_id, {}, &key, options);
+    c.Expect(kept.ok(), std::string("the save's newest conflict is kept: ") +
+                            conflicts::ToString(kept.outcome) + " -- " + kept.message);
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), newer, "with its own bytes");
+  }
+
+  // #273: the fifth choice is refused, not the oldest evicted. An evicted choice
+  // has already put its bytes on the card, and with its override gone their
+  // next upload meets the slot guard and resolves as Keep server -- the
+  // player's explicit answer undone without a word. A refusal writes nothing,
+  // and the choice can be made again once a sync has spent one.
+  {
+    Sandbox sandbox(c, "conflicts-keep-local-full");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    const std::string backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+    c.Expect(sandbox.Write(backup, previous), "the conflict's backup is on the card");
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+    conflicts::Entry entry = SaveEntry(4, "game.srm");
+    entry.backup_sd_path = backup;
+    const std::int64_t id = history.Append(entry).id;
+
+    std::vector<state::Baseline::Key> armed;
     for (std::int64_t rom = 100; rom < 100 + static_cast<std::int64_t>(sync::kMaxKeepLocal);
          ++rom) {
-      sync::ArmKeepLocal(&keep, {rom, std::string("autosave")});
+      c.Expect(sync::ArmKeepLocal(&armed, {rom, std::string("autosave")}),
+               "a choice under the bound is armed");
     }
-    c.ExpectEq(keep.size(), sync::kMaxKeepLocal, "at most kMaxKeepLocal are held");
-    c.Expect(sync::FindByKey(keep, state::Baseline::Key{4, std::string("autosave")}) == nullptr,
-             "and the oldest is the one let go");
+    state::Baseline::Key key{0, std::nullopt};
+    const conflicts::RestoreReport full =
+        conflicts::KeepLocal(*files, history, id, armed, &key, options);
+    c.Expect(full.outcome == conflicts::RestoreOutcome::kKeepLocalFull,
+             std::string("a fifth Keep local while four wait is refused: ") +
+                 conflicts::ToString(full.outcome) + " -- " + full.message);
+    c.ExpectEq(std::string(conflicts::ToString(full.outcome)), std::string("keep_local_full"),
+               "named on the wire as keep_local_full");
+    c.Expect(full.message.find(std::to_string(sync::kMaxKeepLocal)) != std::string::npos,
+             "and says how many are waiting: " + full.message);
+    c.Expect(key.first == 0, "no key is armed");
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and nothing was written");
+
+    // Arming refuses past the bound too, rather than letting the oldest go.
+    c.Expect(!sync::ArmKeepLocal(&armed, {4, std::string("retroarch-srm")}),
+             "ArmKeepLocal refuses a fifth");
+    c.ExpectEq(armed.size(), sync::kMaxKeepLocal, "so at most kMaxKeepLocal are held");
+    c.Expect(sync::FindByKey(armed, state::Baseline::Key{100, std::string("autosave")}) !=
+                 nullptr,
+             "and the oldest is still there");
+
+    // A save already armed takes no new place, so choosing it again is not the
+    // fifth.
+    armed.back() = {4, std::string("retroarch-srm")};
+    const conflicts::RestoreReport again =
+        conflicts::KeepLocal(*files, history, id, armed, &key, options);
+    c.Expect(again.ok(), std::string("a save already armed may be chosen again at the bound: ") +
+                             conflicts::ToString(again.outcome) + " -- " + again.message);
+    c.Expect(sync::ArmKeepLocal(&armed, key), "and arming it again is no refusal");
+    c.ExpectEq(armed.size(), sync::kMaxKeepLocal, "nor a second place");
   }
 
   // Spent by the plan that answered it -- an upload that went or was refused,
@@ -917,13 +1177,26 @@ void KeepLocal(checks::Checks& c) {
         Ran(6, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
             sync::OperationError::kRefused),
         Ran(7, "autosave", sync::Action::kUpload, sync::OperationOutcome::kUploaded),
+        Ran(8, "autosave", sync::Action::kNoOp, sync::OperationOutcome::kNoOp),
     };
-    sync::SpendKeepLocal(&keep, sent, executed);
+    keep.push_back(key(8));
+    std::vector<state::Baseline::Key> sent_too = sent;
+    sent_too.push_back(key(8));
+    const std::vector<sync::OvertakenKeepLocal> overtaken =
+        sync::SpendKeepLocal(&keep, sent_too, executed);
     c.Expect(keep == std::vector<state::Baseline::Key>{key(2), key(4), key(5), key(7)},
-             "the upload that went, the refused one and the download spend theirs; the "
+             "the upload that went, the refused one, the download and the no-op spend theirs; the "
              "transfer that failed, the cancelled one, the save the plan never named and the "
              "choice armed after it went out keep theirs (" + std::to_string(keep.size()) +
                  " left)");
+    // #273: the download spent its choice with nothing sent, and says so --
+    // the caller logs it, so the choice is overtaken out loud rather than
+    // silently dropped. The uploads, sent or refused, had their override, and
+    // the no-op is the server already holding the bytes.
+    c.ExpectEq(overtaken.size(), std::size_t{1}, "one choice was overtaken by the plan");
+    c.Expect(!overtaken.empty() && overtaken[0].key == key(3) &&
+                 overtaken[0].action == sync::Action::kDownload,
+             "the one a download answered");
   }
 
   // An upload that failed before its request was made -- the card could not
@@ -1605,6 +1878,22 @@ void Overlay(checks::Checks& c) {
                "a Keep local the sysmodule refused says why: " + drawn.headline);
     }
 
+    // #273's three refusals, each in its own words and none a success.
+    for (const auto& [outcome, says] :
+         {std::pair{conflicts::RestoreOutcome::kSuperseded, "newer"},
+          std::pair{conflicts::RestoreOutcome::kGameRunning, "Close the game"},
+          std::pair{conflicts::RestoreOutcome::kKeepLocalFull, "waiting for a sync"}}) {
+      conflicts::RestoreReport report;
+      report.outcome = outcome;
+      const std::string text = overlay::RestoreOutcomeText(report);
+      c.Expect(text.find("Nothing was written") != std::string::npos &&
+                   text.find(says) != std::string::npos,
+               std::string(conflicts::ToString(outcome)) + " says why, and that nothing was "
+                                                           "written: " + text);
+      c.Expect(overlay::RestoreOutcomeTone(outcome) == overlay::Tone::kBad,
+               std::string(conflicts::ToString(outcome)) + " is drawn as a refusal");
+    }
+
     // Slow is not gone, for Keep local as for a restore: asked about, never
     // sent twice.
     {
@@ -2232,7 +2521,7 @@ int main(int argc, char** argv) {
 
   if (scenario == "store" || scenario == "record" || scenario == "restore" ||
       scenario == "interrupted" || scenario == "service" || scenario == "overlay" ||
-      scenario == "crash" || scenario == "keep_local") {
+      scenario == "crash" || scenario == "keep_local" || scenario == "late_write") {
     checks::Checks checks;
     if (scenario == "store") {
       Store(checks);
@@ -2244,6 +2533,8 @@ int main(int argc, char** argv) {
       Interrupted(checks);
     } else if (scenario == "crash") {
       Crash(checks);
+    } else if (scenario == "late_write") {
+      LateWrite(checks);
     } else if (scenario == "keep_local") {
       KeepLocal(checks);
     } else if (scenario == "service") {
