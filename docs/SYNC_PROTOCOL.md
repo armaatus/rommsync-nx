@@ -449,22 +449,23 @@ and it is the only thing that ever sends `overwrite=true`:
 1. `KeepLocal` (IPC command 18) restores the conflict's backup onto the card
    through `conflicts::KeepLocal` -- `Restore` itself, so the server's copy it
    replaces is backed up first. It is refused before anything is written
-   (#273):
+   (#273), in this order, so a choice that can never be taken says why before
+   it says "close the game":
    - `not_a_conflict`: the entry is not a save conflict with a slot;
    - `superseded`: a newer entry of the same `(rom_id, slot)` -- another
      conflict, a download over it, a deletion -- has moved the card on since.
      Only a save's newest entry is Keep local's;
+   - `keep_local_full`: `sync::kMaxKeepLocal` choices already wait (sync off or
+     held). Refused rather than letting the oldest go, because that one's bytes
+     are already on the card and its upload without the override would resolve
+     as Keep server without a word;
    - `game_running`: an application is in the foreground. It holds its save in
      memory and writes it on close, over the kept bytes, and the tick #242
      holds would then send *that* with `overwrite=true`. Asked at the write, of
      any application: `pm` names a title, not the save it holds, and RetroArch
      runs every rom under one, so the save's own game cannot be told apart. A
      game started after the restore lands loads the kept bytes, so what it
-     saves on close is play on top of the player's choice;
-   - `keep_local_full`: `sync::kMaxKeepLocal` choices already wait (sync off or
-     held). Refused rather than letting the oldest go, because that one's bytes
-     are already on the card and its upload without the override would resolve
-     as Keep server without a word.
+     saves on close is play on top of the player's choice.
 2. Once the bytes are on the card -- never before -- the sysmodule arms the
    conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
    `sync::kMaxKeepLocal`) and asks for a tick.

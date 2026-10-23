@@ -667,7 +667,8 @@ uploaded under `map_state_slots`' other names stay on the server (see
 [above](#states-and-map_state_slots-save-states)), and a save placed by one
 `play_with` stays where it was placed. `play_with` heads its platform's section;
 on a platform Tico does not run it steps through *Not set* as well, which writes
-`play_with =`.
+`play_with =`, and offers Tico only when the platform's folder map lists a Tico
+folder -- without one, Tico has nowhere to place a save new to the card.
 
 `[tico] account` is a list rather than a step: under the row showing the value
 in force, every account folder the last sync found under Tico's `users/` is a
