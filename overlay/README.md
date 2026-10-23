@@ -45,7 +45,10 @@ client, and that rule is about ownership rather than about the link map.
   from ✅ M4-4. Rows are marked where the sysmodule's `SetConfig` (M5-3, #30)
   accepts an edit; `[sync] on_server_delete` and the two `[sources]` rows are
   changed in place, one press stepping each to its next value through
-  `SetConfig` (M10-23, #264). Nothing here writes `config.ini`.
+  `SetConfig` (M10-23, #264), and so are `[sync] map_state_slots` and each
+  platform's `play_with`; `[tico] account` is a list of the accounts found under
+  Tico's `users/`, a press naming one, and `[sync] slot` is shown and not
+  offered (M10-31, #271). Nothing here writes `config.ini`.
 - **Conflicts** — what a sync overwrote, and putting the backup back ✅ M7-1
   (#36). The one conditional row of the settings menu: `[sync] conflict_show`
   hides it, and never stops the recording.

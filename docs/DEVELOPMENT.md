@@ -956,7 +956,9 @@ the card after a backup (M10-7, #233) -- made it 7, and `GetConfig` carrying
 `on_server_delete` and `[sources]` for the settings screen (M10-23, #264) made
 it 8, and `KeepLocal`'s refusal `not_a_conflict` (M10-20, #249) made it 9, and
 a restore standing down over a file written after its backup,
-`changed_since_backup` (M9-32, #270), made it 10.
+`changed_since_backup` (M9-32, #270), made it 10, and `GetConfig` carrying
+`[sync] slot`, `map_state_slots`, `[tico] account` with the accounts the last
+tick found, and each platform's `play_with` (M10-31, #271) made it 11.
 
 `KeepLocal` is the conflicts screen's Keep local (#249): a restore of a save
 conflict's backup, polled the same way, after which the sysmodule arms that

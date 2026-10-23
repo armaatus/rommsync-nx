@@ -260,8 +260,8 @@ repeating here:
 > **Check the Tico paths on your own card.** The built-in Tico folders are the
 > names Tico uses (`master-system`, `dc`, ...), and Tico 0.8's per-account
 > layout is found on its own -- but with several accounts on the console, no
-> Tico save syncs until `[tico] account` names one, and the settings screen
-> lists them ([CONFIG.md](CONFIG.md#tico-per-account-saves)). A wrong `saves`
+> Tico save syncs until `[tico] account` names one; the settings screen lists
+> them, and a press on one names it ([CONFIG.md](CONFIG.md#tico-per-account-saves)). A wrong `saves`
 > folder is a platform whose saves are silently never found, so look before you
 > rely on the sync.
 
