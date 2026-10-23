@@ -6,6 +6,9 @@
 # re-derive it when .env is gone), the docker probes, and the Python picker
 # setup.sh needs before it installs server/requirements.txt.
 
+# Every stack this repo starts is named under it; reap.sh sweeps by it.
+ORCA_PROJECT_PREFIX=rmx
+
 # A worktree's identity -- its compose project name and its ports -- is a
 # pure function of its absolute path. env.sh writes the result to .env when the
 # worktree is created; teardown recomputes it instead of reading .env back.
@@ -20,9 +23,6 @@
 # Returns non-zero rather than exiting if no SHA-1 tool is available: under
 # `set -e` an aborting derivation would guarantee the very leak it exists to
 # prevent, so callers get to fall back on .env instead.
-# Every stack this repo starts is named under it; reap.sh sweeps by it.
-ORCA_PROJECT_PREFIX=rmx
-
 orca_derive_env() {
   local root="$1" hex=""
 

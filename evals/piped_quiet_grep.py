@@ -18,10 +18,10 @@ import sys
 
 # The SHELL of the payload. `.github/workflows/*.yml` is payload too and carries
 # `run:` blocks with the same hazard -- claude-review.yml has a live one -- but a
-# PR that edits a workflow is merged by a person, not on green, so widening this glob here would red the lint on a file this change
-# may not fix. It is armaatus/autofleet#90 instead, and CLAUDE.md says what is
-# scanned rather than claiming the payload has none. Found by the independent
-# review.
+# PR that edits a workflow is merged by a person, not on green, so widening this
+# glob here would red the lint on a file this change may not fix. It is
+# armaatus/autofleet#90 instead, and CLAUDE.md says what is scanned rather than
+# claiming the payload has none. Found by the independent review.
 #
 # `tests/*.sh` is here too, and is not payload: it is where the hazard has most
 # recently SHIPPED -- test_docs.sh went in with an assertion whose silent
@@ -35,7 +35,6 @@ PATTERNS = (
     "scripts/orca/*.sh",
     "evals/*.sh",
     "tests/*.sh",
-    ".github/scripts/*.sh",
     ".claude/hooks/*.sh",
 )
 
@@ -85,8 +84,8 @@ def offenders(root="."):
         if hits:
             rel = os.path.relpath(path, root)
             # WITH the line numbers. Naming only the file leaves the reader to
-            # find it, which on fleet.sh is 2,600 lines of haystack around a
-            # comment that quotes the bad form on purpose.
+            # find it, which on the old scripts/fleet/fleet.sh was 2,600 lines
+            # of haystack around a comment that quoted the bad form on purpose.
             found.append("%s:%s" % (rel, ",".join(str(n) for n in hits)))
     return found
 
@@ -95,8 +94,8 @@ def selftest():
     """Every row is a shape this detector has already been blind to, or nearly.
 
     Two of them shipped: the sourced helper with no `pipefail` of its own
-    (lib.sh, round 2 of the review) and the flag bundle `-Eq` (fleet.sh, found
-    by the scan's own first run). `guard.py` carries one of these and `evals/lint.sh` runs it; a detector that has
+    (lib.sh, round 2 of the review) and the flag bundle `-Eq` (the old fleet.sh,
+    found by the scan's own first run). `guard.py` carries one of these and `evals/lint.sh` runs it; a detector that has
     shipped blind twice has the least claim to be the exception.
     """
     cases = [

@@ -13,7 +13,7 @@ on:
   pull_request:
     types: [closed]
   # `opened` and `edited` as well as the two closings, and their absence was a
-  # hole with no bottom: the dispatcher selects on the POSITIVE `ready` label, so an
+  # hole with no bottom: an issue is startable only on the POSITIVE `ready` label, so an
   # issue filed with no blockers carried NO label and was unstartable until some
   # unrelated issue happened to close. Every issue filed by hand got `ready` only
   # because somebody passed it on the command line -- and CLAUDE.md tells agents
@@ -56,7 +56,7 @@ jobs:
     # adds a real `Blocked by #12`; run B, from edit 2, correctly sets `blocked`;
     # A finishes, adds `ready` and removes `blocked`. #40 ends `ready` with an
     # open blocker, which is the collision the label exists to prevent, and
-    # the dispatcher will start it (#47).
+    # the next session will start it (#47).
     #
     # `cancel-in-progress` rather than a queue: the job recomputes the whole
     # backlog, so the newer run's answer is strictly better than the older one's
@@ -115,13 +115,14 @@ jobs:
             // returns NO blockers, which marks the issue `ready` with its
             // foundation open. `[0-9]` and not `\d`, because Python's `\d` takes
             // any Unicode decimal digit and JavaScript's does not -- so
-            // `Blocked by #\u0667` was a blocker to the fleet and invisible here.
+            // `Blocked by #\u0667` was a blocker to the old Python reader and
+            // invisible here.
             // No `\*{1,2}` branch: `*` is already in the class, so `**` is two
             // iterations and the extra branch matched the same text two ways --
             // exponential under the outer `*`, not merely redundant. 22
             // asterisks took 15 SECONDS to fail; a separator line in an issue
-            // body would hang this workflow on every edit, and the dispatcher's
-            // queue with it. Found by the independent review.
+            // body would hang this workflow on every edit, and with it the
+            // labels that decide what may start. Found by the independent review.
             const BLOCKED_BY =
               /^[ \t]*(?:(?:[-*+>]|[0-9]+[.)]|\[[ xX]\])[ \t]*)*blocked\s+by\s+#([0-9]+)/gim;
             // ...and only below the FIRST marker that is alone on its own
@@ -197,11 +198,11 @@ jobs:
               // REMOVE FIRST, THEN ADD. `cancel-in-progress` makes a run that
               // dies between these two calls reachable, and the add-then-remove
               // order leaves the issue carrying BOTH labels in that window.
-              // The dispatcher selects on `ready` and never consults
-              // `blocked`, so an issue holding both is startable --
+              // CLAUDE.md makes an issue startable on `ready` and never
+              // consults `blocked`, so an issue holding both is startable --
               // the foundation collision, arriving through the very mechanism
               // added to prevent it. This order leaves NEITHER label instead,
-              // and the fleet starts nothing without `ready`. Found by the
+              // and nothing is started without `ready`. Found by the
               // independent review.
               if (labels.includes(remove)) {
                 // 404 ONLY, and the rest is recorded rather than swallowed.

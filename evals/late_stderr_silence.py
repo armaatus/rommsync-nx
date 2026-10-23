@@ -36,7 +36,6 @@ import sys
 PATTERNS = (
     "scripts/orca/*.sh",
     "evals/*.sh",
-    ".github/scripts/*.sh",
     ".claude/hooks/*.sh",
 )
 

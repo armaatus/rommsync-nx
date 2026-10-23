@@ -21,8 +21,7 @@ bad() { printf '   FAIL: %s\n' "$1" >&2; fails=$((fails + 1)); }
 # The worktree provisioning, the hooks, the evals and this repo's own suite.
 scripts=()
 while IFS= read -r f; do scripts+=("$f"); done < <(
-  ls scripts/orca/*.sh .claude/hooks/*.sh .github/scripts/*.sh evals/*.sh tests/*.sh \
-     2>/dev/null
+  ls scripts/orca/*.sh .claude/hooks/*.sh evals/*.sh tests/*.sh 2>/dev/null
 )
 # An empty list is a lint that checked NOTHING and said it was well-formed,
 # which is hard rule 3 wearing a green tick. It is also the one shape that

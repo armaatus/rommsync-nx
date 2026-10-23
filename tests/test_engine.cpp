@@ -173,6 +173,19 @@ class Console {
     return answer;
   }
 
+  /// What the conflicts page says of entry `id`'s Keep local (#275); `kOpen`
+  /// for an entry the page does not list.
+  ipc::KeepLocalState KeepLocalOf(std::int64_t id) {
+    std::string response;
+    Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}), &response);
+    for (const ipc::ConflictRow& row : ipc::DecodeConflictPage(response).value.entries) {
+      if (row.entry.id == id) {
+        return row.keep_local;
+      }
+    }
+    return ipc::KeepLocalState::kOpen;
+  }
+
   ipc::Error Dequeue(std::int64_t rom_id) {
     std::string response;
     return Call(ipc::Command::kDequeue, ipc::EncodeRomId(rom_id), &response);
@@ -2019,17 +2032,6 @@ void KeepLocalGuards(checks::Checks& c) {
     console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(id), &response);
     return console.AwaitRestore(id);
   };
-  const auto chosen = [&console](std::int64_t id) {
-    std::string response;
-    console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
-                 &response);
-    for (const ipc::ConflictRow& row : ipc::DecodeConflictPage(response).value.entries) {
-      if (row.entry.id == id) {
-        return row.keep_local;
-      }
-    }
-    return ipc::KeepLocalState::kOpen;
-  };
 
   // Under a game: taken and held, and the card is as it was.
   const ipc::RestoreState under_game = keep_local(ids[0]);
@@ -2040,10 +2042,10 @@ void KeepLocalGuards(checks::Checks& c) {
                under_game.report.message);
   c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), server(1),
              "nothing was written: the game's copy is the one it will save over");
-  c.Expect(chosen(ids[0]) == ipc::KeepLocalState::kHeld,
+  c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kHeld,
            std::string("the conflicts page draws it as chosen and held: ") +
-               ipc::ToString(chosen(ids[0])));
-  c.Expect(chosen(ids[1]) == ipc::KeepLocalState::kOpen, "and no other row as chosen");
+               ipc::ToString(console.KeepLocalOf(ids[0])));
+  c.Expect(console.KeepLocalOf(ids[1]) == ipc::KeepLocalState::kOpen, "and no other row as chosen");
   std::this_thread::sleep_for(std::chrono::milliseconds{300});
   c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), server(1),
              "while the game runs, the hold writes nothing however often it asks");
@@ -2064,8 +2066,9 @@ void KeepLocalGuards(checks::Checks& c) {
              "once the game is closed the kept bytes land, with sync switched off");
   c.Expect(console.sandbox.HasBackupOf(game_wrote),
            "and what the game wrote is under .backup/, taken first");
-  c.Expect(chosen(ids[0]) == ipc::KeepLocalState::kWaiting,
-           std::string("the row now waits for its upload: ") + ipc::ToString(chosen(ids[0])));
+  c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kWaiting,
+           std::string("the row now waits for its upload: ") +
+               ipc::ToString(console.KeepLocalOf(ids[0])));
 
   // Three more land at once, with no game. The held one became a waiting one,
   // so it holds its place: four wait.
@@ -2087,7 +2090,7 @@ void KeepLocalGuards(checks::Checks& c) {
                conflicts::ToString(fifth.report.outcome) + " -- " + fifth.report.message);
   c.ExpectEq(console.sandbox.Read(harness::SavePath(file(saves))), server(saves),
              "and nothing was written");
-  c.Expect(chosen(ids[saves - 1]) == ipc::KeepLocalState::kOpen, "nor anything held");
+  c.Expect(console.KeepLocalOf(ids[saves - 1]) == ipc::KeepLocalState::kOpen, "nor anything held");
   running = false;
 
   // One already waiting is chosen again freely: it takes no new place.
@@ -6100,7 +6103,10 @@ int KeepLocalChoice(http::HttpClient& client, const std::string& base) {
 ///      so the next plan is a download. That plan spends the choice with
 ///      nothing sent: the other device's bytes land, the kept ones are backed
 ///      up, and the log says the choice was overtaken;
-///   5. and the next upload of the save goes without the override.
+///   5. and the next upload of the save goes without the override;
+///   6. a third conflict, held under a game that closes WITHOUT writing the
+///      save: the kept bytes land over the card's as they were, and go up with
+///      `overwrite=true` (#275's first acceptance, on its own).
 int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   rig::Checks c;
   harness::Fixture fixture;
@@ -6175,21 +6181,25 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
     return std::int64_t{0};
   };
   // What the conflicts page says of a row's Keep local (#275).
-  const auto chosen = [&console](std::int64_t id) {
-    std::string response;
-    console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
-                 &response);
-    for (const ipc::ConflictRow& row : ipc::DecodeConflictPage(response).value.entries) {
-      if (row.entry.id == id) {
-        return row.keep_local;
-      }
-    }
-    return ipc::KeepLocalState::kOpen;
-  };
   const auto keep_local = [&console](std::int64_t id) {
     std::string response;
     console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(id), &response);
     return console.AwaitRestore(id);
+  };
+  // The game closes, and the tick the landing asks for runs to the end.
+  const auto close_game = [&](const std::string& what) {
+    const int ticks_before = ticks.ticks();
+    running = false;
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    while ((ticks.ticks() <= ticks_before || console.Status().sync_in_progress) &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    c.Expect(ticks.ticks() > ticks_before, what + ": the hold releasing runs a tick of its own");
+    c.Expect(console.Status().last_sync_result == ipc::SyncResult::kOk,
+             what + ": which runs clean: " + ipc::ToString(console.Status().last_sync_result) +
+                 Rendered(console.Log()));
   };
   // One conflict: another device writes the slot, the console's save moves on,
   // and the tick's upload meets the guard.
@@ -6225,24 +6235,13 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
                conflicts::ToString(under_game.report.outcome) + " -- " +
                under_game.report.message);
   c.ExpectEq(console.sandbox.Read(save), theirs, "and the card is as the game found it");
-  c.Expect(chosen(first_conflict) == ipc::KeepLocalState::kHeld,
+  c.Expect(console.KeepLocalOf(first_conflict) == ipc::KeepLocalState::kHeld,
            std::string("the conflicts page shows the choice as held: ") +
-               ipc::ToString(chosen(first_conflict)));
+               ipc::ToString(console.KeepLocalOf(first_conflict)));
   harness::PassASecond();
   const std::string on_close = "what the game wrote as it closed " + stamp + "\n";
   console.sandbox.Reseed(save, on_close);
-  const int ticks_before = ticks.ticks();
-  running = false;
-  const std::chrono::steady_clock::time_point deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{120};
-  while ((ticks.ticks() <= ticks_before || console.Status().sync_in_progress) &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{25});
-  }
-  c.Expect(ticks.ticks() > ticks_before, "the hold releasing runs a tick of its own");
-  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kOk,
-           std::string("which runs clean: ") +
-               ipc::ToString(console.Status().last_sync_result) + Rendered(console.Log()));
+  close_game("the game that saved on close");
   c.ExpectEq(console.sandbox.Read(save), mine,
              "the kept bytes are on the card" + Rendered(console.Log()));
   c.Expect(console.sandbox.HasBackupOf(on_close),
@@ -6261,7 +6260,7 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   }
   c.Expect(kept_on_server, "the kept bytes are on the server");
   c.Expect(!game_on_server, "and the game's write on close is not -- the player never chose it");
-  c.Expect(chosen(first_conflict) == ipc::KeepLocalState::kOpen,
+  c.Expect(console.KeepLocalOf(first_conflict) == ipc::KeepLocalState::kOpen,
            "the choice is spent: the row is open again");
 
   // 3. A second conflict of the save supersedes the first.
@@ -6315,6 +6314,36 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   TickOnce(console, ticks, c, "the tick after");
   c.ExpectEq(overrides().size(), std::size_t{1},
              "the spent choice sends no overwrite=true later");
+
+  // 6. Held under a game that closes without saving: the plain case of #275,
+  // with nothing of the game's to back up -- the card's bytes as the conflict
+  // left them are what the landing backs up.
+  const std::string theirs_third = "the other device, at the third conflict " + stamp + "\n";
+  const std::string mine_third = "the switch's progress, at the third conflict " + stamp + "\n";
+  conflict(theirs_third, mine_third, "the third conflict");
+  const std::int64_t third_conflict = newest_conflict();
+  c.Expect(third_conflict > second_conflict, "the third conflict is the save's newest entry");
+  running = true;
+  const ipc::RestoreState held = keep_local(third_conflict);
+  c.Expect(held.report.outcome == conflicts::RestoreOutcome::kHeld,
+           std::string("Keep local under a running game is held again: ") +
+               conflicts::ToString(held.report.outcome) + " -- " + held.report.message);
+  c.ExpectEq(console.sandbox.Read(save), theirs_third, "nothing is written to the card");
+  c.Expect(console.KeepLocalOf(third_conflict) == ipc::KeepLocalState::kHeld,
+           std::string("the choice shows as held: ") +
+               ipc::ToString(console.KeepLocalOf(third_conflict)));
+  close_game("the game that closed without saving");
+  c.ExpectEq(console.sandbox.Read(save), mine_third,
+             "the kept bytes are on the card" + Rendered(console.Log()));
+  c.ExpectEq(overrides().size(), std::size_t{2},
+             "and went up with overwrite=true, once" + Rendered(console.Log()));
+  bool third_on_server = false;
+  for (const ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+    third_on_server = third_on_server || row.content_hash == crypto::Md5Hex(mine_third);
+  }
+  c.Expect(third_on_server, "the kept bytes are on the server");
+  c.Expect(console.KeepLocalOf(third_conflict) == ipc::KeepLocalState::kOpen,
+           "the choice is spent: the row is open again");
 
   ClearSlots(client, base, fixture, rom.id);
   harness::DeleteArchivalCopies(client, base, fixture, rom.id);

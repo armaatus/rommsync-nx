@@ -3358,8 +3358,35 @@ ipc::RestoreState SdEngine::restore_state() const {
   return restore_;
 }
 
+template <typename Act>
+conflicts::RestoreReport SdEngine::OnCard(Act&& act) {
+  // **Held for the whole check-and-act**, which on the worker is the same
+  // thread as every tick and so cannot contend with one; it is taken anyway
+  // because `Quiesce` reads it to know that no save write is in flight, and
+  // because with no worker this runs on the IPC thread beside one that may
+  // yet be started. Waited on rather than tried: nothing that holds it holds
+  // it for longer than a save copy, and this thread is not the one a screen
+  // is waiting on any more.
+  std::lock_guard<std::timed_mutex> writing(save_write_mutex_);
+
+  // The vector, for the read and the entry it hands back. Inside the write
+  // lock, which is the order both sides take them in.
+  std::lock_guard<std::mutex> history(history_mutex_);
+
+  if (card_ == nullptr) {
+    // A build that never called `UseCard`; a console always has (`card.hpp`,
+    // since M7-2, #37). `kBackupFailed` rather than a transport failure: its
+    // promise is that nothing was written, which is the one thing a build
+    // that cannot open the card is certain of.
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kBackupFailed;
+    report.message = "this build cannot open the SD card, so nothing was written";
+    return report;
+  }
+  return act(*card_);
+}
+
 void SdEngine::RunRestore(std::int64_t entry_id) {
-  conflicts::RestoreReport report;
   bool keep_local = false;
   std::vector<state::Baseline::Key> armed;
   {
@@ -3395,33 +3422,11 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
   // card holds.
   conflicts::RestoreOptions restore_options;
   restore_options.game_running = keep_local && application_running();
-  {
-    // **Held for the whole check-and-act**, which on the worker is the same
-    // thread as every tick and so cannot contend with one; it is taken anyway
-    // because `Quiesce` reads it to know that no save write is in flight, and
-    // because with no worker this runs on the IPC thread beside one that may
-    // yet be started. Waited on rather than tried: nothing that holds it holds
-    // it for longer than a save copy, and this thread is not the one a screen
-    // is waiting on any more.
-    std::lock_guard<std::timed_mutex> writing(save_write_mutex_);
-
-    // The vector, for the read and the entry it hands back. Inside the write
-    // lock, which is the order both sides take them in.
-    std::lock_guard<std::mutex> history(history_mutex_);
-
-    if (card_ == nullptr) {
-      // A build that never called `UseCard`; a console always has (`card.hpp`,
-      // since M7-2, #37). `kBackupFailed` rather than a transport failure: its
-      // promise is that nothing was written, which is the one thing a build
-      // that cannot open the card is certain of.
-      report.outcome = conflicts::RestoreOutcome::kBackupFailed;
-      report.message = "this build cannot open the SD card, so nothing was written";
-    } else if (keep_local) {
-      report = conflicts::KeepLocal(*card_, history_, entry_id, armed, &kept, restore_options);
-    } else {
-      report = conflicts::Restore(*card_, history_, entry_id);
-    }
-  }
+  conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
+    return keep_local
+               ? conflicts::KeepLocal(card, history_, entry_id, armed, &kept, restore_options)
+               : conflicts::Restore(card, history_, entry_id);
+  });
 
   bool woken = false;
   bool unarmed = false;
@@ -3512,27 +3517,18 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
       std::lock_guard<std::mutex> lock(mutex_);
       armed = keep_local_;
     }
-    conflicts::RestoreReport report;
-    {
-      // `RunRestore`'s locks, in its order, for its reasons: this is the same
-      // restore, run later.
-      std::lock_guard<std::timed_mutex> writing(save_write_mutex_);
-      std::lock_guard<std::mutex> history(history_mutex_);
-      if (card_ == nullptr) {
-        report.outcome = conflicts::RestoreOutcome::kBackupFailed;
-        report.message = "this build cannot open the SD card, so nothing was written";
-      } else {
-        // The save's newest entry, which is the one it was held on unless a
-        // tick has recorded another since -- and then `KeepLocal` refuses it
-        // as it would have at the press. No game now: the probe said so, and
-        // `Restore`'s own `UnchangedSinceBackup` still covers a write in
-        // between (#270). The game's write on close is what it backs up first.
-        const conflicts::Entry* entry = conflicts::NewestSaveEntry(history_, key);
-        state::Baseline::Key landed{0, std::nullopt};
-        report = conflicts::KeepLocal(*card_, history_, entry != nullptr ? entry->id : 0, armed,
-                                      &landed);
-      }
-    }
+    // The same restore as `RunRestore`'s, run later.
+    const conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
+      // The save's newest entry, which is the one it was held on unless a
+      // tick has recorded another since -- and then `KeepLocal` refuses it
+      // as it would have at the press. No game now: the probe said so, and
+      // `Restore`'s own `UnchangedSinceBackup` still covers a write in
+      // between (#270). The game's write on close is what it backs up first.
+      const conflicts::Entry* entry = conflicts::NewestSaveEntry(history_, key);
+      state::Baseline::Key landed{0, std::nullopt};
+      return conflicts::KeepLocal(card, history_, entry != nullptr ? entry->id : 0, armed,
+                                  &landed);
+    });
     {
       std::lock_guard<std::mutex> lock(mutex_);
       UnholdLocked(key);

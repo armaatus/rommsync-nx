@@ -1090,6 +1090,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `key` is held no longer. Caller holds `mutex_`.
   void UnholdLocked(const state::Baseline::Key& key);
 
+  /// `act(*card_)`, the card half of a restore -- `RunRestore`'s, and the
+  /// held Keep local `LandHeldKeepLocal` runs later -- under the locks every
+  /// save write takes, in their order. A build with no card answers
+  /// `kBackupFailed` with nothing written. `mutex_` not held.
+  template <typename Act>
+  conflicts::RestoreReport OnCard(Act&& act);
+
   /// The restore `TakeRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when
   /// there is no worker; `mutex_` not held, because a restore is card I/O.

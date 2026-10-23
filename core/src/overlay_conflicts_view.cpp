@@ -109,7 +109,7 @@ std::string ChosenText(ipc::KeepLocalState state) {
       return {};
     case ipc::KeepLocalState::kHeld:
       return "Keep local is chosen: it lands when you close the game, and the next sync "
-             "uploads it";
+             "uploads it over the server's copy";
     case ipc::KeepLocalState::kWaiting:
       return "Keep local is chosen: this console's copy is on the card, and the next sync "
              "uploads it over the server's";
@@ -258,9 +258,9 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
              "one run and try again.";
     case conflicts::RestoreOutcome::kHeld:
       // #275: taken, and waiting for the game to close. Said as a choice that
-      // was made, not as a refusal -- the player does not press it again.
-      return "Keep local is chosen. It lands when you close the game, and the next sync "
-             "uploads it over the server's copy.";
+      // was made, not as a refusal -- the player does not press it again --
+      // and in the words the row says it in once the list is drawn again.
+      return ChosenText(ipc::KeepLocalState::kHeld) + ".";
   }
   return "The restore did not happen";
 }
