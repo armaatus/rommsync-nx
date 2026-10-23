@@ -173,7 +173,7 @@ discarded is replaced by the next write, which is what "rebuilt" costs.
 | `state.db` | header line | v2 (rc1) read, at rc1's own bounds (512 rows, 128 KiB) and streamed past this build's: states and archival rows kept first, then slotted rows in `(rom_id, slot)` order up to `kMaxRecords` (the rest rehashed; a repeat of one let go discards the file), each moved to the shared slot its file is synced in now with its server half dropped (#236, `state::AdoptLegacySaves`); v1 discarded, every save rehashed | discarded, every save rehashed |
 | `conflicts.db` | header line | read | refused and never written over: this boot's entries stay in memory, the backups stay on the card |
 | `queue.json` | `"version"` | read, up to this build's 32 entries and 80 KiB; rc1's 64 entries and 160 KiB past them are discarded whole, and the user queues again (#247) | discarded; the user queues again |
-| `play.db` | header line | read | discarded: unsent play time is lost, nothing else |
+| `play.db` | header line | read; v1 (rc1) rows carry no title and read as `unknown` (#261) | discarded: unsent play time is lost, nothing else |
 | `auth.json` | `"version"` | read | no verdict; re-derived by asking |
 
 `compat.fixtures` (`tests/test_compat.cpp`) holds all of it to the files

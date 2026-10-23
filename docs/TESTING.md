@@ -484,7 +484,7 @@ ctest --test-dir build --output-on-failure
   version past this build and must be refused or discarded by its policy
   ([ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases)), never misread,
   and the refused ones never rewritten. `config.ini`, `token.dat`,
-  `conflicts.db` and `state.db` must each say so in the one sentence
+  `conflicts.db`, `state.db` and `play.db` must each say so in the one sentence
   `records::NewerRelease` builds — file, version, a newer release wrote it,
   what to install (#255) — spelled out in the test rather than built with it,
   so a record that phrases it its own way fails. `engine.newer` is the same downgrade

@@ -806,6 +806,16 @@ struct PlaySession {
   Timestamp start_time{};
   Timestamp end_time{};
   std::int64_t duration_ms = 0;
+
+  /// The application in the foreground when the save was written -- its
+  /// Horizon program id -- or empty when the console did not see one (M10-26,
+  /// #261; `play::AttributeTitles`).
+  ///
+  /// **Never sent.** Neither entry in the pinned snapshot has a field for it, so
+  /// `EncodePlaySessions` leaves it out and it is the client's own record, in
+  /// `play.db`. Here rather than beside the buffered row because it is attached
+  /// where the session is derived and has to survive every step after it.
+  std::optional<std::uint64_t> title_id;
 };
 
 /// Everything wrong with one session that would make it mean something other

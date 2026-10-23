@@ -1,7 +1,8 @@
 // What every on-card record says about a file a later release wrote (#255).
 //
-// `config.ini`, `token.dat`, `conflicts.db` and `state.db` each meet one after a
-// downgrade, or on a card where only one of the two halves was updated. Their
+// `config.ini`, `token.dat`, `conflicts.db`, `state.db` and `play.db` each
+// meet one after a downgrade, or on a card where only one of the two halves was
+// updated (`play.db` since #261 moved its version). Their
 // policies differ -- refused and left as it is, or discarded and rebuilt
 // (docs/ARCHITECTURE.md, "Formats across releases") -- but what happened to the
 // player is the same, so it is said the same way: which file, which version,

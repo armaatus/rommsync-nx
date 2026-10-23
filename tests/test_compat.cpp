@@ -411,10 +411,18 @@ void PlayDb(checks::Checks& c) {
                "play.db: written differently under rc1's version -- bump kFormatVersion");
   }
 
+  // Version 2 (#261) added a title to each row; rc1's are read above, with
+  // their titles unknown.
+  if (read.sessions.size() == 2) {
+    c.Expect(!read.sessions[0].session.title_id.has_value(),
+             "play.db rc1: a session from before titles has none");
+  }
   const rs::play::LoadedBuffer newer = rs::play::ParseBuffer(
-      Bumped(rc1, "rommsync-play-sessions " + std::to_string(rs::play::kFormatVersion) + " ",
+      Bumped(rc1, "rommsync-play-sessions " + std::to_string(kRc1Play) + " ",
              "rommsync-play-sessions " + std::to_string(rs::play::kFormatVersion + 1) + " "));
   c.Expect(newer.sessions.empty() && !newer.diagnostics.empty(), "play.db newer: discarded");
+  c.Expect(SaysNewer(newer.diagnostics, "play.db", rs::play::kFormatVersion + 1),
+           "play.db newer: said as a newer release's, not as a file that is not one");
 }
 
 // --- auth.json: discard, both ways ---------------------------------------------------

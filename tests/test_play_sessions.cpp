@@ -629,6 +629,7 @@ void Store(rig::Checks& checks) {
       session.start_time = At(sync::kMaxTimestampSeconds - play::kMaxWindowSeconds);
       session.end_time = At(sync::kMaxTimestampSeconds);
       session.duration_ms = play::kMaxWindowSeconds * 1000;
+      session.title_id = 0xFFFF'FFFF'FFFF'FFFFULL;  // sixteen digits, longer than "unknown"
       widest.push_back({9'223'372'036'854'775'807LL - static_cast<std::int64_t>(at), session});
     }
     const std::string worst = play::SerializeBuffer(widest, 9'223'372'036'854'775'807LL,
@@ -685,6 +686,173 @@ void Store(rig::Checks& checks) {
     checks.Expect(play::ParseBuffer("something else\n" + good + "\n").sessions.empty(),
                   "and neither are bytes that do not begin with the magic");
   }
+}
+
+// --- titled -------------------------------------------------------------------
+//
+// M10-26 (#261): which application was in the foreground when a save was
+// written. The foreground is a fake here -- `pm:dmnt` is the console's half and
+// no host reaches it -- so what is pinned is the reading of what it said: a
+// session carries the title seen when its save was written, and "unknown"
+// whenever the console did not see one, saw two, or saw one too long before.
+
+/// Tico's GBA module and Tico's library, as stand-ins: two applications, one
+/// after the other, which is what quitting a Tico game back to its library is.
+constexpr std::uint64_t kModule = 0x0100'0000'00AB'C000ULL;
+constexpr std::uint64_t kLibrary = 0x0100'0000'00AB'D000ULL;
+
+play::Foreground Running(std::optional<std::uint64_t> program_id) {
+  play::Foreground foreground;
+  foreground.running = true;
+  foreground.program_id = program_id;
+  return foreground;
+}
+
+/// A hold's worth of polls, one every five seconds, `[from, to]`.
+void Poll(play::Sightings* sightings, std::uint64_t program_id, std::int64_t from,
+          std::int64_t to) {
+  for (std::int64_t at = from; at <= to; at += 5) {
+    sightings->Note(Running(program_id), At(at));
+  }
+}
+
+std::string TitleAt(const play::Sightings& sightings, std::int64_t end) {
+  std::vector<sync::PlaySession> sessions{SessionOf(4, "tico-srm", end - 60, end)};
+  play::AttributeTitles(&sessions, sightings);
+  return play::TitleOf(sessions[0]);
+}
+
+void Titled(rig::Checks& checks) {
+  checks.ExpectEq(std::string(play::kUnknownTitle), std::string("unknown"),
+                  "the word a session without a title says");
+  sync::PlaySession unseen = SessionOf(4, "tico-srm", kNoon - 60, kNoon);
+  checks.ExpectEq(play::TitleOf(unseen), std::string("unknown"),
+                  "a session nothing attributed says unknown");
+  unseen.title_id = 0x42;
+  checks.ExpectEq(play::TitleOf(unseen), std::string("0000000000000042"),
+                  "and a title is its program id, sixteen hex digits as Atmosphere names "
+                  "the folder");
+  unseen.title_id = kModule;
+  checks.ExpectEq(play::TitleOf(unseen), std::string("0100000000ABC000"),
+                  "upper case");
+
+  // A Tico game played under a held tick, quit back to the library at
+  // kNoon - 300, the library left open for a while.
+  play::Sightings sightings(std::chrono::seconds{10});
+  Poll(&sightings, kModule, kNoon - 600, kNoon - 300);
+  Poll(&sightings, kLibrary, kNoon - 295, kNoon - 200);
+  checks.ExpectEq(sightings.spans().size(), std::size_t{2},
+                  "two applications, one stretch each: " + std::to_string(sightings.spans().size()));
+
+  checks.ExpectEq(TitleAt(sightings, kNoon - 298), std::string("0100000000ABC000"),
+                  "a save written as the module exited -- after its last sighting, before the "
+                  "library's first -- is the module's");
+  checks.ExpectEq(TitleAt(sightings, kNoon - 450), std::string("0100000000ABC000"),
+                  "and so is one written while it was being seen, an autosave");
+  checks.ExpectEq(TitleAt(sightings, kNoon - 1000), std::string("unknown"),
+                  "a save written before anything was seen is unknown: the console did not "
+                  "look then");
+  checks.ExpectEq(TitleAt(sightings, kNoon - 100), std::string("unknown"),
+                  "and so is one written long after the last sighting");
+  checks.ExpectEq(TitleAt(sightings, kNoon - 250), std::string("0100000000ABD000"),
+                  "a save written under the library is the library's, if it ever wrote one");
+
+  {
+    // Two applications either side of a write, close enough that both could
+    // have made it: the console cannot say which, and says so.
+    play::Sightings close(std::chrono::seconds{10});
+    Poll(&close, kModule, kNoon - 100, kNoon - 10);
+    Poll(&close, kLibrary, kNoon - 9, kNoon);
+    checks.ExpectEq(TitleAt(close, kNoon - 9), std::string("unknown"),
+                    "a write two applications could both have made is unknown");
+  }
+  {
+    // The same application at two holds an hour apart is not one stretch: the
+    // console did not look in between, and it could have been closed.
+    play::Sightings apart(std::chrono::seconds{10});
+    Poll(&apart, kModule, kNoon - 7200, kNoon - 7100);
+    Poll(&apart, kModule, kNoon - 100, kNoon);
+    checks.ExpectEq(apart.spans().size(), std::size_t{2}, "two holds, two stretches");
+    checks.ExpectEq(TitleAt(apart, kNoon - 3600), std::string("unknown"),
+                    "so a save written between them is unknown");
+  }
+  {
+    play::Sightings quiet(std::chrono::seconds{10});
+    play::Foreground nothing;
+    quiet.Note(nothing, At(kNoon));
+    quiet.Note(Running(std::nullopt), At(kNoon + 5));
+    checks.Expect(quiet.spans().empty(),
+                  "nothing running, and a running application pm would not name, are no "
+                  "sighting");
+  }
+  {
+    // Bounded: a hold that watched someone flip between games all evening.
+    play::Sightings busy(std::chrono::seconds{10});
+    for (std::size_t at = 0; at < play::kMaxTitleSpans + 5; ++at) {
+      busy.Note(Running(at % 2 == 0 ? kModule : kLibrary),
+                At(kNoon + static_cast<std::int64_t>(at) * 5));
+    }
+    checks.ExpectEq(busy.spans().size(), play::kMaxTitleSpans, "the stretches kept are bounded");
+    checks.ExpectEq(sync::UnixSeconds(busy.spans().back().last_seen),
+                    kNoon + static_cast<std::int64_t>(play::kMaxTitleSpans + 4) * 5,
+                    "and the newest are the ones kept");
+    busy.Clear();
+    checks.Expect(busy.spans().empty(), "and a stamped window forgets them");
+  }
+
+  // The title is the client's record, never the server's: neither ingest entry
+  // in the pinned snapshot has a field for it.
+  sync::PlaySession titled = SessionOf(4, "tico-srm", kNoon - 60, kNoon);
+  titled.title_id = kModule;
+  const sync::Encoded wire = sync::EncodePlaySessions({titled});
+  checks.Expect(wire.ok(), "a titled session still encodes");
+  checks.Expect(wire.body.find("title") == std::string::npos &&
+                    wire.body.find("ABC000") == std::string::npos,
+                "and the title is not in the body: " + wire.body);
+
+  // play.db carries it, and reads back a row from before it did.
+  const std::string row = play::SerializeRow({7, titled});
+  checks.Expect(row.find(R"("title":"0100000000ABC000")") != std::string::npos,
+                "a row names its title: " + row);
+  const std::string unknown_row = play::SerializeRow({8, SessionOf(4, "tico-srm", kNoon, kNoon + 60)});
+  checks.Expect(unknown_row.find(R"("title":"unknown")") != std::string::npos,
+                "and a row without one says unknown: " + unknown_row);
+  const std::string text = play::SerializeBuffer({{7, titled}}, 8, At(kNoon));
+  checks.Expect(text.rfind(std::string(play::kFormatMagic) + " 2 8 ", 0) == 0,
+                "the file that carries titles is version 2: " + text);
+  const play::LoadedBuffer read = play::ParseBuffer(text);
+  checks.Expect(read.diagnostics.empty() && read.sessions.size() == 1 &&
+                    read.sessions[0].session.title_id == kModule,
+                "and its title reads back");
+
+  const std::string v1 = std::string(play::kFormatMagic) + " 1 9 " + std::to_string(kNoon) +
+                         "\n" +
+                         R"({"id":7,"rom_id":4,"save_slot":"tico-srm","start_time":)" +
+                         std::to_string(kNoon - 60) + R"(,"end_time":)" + std::to_string(kNoon) +
+                         R"(,"duration_ms":60000})" + "\n";
+  const play::LoadedBuffer old = play::ParseBuffer(v1);
+  checks.Expect(old.diagnostics.empty() && old.sessions.size() == 1 &&
+                    !old.sessions[0].session.title_id.has_value(),
+                "a version 1 row, from before titles, is read and its title is unknown");
+
+  for (const char* bad : {R"("ABC")", R"("0100000000ABC00G")", R"("0000000000000000")", "42",
+                          "null"}) {
+    const std::string poisoned = std::string(play::kFormatMagic) + " 2 9 " +
+                                 std::to_string(kNoon) + "\n" +
+                                 R"({"id":7,"rom_id":4,"save_slot":"tico-srm","start_time":)" +
+                                 std::to_string(kNoon - 60) + R"(,"end_time":)" +
+                                 std::to_string(kNoon) + R"(,"duration_ms":60000,"title":)" + bad +
+                                 "}\n";
+    checks.Expect(play::ParseBuffer(poisoned).sessions.empty(),
+                  std::string("a title that is not one is a row this file did not write: ") + bad);
+  }
+
+  const play::LoadedBuffer newer = play::ParseBuffer(std::string(play::kFormatMagic) + " 3 9 " +
+                                                     std::to_string(kNoon) + "\n");
+  checks.Expect(newer.diagnostics.size() == 1 &&
+                    newer.diagnostics[0].find("written by a newer release") != std::string::npos,
+                "a later release's play.db is said the way every record says one: " +
+                    (newer.diagnostics.empty() ? std::string() : newer.diagnostics[0]));
 }
 
 // --- reconcile ----------------------------------------------------------------
@@ -1149,7 +1317,8 @@ int main(int argc, char** argv) {
   rig::Checks checks;
 
   if (scenario == "encode" || scenario == "derive" || scenario == "carded" ||
-      scenario == "store" || scenario == "reconcile" || scenario == "tick") {
+      scenario == "store" || scenario == "titled" || scenario == "reconcile" ||
+      scenario == "tick") {
     if (scenario == "encode") {
       Encode(checks);
     } else if (scenario == "derive") {
@@ -1158,6 +1327,8 @@ int main(int argc, char** argv) {
       Carded(checks);
     } else if (scenario == "store") {
       Store(checks);
+    } else if (scenario == "titled") {
+      Titled(checks);
     } else if (scenario == "reconcile") {
       Reconcile(checks);
     } else {
