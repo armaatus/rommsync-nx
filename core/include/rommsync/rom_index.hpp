@@ -220,6 +220,9 @@ struct FetchOptions {
 struct FetchResult {
   RomIndex index;
 
+  /// The page's last attempt, once `FetchOptions::policy` had none left. Or
+  /// `kCanceled`, when its token fired: nobody is waiting for this index, and
+  /// that is not a server failing (#251).
   http::Error transport = http::Error::kNone;
 
   /// The status of the request that failed. Zero when none did.

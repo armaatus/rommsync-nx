@@ -303,9 +303,25 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
     }
     return std::move(result);
   };
+  // A page lost in transit is a *failure* retry, on the curve every retry loop
+  // shares, and its budget is the page's: `backoff` is cleared by every answer.
+  const sync::CallPolicy& policy = options.policy;
+  const int attempts = policy.max_attempts > 0 ? policy.max_attempts : 1;
+  retry::Backoff backoff = sync::BackoffFor(policy);
+  const auto canceled = [&policy] {
+    return policy.cancel != nullptr && policy.cancel->canceled();
+  };
   int pages = 0;
   int refused = 0;
   while (pages < kMaxPages && refused < kMaxPages) {
+    if (canceled()) {
+      // Between requests, so a shutdown is not owed the rest of the library. A
+      // cancel, not a failure: the caller reads it as a cancelled tick, never
+      // as a server that is down (#248, #251).
+      result.transport = http::Error::kCanceled;
+      result.message = "the rom index fetch was stopped: the caller cancelled";
+      return finished();
+    }
     http::Request request;
     // Three things about this URL are not decoration.
     //
@@ -330,7 +346,24 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
       request.headers.push_back({"Authorization", "Bearer " + options.bearer_token});
     }
 
+    request.timeout = policy.timeout;
+    request.cancel = policy.cancel;
+
     const http::Result sent = client.Send(request);
+    const bool lost = sent.ok() ? http::TransientStatus(sent.response.status)
+                                : sent.error != http::Error::kCanceled &&
+                                      sent.error != http::Error::kInvalidRequest &&
+                                      !http::AnsweredTooLarge(sent);
+    if (!lost) {
+      backoff.Succeed();
+    } else if (backoff.failures() + 1 < attempts) {
+      // The same page again, after the wait -- unless the caller gave up, which
+      // the top of the loop says without spending the wait first.
+      if (!canceled()) {
+        sync::WaitToRetry(policy, &backoff);
+      }
+      continue;
+    }
     if (http::AnsweredTooLarge(sent)) {
       ++refused;
       streak = 0;
