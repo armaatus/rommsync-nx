@@ -496,7 +496,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   clipped = false;
   const SettingsRow* cursor_row = CursorRow();
   if (cursor_row != nullptr && cursor_row->selectable) {
-    line(Prompt(kGlyphA, cursor_row->action), kBodyFont, plain, kRowHeight);
+    line(Prompt(kGlyphA, cursor_row->press_label), kBodyFont, plain, kRowHeight);
   }
   if (view_.repair.state != ControlState::kInert) {
     line(Prompt(kGlyphX, view_.repair.label), kBodyFont,

@@ -54,7 +54,7 @@ SettingsRow Navigate(std::string label, std::string value, Destination destinati
   row.value = std::move(value);
   row.selectable = true;
   row.destination = destination;
-  row.action = "Open";
+  row.press_label = "Open";
   return row;
 }
 
@@ -66,20 +66,28 @@ struct Choice {
   const char* note;
 };
 
-/// A row showing `values[current]`, whose press sends the value after it.
+/// A row showing the value `in_force` names, whose press sends the one after it.
 ///
 /// The values are the setting's whole cycle, in the order presses visit them,
-/// so the last one's press comes round to the first.
+/// so the last one's press comes round to the first. The value in force is
+/// found by the word `config.ini` stores -- `config::ToString`'s, the one
+/// `ApplyEdit` reads back -- rather than by a position kept in step by hand.
 template <std::size_t N>
 SettingsRow Changeable(const char* section, const char* key, const Choice (&values)[N],
-                       std::size_t current) {
+                       std::string_view in_force) {
+  std::size_t current = 0;
+  for (std::size_t index = 0; index < N; ++index) {
+    if (in_force == values[index].stored) {
+      current = index;
+    }
+  }
   const Choice& now = values[current];
   const Choice& next = values[(current + 1) % N];
   SettingsRow row = Value(key, now.shown);
   row.note = now.note;
   row.selectable = true;
   row.change = config::Assignment{section, key, next.stored, /*remove=*/false};
-  row.action = std::string("Set to ") + next.shown;
+  row.press_label = std::string("Set to ") + next.shown;
   return row;
 }
 
@@ -90,8 +98,7 @@ SettingsRow OnServerDeleteRow(config::OnServerDelete in_force) {
       {"Remove", "remove", "a save deleted in RomM is backed up, then removed from the card"},
       {"Keep", "keep", "a save deleted in RomM stays on the card and is not uploaded again"},
   };
-  return Changeable("sync", "on_server_delete", kValues,
-                    in_force == config::OnServerDelete::kKeep ? 1 : 0);
+  return Changeable("sync", "on_server_delete", kValues, config::ToString(in_force));
 }
 
 /// `[sources]` (#230, #264).
@@ -107,13 +114,8 @@ SettingsSection SourcesSection(const config::SourcesConfig& sources) {
         {"On", "on", "RetroArch's saves sync, even while RetroArch's own Cloud Sync is on"},
         {"Off", "off", "no RetroArch folder is read"},
     };
-    std::size_t current = 0;
-    if (sources.retroarch == config::SourceMode::kOn) {
-      current = 1;
-    } else if (sources.retroarch == config::SourceMode::kOff) {
-      current = 2;
-    }
-    section.rows.push_back(Changeable("sources", "retroarch", kValues, current));
+    section.rows.push_back(
+        Changeable("sources", "retroarch", kValues, config::ToString(sources.retroarch)));
   }
   {
     static constexpr Choice kValues[] = {
@@ -121,7 +123,7 @@ SettingsSection SourcesSection(const config::SourcesConfig& sources) {
         {"On", "true", "RetroArch saves kept beside the roms are read"},
     };
     section.rows.push_back(Changeable("sources", "retroarch_content_dir", kValues,
-                                      sources.retroarch_content_dir ? 1 : 0));
+                                      sources.retroarch_content_dir ? "true" : "false"));
   }
   return section;
 }

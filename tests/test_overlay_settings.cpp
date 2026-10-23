@@ -590,7 +590,7 @@ void ExpectChange(Checks& checks, const overlay::SettingsView& view, const std::
   checks.ExpectEq(row->change->key, label, what + ": and that key");
   checks.ExpectEq(row->change->value, sends, what + ": the next value, in config.ini's words");
   checks.Expect(!row->change->remove, what + ": a press sets, never resets");
-  checks.Expect(Contains(row->action, "Set to"), what + ": the prompt says a press sets it");
+  checks.Expect(Contains(row->press_label, "Set to"), what + ": the prompt says a press sets it");
 }
 
 /// #264: `[sync] on_server_delete` and `[sources]` are on the settings screen,

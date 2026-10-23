@@ -1,5 +1,5 @@
 // The overlay's settings screen -- the whole effective configuration, every
-// complaint the parser had about it, and the one action the screen owns --
+// complaint the parser had about it, and the presses the screen owns --
 // decided here and drawn over there.
 //
 // M4-4 (#26), and the place a bad `config.ini` stops being invisible. A console
@@ -136,7 +136,7 @@ struct SettingsRow {
 
   /// What the A prompt says over this row -- "Open", "Set to Keep" -- or empty
   /// on a row a press does nothing on.
-  std::string action;
+  std::string press_label;
 
   /// M5-3 (#30) can write this key. Marked, and offered only where `change`
   /// is set: the moment `overlay/` opens `config.ini` the invariant that the
@@ -146,7 +146,7 @@ struct SettingsRow {
   /// omission: every row that is not a `kNavigate` is editable, so a marker
   /// would be on every configuration row on the screen and would separate
   /// nothing. What separates the rows a press changes is the A prompt drawn
-  /// over them (`action`). The flag is the model saying which keys
+  /// over them (`press_label`). The flag is the model saying which keys
   /// `config::ApplyEdit` accepts, held by `overlay.settings` rather than by a
   /// screenshot.
   bool editable = false;
