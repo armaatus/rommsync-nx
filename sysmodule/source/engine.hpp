@@ -1293,6 +1293,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// card -- its save still comes, unless this device synced it before.
   std::vector<std::int64_t> fresh_roms_;
 
+  /// The saves this console will not take that the log has already named
+  /// (#257), so each is said once a boot rather than once a tick. Touched only
+  /// inside the saves half of a tick, on the worker, so it needs no lock.
+  sync::Declines declines_;
+
   /// Install requests from RomM's web UI this console has taken and not yet
   /// reported (#245). Guarded by `mutex_`; at most `install::kMaxClaims`, and in
   /// memory only, because a claim hands back every request still taken

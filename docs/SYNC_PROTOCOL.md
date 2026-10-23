@@ -481,10 +481,10 @@ is injected, and the engine's is `place::Placer` (#237):
   matches to the same rom in the same slot, holding bytes the target emulator
   reads; otherwise it would be a second save of the game, uploaded on the next
   tick while the row it came from is offered again. Placing nothing is a named
-  failure with the reason.
+  decline with the reason (below).
 - **A placement only creates.** A file already at the path is one the scan did
-  not pair with this row — skipped, or another slot's — and the operation fails
-  with `kNoLocalSave` without touching it. A missing folder is made. The bytes
+  not pair with this row — skipped, or another slot's — and the operation is
+  declined with `kNoLocalSave` without touching it. A missing folder is made. The bytes
   arrive through the same stage-verify-commit as any download, and
   `execute.placed` replays a power cut at every call of it: no file, or all of
   it.
@@ -689,10 +689,10 @@ executor's own check behind it), else as what the scan would report for the
 path (`ExecuteOptions::reads_as`, `scan::EmulatorAt`). With nothing to say,
 a `tico-*` save is not placed at all, and the check comes before the
 placement's folder is made. A refusal is `OperationError::kOtherEmulator`: nothing fetched, nothing
-backed up, nothing touched, and counted failed — the plan asked for something
-this client will not do, and it will ask again until one of the two saves
-moves. The same holds inside #232's resolution of a 409, which executes through
-the same path. Two libretro cores in one slot are not this rule's: that is RomM's
+backed up, nothing touched, and declined rather than failed (below) — the plan
+asked for something this client will not do, and it will ask again until one of
+the two saves moves. The same holds inside #232's resolution of a 409, which
+executes through the same path. Two libretro cores in one slot are not this rule's: that is RomM's
 pairing and #236's filter.
 
 The per-system table — each Tico module, the emulator id it syncs under, and
@@ -1248,6 +1248,18 @@ bounds.
   `operations_failed` and not with `operations_completed`: the server planned
   work that did not happen, and calling it completed tells RomM the client did
   something it cannot name.
+- **A save this console will not take is declined, not failed** (#257): a
+  pairing `scan::Interchangeable` refuses, a first-time restore the placer has
+  no path for, or one whose path a file already holds. The server plans it again
+  every tick until a file moves, so counted failed it made every tick partial
+  with nothing to be done from the console. `OperationOutcome::kDeclined` is
+  neither completed nor failed, never makes a tick partial, and is written once —
+  a `scan.skipped` warning — then not again until either side changes: a new
+  server save or a moved or rewritten one, the local file moving, or the
+  placement's reason changing (`sync::Declines`, in memory for the boot, bounded
+  at `kMaxDeclines`). RomM's `complete` still counts it with `operations_failed`,
+  as it does an action this build does not know: the server planned it, and it
+  did not happen.
 - One backup per overwrite, always, before writing — and per removal, before
   removing (#233).
 - A card that refuses -- full, failing, or gone -- costs the incoming save and

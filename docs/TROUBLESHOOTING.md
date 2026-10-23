@@ -98,7 +98,7 @@ and a log is not worth it. A save is never in that position; see
 | `net.offline` | the request never completed | [Nothing syncs, and nothing is reachable](#nothing-syncs-and-nothing-is-reachable) |
 | `net.tls` | the TLS handshake or the certificate was refused | [TLS fails](#tls-fails) |
 | `auth.rejected` | the server has stopped accepting this console | [The token expired or was revoked](#the-token-expired-or-was-revoked) |
-| `scan.skipped` | a save file was not matched to a rom | [Saves are skipped: nothing matches](#saves-are-skipped-nothing-matches) |
+| `scan.skipped` | a save file was not matched to a rom, or a server's save will not be taken here | [Saves are skipped: nothing matches](#saves-are-skipped-nothing-matches) |
 | `sync.refused` | the server answered, and the answer will not change | [The server refused the sync](#the-server-refused-the-sync) |
 | `save.failed` | a save could not be written — usually a full card | [The SD card is full](#the-sd-card-is-full) |
 | `sync.tick` | how one sync ended — every tick writes one | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
@@ -319,10 +319,25 @@ Two folder layouts behave differently here, and it matters:
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#formats-only-one-emulator-reads)).
 
 A PS1, N64, Dreamcast, NDS or Saturn save that **is** matched can still be
-refused at the download, with `other_emulator` in a `save.failed` line: the
-server's copy came from RetroArch, whose format for that system Tico's module
-does not read, so it is never written over the card. It syncs with the same
-module on another Switch only.
+declined at the download, in a `scan.skipped declined` line saying the two are
+not the same save format: the server's copy came from RetroArch, whose format for that system
+Tico's module does not read, so it is never written over the card. It syncs with
+the same module on another Switch only.
+
+The same kind of line names a save the console has never had and will not
+place — the platform has no folder for the emulator it is played in, Tico has
+several accounts and none chosen, or a file the scan did not pair is already
+where it would go:
+
+```
+8 warn scan.skipped declined download rom 6, slot autosave: there is no local save for this (rom_id, slot), and /tico/saves/psx/Game.mcd is already a file this sync did not pair with it; it was not touched
+```
+
+None of these is a failed sync, and the sync is not reported partial on their
+account. Each is said **once**, and again only when something changes — a new
+copy on the server, the file moving, or the reason the placement gave — or after
+a reboot. Moving the file in the way, or fixing what the reason names, lets the
+next sync bring the save down.
 
 ---
 

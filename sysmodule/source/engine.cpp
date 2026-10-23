@@ -2437,6 +2437,9 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
   options.execute.place = [placer](const sync::SyncOperation& operation) {
     return placer->Save(operation);
   };
+  // A save this console will not take is said once a boot, not once a tick
+  // (#257).
+  options.execute.declines = &declines_;
   return options;
 }
 
@@ -2582,6 +2585,11 @@ void SdEngine::TallyPlan(const sync::SyncPlan& plan, const sync::ExecutionReport
   // here as a backup that could not be taken, and a backup that could not be
   // taken is an overwrite that did not happen (hard rule 2).
   log::WriteEach(log::Level::kError, log::Event::kSaveFailed, executed.warnings);
+  // And every save this console will not take, the first time it is met (#257):
+  // not a failed save -- nothing was attempted and nothing is wrong with the
+  // card -- but one that is not syncing, which `scan.skipped`'s section of
+  // docs/TROUBLESHOOTING.md answers beside the files the scan would not report.
+  log::WriteEach(log::Level::kWarn, log::Event::kScanSkipped, executed.declines);
   std::lock_guard<std::mutex> history(history_mutex_);
   conflicts::RecordSaves(&history_, plan, executed, reported, record);
 }

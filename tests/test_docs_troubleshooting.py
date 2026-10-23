@@ -515,7 +515,12 @@ def phase_sections(args) -> int:
                         "of this page by the line in their file; one with no line is a "
                         "section nobody reaches.")
 
-    reasons = skip_reasons(repo)
+    # A server's save the console will not take is the engine's line, not the
+    # scan's (#257): `ExecutePlan` leads it with `declined`.
+    if '"declined "' not in read(os.path.join(repo, "core", "src", "sync_execute.cpp")):
+        return fail("core/src/sync_execute.cpp no longer leads a decline's line with "
+                    "`declined `, which the guide quotes")
+    reasons = skip_reasons(repo) + ["declined"]
     checked = 0
     for match in quoted_lines(text):
         if match.group(3) != "scan.skipped":
