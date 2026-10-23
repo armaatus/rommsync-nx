@@ -22,6 +22,8 @@
 //   keep_local   -- #249: a save conflict's Keep local restores the local bytes
 //                   and arms its (rom_id, slot); anything else is refused, and a
 //                   plan that answered the key spends it
+//   late_write   -- #270: a write landing between a restore's backup and its
+//                   copy stays on the card, and the restore stands down
 //   interrupted  -- a restore killed mid-write leaves the old bytes, never a
 //                   splice, and no `.tmp` after the sweep
 //   service      -- both commands through `ipc::Dispatch` over a real `SdEngine`
@@ -49,6 +51,7 @@
 
 #include "crash_disk.hpp"
 #include "engine.hpp"
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rig.hpp"
 #include "rommsync/atomic_file.hpp"
@@ -768,6 +771,86 @@ void Restore(checks::Checks& c) {
              "and the backup it wrote first carries the state discriminator: " +
                  put_back.backup_sd_path);
   }
+}
+
+// --- late_write ---------------------------------------------------------------
+//
+// #270: #263's guarantee, held to the restore. A restore starts from the overlay
+// over a game that may be running, and `SdEngine::RunRestore` does not ask #242's
+// hold -- so a game can write the file after the restore has backed it up and
+// before the backup it restores from is copied over it. That write is in no copy
+// anywhere, and the restore has to see it and stand down.
+
+/// One restore of `entry` with the game writing `late` over `sd_path` at the
+/// moment the restore's own backup is published. `keep` routes it through Keep
+/// local instead, which must arm nothing for a restore that did not land.
+void RestoreUnderLateWrite(checks::Checks& c, const std::string& label, conflicts::Entry entry,
+                           bool keep) {
+  Sandbox sandbox(c, "conflicts-late-" + label);
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string previous = "the bytes this console had, and wants back\n";
+  const std::string server = "the server's copy, which the sync put here\n";
+  const std::string late = "progress the game wrote after the restore's backup\n";
+
+  sandbox.SeedSave(entry.sd_path, server);
+  c.Expect(sandbox.Write(entry.backup_sd_path, previous), label + ": the backup is on the card");
+  conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+  history.Load();
+  const std::int64_t id = history.Append(entry).id;
+
+  conflicts::RestoreOptions options;
+  options.backup_dir = harness::kBackupDir;
+  options.now = []() { return Moment(kWhen + 500); };
+
+  conflicts::RestoreReport done;
+  state::Baseline::Key key{0, std::nullopt};
+  {
+    // `Reseed`: from here on the late bytes are the file, and the teardown audit
+    // holds the restore to them.
+    faulty::LateWrite game([&] { sandbox.Reseed(entry.sd_path, late); });
+    done = keep ? conflicts::KeepLocal(*files, history, id, &key, options)
+                : conflicts::Restore(*files, history, id, options);
+    c.Expect(game.fired(), label + ": the game wrote between the backup and the copy");
+  }
+
+  c.ExpectEq(sandbox.Read(entry.sd_path), late,
+             label + ": the write that landed after the backup is still on the card");
+  c.Expect(!done.ok(), label + ": and the restore did not claim to have run: " + done.message);
+  c.ExpectEq(std::string(conflicts::ToString(done.outcome)), std::string("changed_since_backup"),
+             label + ": named as a file that moved since its backup -- " + done.message);
+  c.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == server,
+           label + ": the restore's own backup is left, holding what it was taken of: " +
+               done.backup_sd_path);
+  c.ExpectEq(sandbox.Read(entry.backup_sd_path), previous,
+             label + ": and the backup it would have restored from is untouched");
+  c.Expect(!std::filesystem::exists(io::TempPathFor(sandbox.Host(entry.sd_path))),
+           label + ": with nothing staged left beside the file");
+  if (keep) {
+    c.Expect(key.first == 0 && !key.second.has_value(),
+             label + ": and Keep local armed nothing, so no upload overrides the server for it");
+  }
+}
+
+void LateWrite(checks::Checks& c) {
+  conflicts::Entry save = SaveEntry(4, "game.srm");
+  RestoreUnderLateWrite(c, "save", save, /*keep=*/false);
+
+  // Keep local is the restore plus an armed key; the key is what would send the
+  // file over the server's copy, so it must not be armed over a write it skipped.
+  RestoreUnderLateWrite(c, "keep-local", save, /*keep=*/true);
+
+  // A state: tens of megabytes on a console, and what RetroArch writes on a
+  // hotkey -- the likelier of the two to be written mid-restore.
+  conflicts::Entry state_entry = SaveEntry(9, "nine.state");
+  state_entry.kind = conflicts::EntryKind::kState;
+  state_entry.event = conflicts::Event::kReplaced;
+  state_entry.slot.reset();
+  state_entry.reason.clear();
+  state_entry.server_content_hash.reset();
+  state_entry.sd_path = StatePath("nine.state");
+  state_entry.backup_sd_path = std::string(harness::kBackupDir) + "/9-state-nine-1757000000.state";
+  RestoreUnderLateWrite(c, "state", state_entry, /*keep=*/false);
 }
 
 // --- keep_local ---------------------------------------------------------------
@@ -2232,7 +2315,7 @@ int main(int argc, char** argv) {
 
   if (scenario == "store" || scenario == "record" || scenario == "restore" ||
       scenario == "interrupted" || scenario == "service" || scenario == "overlay" ||
-      scenario == "crash" || scenario == "keep_local") {
+      scenario == "crash" || scenario == "keep_local" || scenario == "late_write") {
     checks::Checks checks;
     if (scenario == "store") {
       Store(checks);
@@ -2244,6 +2327,8 @@ int main(int argc, char** argv) {
       Interrupted(checks);
     } else if (scenario == "crash") {
       Crash(checks);
+    } else if (scenario == "late_write") {
+      LateWrite(checks);
     } else if (scenario == "keep_local") {
       KeepLocal(checks);
     } else if (scenario == "service") {

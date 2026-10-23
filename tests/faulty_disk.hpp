@@ -15,12 +15,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
 
+#include "rommsync/atomic_file.hpp"
 #include "rommsync/disk.hpp"
 
 namespace faulty {
@@ -212,6 +214,57 @@ class SyncRefused final : public rommsync::io::Disk {
   int error_;
   rommsync::io::Disk* previous_ = nullptr;
   std::atomic<int> refusals_{0};
+};
+
+/// A game that writes its file while an overwrite is half done (#263, #270):
+/// `write` runs once, the moment a backup's name is published under `.backup/`
+/// -- after the copy is complete, before anything replaces or removes the file
+/// it was taken of. Refuses nothing.
+///
+/// Timed to that rename because it is the one call every overwrite path makes
+/// between its backup and its commit: `ExecutePlan`'s three actions, a conflict
+/// restore and a state download all back up through `sync::BackUpFirst`, whose
+/// copy lands by renaming its staged file onto its name.
+class LateWrite final : public rommsync::io::Disk {
+ public:
+  explicit LateWrite(std::function<void()> write) : write_(std::move(write)) {
+    previous_ = rommsync::io::SetDisk(this);
+  }
+  ~LateWrite() override { rommsync::io::SetDisk(previous_); }
+
+  LateWrite(const LateWrite&) = delete;
+  LateWrite& operator=(const LateWrite&) = delete;
+
+  std::FILE* Open(const std::string& path, const char* mode) override {
+    return Inner().Open(path, mode);
+  }
+  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
+    return Inner().Write(file, data, size);
+  }
+  int Rename(const std::string& from, const std::string& to) override {
+    const int renamed = Inner().Rename(from, to);
+    // The backup's own commit: its staged copy onto its name, in `.backup/`.
+    if (renamed == 0 && !fired_ && to.find("/.backup/") != std::string::npos &&
+        from == rommsync::io::TempPathFor(to)) {
+      fired_ = true;
+      write_();
+    }
+    return renamed;
+  }
+  int Remove(const std::string& path) override { return Inner().Remove(path); }
+  bool Sync(const std::string& path) override { return Inner().Sync(path); }
+
+  /// Whether the write happened, so a scenario cannot pass on one that never ran.
+  bool fired() const { return fired_; }
+
+ private:
+  rommsync::io::Disk& Inner() const {
+    return previous_ != nullptr ? *previous_ : rommsync::io::StdioDisk();
+  }
+
+  std::function<void()> write_;
+  rommsync::io::Disk* previous_ = nullptr;
+  bool fired_ = false;
 };
 
 }  // namespace faulty

@@ -1249,6 +1249,7 @@ set(CONFLICT_UNIT_SCENARIOS
   interrupted  # a restore killed mid-write leaves old or new, never a splice, and no .tmp
   crash        # M9-14: a power cut at every call of a restore, and one the card would not confirm
   keep_local   # #249: Keep local restores a save conflict's bytes and arms its key; the plan spends it
+  late_write   # #270: a write between a restore's backup and its copy stays on the card
   service      # both commands through ipc::Dispatch over a real SdEngine
   overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
 )
@@ -1385,6 +1386,7 @@ set(STATES_RIG_SCENARIOS
   roundtrip  # local -> server -> a second sandbox -> identical bytes
   overwrite  # the server's copy moved: back up first, then replace
   crash      # M9-14: ...and a power cut at every call of it loses nothing
+  late_write # #270: ...and a write between its backup and its commit stays on the card
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
   mapped     # #239: Tico's Auto up as .state.auto with its screenshot, down as Tico's and RetroArch's

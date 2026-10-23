@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "crash_disk.hpp"
+#include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/disk.hpp"
@@ -1466,51 +1467,9 @@ void CrashDelete(rig::Checks& checks) {
 // #263: a game writing its save while the sync acts on it. Hard rule 2's backup
 // is a copy of the bytes the save held *at the copy*; a write that lands after it
 // and before the save is replaced or removed is in no copy anywhere, so the
-// replacement or removal has to see it and stand down. `LateWrite` is that
-// game, timed to the one call that separates the two.
-
-/// A `Disk` that writes the save the moment a backup's name is published under
-/// `.backup/` -- after the copy is complete, before anything replaces or removes
-/// the save. `write` is the game; it runs once.
-class LateWrite final : public io::Disk {
- public:
-  explicit LateWrite(std::function<void()> write) : write_(std::move(write)) {
-    previous_ = io::SetDisk(this);
-  }
-  ~LateWrite() override { io::SetDisk(previous_); }
-
-  LateWrite(const LateWrite&) = delete;
-  LateWrite& operator=(const LateWrite&) = delete;
-
-  std::FILE* Open(const std::string& path, const char* mode) override {
-    return Inner().Open(path, mode);
-  }
-  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
-    return Inner().Write(file, data, size);
-  }
-  int Rename(const std::string& from, const std::string& to) override {
-    const int renamed = Inner().Rename(from, to);
-    // The backup's own commit: its staged copy onto its name, in `.backup/`.
-    if (renamed == 0 && !fired_ && to.find("/.backup/") != std::string::npos &&
-        from == io::TempPathFor(to)) {
-      fired_ = true;
-      write_();
-    }
-    return renamed;
-  }
-  int Remove(const std::string& path) override { return Inner().Remove(path); }
-  bool Sync(const std::string& path) override { return Inner().Sync(path); }
-
-  /// Whether the write happened, so a scenario cannot pass on one that never ran.
-  bool fired() const { return fired_; }
-
- private:
-  io::Disk& Inner() const { return previous_ != nullptr ? *previous_ : io::StdioDisk(); }
-
-  std::function<void()> write_;
-  io::Disk* previous_ = nullptr;
-  bool fired_ = false;
-};
+// replacement or removal has to see it and stand down. `faulty::LateWrite`
+// (tests/faulty_disk.hpp) is that game, timed to the one call that separates the
+// two.
 
 void LateWriteDelete(rig::Checks& checks) {
   Sandbox sandbox(checks, "execute-late-delete");
@@ -1534,7 +1493,7 @@ void LateWriteDelete(rig::Checks& checks) {
   {
     // `Reseed` rather than `Write`: from here on the late bytes are the save,
     // and the teardown audit holds the executor to *them*.
-    LateWrite game([&] { sandbox.Reseed(SavePath(name), late); });
+    faulty::LateWrite game([&] { sandbox.Reseed(SavePath(name), late); });
     report = sync::ExecutePlan(client, *files, token, DeletePlan(41, "late"),
                                {{41, "late", SavePath(name), name}}, options);
     checks.Expect(game.fired(), "the game wrote between the backup and the removal");
@@ -1815,7 +1774,7 @@ std::optional<sync::OperationResult> ExecuteUnderLateWrite(
   const std::string& save = target.sd_path;
   sync::ExecutionReport report;
   {
-    LateWrite game([&] { sandbox.Reseed(save, late); });
+    faulty::LateWrite game([&] { sandbox.Reseed(save, late); });
     report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, {target}, options);
     checks.Expect(game.fired(), what + ": the game wrote between the backup and the commit");
   }
