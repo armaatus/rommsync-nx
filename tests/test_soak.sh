@@ -15,11 +15,13 @@
 #                           script's own timeout, on every attempt.
 #   test_soak.sh tracked    the soak's and the image's numbers are handed to
 #                           benchmark-action on main, night by night (#250).
-#   test_soak.sh bench F    F, as `soak.smoke` wrote it, is benchmark-action's
-#                           `customSmallerIsBetter` shape.
+#   test_soak.sh --bench F  F, as `soak.smoke` wrote it, is benchmark-action's
+#                           `customSmallerIsBetter` shape. A flag rather than a
+#                           phase: it takes a file, and `soak.bench` registers it
+#                           on its own, behind `soak.smoke`.
 #
-# None but `bench` needs a network, a token or the rig, so none other skips;
-# `bench` skips when the soak that writes its file did.
+# None but `--bench` needs a network, a token or the rig, so none other skips;
+# `--bench` skips when the soak that writes its file did.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -115,7 +117,7 @@ phase_tracked() {
 # is missing, which is a soak that skipped for want of the rig.
 phase_bench() {
   local file="${1:-}"
-  [ -n "$file" ] || fail "usage: $0 bench FILE"
+  [ -n "$file" ] || fail "usage: $0 --bench FILE"
   if [ ! -s "$file" ]; then
     echo "skip: $file was not written; the soak it comes from did not run"
     exit 77
@@ -201,8 +203,8 @@ case "${1:-}" in
     phase_fresh ;;
   tracked)
     phase_tracked ;;
-  bench)
+  --bench)
     phase_bench "${2:-}" ;;
   *)
-    echo "usage: $0 {workflow|fresh|bounded|tracked|bench FILE}" >&2; exit 2 ;;
+    echo "usage: $0 {workflow|fresh|bounded|tracked|--bench FILE}" >&2; exit 2 ;;
 esac

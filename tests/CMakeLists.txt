@@ -2638,7 +2638,7 @@ set_tests_properties(soak.smoke PROPERTIES
   ENVIRONMENT "ROMMSYNC_BENCH_JSON=${SOAK_BENCH_JSON}"
   FIXTURES_SETUP soak_bench)
 add_test(NAME soak.bench COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_soak.sh"
-         bench "${SOAK_BENCH_JSON}")
+         --bench "${SOAK_BENCH_JSON}")
 set_tests_properties(soak.bench PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
                      FIXTURES_REQUIRED soak_bench
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
