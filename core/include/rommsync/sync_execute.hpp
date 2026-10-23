@@ -324,6 +324,10 @@ enum class OperationError {
   /// server's copy, or a save a `delete` names that changed after the scan
   /// reported it. Either way they were discarded and the local file was not
   /// touched.
+  ///
+  /// Also a save written *after its backup* (#263, `UnchangedSinceBackup`): the
+  /// replacement or removal stood down, and the save and its backup are both
+  /// left on the card.
   kUnverified,
 
   /// A `download` or `conflict` whose server copy was written by an emulator
@@ -388,6 +392,30 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
                            std::string_view discriminator, std::string_view file_name,
                            std::int64_t unix_seconds, std::string* backup_sd_path,
                            std::string* message);
+
+/// Whether the file at `sd_path` is still what `BackUpFirst` found there, asked
+/// immediately before the call that replaces or removes it (#263).
+///
+/// A backup is a copy of the bytes a save held *when it was copied*. Anything
+/// that writes the save after that -- a game launched mid-tick, which #242's
+/// hold is asked too coarsely to stop -- is in no copy anywhere, and the commit
+/// or removal that follows would take it. So the save is compared with its
+/// backup by digest (saves are small, and a size-and-mtime check misses a
+/// same-size rewrite inside FAT32's two-second mtime), and anything but a match
+/// stands the operation down with both files left where they are:
+///
+///   - `backup_sd_path` empty means `BackUpFirst` found nothing to protect, so
+///     there must still be nothing -- a file that appeared since has no copy.
+///     Only ENOENT is nothing, for `BackUpFirst`'s reason.
+///   - A save that differs, or that cannot be read back, is `kUnverified`.
+///   - A backup that cannot be read back is `kUnreadableCard`.
+///
+/// **It narrows the window to the instant between this read and the next call;
+/// it does not close it.** Horizon offers no compare-and-swap on a file, and a
+/// write landing in that instant is the residual risk
+/// docs/SYNC_PROTOCOL.md#backups states.
+OperationError UnchangedSinceBackup(fs::FileSystem& files, const std::string& sd_path,
+                                    const std::string& backup_sd_path, std::string* message);
 
 /// Whether a conflict's losing local copy is on the server too (#240).
 ///

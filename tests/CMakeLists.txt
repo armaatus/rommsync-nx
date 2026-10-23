@@ -958,7 +958,7 @@ set(EXECUTE_UNIT_SCENARIOS
   delete   # M10-7: a server delete is backed up, then removed -- or kept, or refused
   crash_delete # M10-7: ...and a power cut at every call of it leaves the save or its backup
   isolated # #238: a tico-* save is never written where another emulator reads, nor over by one
-  late_delete # #263: a write between the backup and the removal stays on the card
+  late_write # #263: a write between a delete's backup and its removal stays on the card
 )
 foreach(scenario IN LISTS EXECUTE_UNIT_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})

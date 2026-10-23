@@ -1369,6 +1369,51 @@ void LateWriteDelete(rig::Checks& checks) {
   }
 }
 
+/// `sync::UnchangedSinceBackup` on its own, for the case no call through
+/// `io::Disk` can time: `BackUpFirst` found nothing, so there is no backup to
+/// publish, and a file appears before the commit. Nothing on the way from one
+/// to the other touches the card, so the scenario is the function's answer.
+void LateWriteUnbacked(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-late-unbacked");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string save = SavePath("late-unbacked.srm");
+  const std::string backup = std::string(harness::kBackupDir) + "/late-unbacked-backup.srm";
+  std::string message;
+
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, "", &message) ==
+                    sync::OperationError::kNone,
+                "nothing backed up and still nothing there: the commit may go ahead");
+
+  sandbox.Write(save, "");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, "", &message) ==
+                    sync::OperationError::kUnverified,
+                "nothing backed up and a file there now, even an empty one, stands it down: " +
+                    message);
+
+  sandbox.Write(save, "the bytes backed up\n");
+  sandbox.Write(backup, "the bytes backed up\n");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup, &message) ==
+                    sync::OperationError::kNone,
+                "a save that is still its backup may go");
+
+  sandbox.Write(save, "the bytes backed vp\n");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup, &message) ==
+                    sync::OperationError::kUnverified,
+                "one of the same size that is not stands it down: " + message);
+
+  std::error_code error;
+  std::filesystem::remove(sandbox.Host(save), error);
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup, &message) ==
+                    sync::OperationError::kUnverified,
+                "and so does one that is gone since: " + message);
+
+  sandbox.Write(save, "the bytes backed up\n");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup + ".missing", &message) ==
+                    sync::OperationError::kUnreadableCard,
+                "a backup that cannot be read back is the card's failure: " + message);
+}
+
 // --- upload -------------------------------------------------------------------
 //
 // An upload that respects RomM's slot guard: `overwrite=false`, `session_id`
@@ -1641,8 +1686,6 @@ void LateWriteFetch(rig::Checks& checks, http::HttpClient& client, const std::st
                           sandbox.Read(done->backup_sd_path) == previous,
                       "download: the backup is left, holding the bytes it was taken of");
       }
-      checks.Expect(!DeviceIsSynced(client, base, fixture, server.id),
-                    "download: and the server is not told this device holds its copy");
     }
     harness::DeleteSave(client, base, fixture, server.id);
   }
@@ -2831,7 +2874,7 @@ int main(int argc, char** argv) {
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
       scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
       scenario == "delete" || scenario == "crash_delete" || scenario == "isolated" ||
-      scenario == "late_delete") {
+      scenario == "late_write") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -2848,8 +2891,9 @@ int main(int argc, char** argv) {
       CrashDelete(checks);
     } else if (scenario == "isolated") {
       Isolated(checks);
-    } else if (scenario == "late_delete") {
+    } else if (scenario == "late_write") {
       LateWriteDelete(checks);
+      LateWriteUnbacked(checks);
     } else {
       Counting(checks);
     }

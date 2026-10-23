@@ -12,7 +12,9 @@
 //
 // A conflict puts one more step between 3 and 4: the bytes step 3 preserved go
 // up as an archival save (`Archive`, #240). It writes nothing local and cannot
-// stop the overwrite.
+// stop the overwrite. And the last thing before 4 is asking whether the save is
+// still what 3 copied (`UnchangedSinceBackup`, #263): a game that wrote it in
+// between would otherwise lose that write to a commit its backup never saw.
 //
 // Every step before 4 can fail without the save changing at all, and step 4
 // cannot start until step 3 has succeeded. That is docs/SYNC_PROTOCOL.md's hard
@@ -494,6 +496,43 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
   return OperationError::kBackupFailed;
 }
 
+OperationError UnchangedSinceBackup(fs::FileSystem& files, const std::string& sd_path,
+                                    const std::string& backup_sd_path, std::string* message) {
+  const std::string source = files.Resolve(sd_path);
+  if (source.empty()) {
+    *message = "the local file " + sd_path + " is not a path on this card";
+    return OperationError::kUnreadableCard;
+  }
+  if (backup_sd_path.empty()) {
+    std::string unread;
+    if (io::ReadBounded(source, 0, &unread) == io::BoundedRead::kMissing) {
+      return OperationError::kNone;
+    }
+    *message = sd_path +
+               " was written after it was found empty, and nothing holds a copy of it; it was "
+               "left as it is";
+    return OperationError::kUnverified;
+  }
+
+  const std::string backup = files.Resolve(backup_sd_path);
+  const state::HashOutcome kept =
+      backup.empty() ? state::HashOutcome{} : state::HashFile(backup);
+  if (backup.empty() || !kept.ok()) {
+    *message = "the backup at " + backup_sd_path +
+               " could not be read back to compare the save with, so " + sd_path +
+               " was left as it is" + (kept.message.empty() ? "" : ": " + kept.message);
+    return OperationError::kUnreadableCard;
+  }
+  const state::HashOutcome now = state::HashFile(source);
+  if (!now.ok() || now.content_hash != kept.content_hash) {
+    *message = sd_path + " was written after it was backed up to " + backup_sd_path +
+               ", and no copy holds what was written since; it was left as it is, and the "
+               "backup beside it";
+    return OperationError::kUnverified;
+  }
+  return OperationError::kNone;
+}
+
 namespace {
 
 /// `BackUpFirst` with a save's discriminator and this execution's clock filled
@@ -971,6 +1010,22 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     Archive(client, files, token, operation, *target, options, stamp, &result, warnings);
   }
 
+  // The backup is of the save as it was when copied, and a conflict's archival
+  // upload has just held that moment open for a round trip. A game that wrote
+  // the save since would lose the write to the commit (#263), so the save is
+  // compared with its backup last of all. A mismatch repeats the operation next
+  // tick -- a conflict's archive with it, which is what a failed commit costs too.
+  if (const OperationError unchanged =
+          UnchangedSinceBackup(files, target->sd_path, result.backup_sd_path, &message);
+      unchanged != OperationError::kNone) {
+    OperationResult failed = Fail(operation, unchanged, std::move(message));
+    failed.sd_path = target->sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
+    failed.archive = result.archive;
+    failed.archive_save_id = result.archive_save_id;
+    return failed;
+  }
+
   const std::string staged_path = staged.path();
   // Consumed by the commit whether it succeeds or fails, so the guard is done.
   staged.Release();
@@ -1051,9 +1106,10 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
 }
 
 /// A `delete` (#233): back up, check the backup is the bytes the server ruled
-/// on, remove. Hard rule 2 with the overwrite replaced by a removal, and the
-/// same `BackUpFirst` -- so a power cut at any call leaves the save on the card
-/// or its bytes under `.backup/`, never neither (`execute.crash_delete`).
+/// on and the save is still the backup (#263), remove. Hard rule 2 with the
+/// overwrite replaced by a removal, and the same `BackUpFirst` -- so a power cut
+/// at any call leaves the save on the card or its bytes under `.backup/`, never
+/// neither (`execute.crash_delete`).
 OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
                        const SaveTarget* target, const ExecuteOptions& options) {
   if (target == nullptr) {
@@ -1126,6 +1182,18 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
              "the save is not the bytes this tick reported, so the server's ruling is not "
              "about it; it was left on the card");
     failed.sd_path = target->sd_path;
+    return failed;
+  }
+
+  // The backup is the reported bytes; the save has to still be them too, or the
+  // removal takes a write that landed after the copy (#263). Both stay: the
+  // backup is the copy the ruling was about, and the save is newer than it.
+  if (const OperationError unchanged =
+          UnchangedSinceBackup(files, target->sd_path, result.backup_sd_path, &message);
+      unchanged != OperationError::kNone) {
+    OperationResult failed = Fail(operation, unchanged, std::move(message));
+    failed.sd_path = target->sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
     return failed;
   }
 

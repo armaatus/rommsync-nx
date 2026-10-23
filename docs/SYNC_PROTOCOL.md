@@ -442,7 +442,9 @@ steps in this order and no other:
    (`io::WriteAtomically` takes a `string_view`, and a save state does not fit
    in the sysmodule's heap).
 4. **commit** with `io::CommitStaged`, which is `WriteAtomically`'s two-rename
-   commit for a file that arrived on disk rather than as a string.
+   commit for a file that arrived on disk rather than as a string — but only
+   once `sync::UnchangedSinceBackup` has found the save still holding the bytes
+   step 3 copied ([below](#a-write-after-the-backup-263)).
 
 Step 4 cannot start until step 3 has succeeded, and every step before it can
 fail without the save changing at all. A missing `.backup/` therefore *stops*
@@ -558,6 +560,34 @@ listed at the top of that header; a kernel-level injector such as lazyfs is the
 check on those assumptions, and is not in the suite. Every replay drives the
 host backend; the Horizon one (`http_wire.cpp`) syncs its `.part` through the
 same `io::Sync`, and nothing off a console runs it under the replay (#44).
+
+#### A write after the backup (#263)
+
+A backup is a copy of the save *as it was when copied*. A game that writes the
+save after that — launched mid-tick, which #242's hold is asked too coarsely to
+stop: per chunk and before a 409, not per operation — has written bytes that are
+in no copy anywhere, and the commit or removal that follows would take them. A
+conflict holds that window open longest, across its archival upload (#240).
+
+So immediately before the call that replaces or removes a save — the
+`io::CommitStaged` of a `download` or `conflict`, the `io::Remove` of a
+`delete` — `sync::UnchangedSinceBackup` compares the save with its backup by
+MD5. Saves are small enough to read twice, and a size-and-mtime comparison
+misses a same-size rewrite within FAT32's two-second mtime. Anything but a
+match fails the operation `kUnverified` and leaves both files: the save, which
+is newer than any ruling about it, and the backup. Where nothing was backed up
+because nothing was there, there must still be nothing; a file that appeared is
+left alone the same way. The next tick negotiates the save as it now is.
+`execute.late_write` (a `delete`) and `execute.late_fetch` (a `download` and a
+`conflict`) write the save from inside `io::Disk` at the moment the backup's
+name is published, and the write is what is on the card afterwards.
+
+**What this does not close.** The comparison and the call after it are two
+calls, and Horizon offers no compare-and-swap on a file: a write landing in the
+instant between them is still lost. The guarantee is that no write is lost
+that landed before the comparison — which takes the window from a network round
+trip and a backup's worth of I/O down to one hash of the save. The hold
+narrows it further; nothing here closes it.
 
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
@@ -692,7 +722,10 @@ way it obeys an overwrite, because the file is just as gone:
 3. **The backup is checked against the digest the tick reported.** The ruling
    was about those bytes; a save the player wrote to after the scan is progress
    it never saw, so it stays and its stray copy is removed. With no digest to
-   hold it to, the delete is refused before anything is copied.
+   hold it to, the delete is refused before anything is copied. **And the save
+   is checked against the backup**, last of all: one written after the copy
+   stays, with the backup beside it
+   ([A write after the backup](#a-write-after-the-backup-263)).
 4. **Then the file is removed**, and its directory synced. A power cut at any
    call leaves the save or its backup, never neither (`execute.crash_delete`).
 
