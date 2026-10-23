@@ -771,7 +771,12 @@ struct ExecuteOptions {
 /// a save whose rom has left the card is never named again: the oldest choice is
 /// let go first, which costs that save its override and nothing else -- its
 /// next upload meets the slot guard like any other.
-inline constexpr std::size_t kMaxKeepLocal = 16;
+///
+/// Four, because the sysmodule's heap pays for it four times over -- the list
+/// and the three copies a tick holds (`kHeapKeepLocal`, sysmodule main.cpp) --
+/// and because a choice asks for its tick at once, so more than one waits only
+/// while sync is switched off or held.
+inline constexpr std::size_t kMaxKeepLocal = 4;
 
 /// Arm Keep local for `key`: once, however often it is chosen, and at most
 /// `kMaxKeepLocal` of them, the oldest let go first.

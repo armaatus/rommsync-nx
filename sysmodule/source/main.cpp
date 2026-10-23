@@ -104,8 +104,9 @@ namespace {
 //   | the conflict history's entries (M9-22)   | `kHeapConflictHistory`  | 0x8C00  |  35 KiB |
 //   | the declines already said (M10-21)       | `kHeapDeclines`         | 0x400   |   1 KiB |
 //   | the foreground's sightings (M10-26)      | `kHeapTitleSightings`   | 0x400   |   1 KiB |
+//   | the Keep local choices (M10-20)          | `kHeapKeepLocal`        | 0x800   |   2 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x17E800 | 1530 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x17F000 | 1532 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -789,6 +790,14 @@ constexpr size_t kHeapDeclines =
 // their bound, and the copy `TakeSightings` hands the tick that attributes them.
 constexpr size_t kHeapTitleSightings =
     RoundUpToKiB(2 * rommsync::play::kMaxTitleSpans * sizeof(rommsync::play::TitleSpan));
+// Resident for the boot, beside everything: the Keep local choices waiting for
+// their upload (`SdEngine::keep_local_`, #249), at their bound -- and, while a
+// plan runs, the three copies a tick holds of them: the tick's options, and
+// `RunTick`'s per-plan options and its resolution's. A key's slot is budgeted
+// at a name's chunk; `autosave` itself fits the string and allocates nothing.
+constexpr size_t kHeapKeepLocal = RoundUpToKiB(
+    4 * rommsync::sync::kMaxKeepLocal *
+    (sizeof(rommsync::state::Baseline::Key) + kHeapNameBytes));
 constexpr size_t kHeapNewlibOverhead = 0x8000;
 
 constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTransferBuffer +
@@ -796,7 +805,8 @@ constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTrans
                              kHeapListPages + kHeapThreadStacks + kHeapWatcherStack +
                              kHeapLogTail + kHeapPlaySessions + kHeapOpenDirectories +
                              kHeapInstallClaims + kHeapDownloadQueue + kHeapConflictHistory +
-                             kHeapDeclines + kHeapTitleSightings + kHeapNewlibOverhead;
+                             kHeapDeclines + kHeapTitleSightings + kHeapKeepLocal +
+                             kHeapNewlibOverhead;
 
 // The arithmetic above, checked by the compiler rather than by a reader. It is
 // the transfer memory that this is really about: the trimmed socket config is
@@ -933,6 +943,9 @@ static_assert(sizeof(rommsync::play::TitleSpan) == 24,
               "play::TitleSpan changed size; retotal the table");
 static_assert(kHeapTitleSightings == 0x400,
               "play::kMaxTitleSpans moved; retotal the table");
+static_assert(sizeof(rommsync::state::Baseline::Key) == 48,
+              "state::Baseline::Key changed size; retotal the table");
+static_assert(kHeapKeepLocal == 0x800, "sync::kMaxKeepLocal moved; retotal the table");
 // The history read at boot, before the worker starts, under the response row --
 // one more thing held one at a time, as `queue.json` is. `Load` holds the file's
 // text, the entries it parses and the history's own array as they move across:
@@ -951,9 +964,9 @@ static_assert(rommsync::download::kMaxQueueBytes <= kHeapListResponse,
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x17E800, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x17F000, "the table above no longer sums to its peak row");
 
-// 0x180000 leaves 0x1800 -- 6 KiB -- over that peak, which is the margin a
+// 0x180000 leaves 0x1000 -- 4 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, and the arithmetic gave neither.
 // M9-4 (#208) took 40 KiB of it for the PSC watcher's thread, which is the row
@@ -962,7 +975,9 @@ static_assert(kHeapPeak == 0x17E800, "the table above no longer sums to its peak
 // M10-21 (#257) 1 KiB for the declines a tick has already said -- the price of a
 // refused save costing one log line a boot rather than one a tick -- and M10-26
 // (#261) 1 KiB for the foreground's sightings, which a play session's title is
-// read from.
+// read from, and M10-20 (#249) 2 KiB for the Keep local choices -- which is why
+// `sync::kMaxKeepLocal` is 4: a choice asks for its tick at once, so more than
+// one waits only while sync is off or held.
 //
 // **M9-22 (#248) took 15 KiB more**, and every byte of it is cost that was
 // always there: the conflict history, resident and never counted (35 KiB), and
@@ -1059,7 +1074,7 @@ constexpr size_t kInnerHeapSize = 0x180000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");
-static_assert(kHeapMargin == 0x1800,
+static_assert(kHeapMargin == 0x1000,
               "the margin in the sentence above is no longer the one left");
 
 alignas(16) u8 g_inner_heap[kInnerHeapSize];
