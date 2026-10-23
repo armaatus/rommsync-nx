@@ -1722,9 +1722,10 @@ endif()
 # test reading the same library.
 set_tests_properties(contract.captures PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
-# The other half: docs/API_CONTRACT.md against the floor it claims to describe.
-# contract.captures compares captures with a server and cannot see a page that
-# quotes another version's (#260). Reads three paths, so it never skips.
+# The other half: docs/API_CONTRACT.md, SYNC_PROTOCOL.md and AUTH.md against the
+# floor they describe. contract.captures compares captures with a server and
+# cannot see a page that quotes another version's (#260, #266). Reads files
+# only, so it never skips.
 add_test(NAME contract.page
          COMMAND ${Python3_EXECUTABLE}
                  "${CMAKE_CURRENT_SOURCE_DIR}/test_contract_page.py"
