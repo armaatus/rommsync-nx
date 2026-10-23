@@ -712,6 +712,13 @@ struct ExecuteOptions {
   /// that answers it (`SpendKeepLocal`), so it is one upload's and no more.
   /// Empty on every other tick: a conflict is resolved Keep server (with the
   /// local copy archived on the server) unless the player says otherwise.
+  ///
+  /// A Keep local upload that landed is rewritten in place a second later with
+  /// the same bytes (`PUT /api/saves/{id}`, #272): RomM breaks a tie between two
+  /// rows of one second by query order, and the other device's row could
+  /// otherwise be the head the next negotiation names. That costs the upload
+  /// ~1.1 s on the calling thread; a rewrite that fails is a line in
+  /// `ExecutionReport::warnings`, never a failed upload.
   std::vector<state::Baseline::Key> keep_local;
 
   /// Whether an upload and a `/downloaded` carry `content_hash`: the MD5 of the

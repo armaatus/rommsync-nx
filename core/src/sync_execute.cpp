@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -210,6 +211,19 @@ std::optional<std::int64_t> SaveIdOf(const json::Value& save) {
     return std::nullopt;
   }
   return id->integer();
+}
+
+/// The `updated_at` off a `SaveSchema` body, to the whole second, or empty.
+std::optional<Timestamp> UpdatedAtOf(std::string_view body) {
+  const json::ParseResult document = json::Parse(body);
+  if (!document.ok()) {
+    return std::nullopt;
+  }
+  const json::Value* at = document.value.Find("updated_at");
+  if (at == nullptr || !at->is_string()) {
+    return std::nullopt;
+  }
+  return ParseTimestamp(at->string());
 }
 
 http::Request Authed(http::Method method, std::string url, const auth::StoredToken& token,
@@ -717,12 +731,98 @@ const ClientSaveState* ReportedFor(const ExecuteOptions& options, const SaveTarg
   return options.reported != nullptr ? FindByKey(*options.reported, KeyOf(target)) : nullptr;
 }
 
+/// How long a Keep local upload waits before rewriting its row: past the second
+/// it landed in by the server's clock, which a whole second after the server
+/// answered is, with a margin for the phase of the two clocks.
+constexpr std::chrono::milliseconds kTieWait{1'100};
+
+/// After a Keep local upload wrote `own_id` in the second `landed`: rewrite that
+/// row with the bytes it already holds once the second has turned, so it is the
+/// slot's newest by a whole second (#272).
+///
+/// RomM 5.4.0 stores `updated_at` to the whole second and breaks a tie between
+/// two rows of one second by nothing at all: its slot guard and
+/// `promote_to_slot_head` order by id, and negotiate keeps whichever row its
+/// unordered query meets first -- **which differs with the query's shape**.
+/// Measured on the fixture: the same tied slot negotiated with `rom_ids` names
+/// the Keep local row, and without them names the other device's. So whether a
+/// Keep local that landed in the second another device's upload did survives
+/// the next tick is up to MariaDB's plan for that tick's query, and when it does
+/// not, the next tick downloads the other row over the player's choice -- backed
+/// up, but undone without a word. No negotiation this client could send to
+/// check would be the one that tick sends, and the other rows of the slot are a
+/// listing that grows by a row per upload; so the tie is not looked for. It is
+/// made impossible: one rewrite, a second later, of the row this device already
+/// owns. Nothing else is touched, and nothing goes over the guard that the
+/// upload had not already.
+///
+/// Only a Keep local pays this. Every other upload meets the guard, which
+/// refuses it over a row this device has not synced, so it cannot land beside
+/// one in the same second (#232).
+///
+/// Never a reason to fail the upload, which landed. A rewrite that did not
+/// happen is a line in `warnings`, because that next tick may then undo the
+/// choice.
+void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
+                      const SyncOperation& operation, const SaveTarget& target,
+                      const std::string& source, const std::string& sent_digest,
+                      std::int64_t own_id, std::optional<Timestamp> landed,
+                      const ExecuteOptions& options, OperationResult* uploaded,
+                      std::vector<std::string>* warnings) {
+  const std::string unsettled =
+      Describe(operation) + ": the Keep local upload may share its second with another "
+                            "device's upload of this save, and was not moved past it ";
+  std::this_thread::sleep_for(kTieWait);
+  if (options.cancel != nullptr && options.cancel->canceled()) {
+    warnings->push_back(unsettled + "(the tick was cancelled)");
+    return;
+  }
+  const state::HashOutcome digest = state::HashFile(source);
+  if (!digest.ok() || (!sent_digest.empty() && digest.content_hash != sent_digest)) {
+    // The card moved since the upload. Those are new bytes, and the next tick
+    // offers them like any -- in a later second.
+    warnings->push_back(unsettled + "(the save changed on the card since)");
+    return;
+  }
+
+  // `device_id` and `content_hash` keep this device's history against the row
+  // as the upload left it.
+  std::string url = http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
+                                                        std::to_string(own_id)) +
+                    "?device_id=" + http::EncodeQueryValue(token.device_id);
+  if (options.send_content_hash) {
+    url += "&content_hash=" + digest.content_hash;
+  }
+  http::Request request =
+      Authed(http::Method::kPut, std::move(url), token, options.timeout, options.cancel);
+  http::FormPart part;
+  part.name = "saveFile";
+  part.file_path = source;
+  part.file_name = target.file_name;
+  part.content_type = "application/octet-stream";
+  request.form.push_back(std::move(part));
+  const http::Result rewritten = client.Send(request);
+  if (!rewritten.successful()) {
+    warnings->push_back(unsettled + "(" +
+                        (rewritten.ok() ? "HTTP " + std::to_string(rewritten.response.status)
+                                        : std::string(http::ToString(rewritten.error))) +
+                        ")");
+    return;
+  }
+  const std::optional<Timestamp> moved_to = UpdatedAtOf(rewritten.response.body);
+  if (landed.has_value() && (!moved_to.has_value() || *moved_to <= *landed)) {
+    warnings->push_back(unsettled + "(it is still in that second)");
+    return;
+  }
+  uploaded->message += ", and rewritten a second later to be the slot's newest";
+}
+
 /// `POST /api/saves?...&content_hash=<md5>&overwrite=false` with the local file
 /// as `saveFile`.
 OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                        const auth::StoredToken& token, const SyncPlan& plan,
                        const SyncOperation& operation, const SaveTarget* target,
-                       const ExecuteOptions& options) {
+                       const ExecuteOptions& options, std::vector<std::string>* warnings) {
   if (target == nullptr) {
     return Fail(operation, OperationError::kNoLocalSave,
                 "there is no local save for this (rom_id, slot) to upload");
@@ -747,6 +847,7 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
   }
   url += "&session_id=" + std::to_string(plan.session_id);
   url += "&device_id=" + http::EncodeQueryValue(token.device_id);
+  std::string sent_digest;
   if (options.send_content_hash) {
     // Hashed here, just before the transport streams the file, rather than
     // taken from the scan: the card may have moved on since step 0, and RomM
@@ -764,6 +865,7 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
                       " could not be hashed to upload: " + digest.message);
     }
     url += "&content_hash=" + digest.content_hash;
+    sent_digest = digest.content_hash;
   }
   // `overwrite=false` is RomM's slot guard, asked for by name: a slot that holds
   // a save this device has not synced -- another device's, since the plan was
@@ -807,6 +909,15 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
     // operation over an unreadable answer would have the next tick upload it a
     // second time -- which RomM stores as a second save row.
     uploaded.save_id = SaveIdOf(document.value);
+  }
+  if (KeepsLocal(options, operation) && uploaded.save_id.has_value()) {
+    // The one upload that went over the guard, and so the one that can land in
+    // the second another device's did (#272). The second it landed in is read
+    // off the answer: MariaDB truncates the fraction the answer still carries,
+    // and `ParseTimestamp` drops it the same way.
+    OutlastTheSecond(client, token, operation, *target, source, sent_digest,
+                     *uploaded.save_id, UpdatedAtOf(result.response.body), options, &uploaded,
+                     warnings);
   }
   return uploaded;
 }
@@ -1405,7 +1516,7 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       const SaveTarget* target = MatchTarget(targets, operation);
       switch (operation.action) {
         case Action::kUpload:
-          result = Upload(client, files, token, plan, operation, target, options);
+          result = Upload(client, files, token, plan, operation, target, options, &report.warnings);
           break;
         case Action::kDownload:
           result = Fetch(client, files, token, operation, target, options,

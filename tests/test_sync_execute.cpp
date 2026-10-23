@@ -654,6 +654,7 @@ class Scripted final : public http::HttpClient {
 
   http::Result Send(const http::Request& request) override {
     urls.push_back(request.url);
+    methods.push_back(request.method);
     http::Result result;
     result.response.status = status_;
     result.response.body = body_;
@@ -667,6 +668,7 @@ class Scripted final : public http::HttpClient {
   }
 
   std::vector<std::string> urls;
+  std::vector<http::Method> methods;
 
  private:
   int status_;
@@ -701,15 +703,56 @@ void Overwrite(rig::Checks& checks) {
     const sync::ExecutionReport report =
         sync::ExecutePlan(accepted, *files, token, plan, targets, options);
     checks.ExpectEq(report.completed, 2, "both uploads are accepted");
-    if (accepted.urls.size() == 2) {
+    checks.Expect(report.warnings.empty(),
+                  "with nothing to say" +
+                      (report.warnings.empty() ? std::string() : ": " + report.warnings[0]));
+    // A POST per upload, and the Keep local's row rewritten in place after it
+    // (#272): the second has to turn under it, so the row is its slot's newest
+    // however RomM's negotiate breaks a tie.
+    if (accepted.urls.size() == 3) {
       checks.Expect(accepted.urls[0].find("overwrite=false") != std::string::npos &&
                         accepted.urls[0].find("overwrite=true") == std::string::npos,
                     "an upload the plan asked for respects the slot guard: " + accepted.urls[0]);
       checks.Expect(accepted.urls[1].find("overwrite=true") != std::string::npos,
                     "and only an explicit Keep local overrides it: " + accepted.urls[1]);
+      checks.Expect(accepted.methods[2] == http::Method::kPut &&
+                        accepted.urls[2].find("/api/saves/41?") != std::string::npos &&
+                        accepted.urls[2].find("device_id=this-console") != std::string::npos,
+                    "which then rewrites the row it wrote, as this device: " + accepted.urls[2]);
     } else {
-      checks.Expect(false, "one request per upload, got " + std::to_string(accepted.urls.size()));
+      checks.Expect(false, "a request per upload and the Keep local's rewrite, got " +
+                               std::to_string(accepted.urls.size()));
     }
+  }
+
+  // A rewrite that does not happen leaves the upload standing -- it landed --
+  // and is said, because the next tick may then undo the choice (#272).
+  {
+    class RefusesTheRewrite final : public http::HttpClient {
+     public:
+      http::Result Send(const http::Request& request) override {
+        http::Result result;
+        result.response.status = request.method == http::Method::kPut ? 503 : 201;
+        result.response.body = R"({"id":41,"updated_at":"2026-10-23T18:00:00.250000+00:00"})";
+        return result;
+      }
+      http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+        http::Result result;
+        result.error = http::Error::kConnectFailed;
+        return result;
+      }
+    } refuses;
+    sync::SyncPlan one = plan;
+    one.operations.erase(one.operations.begin());
+    sync::ExecuteOptions options = OptionsAt(1'757'000'002);
+    options.keep_local = {{8, std::string("kept")}};
+    const sync::ExecutionReport report =
+        sync::ExecutePlan(refuses, *files, token, one, targets, options);
+    checks.ExpectEq(report.completed, 1, "the Keep local upload still counts as done");
+    checks.Expect(report.warnings.size() == 1 &&
+                      report.warnings[0].find("not moved past it (HTTP 503)") != std::string::npos,
+                  "and the rewrite that failed is said: " +
+                      (report.warnings.empty() ? std::string("nothing") : report.warnings[0]));
   }
 
   // Refused with the guard's own answer.
@@ -2620,8 +2663,9 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   // to the whole second, and a tie goes to whichever row its unordered query
   // returns first -- the occupant. Arbitrating against the occupant, this device
   // has no history, and the sync-history check below would fail for a reason
-  // that has nothing to do with whether the upload recorded one (#265; the
-  // product's side of the tie is #272).
+  // that has nothing to do with whether the upload recorded one (#265). The
+  // executor now settles that tie itself (#272, `tie` below); the wait keeps
+  // this scenario about the guard rather than about the tie.
   harness::PassASecond();
   sync::ExecuteOptions keep = OptionsAt(1'757'000'011);
   keep.keep_local = {{rom.id, slot}};
