@@ -2638,9 +2638,9 @@ void Corrupted(rig::Checks& checks, http::HttpClient& client, const std::string&
 // anything.
 //
 // It also pins what the flag does *not* do. It does not stop a slot accreting a
-// row per upload: RomM matches the existing row by a second-granularity datetime
-// tag it computes at ingest, so only an upload inside the same second as the
-// previous one lands on the same row (issue #85, and docs/API_CONTRACT.md).
+// row per upload: RomM 5.4.0 reserves a fresh name for every slotted upload, and
+// `overwrite=true` even turns off the promotion that would otherwise answer
+// identical bytes with the row already holding them (docs/API_CONTRACT.md).
 
 void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& base,
               const Fixture& fixture, const harness::Rom& rom) {
@@ -2730,20 +2730,14 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   // assumed -- and **this scenario asserted the wrong thing until it went red in
   // CI**. It does not reliably replace the occupying row.
   //
-  // RomM stamps a slot upload with a second-granularity datetime tag and then
-  // looks the existing row up *by that tagged name*
-  // (`_apply_datetime_tag` and `get_save_by_filename` in `endpoints/saves.py`,
-  // 5.2.0). So a POST replaces the row in place only when it lands in the same
-  // wall-clock second as the ingest that created it, with the same base file
-  // name; one second later the name it computes matches nothing and RomM writes
-  // a **second** row. That is a race, and it is the one this scenario used to
-  // win on a fast laptop and lose in CI (issue #85).
-  //
-  // So the identity assertion is made in the only direction that is
-  // deterministic: after a second has certainly passed, a new row appears and
-  // the occupant is left alone. The same-second case is real and is what made
-  // the old assertion pass; it is deliberately not asserted, because a test that
-  // has to win a race is a test that reports the machine's speed.
+  // 5.2.0 looked the existing row up by a second-granularity datetime tag, so a
+  // POST replaced the row in place only inside the second of the ingest that
+  // created it -- a race this scenario used to win on a fast laptop and lose in
+  // CI (issue #85). 5.4.0 reserves a fresh tagged name for every slotted upload
+  // (`reserve_version_name`, `handler/asset_store.py`), so the re-post below is
+  // a second row however fast it lands, and under `overwrite=true` that holds
+  // even for the same bytes. The wait before it stays: it costs two seconds and
+  // keeps the assertion from resting on which release the fixture runs.
   // Every row this scenario leaves on the fixture, removed on the way out
   // however it exits. `save_id` is best-effort on an `OperationResult` -- it is
   // parsed for the report and decides nothing -- so an upload can succeed and
