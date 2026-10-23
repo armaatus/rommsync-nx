@@ -369,17 +369,23 @@ std::vector<config::Diagnostic> Notes(const config::Config& config, const Settin
                          "which are not read unless [sources] retroarch_content_dir = on, so "
                          "RetroArch's states are not synced"));
   }
+  // Not read, and said with the remedy (#264): the player reads this on the
+  // console, so it names RetroArch's own menu entry (`intl/msg_hash_us.h`,
+  // v1.22.2) rather than a retroarch.cfg key. Both sentences stay under
+  // `ipc::kMaxDiagnosticTextBytes`, which would otherwise cut the remedy off.
   if (settings.sort_savefiles_by_content && config.sync.saves) {
     notes.push_back(Note(Severity::kWarning,
                          "RetroArch sorts saves by content directory "
-                         "(sort_savefiles_by_content_enable), a layout this client does not "
-                         "read, so RetroArch's saves are not synced"));
+                         "(sort_savefiles_by_content_enable), which this client does not read, "
+                         "so they are not synced: in RetroArch, turn off Settings > Saving > "
+                         "Sort Saves into Folders by Content Directory"));
   }
   if (settings.sort_savestates_by_content && config.sync.states) {
     notes.push_back(Note(Severity::kWarning,
                          "RetroArch sorts states by content directory "
-                         "(sort_savestates_by_content_enable), a layout this client does not "
-                         "read, so RetroArch's states are not synced"));
+                         "(sort_savestates_by_content_enable), which this client does not read, "
+                         "so they are not synced: in RetroArch, turn off Settings > Saving > "
+                         "Sort Save States into Folders by Content Directory"));
   }
   return notes;
 }

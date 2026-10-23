@@ -18,10 +18,12 @@
 
 #include "checks.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/ipc.hpp"
 #include "rommsync/retroarch_cfg.hpp"
 #include "scratch.hpp"
 
 namespace config = rommsync::config;
+namespace ipc = rommsync::ipc;
 namespace retroarch = rommsync::retroarch;
 
 namespace {
@@ -293,6 +295,32 @@ void Notes(checks::Checks& c) {
   c.Expect(Mentions(retroarch::Notes(automatic, by_content), "sort_savefiles_by_content_enable",
                     config::Severity::kWarning),
            "a per-content-directory layout is said not to be read");
+
+  // ...and says what to change, in RetroArch's own words (#264): the menu path
+  // and the label are `intl/msg_hash_us.h` at v1.22.2, the build #230 pinned.
+  // The player is reading this on the console, with RetroArch's menu one
+  // button away and no retroarch.cfg in sight.
+  c.Expect(Mentions(retroarch::Notes(automatic, by_content),
+                    "turn off Settings > Saving > Sort Saves into Folders by Content Directory",
+                    config::Severity::kWarning),
+           "the saves warning names the RetroArch setting to turn off");
+  retroarch::Settings states_by_content;
+  states_by_content.sort_savestates_by_content = true;
+  const config::Config with_states = WithSources("[sync]\nstates = true\n");
+  c.Expect(Mentions(retroarch::Notes(with_states, states_by_content),
+                    "turn off Settings > Saving > Sort Save States into Folders by Content "
+                    "Directory",
+                    config::Severity::kWarning),
+           "and the states warning names its own");
+  // The settings screen gets these through `GetConfig`, which cuts a message at
+  // `ipc::kMaxDiagnosticTextBytes` -- and the cut would land on the remedy.
+  retroarch::Settings both = by_content;
+  both.sort_savestates_by_content = true;
+  for (const config::Diagnostic& note : retroarch::Notes(with_states, both)) {
+    c.Expect(note.message.size() <= ipc::kMaxDiagnosticTextBytes,
+             "reaches the overlay uncut (" + std::to_string(note.message.size()) +
+                 " bytes): " + note.message);
+  }
 
   // A value [sources] does not know is a warning, and the default stands.
   const config::LoadResult typo =
