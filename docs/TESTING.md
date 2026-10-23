@@ -957,9 +957,26 @@ ctest --test-dir build --output-on-failure
   These are host numbers: the host's standard library, C++ allocations only
   (libcurl's are the host transport's), and a fixture library of a few roms.
   What carries to the console is the shape -- flat or growing -- and the order
-  of magnitude of a tick. Not done here: curl-style OOM injection (fail
-  allocation *N* on run *N*), and `libfaketime` to run the scheduler's own
-  clock fast -- the soak asks for each tick instead of waiting for one.
+  of magnitude of a tick.
+- **The heap running out, at every allocation** (M9-23, #250). `test_oom` is
+  curl's OOM injection: `count_new::FailAt(n)` fails the *n*th allocation from
+  now, once, and a run counts what one tick -- or one rom download -- allocates
+  and then fails each of them in turn, one child process per allocation.
+  The child dies the way the console would: a throwing `new` that fails is a
+  `bad_alloc` nothing catches, which under the sysmodule's `-fno-exceptions` is
+  `std::terminate`, with no destructor run and no file closed. The sysmodule's
+  terminate handler (`sysmodule/source/last_words.cpp`) is installed in the child
+  as `main.cpp` installs it, and writes `process.terminated` with the exception's
+  type to the log without allocating (`log::WriteLast`) before it aborts. The
+  parent reads what the death left: the log's last line has to say why, and,
+  after the next boot's sweep, `oom.tick`'s save is its old bytes or the
+  server's -- the server's only beside a backup of the old (`crash::OldOrNew`)
+  -- and `oom.download`'s rom is whole or absent, `queue.json` still reads and
+  the save beside the rom is untouched. `oom.last_words` holds the line and the
+  handler on their own. The server's answers are recorded once from the rig
+  and replayed in every child, because a tick that completed would change the
+  next one's plan and allocation *N* has to be the same allocation every run.
+  A tick is a few hundred allocations, so every one is failed on every push.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two

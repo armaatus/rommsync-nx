@@ -47,6 +47,7 @@
 #include "http/http_wire.hpp"
 #include "http/ssl_http_client.hpp"
 #include "ipc/server.hpp"
+#include "last_words.hpp"
 #include "power.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/conflict_log.hpp"
@@ -1729,6 +1730,11 @@ int main(int, char**) {
   g_log = std::make_unique<rommsync::log::FileSink>(
       std::string(rommsync::sysmodule::kConfigDir) + rommsync::log::kLogFileName);
   rommsync::log::SetSink(g_log.get());
+  // From here a `std::terminate` -- a `bad_alloc` above all, under
+  // `-fno-exceptions` -- writes `process.terminated` to that file before it
+  // aborts, rather than leaving a sysmodule that is simply gone (#250,
+  // last_words.hpp). Not earlier: before the sink there is nowhere to write.
+  rommsync::sysmodule::InstallLastWords();
 
   // What `__appInit` could not say at the time, now that there is somewhere to
   // say it (M9-1, #195). It is first, before even the version line, because a

@@ -111,6 +111,7 @@ and a log is not worth it. A save is never in that position; see
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
+| `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -935,6 +936,38 @@ folder map ([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-def
 For a game with too many saves on the server, delete old versions in RomM's web
 UI. For a library past the index, nothing on the console helps yet; the roms
 with the lowest ids are the ones matched.
+
+---
+
+## The sysmodule stopped
+
+**Symptom.** The overlay says `sys-rommsync` is not running, and the last line
+of the log is this one:
+
+```
+812 error process.terminated an uncaught St9bad_alloc: the heap is spent, and the sysmodule stopped
+```
+
+**What it means.** The sysmodule ran out of memory — it lives in a fixed heap
+of about 1.5 MiB — and stopped. Something the standard library refused ends
+the process the same way, named by its type instead (`St12length_error`). Either
+way it is a bug in the client, not in your setup: the heap is sized for the
+largest library and server answers the code accepts, and a stop means one of
+those bounds is wrong.
+
+**What it costs.** Nothing that is not picked up again. Every save is backed
+up before it is overwritten and every write is atomic, so a stop part way
+through a sync leaves each save as it was or as the server had it, with a
+backup of the old copy under `config/rommsync/.backup/`
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#backups)). A rom part way down is resumed
+or started again. A test runs a sync and a download with the memory running
+out at every single point they allocate, and holds each one to exactly this.
+
+**What to do.** Reboot the console to start the sysmodule again, and report it
+with the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug-report)):
+the lines before this one say what it was doing. If it happens on every boot,
+move `config/rommsync/queue.json` out of the way first — a queue is the one
+thing a boot reads that grows with what you asked for.
 
 ---
 

@@ -2627,6 +2627,43 @@ foreach(name alloc.steady soak.smoke)
   set_tests_properties(${name} PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M9-23 (#250): an allocation failing at every point --------------------------
+# curl's OOM injection over a tick and a rom download: count the allocations,
+# then fail allocation N in a child process for each N, and judge what the
+# death left on the card (tests/test_oom.cpp). Its own executable for
+# test_heap_steady's reason -- it replaces the global allocation functions --
+# with the sysmodule's terminate handler compiled in, which is what writes the
+# line each child is held to.
+#
+# Every allocation, not a sample: a tick is a few hundred and a child is a
+# millisecond or two, so the whole sweep is about a second. Serial with the
+# other rig tests for the reason they are: the recording run negotiates as the
+# shared fixture device.
+add_executable(test_oom test_oom.cpp count_new.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/last_words.cpp")
+target_link_libraries(test_oom PRIVATE rommsync::host)
+target_include_directories(test_oom PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_oom PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_compile_options(test_oom PRIVATE
+    -fno-builtin-operator-new -fno-builtin-operator-delete)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  target_compile_options(test_oom PRIVATE -fno-allocation-dce)
+endif()
+add_test(NAME oom.last_words COMMAND test_oom last_words)
+set_tests_properties(oom.last_words PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+foreach(scenario tick download)
+  add_test(NAME oom.${scenario} COMMAND test_oom ${scenario})
+  if(NOT ROMMSYNC_REQUIRE_RIG)
+    set_tests_properties(oom.${scenario} PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  set_tests_properties(oom.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+endforeach()
+
 # The nightly soak's two halves that are not the soak itself: the workflow that
 # runs it on a schedule and keeps what it measured, and the check on main that
 # goes red when it has stopped passing (scripts/soak-fresh.sh), and that check's

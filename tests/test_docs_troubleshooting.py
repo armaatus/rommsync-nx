@@ -87,6 +87,10 @@ SECTIONS = [
     "Tico saves from the wrong account, or none",
     "RomM calls a platform something else",
     "Some saves are left out: the limits",
+    # M9-23 (#250). `process.terminated` is the sysmodule's last line before a
+    # `std::terminate` -- out of memory, under `-fno-exceptions` -- and before it
+    # a sysmodule that stopped left nothing to read at all.
+    "The sysmodule stopped",
     "What to attach to a bug report",
     "What this page cannot tell you yet",
 ]
@@ -309,13 +313,14 @@ def phase_emitted(args) -> int:
 
     body = "\n".join(strip_comments(read(path)) for path in sorted(sources))
 
-    # A *call*, not a mention: one of the five entry points, an open paren, and
+    # A *call*, not a mention: one of the six entry points -- `WriteLast` is the
+    # dying process's (#250) -- an open paren, and
     # the event within the same statement. The level argument in between may be a
     # literal or a call (`LevelFor(note.severity)`), so it is matched loosely and
     # bounded by the statement's own semicolon.
     orphans = sorted(
         tag for tag, name in known.items()
-        if not re.search(rf"\b(?:Error|Warn|Info|Write|WriteEach)\s*\([^;]{{0,80}}?"
+        if not re.search(rf"\b(?:Error|Warn|Info|Write|WriteEach|WriteLast)\s*\([^;]{{0,80}}?"
                          rf"Event::{name}\b", body))
     if orphans:
         return fail(f"docs/TROUBLESHOOTING.md documents {orphans}, and nothing outside the "

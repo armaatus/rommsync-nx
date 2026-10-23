@@ -1,6 +1,8 @@
 #include "rommsync/log.hpp"
 
 #include <array>
+#include <atomic>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -28,6 +30,13 @@ struct State {
   bool sink_enabled = true;
 
   std::uint64_t written = 0;
+
+  /// `sink`, `sink_enabled` and `written` again, stored on every change for
+  /// `WriteLast` alone: it cannot wait for the lock above, and these are what
+  /// it reads when it cannot have it.
+  std::atomic<Sink*> last_sink{nullptr};
+  std::atomic<bool> last_enabled{true};
+  std::atomic<std::uint64_t> last_written{0};
 
   /// The last `kTailLines` lines, as a fixed ring rather than a container that
   /// grows at one end and shrinks at the other (M9-15, #204).
@@ -354,6 +363,8 @@ const char* ToString(Event event) {
       return "download.remote";
     case Event::kPlayRecorded:
       return "play.recorded";
+    case Event::kTerminated:
+      return "process.terminated";
   }
   return "unknown";
 }
@@ -386,6 +397,7 @@ void SetSink(Sink* sink) {
   State& state = TheLog();
   std::lock_guard<std::mutex> lock(state.mutex);
   state.sink = sink;
+  state.last_sink.store(sink, std::memory_order_relaxed);
 }
 
 Sink* GetSink() {
@@ -398,6 +410,7 @@ void SetSinkEnabled(bool enabled) {
   State& state = TheLog();
   std::lock_guard<std::mutex> lock(state.mutex);
   state.sink_enabled = enabled;
+  state.last_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 bool SinkEnabled() {
@@ -414,6 +427,7 @@ void Write(Level level, Event event, std::string_view detail) {
     std::lock_guard<std::mutex> lock(state.mutex);
 
     const std::uint64_t ordinal = ++state.written;
+    state.last_written.store(ordinal, std::memory_order_relaxed);
     line = std::to_string(ordinal);
     line += ' ';
     line += ToString(level);
@@ -468,6 +482,54 @@ void Write(Level level, Event event, std::string_view detail) {
   if (sink != nullptr) {
     sink->Write(level, line);
   }
+}
+
+void WriteLast(Event event, std::string_view detail) noexcept {
+  State& state = TheLog();
+  std::uint64_t ordinal = 0;
+  Sink* sink = nullptr;
+  bool enabled = false;
+  if (state.mutex.try_lock()) {
+    ordinal = ++state.written;
+    state.last_written.store(ordinal, std::memory_order_relaxed);
+    sink = state.sink;
+    enabled = state.sink_enabled;
+    state.mutex.unlock();
+  } else {
+    ordinal = state.last_written.load(std::memory_order_relaxed) + 1;
+    sink = state.last_sink.load(std::memory_order_relaxed);
+    enabled = state.last_enabled.load(std::memory_order_relaxed);
+  }
+  if (sink == nullptr || !enabled) {
+    return;
+  }
+
+  std::array<char, kMaxLineBytes> line{};
+  std::size_t used = 0;
+  const auto append = [&line, &used](std::string_view text) {
+    const std::size_t room = line.size() - used;
+    const std::size_t take = text.size() < room ? text.size() : room;
+    std::memcpy(line.data() + used, text.data(), take);
+    used += take;
+  };
+  const std::to_chars_result rendered =
+      std::to_chars(line.data(), line.data() + line.size(), ordinal);
+  used = static_cast<std::size_t>(rendered.ptr - line.data());
+  append(" ");
+  append(ToString(Level::kError));
+  append(" ");
+  append(ToString(event));
+  if (!detail.empty()) {
+    append(" ");
+    append(detail);
+  }
+  // One line, whatever `detail` held: `Flatten`'s rule, done in place.
+  for (std::size_t at = 0; at < used; ++at) {
+    if (line[at] == '\n' || line[at] == '\r' || line[at] == '\t') {
+      line[at] = ' ';
+    }
+  }
+  sink->WriteLast(Level::kError, std::string_view(line.data(), used));
 }
 
 void WriteEach(Level level, Event event, const std::vector<std::string>& lines) {
@@ -527,6 +589,8 @@ void Reset() {
   // scenario that put a console to sleep (M9-4, #208) and reset afterwards would
   // otherwise leave the next one silently writing nothing to its sink.
   state.sink_enabled = true;
+  state.last_enabled.store(true, std::memory_order_relaxed);
+  state.last_written.store(0, std::memory_order_relaxed);
 }
 
 std::string PreviousLogPathFor(std::string_view path) { return std::string(path) + ".old"; }
@@ -544,6 +608,18 @@ void FileSink::RotateLocked() {
   if (std::rename(path_.c_str(), previous.c_str()) == 0) {
     bytes_ = 0;
   }
+}
+
+void FileSink::WriteLast(Level, std::string_view line) noexcept {
+  std::FILE* file = std::fopen(path_.c_str(), "ab");
+  if (file == nullptr) {
+    return;
+  }
+  // Before the first write, which is when stdio would allocate its buffer.
+  std::setvbuf(file, nullptr, _IONBF, 0);
+  std::fwrite(line.data(), 1, line.size(), file);
+  std::fputc('\n', file);
+  std::fclose(file);
 }
 
 void FileSink::Write(Level, std::string_view line) {

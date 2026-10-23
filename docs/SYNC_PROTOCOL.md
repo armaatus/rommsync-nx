@@ -605,6 +605,11 @@ check on those assumptions, and is not in the suite. Every replay drives the
 host backend; the Horizon one (`http_wire.cpp`) syncs its `.part` through the
 same `io::Sync`, and nothing off a console runs it under the replay (#44).
 
+A process that **runs out of memory** mid-overwrite is the same question asked
+of a death rather than a power cut, and `oom.tick` asks it at every allocation a
+tick makes (#250, docs/TESTING.md): the save is old or new, new only beside a
+backup of the old, and the log's last line says the sysmodule stopped.
+
 #### A write after the backup (#263)
 
 A backup is a copy of the save *as it was when copied*. A game that writes the

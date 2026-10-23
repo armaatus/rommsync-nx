@@ -202,6 +202,14 @@ enum class Event {
   /// The one place a title is seen, because the completion that carries the
   /// session usually releases it from `play.db` in the same tick.
   kPlayRecorded,
+
+  /// The process is ending in `std::terminate` (#250), and this is the last
+  /// thing it says. Under `-fno-exceptions` (`switch.mk`) a `bad_alloc` -- the
+  /// 1.5 MiB heap spent -- or any other throw from the standard library ends
+  /// here, and before this line it ended with no crash report anybody could
+  /// read. Written by `WriteLast`, which allocates nothing, because the usual
+  /// cause is that there is nothing left to allocate.
+  kTerminated,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -215,7 +223,7 @@ inline constexpr std::array kAllEvents = {
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
     Event::kSyncHeld,    Event::kSaveDeleted, Event::kRemoteInstall,
-    Event::kPlayRecorded,
+    Event::kPlayRecorded, Event::kTerminated,
 };
 
 /// Stable tag -- `net.offline`. Never null.
@@ -273,6 +281,15 @@ class Sink {
   /// logged, and two sinks may be called at once. `FileSink` owns a lock of its
   /// own for that reason.
   virtual void Write(Level level, std::string_view line) = 0;
+
+  /// The same, from a process that is about to end and may have no heap left
+  /// to allocate from (`WriteLast`). **Must not allocate**, must not take a
+  /// lock the dying thread may already hold, and must not throw. A sink that
+  /// cannot honour all three writes nothing, which is the default.
+  virtual void WriteLast(Level level, std::string_view line) noexcept {
+    static_cast<void>(level);
+    static_cast<void>(line);
+  }
 
  protected:
   Sink() = default;
@@ -346,6 +363,26 @@ void Write(Level level, Event event, std::string_view detail);
 inline void Error(Event event, std::string_view detail) { Write(Level::kError, event, detail); }
 inline void Warn(Event event, std::string_view detail) { Write(Level::kWarn, event, detail); }
 inline void Info(Event event, std::string_view detail) { Write(Level::kInfo, event, detail); }
+
+/// The one line a dying process writes: `<ordinal> error <event> <detail>`,
+/// rendered on the stack and handed to the sink's `WriteLast` (#250).
+///
+/// **It allocates nothing**, because what calls it is `std::terminate`, and on
+/// the console that is most often a `bad_alloc`: a line that needed a
+/// `std::string` would be the second allocation to fail. So it differs from
+/// `Write` in exactly the ways that cost memory or could deadlock:
+///
+///   * `detail` is not redacted. The caller passes text it built itself -- an
+///     exception's type name -- never a value that came off the network.
+///   * The ring is not written: nothing can read it after the process ends.
+///   * The log's lock is only *tried*. The thread that ran out of memory may be
+///     inside `Write` holding it, and waiting for it would hang the console
+///     instead of ending the process; without it the ordinal is the last one
+///     written, read without the lock.
+///
+/// Honours `SetSinkEnabled(false)`: a sleeping console's card is off-limits
+/// even to its last words.
+void WriteLast(Event event, std::string_view detail) noexcept;
 
 /// Every line of `text`, split on newlines, as one log line each.
 ///
@@ -488,6 +525,11 @@ class FileSink : public Sink {
   explicit FileSink(std::string path, std::size_t max_bytes = kMaxFileBytes);
 
   void Write(Level level, std::string_view line) override;
+
+  /// Appends without `mutex_` and without rotating -- the file may run one line
+  /// past `max_bytes`, which beats a hang -- and unbuffered, so `stdio` never
+  /// allocates a buffer for it.
+  void WriteLast(Level level, std::string_view line) noexcept override;
 
   const std::string& path() const { return path_; }
 
