@@ -929,11 +929,11 @@ A removed command leaves a hole.
 | 11 | `ListBegin` | `ListRequest` -> cursor | never fails |
 | 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
-| 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` | never fails; an empty history is a page |
+| 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` (each row with `backup_present` and `keep_local`: `open \| held \| waiting`) | never fails; an empty history is a page |
 | 15 | `RestoreBackup` | `entry_id` -> `RestoreState` (phase + which entry) | never fails, never waits for the copy; a press while one runs answers that one |
 | 16 | `GetLog` | `lines` -> the last N log lines + how many were ever written | never fails; an empty tail is an answer |
-| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed \| not_a_conflict \| changed_since_backup \| superseded \| game_running \| keep_local_full` |
-| 18 | `KeepLocal` | `entry_id` -> `RestoreState` | never fails; `RestoreBackup` for a save conflict, and the next upload of it goes with `overwrite=true`; refused, nothing written, when superseded, under a running game, or with `sync::kMaxKeepLocal` waiting |
+| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed \| not_a_conflict \| changed_since_backup \| superseded \| keep_local_full \| held` |
+| 18 | `KeepLocal` | `entry_id` -> `RestoreState` | never fails; `RestoreBackup` for a save conflict, and the next upload of it goes with `overwrite=true`; refused, nothing written, when superseded or with `sync::kMaxKeepLocal` waiting; `held`, nothing written yet, under a running game -- it lands when the game closes |
 
 `RestoreBackup` and `GetRestoreState` are one restore in two calls, since M9-6
 (#209). A restore copies a whole save, and a save is as large as a game makes
@@ -954,7 +954,8 @@ a restore standing down over a file written after its backup,
 `[sync] slot`, `map_state_slots`, `[tico] account` with the accounts the last
 tick found, and each platform's `play_with` (M10-31, #271) made it 11, and Keep
 local's refusals `superseded`, `game_running` and `keep_local_full` (M10-33,
-#273) made it 12.
+#273) made it 12, and `held` in place of `game_running` with a conflict row's
+`keep_local` (M10-34, #275) made it 13.
 
 `KeepLocal` is the conflicts screen's Keep local (#249): a restore of a save
 conflict's backup, polled the same way, after which the sysmodule arms that

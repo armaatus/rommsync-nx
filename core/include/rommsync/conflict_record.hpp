@@ -97,9 +97,9 @@ struct RestoreOptions {
   std::function<sync::Timestamp()> now;
 
   /// `KeepLocal` only: a game is in the foreground, as the caller found it --
-  /// `core/` has no foreground to look at. Refused after the entry's own
-  /// refusals, so a choice that could never be taken says why rather than
-  /// "close the game" first (#273).
+  /// `core/` has no foreground to look at. The choice is then **held** rather
+  /// than written (#275), and only after the entry's own refusals, so a choice
+  /// that could never be taken says why rather than being held first (#273).
   bool game_running = false;
 };
 
@@ -154,9 +154,14 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 ///       - with `kKeepLocalFull` when `armed` -- the choices already waiting --
 ///         holds `sync::kMaxKeepLocal` keys and not this one (#273), so that
 ///         `sync::ArmKeepLocal` never has to refuse bytes already restored;
-///       - with `kGameRunning` when `options.game_running` says so (#273): the
-///         game would save over the kept bytes when it closes;
-///   - on `kRestored` only, `*key` is the conflict's `(rom_id, slot)`, which the
+///   - it is **held**, with nothing written -- not even a backup -- when
+///     `options.game_running` says a game is in the foreground (#275): the
+///     game would save over the kept bytes when it closes. `kHeld`, and `*key`
+///     is set: the caller keeps it and calls `KeepLocal` again, with no game,
+///     once none runs. That call's `Restore` backs up whatever the game wrote
+///     meanwhile and puts the kept bytes over it -- the player chose them under
+///     that game, knowing it was running, and the screen said when they land;
+///   - on `kRestored`, `*key` is the conflict's `(rom_id, slot)`, which the
 ///     caller arms (`sync::ArmKeepLocal`) for the next tick. That upload is then
 ///     the one sent with `overwrite=true` (`sync::ExecuteOptions::keep_local`);
 ///     every other upload still meets RomM's slot guard.
@@ -167,6 +172,13 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 /// this console's lineage; it deletes no other row. A head written by another
 /// lineage, even one this console does not load (#236), stays on the server as
 /// that lineage's newest save.
+/// The newest `kSave` entry of `key`'s save, of any event, or null (#273).
+///
+/// The one Keep local applies to: an older conflict is `kSuperseded`. Also how
+/// a held choice (#275), which keeps only its key, finds its entry again, and
+/// how the conflicts page tells which row a waiting choice belongs to.
+const Entry* NewestSaveEntry(const History& history, const state::Baseline::Key& key);
+
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
                         const std::vector<state::Baseline::Key>& armed,
                         state::Baseline::Key* key, const RestoreOptions& options = {});

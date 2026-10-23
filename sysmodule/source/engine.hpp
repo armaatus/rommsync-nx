@@ -397,7 +397,8 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// answer that names one is a sighting (`play::Sightings`), and the tick after
   /// the game gives each play session the application seen when its save was
   /// written -- "unknown" when none was. Only a tick that falls due, its hold,
-  /// a "Sync now" press and a Keep local's restore (#273) ask, so a game played
+  /// a "Sync now" press, a Keep local's restore (#273) and the poll that lands a
+  /// held one (#275) ask, so a game played
   /// entirely between two ticks is never seen: deliberately, because asking
   /// between ticks would be a poll on a console with nothing owed, which #242
   /// keeps at none.
@@ -647,10 +648,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// #249: `RequestRestore`, taken and run the same way, through
   /// `conflicts::KeepLocal`. Once the bytes are back, the conflict's
   /// `(rom_id, slot)` is armed in `keep_local_` and a tick is asked for, whose
-  /// upload of that save is the one sent with `overwrite=true`. Refused with
-  /// nothing written while a game is in the foreground (`application_running`,
-  /// asked at the write), and by `conflicts::KeepLocal` for a superseded entry
-  /// or with `sync::kMaxKeepLocal` already waiting (#273).
+  /// upload of that save is the one sent with `overwrite=true`. Refused by
+  /// `conflicts::KeepLocal` for a superseded entry or with
+  /// `sync::kMaxKeepLocal` already waiting, held and armed together (#273).
+  /// **Held** with nothing written while a game is in the foreground
+  /// (`application_running`, asked at the write; #275): the key goes into
+  /// `keep_local_held_`, and the worker lands it once no application runs
+  /// (`LandHeldKeepLocal`), ahead of the tick that uploads it.
   ipc::RestoreState RequestKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
 
@@ -1067,6 +1071,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// to the worker or run it here (#209). `keep_local` is which of the two.
   ipc::RestoreState TakeRestore(std::int64_t entry_id, bool keep_local);
 
+  /// #275: land every Keep local held under a game, on the worker, once the
+  /// probe has said no application runs. Each is `conflicts::KeepLocal` again
+  /// on its save's newest entry, with no game: the card's bytes -- what the
+  /// game wrote on close -- are backed up first and the kept bytes go over
+  /// them, then the key is armed as any landed choice's. One that does not
+  /// land is dropped and logged; the row is open again and the press can be
+  /// repeated. `ask_tick` asks for the tick that uploads them, which the
+  /// caller about to run one does not need.
+  void LandHeldKeepLocal(bool ask_tick);
+
   /// The restore `TakeRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when
   /// there is no worker; `mutex_` not held, because a restore is card I/O.
@@ -1378,6 +1392,15 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// ends in a conflict with them backed up and archived -- the player is asked
   /// again rather than anything being lost.
   std::vector<state::Baseline::Key> keep_local_;
+
+  /// Keep local choices taken under a running game, whose restore has not
+  /// landed (#275). Guarded by `mutex_`. Only a key: the entry is the save's
+  /// newest (`conflicts::NewestSaveEntry`), which is the only one Keep local
+  /// takes. Bounded **with** `keep_local_` -- the two together are at most
+  /// `sync::kMaxKeepLocal` -- and a key moves from here to there as it lands,
+  /// so the heap row holds no more keys than before (`kHeapKeepLocal`). In
+  /// memory, like `keep_local_`: a reboot forgets it, and nothing was written.
+  std::vector<state::Baseline::Key> keep_local_held_;
 
   /// Roms downloaded since the last tick that negotiated, whose saves that tick
   /// asks for with `restore_unlisted` (#241). Guarded by `mutex_`; at most

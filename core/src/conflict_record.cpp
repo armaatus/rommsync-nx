@@ -291,6 +291,20 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
   return report;
 }
 
+const Entry* NewestSaveEntry(const History& history, const state::Baseline::Key& key) {
+  // Ids only grow, so the newest is the one with the largest id -- of any
+  // event: a download or a deletion moved the card on as surely as a second
+  // conflict did.
+  const Entry* newest = nullptr;
+  for (const Entry& entry : history.entries()) {
+    if (entry.kind == EntryKind::kSave && entry.rom_id == key.first && entry.slot == key.second &&
+        (newest == nullptr || entry.id > newest->id)) {
+      newest = &entry;
+    }
+  }
+  return newest;
+}
+
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
                         const std::vector<state::Baseline::Key>& armed,
                         state::Baseline::Key* key, const RestoreOptions& options) {
@@ -306,18 +320,12 @@ RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int6
                   "not a save conflict, so there is no server copy to keep this console's over");
   }
   if (entry != nullptr) {
-    // Ids only grow, so a later entry of the same save is one with a larger id
-    // -- of any event: a download or a deletion moved the card on as surely as
-    // a second conflict did.
-    for (const Entry& other : history.entries()) {
-      if (other.id > entry->id && other.kind == EntryKind::kSave &&
-          other.rom_id == entry->rom_id && other.slot == entry->slot) {
-        return refuse(RestoreOutcome::kSuperseded,
-                      "a newer entry of this save is in the history, so these bytes are not the "
-                      "ones on the card to keep; choose on the newest one");
-      }
-    }
     const state::Baseline::Key wanted{entry->rom_id, entry->slot};
+    if (NewestSaveEntry(history, wanted) != entry) {
+      return refuse(RestoreOutcome::kSuperseded,
+                    "a newer entry of this save is in the history, so these bytes are not the "
+                    "ones on the card to keep; choose on the newest one");
+    }
     if (armed.size() >= sync::kMaxKeepLocal && sync::FindByKey(armed, wanted) == nullptr) {
       return refuse(RestoreOutcome::kKeepLocalFull,
                     std::to_string(sync::kMaxKeepLocal) +
@@ -325,9 +333,19 @@ RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int6
                         "this would be one more");
     }
     if (options.game_running) {
-      return refuse(RestoreOutcome::kGameRunning,
-                    "a game is running, and would save over the kept bytes when it closes; "
-                    "close it and choose Keep local again");
+      // Taken, not refused (#275): the caller holds the key and lands it once
+      // no application runs. Nothing is backed up now either -- the card is not
+      // touched until then, and the landing's own backup is the one that holds
+      // whatever the game wrote meanwhile.
+      RestoreReport held;
+      held.outcome = RestoreOutcome::kHeld;
+      held.message = entry->file_name +
+                     ": Keep local is chosen, and lands when the game closes -- this console's "
+                     "bytes go back on the card then, what the game saved under .backup/ first, "
+                     "and the next sync uploads them over the server's copy. Nothing is written "
+                     "until then";
+      *key = wanted;
+      return held;
     }
   }
   // A missing entry falls through: `Restore` names that refusal itself.

@@ -702,6 +702,20 @@ closes. Downloads from
 the queue are not held — a rom is not a save — so a rom queued from the overlay
 mid-game still comes down.
 
+**Keep local chosen during a game** waits too (#275): the Conflicts screen says
+*lands when you close the game*, and the log says so —
+
+```
+23 info sync.held rom 12: a game is running, so Keep local is held -- nothing is written until it closes, and the kept bytes then land ahead of their upload
+```
+
+When the game closes, your kept bytes go back on the card — over whatever the
+game saved as it closed, which is copied under `.backup/` first and named on the
+`sync.held` line that says the choice landed — and the sync after it uploads
+them over the server's copy. This happens even with sync switched off; only the
+upload waits for sync then. A held choice that cannot land is a `save.failed`
+warning, nothing is written, and the conflict is offered again.
+
 **The play time it records.** The sync after the game names what you played,
 one line per save that changed, with the application the console saw in the
 foreground when the save was written — its title id:

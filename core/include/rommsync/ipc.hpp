@@ -165,7 +165,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **12** since M10-33 (#273), which added Keep local's three refusals,
 /// `kSuperseded`, `kGameRunning` and `kKeepLocalFull`: outcomes a v11 overlay
 /// would refuse to decode in a `RestoreState`.
-inline constexpr std::uint32_t kVersion = 12;
+///
+/// **13** since M10-34 (#275), which replaced `kGameRunning` with
+/// `conflicts::RestoreOutcome::kHeld` -- Keep local under a game is held, not
+/// refused -- and added `ConflictRow::keep_local`, a required field.
+inline constexpr std::uint32_t kVersion = 13;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -885,7 +889,21 @@ struct ConflictQuery {
   std::int32_t limit = kMaxConflictPage;
 };
 
-/// One entry, plus the one thing about it that is not in the file.
+/// Whether the player's Keep local is chosen for a conflict row (#275).
+enum class KeepLocalState {
+  /// Nothing chosen: the choice is on offer.
+  kOpen,
+
+  /// Chosen under a running game and held: nothing is on the card yet, and the
+  /// kept bytes land when no application runs (`conflicts::RestoreOutcome::kHeld`).
+  kHeld,
+
+  /// Chosen and on the card; the upload with `overwrite=true` has not gone yet.
+  kWaiting,
+};
+const char* ToString(KeepLocalState state);
+
+/// One entry, plus the facts about it that are not in the file.
 struct ConflictRow {
   conflicts::Entry entry;
 
@@ -903,6 +921,13 @@ struct ConflictRow {
   /// the restore itself with `RestoreOutcome::kBackupFailed`, which is the
   /// honest split: "it is gone" and "I cannot see" are different sentences.
   bool backup_present = false;
+
+  /// A Keep local chosen for this entry and not yet spent (#275), so the
+  /// screen draws it as chosen rather than as open. In memory on the
+  /// sysmodule, like the choice itself, and answered as the page is built for
+  /// `backup_present`'s reason. Only ever on a save's newest entry: that is
+  /// the one Keep local takes (`conflicts::NewestSaveEntry`).
+  KeepLocalState keep_local = KeepLocalState::kOpen;
 };
 
 struct ConflictPage {
@@ -1260,9 +1285,11 @@ class Engine {
   /// `restore_state()`, with two differences an implementation owes the wire.
   /// It is refused, before anything is written, for an entry that is not a
   /// save conflict (`kNotAConflict`), one a newer entry of the same save
-  /// replaced (`kSuperseded`), while a game is in the foreground
-  /// (`kGameRunning`), and while `sync::kMaxKeepLocal` choices already wait
-  /// (`kKeepLocalFull`, #273); and once
+  /// replaced (`kSuperseded`), and while `sync::kMaxKeepLocal` choices already
+  /// wait (`kKeepLocalFull`, #273). While a game is in the foreground it is
+  /// taken and **held** (`kHeld`, #275): nothing is written until no
+  /// application runs, and the restore then lands ahead of the tick that
+  /// uploads it. Once
   /// the bytes are back on the card, the conflict's `(rom_id, slot)` goes into
   /// the next tick's `sync::ExecuteOptions::keep_local` -- the one upload sent
   /// with `overwrite=true` -- and a tick is asked for, so the choice goes up

@@ -327,10 +327,10 @@ const char* ToString(RestoreOutcome outcome) {
       return "changed_since_backup";
     case RestoreOutcome::kSuperseded:
       return "superseded";
-    case RestoreOutcome::kGameRunning:
-      return "game_running";
     case RestoreOutcome::kKeepLocalFull:
       return "keep_local_full";
+    case RestoreOutcome::kHeld:
+      return "held";
   }
   return "no_such_entry";
 }

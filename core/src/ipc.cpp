@@ -250,8 +250,14 @@ constexpr conflicts::RestoreOutcome kAllRestoreOutcomes[] = {
     conflicts::RestoreOutcome::kNothingToRestore, conflicts::RestoreOutcome::kBackupMissing,
     conflicts::RestoreOutcome::kBackupFailed,  conflicts::RestoreOutcome::kWriteFailed,
     conflicts::RestoreOutcome::kNotAConflict,  conflicts::RestoreOutcome::kChangedSinceBackup,
-    conflicts::RestoreOutcome::kSuperseded,    conflicts::RestoreOutcome::kGameRunning,
-    conflicts::RestoreOutcome::kKeepLocalFull,
+    conflicts::RestoreOutcome::kSuperseded,    conflicts::RestoreOutcome::kKeepLocalFull,
+    conflicts::RestoreOutcome::kHeld,
+};
+
+constexpr KeepLocalState kAllKeepLocalStates[] = {
+    KeepLocalState::kOpen,
+    KeepLocalState::kHeld,
+    KeepLocalState::kWaiting,
 };
 
 constexpr RestorePhase kAllRestorePhases[] = {
@@ -676,6 +682,18 @@ const char* ToString(SyncOutcome outcome) {
       return "deferred";
   }
   return "accepted";
+}
+
+const char* ToString(KeepLocalState state) {
+  switch (state) {
+    case KeepLocalState::kOpen:
+      return "open";
+    case KeepLocalState::kHeld:
+      return "held";
+    case KeepLocalState::kWaiting:
+      return "waiting";
+  }
+  return "open";
 }
 
 const char* ToString(RestorePhase phase) {
@@ -1387,6 +1405,7 @@ std::string EncodeConflictPage(const ConflictPage& page) {
     out += "{\"entry\":";
     out += conflicts::SerializeEntry(row.entry);
     AppendBool(&out, "backup_present", row.backup_present);
+    AppendText(&out, "keep_local", ToString(row.keep_local));
     out += '}';
   }
   out += ']';
@@ -1415,7 +1434,9 @@ Decoded<ConflictPage> DecodeConflictPage(std::string_view text) {
             return;
           }
           ConflictRow row;
-          if (!ReadBool(element, "backup_present", &row.backup_present, error)) {
+          if (!ReadBool(element, "backup_present", &row.backup_present, error) ||
+              !ReadEnum(element, "keep_local", kAllKeepLocalStates, ToString,
+                        "a Keep local state", &row.keep_local, error)) {
             return;
           }
           std::string why;

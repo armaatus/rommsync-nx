@@ -1077,18 +1077,28 @@ void KeepLocal(checks::Checks& c) {
              std::string("superseded comes before a running game: ") +
                  conflicts::ToString(stale.outcome));
 
-    // The newest conflict of a save is still Keep local's to take -- but not
-    // under a game, which would save over the kept bytes when it closes.
+    // The newest conflict of a save is still Keep local's to take -- and under a
+    // game it is taken but **held** (#275): the game would save over the kept
+    // bytes when it closes, so nothing is written now, and the key comes back
+    // for the caller to land once the game has closed.
     conflicts::Entry third = SaveEntry(4, "game.srm");
     third.backup_sd_path = newer_backup;
     const std::int64_t third_id = history.Append(third).id;
     const conflicts::RestoreReport running =
         conflicts::KeepLocal(*files, history, third_id, {}, &key, under_game);
-    c.Expect(running.outcome == conflicts::RestoreOutcome::kGameRunning,
-             std::string("the newest conflict under a game is refused: ") +
+    c.Expect(running.outcome == conflicts::RestoreOutcome::kHeld,
+             std::string("the newest conflict under a game is held, not refused: ") +
                  conflicts::ToString(running.outcome) + " -- " + running.message);
-    c.Expect(key.first == 0, "and arms nothing");
-    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and writes nothing");
+    c.ExpectEq(std::string(conflicts::ToString(running.outcome)), std::string("held"),
+               "and named on the wire as held");
+    c.Expect(!running.ok(), "held is not restored: no bytes are on the card yet");
+    c.Expect(running.message.find("close") != std::string::npos,
+             "and its sentence says when it lands: " + running.message);
+    c.Expect(key.first == 4 && key.second == std::optional<std::string>("retroarch-srm"),
+             "the key comes back, for the caller to hold");
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and nothing is written");
+    c.Expect(running.backup_sd_path.empty(), "not even a backup: nothing is replaced yet");
+    key = {0, std::nullopt};
     const conflicts::RestoreReport kept =
         conflicts::KeepLocal(*files, history, third_id, {}, &key, options);
     c.Expect(kept.ok(), std::string("the save's newest conflict is kept: ") +
@@ -1878,10 +1888,74 @@ void Overlay(checks::Checks& c) {
                "a Keep local the sysmodule refused says why: " + drawn.headline);
     }
 
-    // #273's three refusals, each in its own words and none a success.
+    // #275: Keep local under a game is held. The screen says it is chosen and
+    // when it lands -- not a refusal, and not done -- and the row reads as
+    // chosen once the player is back on the list.
+    {
+      overlay::ConflictsModel held = conflict_model(64);
+      held.Activate();
+      held.Activate();
+      held.MoveSelection(1);
+      held.Activate();
+      held.Next();
+      conflicts::RestoreReport waiting;
+      waiting.outcome = conflicts::RestoreOutcome::kHeld;
+      waiting.message = "game.srm: Keep local is chosen, and lands when the game closes";
+      held.OnRestoreState(Done(64, waiting));
+      overlay::ConflictsView drawn = held.Render();
+      c.Expect(drawn.mode == overlay::ConflictsMode::kDetail &&
+                   drawn.headline.find("close the game") != std::string::npos,
+               "a held Keep local says it lands when the game closes: " + drawn.headline);
+      c.Expect(drawn.tone == overlay::Tone::kGood, "as a choice made, not a refusal");
+      c.Expect(!drawn.can_restore, "and offers no second press");
+      c.Expect(held.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+               "nor polls: it is answered");
+      held.Back();
+      drawn = held.Render();
+      c.Expect(!drawn.rows.empty() &&
+                   drawn.rows[0].note.find("Keep local") != std::string::npos &&
+                   drawn.rows[0].note.find("close the game") != std::string::npos,
+               "the row is drawn as chosen, held for the game: " +
+                   (drawn.rows.empty() ? std::string() : drawn.rows[0].note));
+      held.Activate();
+      drawn = held.Render();
+      c.Expect(drawn.headline.find("Keep local") != std::string::npos && !drawn.can_restore,
+               "and its detail says so rather than offering the choice again: " +
+                   drawn.headline);
+      held.Activate();
+      c.Expect(held.Render().mode == overlay::ConflictsMode::kDetail,
+               "A on a chosen entry opens no choice");
+    }
+
+    // A page from the sysmodule says which rows are chosen, held or waiting,
+    // and each reads as chosen, not as open.
+    for (const auto& [state, says] :
+         {std::pair{ipc::KeepLocalState::kHeld, "close the game"},
+          std::pair{ipc::KeepLocalState::kWaiting, "next sync"}}) {
+      overlay::ConflictsModel model;
+      model.Next();
+      ipc::ConflictPage page;
+      page.total = 1;
+      conflicts::Entry entry = SaveEntry(4, "game.srm");
+      entry.id = 65;
+      ipc::ConflictRow row = Row(entry, true);
+      row.keep_local = state;
+      page.entries = {row};
+      model.OnPage(page);
+      const overlay::ConflictsView list = model.Render();
+      c.Expect(!list.rows.empty() && list.rows[0].note.find(says) != std::string::npos &&
+                   list.rows[0].tone == overlay::Tone::kGood,
+               std::string("a ") + ipc::ToString(state) + " row is drawn as chosen: " +
+                   (list.rows.empty() ? std::string() : list.rows[0].note));
+      model.Activate();
+      const overlay::ConflictsView detail = model.Render();
+      c.Expect(!detail.can_restore && detail.headline.find(says) != std::string::npos,
+               std::string("and its detail says what is left to happen: ") + detail.headline);
+    }
+
+    // #273's refusals, each in its own words and none a success.
     for (const auto& [outcome, says] :
          {std::pair{conflicts::RestoreOutcome::kSuperseded, "newer"},
-          std::pair{conflicts::RestoreOutcome::kGameRunning, "Close the game"},
           std::pair{conflicts::RestoreOutcome::kKeepLocalFull, "waiting for a sync"}}) {
       conflicts::RestoreReport report;
       report.outcome = outcome;

@@ -66,6 +66,12 @@
 // nothing. `ChoiceMeaning()` is each choice's sentence, for the reason
 // `RestoreMeaning()` is published.
 //
+// A Keep local pressed under a running game is **held** (#275): the answer is
+// `kHeld`, nothing is on the card yet, and the screen says it lands when the
+// game closes. A row whose choice is made and not yet spent -- held, or on the
+// card waiting for its upload (`ipc::ConflictRow::keep_local`) -- is drawn as
+// chosen rather than open, and A on it offers no second choice.
+//
 // Hard rule 4 applies as it does to the rest of `core/`: no libnx header, no
 // libultrahand type. What crosses is strings and enums, so the renderer picks
 // the colour for a `Tone` and this file names none.

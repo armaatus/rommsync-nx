@@ -100,6 +100,23 @@ const char* ChoiceLabel(ConflictChoice choice) {
   return "Skip";
 }
 
+/// A row whose Keep local is chosen and not yet spent (#275), in one sentence:
+/// the list's note and the detail's headline are the same fact. Empty for an
+/// open row.
+std::string ChosenText(ipc::KeepLocalState state) {
+  switch (state) {
+    case ipc::KeepLocalState::kOpen:
+      return {};
+    case ipc::KeepLocalState::kHeld:
+      return "Keep local is chosen: it lands when you close the game, and the next sync "
+             "uploads it";
+    case ipc::KeepLocalState::kWaiting:
+      return "Keep local is chosen: this console's copy is on the card, and the next sync "
+             "uploads it over the server's";
+  }
+  return {};
+}
+
 Restorability RestorabilityOf(const ipc::ConflictRow& row) {
   if (!conflicts::Overwrote(row.entry.event)) {
     // Nothing was replaced -- a state both sides kept. The only case where
@@ -236,12 +253,14 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
       // lists that one too -- higher up, since the list is newest first.
       return "Nothing was written: a newer entry of this save replaced this one. Choose on "
              "that one.";
-    case conflicts::RestoreOutcome::kGameRunning:
-      return "Nothing was written: a game is running, and would save over the kept bytes. "
-             "Close the game and try again.";
     case conflicts::RestoreOutcome::kKeepLocalFull:
       return "Nothing was written: too many Keep local choices are waiting for a sync. Let "
              "one run and try again.";
+    case conflicts::RestoreOutcome::kHeld:
+      // #275: taken, and waiting for the game to close. Said as a choice that
+      // was made, not as a refusal -- the player does not press it again.
+      return "Keep local is chosen. It lands when you close the game, and the next sync "
+             "uploads it over the server's copy.";
   }
   return "The restore did not happen";
 }
@@ -249,6 +268,7 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
 Tone RestoreOutcomeTone(conflicts::RestoreOutcome outcome) {
   switch (outcome) {
     case conflicts::RestoreOutcome::kRestored:
+    case conflicts::RestoreOutcome::kHeld:
       return Tone::kGood;
     case conflicts::RestoreOutcome::kNothingToRestore:
       return Tone::kNeutral;
@@ -259,7 +279,6 @@ Tone RestoreOutcomeTone(conflicts::RestoreOutcome outcome) {
     case conflicts::RestoreOutcome::kNotAConflict:
     case conflicts::RestoreOutcome::kChangedSinceBackup:
     case conflicts::RestoreOutcome::kSuperseded:
-    case conflicts::RestoreOutcome::kGameRunning:
     case conflicts::RestoreOutcome::kKeepLocalFull:
       return Tone::kBad;
   }
@@ -458,14 +477,22 @@ void ConflictsModel::FinishRestore(const conflicts::RestoreReport& report) {
   // would replace the loaded rows with the first eight -- and the open detail,
   // found by id, would vanish underneath the outcome the user is reading.
   //
-  // The one fact that *did* change is the entry this restore could not find.
-  if (report.outcome == conflicts::RestoreOutcome::kBackupMissing) {
-    for (ipc::ConflictRow& row : rows_) {
-      if (row.entry.id == restored) {
-        row.backup_present = false;
-        break;
-      }
+  // The facts that *did* change are on this restore's own row: a backup it
+  // could not find, and a Keep local it chose (#275) -- held for a game to
+  // close, or on the card waiting for its upload. The rest of the page is as
+  // the sysmodule last sent it.
+  for (ipc::ConflictRow& row : rows_) {
+    if (row.entry.id != restored) {
+      continue;
     }
+    if (report.outcome == conflicts::RestoreOutcome::kBackupMissing) {
+      row.backup_present = false;
+    } else if (kept_local && report.outcome == conflicts::RestoreOutcome::kHeld) {
+      row.keep_local = ipc::KeepLocalState::kHeld;
+    } else if (kept_local && report.ok()) {
+      row.keep_local = ipc::KeepLocalState::kWaiting;
+    }
+    break;
   }
 }
 
@@ -599,10 +626,12 @@ void ConflictsModel::Activate() {
     }
     case ConflictsMode::kDetail: {
       const ipc::ConflictRow* row = Current();
-      if (row == nullptr || RestorabilityOf(*row) != Restorability::kReady) {
+      if (row == nullptr || RestorabilityOf(*row) != Restorability::kReady ||
+          row->keep_local != ipc::KeepLocalState::kOpen) {
         // Nothing to confirm. The row already says why, and asking a user to
         // confirm something the screen knows will not happen is worse than not
-        // offering it.
+        // offering it. A chosen Keep local (#275) is a choice already made:
+        // offering it again would read as though it had not been.
         return;
       }
       if (restoring_ != 0) {
@@ -708,6 +737,12 @@ ConflictsView ConflictsModel::Render() const {
           // this console lost are on this card and nowhere else.
           drawn.note = kCardOnlyNote;
           drawn.tone = Tone::kWarn;
+        }
+        if (row.keep_local != ipc::KeepLocalState::kOpen) {
+          // Chosen, not open (#275): the player has answered this one, and
+          // the row says what is left to happen.
+          drawn.note = ChosenText(row.keep_local);
+          drawn.tone = Tone::kGood;
         }
       } else {
         drawn.note = RestorabilityText(drawn.restorable);
@@ -830,7 +865,9 @@ ConflictsView ConflictsModel::Render() const {
          Tone::kWarn);
   }
 
-  view.can_restore = restorable == Restorability::kReady && !restored_ && restoring_ == 0;
+  const bool chosen = row->keep_local != ipc::KeepLocalState::kOpen;
+  view.can_restore =
+      restorable == Restorability::kReady && !restored_ && restoring_ == 0 && !chosen;
   view.keep_choice = entry.save_conflict();
 
   if (mode_ == ConflictsMode::kConfirm && view.keep_choice) {
@@ -877,6 +914,12 @@ ConflictsView ConflictsModel::Render() const {
     view.tone = RestoreOutcomeTone(last_restore_.outcome);
     view.hint = last_restore_.message.empty() ? std::string("B goes back to the list")
                                               : last_restore_.message;
+    return view;
+  }
+  if (chosen) {
+    view.headline = ChosenText(row->keep_local);
+    view.tone = Tone::kGood;
+    view.hint = "B goes back to the list";
     return view;
   }
   if (restorable == Restorability::kReady && view.keep_choice) {
