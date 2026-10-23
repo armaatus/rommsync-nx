@@ -46,6 +46,8 @@ bool AnsweredTooLarge(const Result& result) {
          result.response.status < 300;
 }
 
+bool TransientStatus(int status) { return status >= 500 || status == 408 || status == 429; }
+
 const char* ToString(Error error) {
   switch (error) {
     case Error::kNone:           return "ok";

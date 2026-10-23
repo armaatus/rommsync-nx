@@ -5,7 +5,10 @@
 // server's poll interval per consecutive failure and capped it at
 // `PairingConfig::max_poll_backoff`. That policy is right and this file is it,
 // lifted out so the scheduler (M7-2, #37) shares it rather than growing a
-// second one that drifts.
+// second one that drifts. Every retry inside one call -- a `sync::CallPolicy`,
+// a download drain's, a page of the rom index -- walks it too, through
+// `sync::WaitToRetry`; five of them once doubled a delay of their own, with no
+// jitter, until #251.
 //
 // **Jitter is the thing the lifted version adds.** Several consoles on one LAN
 // come back from a router reboot at the same instant, fail at the same instant,

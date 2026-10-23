@@ -667,6 +667,19 @@ struct CallPolicy {
   const http::CancelToken* cancel = nullptr;
 };
 
+/// The curve a `CallPolicy`'s retries walk, with no failures on it yet.
+///
+/// One per call, or per page of a paged one (`roms::FetchRomIndex`), and never
+/// shared between two loops: `retry::Backoff`'s own rule.
+retry::Backoff BackoffFor(const CallPolicy& policy);
+
+/// Wait out one retry: the next delay on `*backoff`, on `policy.wait` -- or
+/// asleep, when there is none. Answers the delay waited.
+///
+/// Every `CallPolicy` loop waits through this rather than doubling a delay of
+/// its own, which is how five of them came to retry in lockstep (#251).
+std::chrono::milliseconds WaitToRetry(const CallPolicy& policy, retry::Backoff* backoff);
+
 /// The spelling `Negotiate` takes: `CallPolicy`, plus the one thing a caller says
 /// about *what* is asked rather than how hard.
 struct NegotiateOptions : CallPolicy {

@@ -8,7 +8,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -1361,7 +1360,7 @@ Verdict Judge(const http::Result& result, Reason* why) {
     say("the server has no such rom any more");
     return Verdict::kFatal;
   }
-  if (status == 408 || status == 429 || status >= 500) {
+  if (http::TransientStatus(status)) {
     // A proxy and a rate limiter answer with the first two; a 5xx is the server
     // having a bad minute. All three are worth another request.
     say("the server answered " + std::to_string(status));
@@ -1479,6 +1478,17 @@ struct Step {
   std::string message;
 };
 
+/// The worker's retry knobs, as the policy `sync::WaitToRetry` waits on.
+sync::CallPolicy RetryOf(const WorkerOptions& options) {
+  sync::CallPolicy policy;
+  policy.backoff = options.backoff;
+  policy.max_backoff = options.max_backoff;
+  policy.jitter = options.jitter;
+  policy.random = options.random;
+  policy.wait = options.wait;
+  return policy;
+}
+
 /// One drain, and the bookkeeping its two request loops share.
 class Drainer {
  public:
@@ -1490,7 +1500,8 @@ class Drainer {
         queue_(queue),
         options_(options),
         budget_(options.max_attempts > 0 ? options.max_attempts : 1),
-        backoff_(options.backoff) {}
+        retry_(RetryOf(options)),
+        backoff_(sync::BackoffFor(retry_)) {}
 
   DrainResult Run() {
     DrainResult result;
@@ -1563,23 +1574,9 @@ class Drainer {
     }
   }
 
-  /// Wait out one backoff, doubling it for the next.
-  ///
-  /// `sync::Negotiate`'s scheme, clamped before its first use for the same
-  /// reason: a caller whose `backoff` already exceeds `max_backoff` must not
-  /// wait longer than the ceiling the header calls binding, exactly once.
-  void Wait() {
-    if (backoff_ > options_.max_backoff) {
-      backoff_ = options_.max_backoff;
-    }
-    if (options_.wait != nullptr) {
-      options_.wait(backoff_);
-    } else {
-      std::this_thread::sleep_for(backoff_);
-    }
-    waited_ += backoff_;
-    backoff_ = backoff_ * 2 > options_.max_backoff ? options_.max_backoff : backoff_ * 2;
-  }
+  /// Wait out one backoff, doubling it for the next: `sync::CallPolicy`'s
+  /// curve, jitter and all.
+  void Wait() { waited_ += sync::WaitToRetry(retry_, &backoff_); }
 
   /// Spend one of the entry's requests, and say whether it had one to spend.
   ///
@@ -1693,7 +1690,7 @@ class Drainer {
     destination_.clear();
     staging_.clear();
     spent_ = 0;
-    backoff_ = options_.backoff;
+    backoff_.Succeed();
 
     // 1. Who is this rom? `Enqueue` recorded an id and nothing else, because no
     // IPC command may block on the network (ipc.hpp).
@@ -2275,7 +2272,10 @@ class Drainer {
   std::vector<std::int64_t> deferred_;
   std::string deferred_message_;
 
-  std::chrono::milliseconds backoff_;
+  /// `options_`' retry knobs, as the `sync::CallPolicy` `sync::WaitToRetry`
+  /// reads, and the curve walked for the entry in hand.
+  sync::CallPolicy retry_;
+  retry::Backoff backoff_;
   std::chrono::milliseconds waited_{0};
   int requests_ = 0;
   int downloaded_ = 0;

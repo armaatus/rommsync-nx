@@ -22,7 +22,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -737,7 +736,7 @@ std::optional<IngestOutcome> Refused(const http::Result& result) {
                   "the play-session flush was rejected: HTTP 403; this pairing was not granted "
                   "roms.user.write");
   }
-  if (status >= 500 || status == 429 || status == 408) {
+  if (http::TransientStatus(status)) {
     return Refuse(IngestError::kServerError,
                   "the play-session flush: HTTP " + std::to_string(status) +
                       (status == 429 ? "; the server is rate limiting" : ""));
@@ -785,8 +784,7 @@ IngestOutcome IngestSessions(http::HttpClient& client, const auth::StoredToken& 
   }
 
   const int attempts = options.max_attempts > 0 ? options.max_attempts : 1;
-  std::chrono::milliseconds backoff =
-      options.backoff > options.max_backoff ? options.max_backoff : options.backoff;
+  retry::Backoff backoff = sync::BackoffFor(options);
   std::chrono::milliseconds waited{0};
 
   for (int attempt = 1;; ++attempt) {
@@ -825,13 +823,7 @@ IngestOutcome IngestSessions(http::HttpClient& client, const auth::StoredToken& 
       outcome.waited = waited;
       return outcome;
     }
-    if (options.wait != nullptr) {
-      options.wait(backoff);
-    } else {
-      std::this_thread::sleep_for(backoff);
-    }
-    waited += backoff;
-    backoff = backoff * 2 > options.max_backoff ? options.max_backoff : backoff * 2;
+    waited += sync::WaitToRetry(options, &backoff);
   }
 }
 

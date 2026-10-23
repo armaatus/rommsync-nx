@@ -74,6 +74,7 @@
 #include <vector>
 
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/backoff.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
@@ -916,10 +917,15 @@ struct WorkerOptions {
   int max_attempts = 3;
 
   /// The first delay before a retry, doubled per consecutive retryable failure
-  /// and capped at `max_backoff`. `sync::NegotiateOptions`' scheme, and its
-  /// reasoning: every network call retries with backoff (CLAUDE.md).
+  /// and capped at `max_backoff`. `sync::CallPolicy`'s curve, walked the same
+  /// way (`sync::WaitToRetry`), and its reasoning: every network call retries
+  /// with backoff (CLAUDE.md).
   std::chrono::milliseconds backoff{1'000};
   std::chrono::milliseconds max_backoff{8'000};
+
+  /// `sync::CallPolicy::jitter` and `::random`, for the same lockstep (#251).
+  double jitter = 0.25;
+  retry::Backoff::Random random;
 
   /// How the worker waits between attempts. **Null means the default sleep, not
   /// "do not wait"** -- `sync::NegotiateOptions::wait`'s contract, so a caller

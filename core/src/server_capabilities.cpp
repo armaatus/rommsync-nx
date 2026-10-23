@@ -11,7 +11,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 namespace rommsync::server {
@@ -294,8 +293,6 @@ bool Component(std::string_view text, int* out) {
   return true;
 }
 
-bool TransientStatus(int status) { return status >= 500 || status == 408 || status == 429; }
-
 }  // namespace
 
 std::optional<Version> ParseVersion(std::string_view text) {
@@ -431,7 +428,7 @@ auth::Parsed<bool> ParseHeartbeatInstall(std::string_view body) {
 
 bool Probe::transient() const {
   return (transport != http::Error::kNone && transport != http::Error::kInvalidRequest) ||
-         TransientStatus(status);
+         http::TransientStatus(status);
 }
 
 Probe ReadServer(http::HttpClient& client, std::string_view base_url,
@@ -450,8 +447,7 @@ Probe ReadServer(http::HttpClient& client, std::string_view base_url,
   request.cancel = policy.cancel;
 
   const int attempts = policy.max_attempts > 0 ? policy.max_attempts : 1;
-  std::chrono::milliseconds backoff =
-      policy.backoff > policy.max_backoff ? policy.max_backoff : policy.backoff;
+  retry::Backoff backoff = sync::BackoffFor(policy);
 
   for (int attempt = 1;; ++attempt) {
     probe = Probe{};
@@ -486,12 +482,7 @@ Probe ReadServer(http::HttpClient& client, std::string_view base_url,
     if (policy.cancel != nullptr && policy.cancel->canceled()) {
       return probe;
     }
-    if (policy.wait != nullptr) {
-      policy.wait(backoff);
-    } else {
-      std::this_thread::sleep_for(backoff);
-    }
-    backoff = backoff * 2 > policy.max_backoff ? policy.max_backoff : backoff * 2;
+    sync::WaitToRetry(policy, &backoff);
   }
 }
 

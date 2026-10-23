@@ -25,7 +25,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -142,7 +141,7 @@ std::optional<Completion> Refused(const http::Result& result) {
   // The same three-way split `Refused` makes next door: a 429 or a 408 is the
   // server declining *now*, and letting either fall through to a non-retryable
   // error would give up on a tick over a rate limiter.
-  if (status >= 500 || status == 429 || status == 408) {
+  if (http::TransientStatus(status)) {
     return Refuse(CompleteError::kServerError,
                   "the completion: HTTP " + std::to_string(status) +
                       (status == 429 ? "; the server is rate limiting" : ""));
@@ -537,11 +536,7 @@ Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& to
   }
 
   const int attempts = options.max_attempts > 0 ? options.max_attempts : 1;
-  // Clamped before the first use rather than after the first doubling, exactly
-  // as `Negotiate` does it: a caller whose `backoff` already exceeds
-  // `max_backoff` would otherwise wait past the ceiling once.
-  std::chrono::milliseconds backoff =
-      options.backoff > options.max_backoff ? options.max_backoff : options.backoff;
+  retry::Backoff backoff = BackoffFor(options);
   std::chrono::milliseconds waited{0};
 
   for (int attempt = 1;; ++attempt) {
@@ -573,13 +568,7 @@ Completion CompleteSession(http::HttpClient& client, const auth::StoredToken& to
       outcome.waited = waited;
       return outcome;
     }
-    if (options.wait != nullptr) {
-      options.wait(backoff);
-    } else {
-      std::this_thread::sleep_for(backoff);
-    }
-    waited += backoff;
-    backoff = backoff * 2 > options.max_backoff ? options.max_backoff : backoff * 2;
+    waited += WaitToRetry(options, &backoff);
   }
 }
 
