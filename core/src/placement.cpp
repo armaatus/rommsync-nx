@@ -287,6 +287,30 @@ const scan::FolderPlan& Placer::PlanOf(scan::Folders which) {
   return *plan;
 }
 
+void Placer::Claim(const std::string& sd_path, scan::Folders which) {
+  std::string directory;
+  std::string leaf;
+  if (!fs::SplitPath(sd_path, &directory, &leaf)) {
+    return;
+  }
+  // `PlanOf`'s own copy: placing asked it already, so this plans nothing.
+  scan::FolderPlan& plan = which == scan::Folders::kSaves ? *saves_plan_ : *states_plan_;
+  const std::string wanted = LowerAscii(directory);
+  for (const scan::ScanFolder& folder : plan.folders) {
+    if (LowerAscii(folder.directory) == wanted) {
+      return;  // planned already: there on the card, or claimed earlier this tick
+    }
+  }
+  // Not planned, yet read: a core folder this placement makes, which the scan
+  // counts against `kMaxRetroArchFolders` from the next tick on -- and so the
+  // placements after this one in the tick must too (#269).
+  std::optional<scan::ScanFolder> made = scan::FolderIn(plan, directory);
+  if (made.has_value()) {
+    plan.folders.push_back(std::move(*made));
+    ++plan.core_folders;
+  }
+}
+
 std::string Placer::ReadsBackAs(const roms::Rom& rom, const std::string& sd_path,
                                 scan::Folders which, int card) {
   // The scan's own plan of folders, and its own rules within one, so what is
@@ -411,6 +435,7 @@ Placement Placer::Save(const sync::SyncOperation& operation) {
       !why.empty()) {
     return Refuse(why);
   }
+  Claim(placed.sd_path, scan::Folders::kSaves);
   placed.emulator = target.emulator_id;
   return placed;
 }
@@ -462,6 +487,7 @@ Placement Placer::State(std::int64_t rom_id, std::string_view file_name,
       !why.empty()) {
     return Refuse(why);
   }
+  Claim(placed.sd_path, scan::Folders::kStates);
   return placed;
 }
 

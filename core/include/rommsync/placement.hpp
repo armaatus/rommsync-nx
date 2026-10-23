@@ -178,6 +178,15 @@ class Placer {
   /// `scan::PlanFolders` for `which`, planned on first use and kept for the tick.
   const scan::FolderPlan& PlanOf(scan::Folders which);
 
+  /// Adds the folder of a placement just made to the plan `PlanOf` keeps, when
+  /// it is a core folder the card does not hold yet: the scan counts it against
+  /// `scan::kMaxRetroArchFolders` once it is made, so every placement after this
+  /// one in the tick counts it too (#269). Kept when the download then fails and
+  /// `fs::MadeFolders` takes the folder back: the count is one high for the rest
+  /// of the tick, which refuses a placement the next tick plans afresh, and
+  /// never lets one past the bound.
+  void Claim(const std::string& sd_path, scan::Folders which);
+
   const config::Config& config_;
   const retroarch::Settings& retroarch_;
   const roms::RomIndex& index_;
