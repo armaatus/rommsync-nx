@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/backoff.hpp"
 #include "rommsync/disk.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
@@ -741,12 +742,22 @@ const ClientSaveState* ReportedFor(const ExecuteOptions& options, const SaveTarg
 
 /// How long a Keep local upload waits before rewriting its row: past the second
 /// it landed in by the server's clock, which a whole second after the server
-/// answered is, with a margin for the phase of the two clocks. Also the first
-/// step of the rewrite's backoff, doubled per attempt.
+/// answered is, with a margin for the phase of the two clocks. Exact, not
+/// jittered: it waits for a clock, not for a server to recover.
 constexpr std::chrono::milliseconds kTieWait{1'100};
 
-/// Attempts at the rewrite. Bounded like every `CallPolicy`'s three.
+/// Attempts at the rewrite: `CallPolicy::max_attempts`'s three.
 constexpr int kRewriteAttempts = 3;
+
+/// The curve between them: `retry::Backoff`'s, jittered like every other retry
+/// in the client (#251), starting at twice the tie wait so a retry of a rewrite
+/// that was still in the second always waits longer than the first did.
+retry::BackoffConfig RewriteBackoff() {
+  retry::BackoffConfig config;
+  config.floor = kTieWait * 2;
+  config.cap = kTieWait * 4;
+  return config;
+}
 
 /// `options.wait`, or a sleep that wakes to check `options.cancel`, so a
 /// shutdown is not held up by a second nobody needs any more.
@@ -798,8 +809,9 @@ void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
       Describe(operation) + ": the Keep local upload may share its second with another "
                             "device's upload of this save, and was not moved past it ";
   std::string last_failure;
+  retry::Backoff backoff(RewriteBackoff());
   for (int attempt = 1; attempt <= kRewriteAttempts; ++attempt) {
-    Wait(options, kTieWait * (1 << (attempt - 1)));
+    Wait(options, attempt == 1 ? kTieWait : backoff.Fail());
     if (options.cancel != nullptr && options.cancel->canceled()) {
       warnings->push_back(not_moved + "(the tick was cancelled)");
       return;
@@ -834,8 +846,9 @@ void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
       last_failure = refused->second;
       // The link, or RomM having a bad minute, is worth another attempt; a
       // refusal of this request is not.
-      const bool transient = refused->first == OperationError::kTransferFailed ||
-                             (rewritten.ok() && rewritten.response.status >= 500);
+      const bool transient =
+          refused->first == OperationError::kTransferFailed ||
+          (rewritten.ok() && http::TransientStatus(rewritten.response.status));
       if (!transient) {
         break;
       }
