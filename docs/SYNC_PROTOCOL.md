@@ -641,9 +641,32 @@ that landed before the comparison — which takes the window from a network roun
 trip and a backup's worth of I/O down to one hash of the save. The hold
 narrows it further; nothing here closes it.
 
-**Nor is every overwrite covered yet.** A conflict restore (M7-1, from the
-overlay, over a running game) and a save state's download back up and then
-overwrite with no comparison between; #270 extends the check to both.
+**Every overwrite asks it, not only the plan's (#270).** The other two paths
+that back up and then overwrite make the same comparison last:
+
+- **A conflict restore** (M7-1, [below](#finding-the-backup-again-and-putting-it-back)),
+  between its backup and its `io::CopyAtomically`. It is the likelier of the
+  two to meet a late write: it starts from the overlay, over a game that may be
+  running, and `SdEngine::RunRestore` takes the save-write lock but not #242's
+  hold. A file written since stops it with `changed_since_backup` and nothing
+  written — the file holds the game's write, the restore's own backup what was
+  there before, and the entry's backup is untouched, so the press can be
+  repeated once the game is closed. Keep local arms nothing for a restore that
+  did not land.
+- **A save state's download** ([below](#backups-and-verification)), between its
+  backup and its `io::CommitStaged`: RetroArch writes a state on a hotkey. A
+  state written since fails the download `changed_since_backup`, its staged
+  bytes are discarded, and the next tick, finding both sides moved, keeps both.
+
+A state is tens of megabytes, so for it the comparison is two full streamed
+reads of the card, 4 KiB at a time and nothing buffered. Hashing the state
+against a digest taken while the backup was copied would save one of them, and
+was weighed and not taken: the backup is hashed *before* the state, so the
+window left is the state's own hash either way, and re-reading the backup is
+what proves it is on the card as copied. A state download is a moved server row
+over an unchanged local file — rare, and nobody waits on it.
+`conflicts.late_write` (a save, a Keep local and a state) and `states.late_write`
+force each with the same `io::Disk` (`faulty::LateWrite`, `tests/faulty_disk.hpp`).
 
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
@@ -820,9 +843,10 @@ to prevent.
 
 `conflicts::Restore` puts those bytes back, and it is **a save overwrite in its
 own right**: it copies the file it is about to replace under `.backup/` first,
-through the same `sync::BackUpFirst`, and then commits with
-`io::CopyAtomically`. A restore that ate the server's copy would be this rule
-broken one level up.
+through the same `sync::BackUpFirst`, checks the file is still what it copied
+([A write after the backup](#a-write-after-the-backup-263), #270), and then
+commits with `io::CopyAtomically`. A restore that ate the server's copy, or a
+save the game wrote after that copy, would be this rule broken one level up.
 
 It writes the local file and nothing else. **The server stays the source of
 truth**: the next negotiation arbitrates, and will most likely plan an `upload`.
@@ -1120,8 +1144,9 @@ A state that is replaced goes through the same four steps as a save, using the
 same two `io` primitives: fetch to `io::TempPathFor(<state>)`, check it, back it
 up with `io::CopyAtomically` into `.backup/`, then `io::CommitStaged` it into
 place. The `harness::Sandbox` teardown audit covers a state exactly as it covers
-a `.srm`. One difference for now: a state is not compared with its backup
-before the commit, so a write between the two is lost
+a `.srm`. Like a save, a state is compared with its backup immediately before
+the commit, and one written between the two is left with the backup beside it
+and the download failed `changed_since_backup`
 ([A write after the backup](#a-write-after-the-backup-263), #270).
 
 The backup name carries a discriminator built from the state's own name —

@@ -29,6 +29,7 @@
 //   2. check those bytes against the length the server reported -- which is all
 //      there is; see the header
 //   3. `sync::BackUpFirst` the state's current bytes into `.backup/`
+//      ...and `sync::UnchangedSinceBackup` that nothing wrote the state since (#270)
 //   4. `io::CommitStaged` the bytes onto the state
 #include "rommsync/state_sync.hpp"
 
@@ -168,6 +169,8 @@ const char* ToString(StateError error) {
       return "forbidden";
     case StateError::kUnverified:
       return "unverified";
+    case StateError::kChangedSinceBackup:
+      return "changed_since_backup";
     case StateError::kCommitFailed:
       return "commit_failed";
     case StateError::kNoPlacement:
@@ -193,6 +196,7 @@ auth::Answer AnswerOf(StateError error) {
     case StateError::kTransferFailed:
     case StateError::kRefused:
     case StateError::kUnverified:
+    case StateError::kChangedSinceBackup:
     case StateError::kCommitFailed:
     case StateError::kNoPlacement:
     case StateError::kCanceled:
@@ -622,6 +626,31 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     StateOperationResult failed =
         Fail(server.rom_id, server.file_name, action, error, std::move(message));
     failed.sd_path = sd_path;
+    return failed;
+  }
+
+  // **And the state is still what the backup copied** (#270, #263's check):
+  // RetroArch writes a state on a hotkey, and one written since the backup is in
+  // no copy anywhere. Last before the commit, and while the staged bytes are
+  // still the guard's, so standing down discards them.
+  //
+  // Two full reads of a state that may be tens of megabytes, streamed 4 KiB at a
+  // time (`state::HashFile`), so nothing is buffered. Weighed against a digest
+  // `io::CopyAtomically` would take while copying the backup, which reads the
+  // card once fewer: the backup is hashed *before* the state, so the window this
+  // leaves is the state's own hash either way, and only re-reading the backup
+  // proves it is on the card as copied. A state download is a moved server row
+  // over an unchanged local file -- rare, and never on a timer a player waits on.
+  const OperationError unchanged =
+      UnchangedSinceBackup(files, sd_path, result.backup_sd_path, &message);
+  if (unchanged != OperationError::kNone) {
+    const StateError error = unchanged == OperationError::kUnverified
+                                 ? StateError::kChangedSinceBackup
+                                 : StateError::kUnreadableCard;
+    StateOperationResult failed =
+        Fail(server.rom_id, server.file_name, action, error, std::move(message));
+    failed.sd_path = sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
     return failed;
   }
 

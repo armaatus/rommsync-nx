@@ -203,9 +203,10 @@ int Version() {
   // since M10-23 (#264): `ConfigView` gained `on_server_delete` and `sources`,
   // required fields a v7 decoder never reads and a v8 one will not do without.
   // 9 since M10-20 (#249): a restore's outcome gained `not_a_conflict`, which a
-  // v8 decoder refuses. What is frozen is command 0's *encoding*, asserted
+  // v8 decoder refuses. 10 since M9-32 (#270): and `changed_since_backup`, which
+  // a v9 decoder refuses. What is frozen is command 0's *encoding*, asserted
   // above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{9},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{10},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");

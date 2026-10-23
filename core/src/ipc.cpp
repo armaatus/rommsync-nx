@@ -247,7 +247,7 @@ constexpr conflicts::RestoreOutcome kAllRestoreOutcomes[] = {
     conflicts::RestoreOutcome::kRestored,      conflicts::RestoreOutcome::kNoSuchEntry,
     conflicts::RestoreOutcome::kNothingToRestore, conflicts::RestoreOutcome::kBackupMissing,
     conflicts::RestoreOutcome::kBackupFailed,  conflicts::RestoreOutcome::kWriteFailed,
-    conflicts::RestoreOutcome::kNotAConflict,
+    conflicts::RestoreOutcome::kNotAConflict,  conflicts::RestoreOutcome::kChangedSinceBackup,
 };
 
 constexpr RestorePhase kAllRestorePhases[] = {

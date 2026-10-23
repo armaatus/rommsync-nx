@@ -422,9 +422,12 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
 /// or removal that follows would take it. So the save is compared with its
 /// backup by digest, and anything but a match stands the operation down with
 /// both files left where they are. A digest because a size-and-mtime check
-/// misses a same-size rewrite inside FAT32's two-second mtime, and because what
-/// `ExecutePlan` replaces is a save file, kilobytes; a state's tens of megabytes
-/// do not come through here (state_sync.hpp).
+/// misses a same-size rewrite inside FAT32's two-second mtime.
+///
+/// Every overwrite asks it: `ExecutePlan`'s three actions, a state download
+/// (`state_sync.cpp`) and a conflict restore (`conflicts::Restore`), the last
+/// two since #270. Both files are streamed through `state::HashFile`, so a
+/// state's tens of megabytes cost two reads of the card and no heap.
 ///
 ///   - `backup_sd_path` empty means `BackUpFirst` found nothing to protect, so
 ///     there must still be nothing -- a file that appeared since has no copy.

@@ -219,7 +219,7 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
     return report;
   }
 
-  // **Step 3 of the four, and it is not optional.** A restore is a save
+  // **Step 3 of the five, and it is not optional.** A restore is a save
   // overwrite, so the bytes it is about to replace go under `.backup/` first,
   // through the same call M2-5 makes -- with the save's slot or the state's name
   // as the discriminator, so one rom's save and its state never share a name.
@@ -237,6 +237,23 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
                      "was written: " +
                      message;
     report.backup_sd_path.clear();
+    return report;
+  }
+
+  // **And the file is still what step 3 copied** (#270, #263's check). A restore
+  // runs from the overlay over a game that may be running, and nothing holds the
+  // game off the file: a save it wrote since the backup is in no copy anywhere,
+  // so the restore stands down and leaves it. Last before the copy, so the
+  // window left is this read and nothing else.
+  const sync::OperationError unchanged =
+      sync::UnchangedSinceBackup(files, entry->sd_path, report.backup_sd_path, &message);
+  if (unchanged != sync::OperationError::kNone) {
+    // A backup that cannot be read back is not one this restore may lean on,
+    // which is `kBackupFailed`'s promise: nothing was written.
+    report.outcome = unchanged == sync::OperationError::kUnverified
+                         ? RestoreOutcome::kChangedSinceBackup
+                         : RestoreOutcome::kBackupFailed;
+    report.message = "nothing was restored: " + message;
     return report;
   }
 

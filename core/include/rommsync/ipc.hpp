@@ -151,7 +151,12 @@ inline constexpr const char* kServiceName = "rommsync";
 /// `conflicts::RestoreOutcome::kNotAConflict`. The command alone would not bump
 /// it -- an older sysmodule answers `kUnknownCommand` -- but the outcome is a
 /// value a v8 overlay refuses to decode in a `RestoreState`.
-inline constexpr std::uint32_t kVersion = 9;
+///
+/// **10** since M9-32 (#270), which added
+/// `conflicts::RestoreOutcome::kChangedSinceBackup`: a restore that stood down
+/// over a file written after its backup, which a v9 overlay would refuse to
+/// decode in a `RestoreState` for the same reason.
+inline constexpr std::uint32_t kVersion = 10;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

@@ -225,6 +225,10 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
       return "The backup was made and the restore did not land. The file is as it was.";
     case conflicts::RestoreOutcome::kNotAConflict:
       return "Nothing was written: Keep local is only for a save conflict";
+    case conflicts::RestoreOutcome::kChangedSinceBackup:
+      // A game saved mid-restore (#270). The press can simply be repeated once
+      // the game is closed, which is the one thing the player needs to know.
+      return "Nothing was written: the game saved while this ran. Close it and try again.";
   }
   return "The restore did not happen";
 }
@@ -240,6 +244,7 @@ Tone RestoreOutcomeTone(conflicts::RestoreOutcome outcome) {
     case conflicts::RestoreOutcome::kBackupFailed:
     case conflicts::RestoreOutcome::kWriteFailed:
     case conflicts::RestoreOutcome::kNotAConflict:
+    case conflicts::RestoreOutcome::kChangedSinceBackup:
       return Tone::kBad;
   }
   return Tone::kBad;

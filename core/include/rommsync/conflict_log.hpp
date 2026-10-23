@@ -463,6 +463,14 @@ enum class RestoreOutcome {
   /// outcome by name and an older overlay refuses one it does not know --
   /// which is why it bumped `ipc::kVersion` to 9.
   kNotAConflict,
+
+  /// **The file was written after the restore backed it up** (#270): a game
+  /// running under the overlay saved between the restore's backup and its copy.
+  /// Those bytes are in no copy anywhere, so nothing was written over them: the
+  /// file holds the game's write, `backup_sd_path` what it held before, and the
+  /// entry's own backup is untouched -- the restore can simply be asked again.
+  /// Appended, and it bumped `ipc::kVersion` to 10 for `kNotAConflict`'s reason.
+  kChangedSinceBackup,
 };
 const char* ToString(RestoreOutcome outcome);
 

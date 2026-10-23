@@ -15,7 +15,8 @@
 // `Restore` backs the file up *first*, through the same `sync::BackUpFirst`
 // M2-5 uses, and only then commits with `io::CopyAtomically`. A restore that
 // ate the server's copy would be the bug backups exist to prevent, one level
-// up.
+// up -- and so would one that ate a save the game wrote after that backup,
+// which is why `sync::UnchangedSinceBackup` sits between the two (#270).
 //
 // **The server stays the source of truth** (hard rule 3). A restore writes the
 // local file and nothing else: the next negotiation arbitrates, and will most
@@ -97,7 +98,7 @@ struct RestoreOptions {
 
 /// Put the bytes `entry_id` names back on the card.
 ///
-/// Four steps, in this order and no other:
+/// Five steps, in this order and no other:
 ///
 ///   1. the entry is found, and is one that replaced something;
 ///   2. the backup it names is still there;
@@ -105,7 +106,11 @@ struct RestoreOptions {
 ///      `sync::BackUpFirst` -- the same call M2-5 makes, with the save's slot or
 ///      the state's name as the discriminator, so one rom's save and its state
 ///      never come to share a backup name;
-///   4. and only then is the backup copied onto `sd_path` with
+///   4. the file is checked to still be what step 3 copied, through
+///      `sync::UnchangedSinceBackup` (#270). A game running under the overlay
+///      that saved in between has written bytes no copy holds, so the restore
+///      stops there with `kChangedSinceBackup` and writes nothing;
+///   5. and only then is the backup copied onto `sd_path` with
 ///      `io::CopyAtomically`, which stages at `io::TempPathFor` and commits with
 ///      two renames. An interruption leaves the old bytes or the new ones and
 ///      never a splice; the `.tmp` is removed on a failure, or swept by

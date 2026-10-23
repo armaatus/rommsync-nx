@@ -16,7 +16,8 @@
 //     replaced only when `state.db` says which server row it is paired with and
 //     that row has not moved since -- and even then the previous bytes go under
 //     `.backup/` first, through the same two `io` primitives and in the same
-//     order as a save (`sync::BackUpFirst`, `io::CommitStaged`).
+//     order as a save (`sync::BackUpFirst`, `io::CommitStaged`), with the same
+//     check between them that the state was not written since (#270).
 //   - **Keep both on anything else.** Two copies this client cannot tell apart
 //     stay where they are: the local file is not touched and the server row is
 //     not written. That costs disk and a warning; the alternative costs a
@@ -224,6 +225,16 @@ enum class StateError {
   /// were discarded and the local file was not touched. **This is the only
   /// check a state download gets** -- see the header note.
   kUnverified,
+
+  /// The state was written after it was backed up and before the download was
+  /// committed over it (#270, `sync::UnchangedSinceBackup`): a save-state
+  /// hotkey mid-tick. The download stood down, its staged bytes were discarded,
+  /// and the state and its backup are both left on the card. The next tick sees
+  /// both sides moved and keeps both.
+  ///
+  /// Not `kUnverified`, which names *downloaded* bytes that failed their length:
+  /// here the download was fine and it is the local file that moved.
+  kChangedSinceBackup,
 
   /// The verified bytes could not be moved onto the state.
   kCommitFailed,

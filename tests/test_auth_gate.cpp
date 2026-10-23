@@ -150,6 +150,8 @@ void Answers(checks::Checks& c) {
            "states: a refusal that was not 401 or 403 judged nothing");
   c.Expect(sync::AnswerOf(sync::StateError::kUnverified) == Answer::kSilent,
            "states: bytes that were not the state judged nothing");
+  c.Expect(sync::AnswerOf(sync::StateError::kChangedSinceBackup) == Answer::kSilent,
+           "states: a state written mid-download judged nothing");
   c.Expect(sync::AnswerOf(sync::StateError::kCommitFailed) == Answer::kSilent,
            "states: a commit that did not land judged nothing");
   c.Expect(sync::AnswerOf(sync::StateError::kNoPlacement) == Answer::kSilent,
