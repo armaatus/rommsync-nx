@@ -632,15 +632,9 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // **And the state is still what the backup copied** (#270, #263's check):
   // RetroArch writes a state on a hotkey, and one written since the backup is in
   // no copy anywhere. Last before the commit, and while the staged bytes are
-  // still the guard's, so standing down discards them.
-  //
-  // Two full reads of a state that may be tens of megabytes, streamed 4 KiB at a
-  // time (`state::HashFile`), so nothing is buffered. Weighed against a digest
-  // `io::CopyAtomically` would take while copying the backup, which reads the
-  // card once fewer: the backup is hashed *before* the state, so the window this
-  // leaves is the state's own hash either way, and only re-reading the backup
-  // proves it is on the card as copied. A state download is a moved server row
-  // over an unchanged local file -- rare, and never on a timer a player waits on.
+  // still the guard's, so standing down discards them. Two streamed reads of a
+  // state that may be tens of megabytes; why that and not a digest taken during
+  // the backup's copy is docs/SYNC_PROTOCOL.md#a-write-after-the-backup-263.
   const OperationError unchanged =
       UnchangedSinceBackup(files, sd_path, result.backup_sd_path, &message);
   if (unchanged != OperationError::kNone) {

@@ -451,7 +451,7 @@ enum class RestoreOutcome {
   kBackupFailed,
 
   /// The backup was made and the restore did not land. Whatever is at `sd_path`
-  /// is what was there before -- `io::CopyAtomically` stages and commits, so
+  /// is what was there before -- the copy is staged and then committed, so
   /// there is no third state.
   kWriteFailed,
 

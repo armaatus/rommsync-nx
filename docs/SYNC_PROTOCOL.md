@@ -573,8 +573,8 @@ durable before the next one can be:
    power cut could keep it and lose the backup's name — the one gap the call
    order hid, found by the replay below.
 3. The new bytes are staged beside the save and **synced** — by
-   `io::WriteAtomically`/`CopyAtomically` for a restore, by the HTTP backend
-   before it renames its `.part` for a download.
+   `io::CopyStaged` for a restore, by the HTTP backend before it renames its
+   `.part` for a download.
 4. `io::CommitStaged`: the save to `<save>.old`, the staged file onto the save,
    `<save>.old` removed, and the save's directory synced. A cut between the two
    renames leaves `.old` and no save, which the boot sweep renames back.
@@ -645,7 +645,7 @@ narrows it further; nothing here closes it.
 that back up and then overwrite make the same comparison last:
 
 - **A conflict restore** (M7-1, [below](#finding-the-backup-again-and-putting-it-back)),
-  between its backup and its `io::CopyAtomically`. It is the likelier of the
+  between its staged copy and its `io::CommitStaged`. It is the likelier of the
   two to meet a late write: it starts from the overlay, over a game that may be
   running, and `SdEngine::RunRestore` takes the save-write lock but not #242's
   hold. A file written since stops it with `changed_since_backup` and nothing
@@ -843,10 +843,11 @@ to prevent.
 
 `conflicts::Restore` puts those bytes back, and it is **a save overwrite in its
 own right**: it copies the file it is about to replace under `.backup/` first,
-through the same `sync::BackUpFirst`, checks the file is still what it copied
-([A write after the backup](#a-write-after-the-backup-263), #270), and then
-commits with `io::CopyAtomically`. A restore that ate the server's copy, or a
-save the game wrote after that copy, would be this rule broken one level up.
+through the same `sync::BackUpFirst`, stages the backup's bytes beside the file
+with `io::CopyStaged`, checks the file is still what it copied
+([A write after the backup](#a-write-after-the-backup-263), #270), and only then
+commits with `io::CommitStaged`. A restore that ate the server's copy, or a save
+the game wrote after that copy, would be this rule broken one level up.
 
 It writes the local file and nothing else. **The server stays the source of
 truth**: the next negotiation arbitrates, and will most likely plan an `upload`.

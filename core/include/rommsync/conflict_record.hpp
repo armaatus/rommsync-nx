@@ -13,10 +13,11 @@
 // ## A restore is itself an overwrite
 //
 // `Restore` backs the file up *first*, through the same `sync::BackUpFirst`
-// M2-5 uses, and only then commits with `io::CopyAtomically`. A restore that
-// ate the server's copy would be the bug backups exist to prevent, one level
-// up -- and so would one that ate a save the game wrote after that backup,
-// which is why `sync::UnchangedSinceBackup` sits between the two (#270).
+// M2-5 uses, and only then copies the backup into place, staged and committed.
+// A restore that ate the server's copy would be the bug backups exist to
+// prevent, one level up -- and so would one that ate a save the game wrote
+// after that backup, which is why `sync::UnchangedSinceBackup` runs between the
+// staged copy and its commit (#270).
 //
 // **The server stays the source of truth** (hard rule 3). A restore writes the
 // local file and nothing else: the next negotiation arbitrates, and will most
@@ -98,7 +99,7 @@ struct RestoreOptions {
 
 /// Put the bytes `entry_id` names back on the card.
 ///
-/// Five steps, in this order and no other:
+/// Six steps, in this order and no other:
 ///
 ///   1. the entry is found, and is one that replaced something;
 ///   2. the backup it names is still there;
@@ -106,14 +107,17 @@ struct RestoreOptions {
 ///      `sync::BackUpFirst` -- the same call M2-5 makes, with the save's slot or
 ///      the state's name as the discriminator, so one rom's save and its state
 ///      never come to share a backup name;
-///   4. the file is checked to still be what step 3 copied, through
-///      `sync::UnchangedSinceBackup` (#270). A game running under the overlay
-///      that saved in between has written bytes no copy holds, so the restore
-///      stops there with `kChangedSinceBackup` and writes nothing;
-///   5. and only then is the backup copied onto `sd_path` with
-///      `io::CopyAtomically`, which stages at `io::TempPathFor` and commits with
-///      two renames. An interruption leaves the old bytes or the new ones and
-///      never a splice; the `.tmp` is removed on a failure, or swept by
+///   4. the backup is copied to `io::TempPathFor(sd_path)` with `io::CopyStaged`,
+///      streamed and synced, with nothing at `sd_path` touched yet;
+///   5. the file is checked to still be what step 3 copied, through
+///      `sync::UnchangedSinceBackup` (#270) -- after the copy, so the window
+///      left is the check's own read. A game running under the overlay that
+///      saved in between has written bytes no copy holds, so the restore stops
+///      there with `kChangedSinceBackup`, discards the staged copy and writes
+///      nothing;
+///   6. and only then is the staged copy committed with `io::CommitStaged`'s two
+///      renames. An interruption leaves the old bytes or the new ones and never a
+///      splice; the `.tmp` is removed on a failure, or swept by
 ///      `sync::RecoverStaging` when the process died before it could be.
 ///
 /// The history is **not** updated: the entry stays exactly as it was, so a user

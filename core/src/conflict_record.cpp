@@ -219,7 +219,7 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
     return report;
   }
 
-  // **Step 3 of the five, and it is not optional.** A restore is a save
+  // **Step 3 of the six, and it is not optional.** A restore is a save
   // overwrite, so the bytes it is about to replace go under `.backup/` first,
   // through the same call M2-5 makes -- with the save's slot or the state's name
   // as the discriminator, so one rom's save and its state never share a name.
@@ -240,11 +240,24 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
     return report;
   }
 
+  // Streamed and staged: a save state is tens of megabytes and the sysmodule's
+  // inner heap is 1.5 MiB, and the two-rename commit is what makes an
+  // interruption leave the old bytes or the new ones and never a splice. Staged
+  // apart from the commit so the check below comes after the slow part.
+  io::StagedFile staged(io::TempPathFor(destination));
+  const io::CopyResult copied = io::CopyStaged(backup, destination);
+  if (!copied.ok()) {
+    report.outcome = RestoreOutcome::kWriteFailed;
+    report.message = "the backup could not be written back over " + entry->sd_path + ": " +
+                     copied.message;
+    return report;
+  }
+
   // **And the file is still what step 3 copied** (#270, #263's check). A restore
   // runs from the overlay over a game that may be running, and nothing holds the
   // game off the file: a save it wrote since the backup is in no copy anywhere,
-  // so the restore stands down and leaves it. Last before the copy, so the
-  // window left is this read and nothing else.
+  // so the restore stands down, its staged copy goes with the guard, and the
+  // file is left. Last before the commit, so the window left is this read.
   const sync::OperationError unchanged =
       sync::UnchangedSinceBackup(files, entry->sd_path, report.backup_sd_path, &message);
   if (unchanged != sync::OperationError::kNone) {
@@ -257,14 +270,13 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
     return report;
   }
 
-  // Streamed and staged: a save state is tens of megabytes and the sysmodule's
-  // inner heap is 1.5 MiB, and the two-rename commit is what makes an
-  // interruption leave the old bytes or the new ones and never a splice.
-  const io::CopyResult copied = io::CopyAtomically(backup, destination);
-  if (!copied.ok()) {
+  // Consumed by the commit whether it succeeds or fails, so the guard is done.
+  staged.Release();
+  const io::WriteResult committed = io::CommitStaged(io::TempPathFor(destination), destination);
+  if (!committed.ok()) {
     report.outcome = RestoreOutcome::kWriteFailed;
     report.message = "the backup could not be written back over " + entry->sd_path + ": " +
-                     copied.message;
+                     committed.message;
     return report;
   }
 

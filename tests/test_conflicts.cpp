@@ -42,6 +42,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -781,11 +782,16 @@ void Restore(checks::Checks& c) {
 // before the backup it restores from is copied over it. That write is in no copy
 // anywhere, and the restore has to see it and stand down.
 
-/// One restore of `entry` with the game writing `late` over `sd_path` at the
-/// moment the restore's own backup is published. `keep` routes it through Keep
-/// local instead, which must arm nothing for a restore that did not land.
+/// When the game writes: as the restore's own backup is published, or once the
+/// backup's bytes have been staged beside the file -- after the slow part, where
+/// a check placed before the copy would already have passed.
+enum class Late { kAfterBackup, kDuringCopy };
+
+/// One restore of `entry` with the game writing `late` over `sd_path` at `when`.
+/// `keep` routes it through Keep local instead, which must arm nothing for a
+/// restore that did not land.
 void RestoreUnderLateWrite(checks::Checks& c, const std::string& label, conflicts::Entry entry,
-                           bool keep) {
+                           bool keep, Late when = Late::kAfterBackup) {
   Sandbox sandbox(c, "conflicts-late-" + label);
   const std::unique_ptr<fs::FileSystem> files =
       rommsync::host::MakeNativeFileSystem(sandbox.root().string());
@@ -808,10 +814,16 @@ void RestoreUnderLateWrite(checks::Checks& c, const std::string& label, conflict
   {
     // `Reseed`: from here on the late bytes are the file, and the teardown audit
     // holds the restore to them.
-    faulty::LateWrite game([&] { sandbox.Reseed(entry.sd_path, late); });
+    const auto write = [&] { sandbox.Reseed(entry.sd_path, late); };
+    std::optional<faulty::LateWrite> game;
+    if (when == Late::kAfterBackup) {
+      game.emplace(write);
+    } else {
+      game.emplace(write, io::TempPathFor(sandbox.Host(entry.sd_path)));
+    }
     done = keep ? conflicts::KeepLocal(*files, history, id, &key, options)
                 : conflicts::Restore(*files, history, id, options);
-    c.Expect(game.fired(), label + ": the game wrote between the backup and the copy");
+    c.Expect(game->fired(), label + ": the game wrote between the backup and the commit");
   }
 
   c.ExpectEq(sandbox.Read(entry.sd_path), late,
@@ -839,6 +851,11 @@ void LateWrite(checks::Checks& c) {
   // Keep local is the restore plus an armed key; the key is what would send the
   // file over the server's copy, so it must not be armed over a write it skipped.
   RestoreUnderLateWrite(c, "keep-local", save, /*keep=*/true);
+
+  // The same write landing while the backup's bytes stream into place beside
+  // the file: for a state that copy is the long part, so the check has to come
+  // after it rather than before.
+  RestoreUnderLateWrite(c, "during-copy", save, /*keep=*/false, Late::kDuringCopy);
 
   // A state: tens of megabytes on a console, and what RetroArch writes on a
   // hotkey -- the likelier of the two to be written mid-restore.

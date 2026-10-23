@@ -230,6 +230,15 @@ class LateWrite final : public rommsync::io::Disk {
   explicit LateWrite(std::function<void()> write) : write_(std::move(write)) {
     previous_ = rommsync::io::SetDisk(this);
   }
+
+  /// Later still: `write` runs once `synced` -- a host path -- has been synced,
+  /// instead of at the backup's rename. Aimed at a staged copy's `.tmp`, it is a
+  /// game writing while the slow part of an overwrite runs, after any check
+  /// placed before that copy.
+  LateWrite(std::function<void()> write, std::string synced)
+      : write_(std::move(write)), synced_(std::move(synced)) {
+    previous_ = rommsync::io::SetDisk(this);
+  }
   ~LateWrite() override { rommsync::io::SetDisk(previous_); }
 
   LateWrite(const LateWrite&) = delete;
@@ -244,7 +253,7 @@ class LateWrite final : public rommsync::io::Disk {
   int Rename(const std::string& from, const std::string& to) override {
     const int renamed = Inner().Rename(from, to);
     // The backup's own commit: its staged copy onto its name, in `.backup/`.
-    if (renamed == 0 && !fired_ && to.find("/.backup/") != std::string::npos &&
+    if (renamed == 0 && !fired_ && synced_.empty() && to.find("/.backup/") != std::string::npos &&
         from == rommsync::io::TempPathFor(to)) {
       fired_ = true;
       write_();
@@ -252,7 +261,14 @@ class LateWrite final : public rommsync::io::Disk {
     return renamed;
   }
   int Remove(const std::string& path) override { return Inner().Remove(path); }
-  bool Sync(const std::string& path) override { return Inner().Sync(path); }
+  bool Sync(const std::string& path) override {
+    const bool synced = Inner().Sync(path);
+    if (synced && !fired_ && !synced_.empty() && path == synced_) {
+      fired_ = true;
+      write_();
+    }
+    return synced;
+  }
 
   /// Whether the write happened, so a scenario cannot pass on one that never ran.
   bool fired() const { return fired_; }
@@ -263,6 +279,7 @@ class LateWrite final : public rommsync::io::Disk {
   }
 
   std::function<void()> write_;
+  std::string synced_;
   rommsync::io::Disk* previous_ = nullptr;
   bool fired_ = false;
 };

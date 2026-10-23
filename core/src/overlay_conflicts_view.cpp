@@ -226,9 +226,11 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
     case conflicts::RestoreOutcome::kNotAConflict:
       return "Nothing was written: Keep local is only for a save conflict";
     case conflicts::RestoreOutcome::kChangedSinceBackup:
-      // A game saved mid-restore (#270). The press can simply be repeated once
-      // the game is closed, which is the one thing the player needs to know.
-      return "Nothing was written: the game saved while this ran. Close it and try again.";
+      // Almost always a game saving mid-restore (#270), though a file the card
+      // would not read back lands here too, so the sentence claims no more than
+      // that it changed. The press can be repeated once the game is closed.
+      return "Nothing was written: the file changed while this ran. Close the game and try "
+             "again.";
   }
   return "The restore did not happen";
 }

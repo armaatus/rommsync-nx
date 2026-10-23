@@ -275,7 +275,7 @@ const char* ToString(CopyError error) {
   return "none";
 }
 
-CopyResult CopyAtomically(const std::string& from, const std::string& to) {
+CopyResult CopyStaged(const std::string& from, const std::string& to) {
   CopyResult result;
   errno = 0;
   std::FILE* source = std::fopen(from.c_str(), "rb");
@@ -331,8 +331,8 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
     result.message = Describe(from, "could not be read to the end");
     return result;
   }
-  // Only once the bytes are known to be all there, and before the commit below
-  // -- which is the whole point of this copy: the previous bytes have to be on
+  // Only once the bytes are known to be all there, and before the commit that
+  // follows -- which is the whole point of this copy: the previous bytes have to be on
   // the card before the save they came from is overwritten. Syncing a temp file
   // that is about to be deleted would just be a slow way to fail.
   const bool synced = !short_write && flushed && closed && Sync(temp);
@@ -342,15 +342,23 @@ CopyResult CopyAtomically(const std::string& from, const std::string& to) {
     result.message = Describe(temp, Incomplete(short_write || !flushed, refused));
     return result;
   }
+  result.bytes_copied = copied;
+  return result;
+}
 
-  const WriteResult committed = CommitStaged(temp, to);
-  if (!committed.ok()) {
-    result.error = committed.error == WriteError::kOpenFailed ? CopyError::kOpenFailed
-                                                              : CopyError::kCommitFailed;
-    result.message = committed.message;
+CopyResult CopyAtomically(const std::string& from, const std::string& to) {
+  CopyResult result = CopyStaged(from, to);
+  if (!result.ok()) {
     return result;
   }
-  result.bytes_copied = copied;
+  const WriteResult committed = CommitStaged(TempPathFor(to), to);
+  if (!committed.ok()) {
+    CopyResult failed;
+    failed.error = committed.error == WriteError::kOpenFailed ? CopyError::kOpenFailed
+                                                              : CopyError::kCommitFailed;
+    failed.message = committed.message;
+    return failed;
+  }
   result.name_durable = committed.name_durable;
   return result;
 }

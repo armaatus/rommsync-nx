@@ -337,6 +337,17 @@ struct CopyResult {
 /// (docs/SYNC_PROTOCOL.md#backups).
 CopyResult CopyAtomically(const std::string& from, const std::string& to);
 
+/// `CopyAtomically` without its commit: the bytes of `from` end up synced at
+/// `TempPathFor(to)`, and nothing at `to` has changed. The caller commits with
+/// `CommitStaged` or removes the staged file -- `StagedFile` is the guard.
+///
+/// For the caller that has to ask one more question *after* the slow part and
+/// before the rename: `conflicts::Restore` (#270) checks the file it is about
+/// to replace was not written while the backup streamed into place, and a
+/// check made before the copy would leave the whole copy as the window.
+/// On success `name_durable` is meaningless -- there is no name yet.
+CopyResult CopyStaged(const std::string& from, const std::string& to);
+
 /// Read a whole file.
 ///
 /// **`kMissing` means ENOENT, and nothing else.** A file that exists and refuses
