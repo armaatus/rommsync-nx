@@ -79,6 +79,7 @@ phase_measured() {
   # chain -- must fail, and fail on the worker. The script reads the constant
   # out of the header text, so no rebuild; the frames are the ones just measured.
   local header="$SCRATCH/sysmodule/source/sized_thread.hpp" out
+  cp "$header" "$header.orig"
   sed 's/kThreadStackBytes = 0x[0-9A-Fa-f]*;/kThreadStackBytes = 0x2000;/' "$header" >"$header.new" &&
     mv "$header.new" "$header"
   grep -q 'kThreadStackBytes = 0x2000;' "$header" ||
@@ -93,6 +94,26 @@ phase_measured() {
     fail "the walk failed with the worker's stack shrunk, but not on the worker"
   }
   echo "ok: with kThreadStackBytes shrunk to 0x2000 the walk fails on the worker thread"
+  mv "$header.orig" "$header"
+
+  # And on the ceiling sized_thread.hpp points a reader to rather than quoting a
+  # figure: `kWorkerRestBytes` shrunk under the worker's measured chain, with
+  # its stack as it is, must fail on that ceiling.
+  local budget="$SCRATCH/sysmodule/source/stack_budget.hpp"
+  sed 's/kWorkerRestBytes = 0x[0-9A-Fa-f]*;/kWorkerRestBytes = 0x100;/' "$budget" >"$budget.new" &&
+    mv "$budget.new" "$budget"
+  grep -q 'kWorkerRestBytes = 0x100;' "$budget" ||
+    fail "could not shrink kWorkerRestBytes in the scratch copy of stack_budget.hpp"
+  if out="$(toolchain_run "$SCRATCH" \
+              'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' 2>&1)"; then
+    echo "$out" >&2
+    fail "the walk passed with kWorkerRestBytes shrunk to 0x100; it is not holding the worker to its ceiling"
+  fi
+  grep -q "the worker thread spends .*(kWorkerRestBytes)" <<<"$out" || {
+    echo "$out" >&2
+    fail "the walk failed with kWorkerRestBytes shrunk, but not on that ceiling"
+  }
+  echo "ok: with kWorkerRestBytes shrunk to 0x100 the walk fails on the worker's ceiling"
 }
 
 case "${1:-}" in
