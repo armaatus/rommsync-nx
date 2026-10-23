@@ -66,6 +66,21 @@ log::Level LevelFor(config::Severity severity) {
 /// in consecutive statements, and two copies is how they come to disagree.
 bool StoppedAccepting(int status) { return status == 401 || status == 403; }
 
+/// How a log line names a rom -- `Tetris (World) (rom 812)`, with `, slot S`
+/// inside the parentheses when one is given: its file name when the index has
+/// it, and its id always, so a line about a rom the index has lost can still be
+/// traced.
+std::string RomLabel(const roms::RomIndex& index, std::int64_t rom_id,
+                     const std::optional<std::string>* slot = nullptr) {
+  const roms::Rom* rom = index.ById(rom_id);
+  std::string label = (rom != nullptr ? rom->fs_name_no_ext : std::string("rom")) + " (rom " +
+                      std::to_string(rom_id);
+  if (slot != nullptr) {
+    label += ", slot " + slot->value_or("none");
+  }
+  return label + ")";
+}
+
 /// The one line every tick ends with, whatever ended it.
 ///
 /// **Every path out of `RunOneTick` writes one**, including the four that return
@@ -2520,12 +2535,9 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
     // this plan put on the card, the kept bytes under `.backup/` -- which the
     // player is told rather than left to find (#273).
     for (const sync::OvertakenKeepLocal& choice : overtaken) {
-      const roms::Rom* rom = library.index.ById(choice.key.first);
       log::Warn(log::Event::kSyncRefused,
-                (rom != nullptr ? rom->fs_name_no_ext : std::string("rom")) + " (rom " +
-                    std::to_string(choice.key.first) + ", slot " +
-                    choice.key.second.value_or("none") +
-                    "): Keep local was overtaken -- the server asked for a " +
+                RomLabel(library.index, choice.key.first, &choice.key.second) +
+                    ": Keep local was overtaken -- the server asked for a " +
                     sync::ToString(choice.action) +
                     ", not an upload, so nothing went over its copy and the choice is spent");
     }
@@ -2573,10 +2585,8 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
   // out of this tick (#246): its saves were not offered and nothing of it was
   // touched. Named, so the one game that is not syncing can be found.
   for (const std::int64_t rom_id : tick.oversized_roms) {
-    const roms::Rom* rom = library.index.ById(rom_id);
     log::Warn(log::Event::kSyncRefused,
-              (rom != nullptr ? rom->fs_name_no_ext : std::string("rom")) + " (rom " +
-                  std::to_string(rom_id) + "): the server holds more saves for it than the " +
+              RomLabel(library.index, rom_id) + ": the server holds more saves for it than the " +
                   std::to_string(sync::kMaxPlanOperations) +
                   " one plan can carry, so it was left out of this sync");
   }

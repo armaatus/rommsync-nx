@@ -153,9 +153,9 @@ struct SettingsRow {
   /// omission: every row that is not a `kNavigate` is editable but `[sync]
   /// slot` (#271), so a marker would be on nearly every configuration row on
   /// the screen and would separate nothing. What separates the rows a press
-  /// changes is the A prompt drawn over them (`press_label`). The flag is the model saying which keys
-  /// `config::ApplyEdit` accepts, held by `overlay.settings` rather than by a
-  /// screenshot.
+  /// changes is the A prompt drawn over them (`press_label`). The flag is the
+  /// model saying which keys `config::ApplyEdit` accepts, held by
+  /// `overlay.settings` rather than by a screenshot.
   bool editable = false;
 };
 

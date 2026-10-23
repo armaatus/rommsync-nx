@@ -398,9 +398,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// the game gives each play session the application seen when its save was
   /// written -- "unknown" when none was. Only a tick that falls due, its hold,
   /// a "Sync now" press and a Keep local's restore (#273) ask, so a game played
-  /// entirely between two ticks is
-  /// never seen: deliberately, because asking between ticks would be a poll on
-  /// a console with nothing owed, which #242 keeps at none.
+  /// entirely between two ticks is never seen: deliberately, because asking
+  /// between ticks would be a poll on a console with nothing owed, which #242
+  /// keeps at none.
   using ForegroundProbe = std::function<play::Foreground()>;
   void UseForegroundProbe(ForegroundProbe probe,
                           std::chrono::milliseconds poll = kForegroundPollInterval);
