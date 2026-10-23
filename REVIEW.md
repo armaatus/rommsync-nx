@@ -1,20 +1,14 @@
 # Review policy
 
-What the independent review looks for, which findings **block a merge** and
+What a review of a change here looks for, which findings **block a merge** and
 which do not, and what it should not report at all.
 
-**It runs once.** One review per pull request, from a context that has not seen
-the conversation which produced the diff, because an author reviewing its own
-work shares its blind spots. If it asks for changes, the author gets exactly one
-fix session and that fix is re-reviewed once. That second verdict is final: a
-second request for changes parks the pull request for a person. **Two reviews
-maximum, ever.**
-
-Nothing else reads the branch. That bound is the finding of #86, which burned
-four reviews without one ever judging the commit that merged: every answer to a
-finding is a commit, every commit moves the head, and a head move invalidates
-the review that asked for it. Reviewing a branch four times is not four times
-the assurance; it is the same review of four different commits.
+Work reaches `main` as one pull request per milestone: each ticket's branch is
+merged into the integration branch (`fleet/mN`), and the maintainer reviews and
+merges that. Before it opens, each branch can be reviewed from a context that
+has not seen the conversation which produced it — `/code-review` and
+`/mattpocock-skills:code-review` — because an author reviewing its own work
+shares its blind spots. Whoever reviews, this is the standard.
 
 Read this file before reviewing. If you are the author, read it before you
 finish — a finding you can predict is one you can avoid.
@@ -50,21 +44,44 @@ gets one line or none.
    edited, which is Important because those bodies are the only channel between
    parallel worktrees.
 
-**A fleet pull request carries its `fleet.sh cost` figure.** It is the only
-number saying whether a run got cheaper. Missing, it is a Suggestion.
-
 ### ...and this project's own
 
-A host repository adds its correctness rules in **`.autofleet/review.md`**, and
-they are part of this policy wherever that file exists. Read it after this one.
+The failure paths this codebase cares about most.
 
-That seam is the point. The rules that belong there are the ones this file
-cannot know — the save file that must be written atomically, the header that may
-not appear in `core/`, the address a test may not reach. They were written into
-this file once, and this file is **vendored into every host repository**, so
-every project that installed autofleet was reviewed against another project's
-save format. Nothing in the payload may know about one project; that is hard rule
-2, and this file was breaking it.
+**Correctness**
+
+- **The save guarantee.** Any path that overwrites a save file backs it up first
+  and writes atomically. An interruption anywhere in the sequence leaves either
+  the old file or the new one. A failed backup aborts the write. This is
+  CLAUDE.md hard rule 2, and a breach is always Important.
+- **Network calls.** Every one has a timeout, is safe offline, retries with
+  backoff, and never blocks boot. A call missing a timeout is Important.
+- **Conflict resolution.** The server is the source of truth. Local-wins
+  behaviour that is not explicitly specified in the issue is a bug.
+- **Partial state.** What is left on disk when the process dies here? A
+  half-written state.db, a `.tmp` beside a save, or a token file with no
+  matching device record is Important.
+- **Integer and buffer handling** in anything that parses a server response.
+
+**Portability and platform rules**
+
+- Nothing in `core/` includes a host-only or libnx header (hard rule 4). CI
+  catches the mechanical form; report the ones it cannot — a platform
+  assumption smuggled in as a type, a path separator, an endianness assumption,
+  a `long` that is not the same width on aarch64.
+- Nothing new is on the boot path.
+- No real hardware and no production RomM is touched (hard rule 1). A test or
+  script that reaches a non-loopback address is Important —
+  `policy.loopback_only` exists for this and a finding here means it was worked
+  around.
+- No secrets in the tree (hard rule 5): `config.ini`, `token.dat`, `device.dat`,
+  `.env`, `server/testing/fixture-auth.env`.
+
+**Compliance with the spec**
+
+- The Switch targets are built by CI (`switch-build`), not by `ctest`; a change
+  under `sysmodule/`, `overlay/` or `tlsprobe/` whose commit message does not say
+  it was built with devkitPro is a finding.
 
 ## Critical, Important, Suggestion
 
@@ -75,15 +92,13 @@ away.** There is no second reviewer behind this one to take the argument to.
 **Important** — a real defect or a breach of a hard rule: wrong behaviour on a
 path that matters, a missing test that would have caught the bug, a broken build
 on either target, or the tracker left saying something untrue. Fixed, or
-disputed in the commit message with a reason the re-review accepts.
+disputed in the commit message with a reason the reviewer accepts.
 
 **Suggestion** — naming, comment wording, ordering, a clearer formulation of
-something already correct. **A Suggestion is posted, and that is all.** It goes
-in an ordinary pull request comment that blocks nothing and that nobody has to
-answer; `review.sh` separates them from the blocking half by severity, so
-labelling one thing as another is the single mistake here that moves a merge.
-The asymmetry is deliberate: a nit that held a branch cost a whole loop to
-change a comment.
+something already correct. **A Suggestion blocks nothing** and nobody has to
+answer it, so labelling one thing as another is the single mistake here that
+moves a merge. The asymmetry is deliberate: a nit that held a branch cost a
+whole loop to change a comment.
 
 **A Suggestion never becomes its own issue.** One that does costs a whole loop —
 brief, implementation, review, fix — to change a comment, and a review that
@@ -102,30 +117,12 @@ whose signal is buried in twenty preferences costs more attention than it saves.
   against the cap of five.
 - **Anything you cannot cite.** A behaviour claim needs a `file:line` in the
   actual source, not an inference from a name. If you are unsure a finding is
-  real, drop it or say you are unsure — there is one fix session behind this
-  review, and a wrong Important finding spends it with no later round to take it
-  back in.
-
-## The verdict is a field, not a sentence
-
-The reviewer answers with a JSON object — `verdict`, and `findings` each
-carrying a severity, a file, a line and its text. `scripts/fleet/review.sh`
-posts it: the Critical and Important findings as the review body, the
-Suggestions as an ordinary comment, and a marker naming the head it judged.
-
-**`verdict` is `request-changes` if and only if something is Critical or
-Important.** Nothing reads prose to decide. That marker is the only thing
-`.github/scripts/merge_gate.py` looks for, and it is written by the script from
-the `verdict` field — never spelled by the model, and never reachable from the
-worktree under review (`.claude/hooks/guard.py` refuses `gh pr review` there).
-
-It has to be a marker and not GitHub's own APPROVED state because GitHub
-refuses `--approve` and `--request-changes` on your own pull request, and the
-reviewer signs in as whoever `gh` is — normally the account that opened the PR.
-`review.sh` tries the real state first and falls back, so a repository with a
-separate reviewer identity gets the badge for free.
-
-**A count of findings is not a trailer.** Three HTML comments used to end every
-review body, because the gate could not otherwise tell five Suggestions from
-nothing at all — both being a COMMENTED verdict. The severity field tells it
-now, in the one place the reviewer states it.
+  real, drop it or say you are unsure — a wrong Important finding spends a fix
+  on nothing.
+- **Anything CI already enforces**: compiler warnings, `core/` include hygiene,
+  shell scripts that do not parse, an unformatted Python file, artifact shape.
+- **Generated or vendored trees**: `build/`, `.venv/`, `server/testing/library/`,
+  `.cache/`, `overlay/lib/`.
+- **`server/contract/captures/` content.** It is a recorded snapshot of a real
+  server and is not written by hand. A *change* to it, on the other hand, is
+  Important.

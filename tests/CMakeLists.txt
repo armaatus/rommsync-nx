@@ -1743,7 +1743,7 @@ add_test(NAME agent.config
          COMMAND "${BASH_PROGRAM}" "${CMAKE_SOURCE_DIR}/evals/lint.sh")
 set_tests_properties(agent.config PROPERTIES TIMEOUT 60)
 
-# --- worktree environment: scripts/orca/env.sh -------------------------------
+# --- worktree environment: scripts/orca/ ------------------------------------
 # setup.sh's first step, and not its only caller -- compose.sh generates a
 # missing .env too, so the romm tab writes one concurrently. Losing that race
 # used to abort setup under `set -e` and leave a worktree with nothing
@@ -1776,9 +1776,20 @@ add_test(NAME orca.env_setup_fails_fast
 add_test(NAME orca.env_romm_version
          COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" romm_version)
 
+# The stack name and ports, which every running worktree's RomM is filed under:
+# moving provisioning to scripts/orca/ (#277) must not rename one.
+add_test(NAME orca.env_derivation
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" derivation)
+
+# Every compose profile is activated by every teardown path, or `down` leaves
+# that service running and holding this worktree's port (#122).
+add_test(NAME orca.teardown_profiles
+         COMMAND "${BASH_PROGRAM}" "${ORCA_ENV_TEST}" teardown_profiles)
+
 set_tests_properties(orca.env_concurrent_writers orca.env_never_partial
                      orca.env_picks_python orca.env_replaces_dead_venv
                      orca.env_setup_fails_fast orca.env_romm_version
+                     orca.env_derivation orca.teardown_profiles
                      PROPERTIES TIMEOUT 60)
 
 # --- the Switch targets: sysmodule/, overlay/ and switch.mk ------------------
@@ -2345,7 +2356,7 @@ set(ENGINE_SCENARIOS
   restore_race  # M7-2: a restore pressed while a tick is writing saves waits its turn, not interleaved
   restore_polled  # M9-6: a restore on a slow card holds no IPC call while it copies
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
-  keep_local_guards  # #273: Keep local refused under a game and past four waiting, nothing written
+  keep_local_guards  # #273/#275: Keep local held under a game, refused past four waiting
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
@@ -2409,7 +2420,7 @@ set(ENGINE_RIG_SCENARIOS
   install_wake       # review: a refused remote-install claim is asked again after a wake
   declined           # #257: a save the placer will not place costs one line, never a failed save
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
-  keep_local_overtaken  # #273: a game, a newer conflict and a download each spend or refuse it unsent
+  keep_local_overtaken  # #273/#275: held under a game then landed; superseded and overtaken unsent
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # What this project's provisioning scripts share. Sourced, never run.
 #
-# This used to be the fleet's library too -- the dispatcher, the review loop,
-# the autostart watcher. That half is scripts/fleet/ now (autofleet v2); what is
-# left is the project half: the stack-name derivation test_rig_fixture.sh needs
-# when .env is gone (kept byte-identical to what scripts/fleet/env.sh derives
-# with AUTOFLEET_PROJECT_PREFIX=rmx), the docker probe, and the Python picker
-# .autofleet/setup.sh needs before it installs server/requirements.txt.
+# setup.sh, env.sh, archive.sh and reap.sh all lean on it: the stack-name and
+# port derivation (env.sh writes it to .env; teardown and test_rig_fixture.sh
+# re-derive it when .env is gone), the docker probes, and the Python picker
+# setup.sh needs before it installs server/requirements.txt.
+
+# Every stack this repo starts is named under it; reap.sh sweeps by it.
+ORCA_PROJECT_PREFIX=rmx
 
 # A worktree's identity -- its compose project name and its ports -- is a
 # pure function of its absolute path. env.sh writes the result to .env when the
@@ -55,7 +56,7 @@ print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:4])
   # directory names collide (a checkout and a worktree both called
   # "rommsync-nx") would otherwise share a compose project, and the second
   # `up -d` would adopt and recreate the first's containers and database.
-  orca_project="rmx-${orca_slug}-${orca_offset}"
+  orca_project="${ORCA_PROJECT_PREFIX}-${orca_slug}-${orca_offset}"
 }
 
 # Whether the daemon is actually answering.
@@ -65,6 +66,30 @@ print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:4])
 # stack that survived because the daemon was down is exactly the one that needs
 # reporting, and calling it removed is worse than not checking at all.
 orca_docker_ready() { docker info >/dev/null 2>&1; }
+
+# Take one stack down by name, volumes included, whatever .env says.
+#
+# `-p` names the project outright, so teardown hits the stack it was given even
+# when .env disagrees. `--profile tls` because `down` only touches services
+# whose profile is ACTIVE: the TLS terminator tls-fixture.sh starts would
+# otherwise survive, come back on every docker start under `restart:
+# unless-stopped`, hold the worktree's TLS_PORT, and block the network removal
+# behind it (#122). `orca.teardown_profiles` fails the day a profile is added
+# and not named here.
+orca_stack_down() {
+  docker compose -p "$1" -f server/testing/docker-compose.yml \
+    --profile tls down -v --remove-orphans
+}
+
+# Everything docker holds for one compose project, as `kind<TAB>name` lines.
+# Only meaningful once orca_docker_ready succeeds.
+orca_project_remnants() {
+  local filter="label=com.docker.compose.project=$1" tab
+  tab="$(printf '\t')"
+  docker ps -a      --filter "$filter" --format "container${tab}{{.Names}}" 2>/dev/null || true
+  docker volume ls  --filter "$filter" --format "volume${tab}{{.Name}}"     2>/dev/null || true
+  docker network ls --filter "$filter" --format "network${tab}{{.Name}}"    2>/dev/null || true
+}
 
 # The Python that server/requirements.txt can actually be installed with.
 #

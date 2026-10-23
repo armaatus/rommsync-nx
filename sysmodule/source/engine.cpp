@@ -1048,6 +1048,25 @@ void SdEngine::RunWorker() {
       continue;
     }
 
+    // A Keep local held under a game (#275) lands once none runs -- whether
+    // or not a tick is owed, so a switched-off sync still puts the kept bytes
+    // on the card when the screen said it would. Asked every
+    // `foreground_poll_` while one is held, and never otherwise, so a console
+    // with none still never asks `pm` between ticks -- and a drain or a list
+    // pump looping through here does not ask once per pass.
+    if (!keep_local_held_.empty() && clock_->Steady() >= held_poll_due_) {
+      lock.unlock();
+      const bool game = application_running();
+      if (!game) {
+        LandHeldKeepLocal(/*ask_tick=*/true);
+      }
+      lock.lock();
+      if (!game) {
+        continue;
+      }
+      held_poll_due_ = clock_->Steady() + foreground_poll_;
+    }
+
     // Read **before** the decision and compared after the pump: everything that
     // gives this thread work bumps it under `mutex_`, so a notification that
     // lands while the lock is released below cannot be missed. See `wakes_`.
@@ -1062,6 +1081,12 @@ void SdEngine::RunWorker() {
       // server it has not asked.
       lock.unlock();
       bool game = application_running();
+      if (!game) {
+        // A held Keep local the check above saw under the game -- which
+        // closed between the two asks -- lands first, so this tick is the one
+        // that sends it (#275).
+        LandHeldKeepLocal(/*ask_tick=*/false);
+      }
       lock.lock();
       if (!game) {
         holding_ = false;
@@ -1124,6 +1149,17 @@ void SdEngine::RunWorker() {
       continue;
     }
 
+    if (!keep_local_held_.empty()) {
+      // A held Keep local is asked after every `foreground_poll_`, as a held
+      // tick is: the one deadline it adds, and only while one is held.
+      const std::chrono::steady_clock::time_point now = clock_->Steady();
+      const std::chrono::milliseconds until =
+          held_poll_due_ > now
+              ? std::chrono::duration_cast<std::chrono::milliseconds>(held_poll_due_ - now)
+              : std::chrono::milliseconds{0};
+      decision.sleep_for = decision.parked ? until : std::min(decision.sleep_for, until);
+      decision.parked = false;
+    }
     const auto woken = [this, decided_at] { return stopping_ || wakes_ != decided_at; };
     if (woken()) {
       continue;
@@ -3216,9 +3252,35 @@ bool SdEngine::BackupPresent(const conflicts::Entry& entry) const {
 }
 
 ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) {
-  // The worker appends to this after every half of a tick now (M7-2, #37), so
-  // reading it is no longer a single-threaded read.
-  std::lock_guard<std::mutex> history(history_mutex_);
+  {
+    // The worker appends to this after every half of a tick now (M7-2, #37), so
+    // reading it is no longer a single-threaded read.
+    std::lock_guard<std::mutex> history(history_mutex_);
+    BuildConflictPage(query, page);
+  }
+  // Which rows a Keep local is chosen for (#275), answered from the lists
+  // themselves under `mutex_` -- after `history_mutex_` is let go, since
+  // `mutex_` is never taken under it, and with no copy of either list: this
+  // runs on the IPC thread, possibly beside a tick's three (`kHeapKeepLocal`).
+  // `BuildConflictPage` marked each candidate `kWaiting`, the longest
+  // spelling, so a row answered `held` or `open` here only shrinks the page it
+  // was fitted into.
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (ipc::ConflictRow& row : page->entries) {
+    if (row.keep_local == ipc::KeepLocalState::kOpen) {
+      continue;
+    }
+    const state::Baseline::Key key{row.entry.rom_id, row.entry.slot};
+    if (sync::FindByKey(keep_local_held_, key) != nullptr) {
+      row.keep_local = ipc::KeepLocalState::kHeld;
+    } else if (sync::FindByKey(keep_local_, key) == nullptr) {
+      row.keep_local = ipc::KeepLocalState::kOpen;
+    }
+  }
+  return ipc::Error::kOk;
+}
+
+void SdEngine::BuildConflictPage(const ipc::ConflictQuery& query, ipc::ConflictPage* page) {
   const std::vector<conflicts::Entry>& entries = history_.entries();
   page->offset = query.offset;
   page->total = static_cast<std::int32_t>(entries.size());
@@ -3231,6 +3293,14 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
     ipc::ConflictRow row;
     row.entry = entries[at];
     row.backup_present = BackupPresent(entries[at]);
+    // A choice is its save's, and drawn on the entry it was made on: the
+    // save's newest, which is the only one Keep local takes. A candidate for
+    // now; `ListConflicts` says whether it is chosen.
+    if (entries[at].save_conflict() &&
+        conflicts::NewestSaveEntry(history_, {entries[at].rom_id, entries[at].slot}) ==
+            &entries[at]) {
+      row.keep_local = ipc::KeepLocalState::kWaiting;
+    }
     if (!ipc::AppendIfItFits(page, std::move(row))) {
       // The byte bound, not the count: the page stops here and says so, and the
       // caller's next offset is this one. See `ipc::ConflictQuery`.
@@ -3238,7 +3308,6 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
     }
   }
   page->has_more = at < entries.size();
-  return ipc::Error::kOk;
 }
 
 ipc::RestoreState SdEngine::RequestRestore(std::int64_t entry_id) {
@@ -3289,61 +3358,79 @@ ipc::RestoreState SdEngine::restore_state() const {
   return restore_;
 }
 
+template <typename Act>
+conflicts::RestoreReport SdEngine::OnCard(Act&& act) {
+  // **Held for the whole check-and-act**, which on the worker is the same
+  // thread as every tick and so cannot contend with one; it is taken anyway
+  // because `Quiesce` reads it to know that no save write is in flight, and
+  // because with no worker this runs on the IPC thread beside one that may
+  // yet be started. Waited on rather than tried: nothing that holds it holds
+  // it for longer than a save copy, and this thread is not the one a screen
+  // is waiting on any more.
+  std::lock_guard<std::timed_mutex> writing(save_write_mutex_);
+
+  // The vector, for the read and the entry it hands back. Inside the write
+  // lock, which is the order both sides take them in.
+  std::lock_guard<std::mutex> history(history_mutex_);
+
+  if (card_ == nullptr) {
+    // A build that never called `UseCard`; a console always has (`card.hpp`,
+    // since M7-2, #37). `kBackupFailed` rather than a transport failure: its
+    // promise is that nothing was written, which is the one thing a build
+    // that cannot open the card is certain of.
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kBackupFailed;
+    report.message = "this build cannot open the SD card, so nothing was written";
+    return report;
+  }
+  return act(*card_);
+}
+
 void SdEngine::RunRestore(std::int64_t entry_id) {
-  conflicts::RestoreReport report;
   bool keep_local = false;
   std::vector<state::Baseline::Key> armed;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     keep_local = restore_keeps_local_;
     if (keep_local) {
-      // For `conflicts::KeepLocal`'s bound. Only a restore arms, and one runs
-      // at a time, so the list can only shrink before the arm below.
+      // For `conflicts::KeepLocal`'s bound, which the held choices count
+      // towards as well as the armed ones (#275): each is a key waiting for
+      // its upload. Only a restore arms or holds, and one runs at a time, so
+      // the lists can only shrink before the arm below.
+      // Reserved once, so the copy is its keys and no doubling (`kHeapKeepLocal`).
+      armed.reserve(keep_local_.size() + keep_local_held_.size());
       armed = keep_local_;
+      for (const state::Baseline::Key& key : keep_local_held_) {
+        if (sync::FindByKey(armed, key) == nullptr) {
+          armed.push_back(key);
+        }
+      }
     }
   }
   state::Baseline::Key kept{0, std::nullopt};
-  // **Never under a running game** (#273). The game holds its save in memory
-  // and writes it when it closes, over the bytes Keep local puts back -- and
-  // the tick #242 holds for it would then upload *that* write with
-  // `overwrite=true`, bytes the player never chose. Asked of any application:
-  // `pm` names a title, not the save it holds, and RetroArch runs every rom
-  // under one, so "the save's own game" cannot be told from another. Asked
-  // before the locks below, since on a console it is a service call; `KeepLocal`
-  // refuses on it after the entry's own refusals. A plain restore is not asked:
-  // it overrules nothing, and the next sync arbitrates whatever the card holds.
+  // **Never written under a running game** (#273). The game holds its save in
+  // memory and writes it when it closes, over the bytes Keep local puts back --
+  // and the tick #242 holds for it would then upload *that* write with
+  // `overwrite=true`, bytes the player never chose. So the choice is **held**
+  // (#275): `KeepLocal` writes nothing and answers `kHeld`, and the worker
+  // lands it once no application runs (`LandHeldKeepLocal`). Asked of any
+  // application: `pm` names a title, not the save it holds, and RetroArch runs
+  // every rom under one, so "the save's own game" cannot be told from another.
+  // Asked before the locks below, since on a console it is a service call;
+  // `KeepLocal` holds only after the entry's own refusals. A plain restore is
+  // not asked: it overrules nothing, and the next sync arbitrates whatever the
+  // card holds.
   conflicts::RestoreOptions restore_options;
   restore_options.game_running = keep_local && application_running();
-  {
-    // **Held for the whole check-and-act**, which on the worker is the same
-    // thread as every tick and so cannot contend with one; it is taken anyway
-    // because `Quiesce` reads it to know that no save write is in flight, and
-    // because with no worker this runs on the IPC thread beside one that may
-    // yet be started. Waited on rather than tried: nothing that holds it holds
-    // it for longer than a save copy, and this thread is not the one a screen
-    // is waiting on any more.
-    std::lock_guard<std::timed_mutex> writing(save_write_mutex_);
-
-    // The vector, for the read and the entry it hands back. Inside the write
-    // lock, which is the order both sides take them in.
-    std::lock_guard<std::mutex> history(history_mutex_);
-
-    if (card_ == nullptr) {
-      // A build that never called `UseCard`; a console always has (`card.hpp`,
-      // since M7-2, #37). `kBackupFailed` rather than a transport failure: its
-      // promise is that nothing was written, which is the one thing a build
-      // that cannot open the card is certain of.
-      report.outcome = conflicts::RestoreOutcome::kBackupFailed;
-      report.message = "this build cannot open the SD card, so nothing was written";
-    } else if (keep_local) {
-      report = conflicts::KeepLocal(*card_, history_, entry_id, armed, &kept, restore_options);
-    } else {
-      report = conflicts::Restore(*card_, history_, entry_id);
-    }
-  }
+  conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
+    return keep_local
+               ? conflicts::KeepLocal(card, history_, entry_id, armed, &kept, restore_options)
+               : conflicts::Restore(card, history_, entry_id);
+  });
 
   bool woken = false;
   bool unarmed = false;
+  const bool held = keep_local && report.outcome == conflicts::RestoreOutcome::kHeld;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (restore_.entry_id != entry_id) {
@@ -3351,7 +3438,20 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
       // refuse rather than write one restore's outcome under another's id.
       return;
     }
-    if (keep_local && report.ok()) {
+    if (held) {
+      // Held, not armed: nothing is on the card yet. The worker is woken so
+      // its next wait is bounded by the poll that lands it (`RunWorker`), and
+      // that poll is one `foreground_poll_` off -- the probe was just asked.
+      // `KeepLocal` counted it against the bound, so there is room.
+      if (sync::FindByKey(keep_local_held_, kept) == nullptr) {
+        keep_local_held_.push_back(kept);
+      }
+      held_poll_due_ = clock_->Steady() + foreground_poll_;
+      woken = true;
+    } else if (keep_local && report.ok()) {
+      // Landed here -- the game closed before the worker's poll did it -- so
+      // it is held no longer.
+      UnholdLocked(kept);
       // Armed only once the bytes are on the card: an override for a restore
       // that did not land would send whatever is there now over the server's
       // copy. A tick is asked for at once, so the choice goes up while the
@@ -3376,7 +3476,87 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
                   ": Keep local restored the bytes but could not arm their upload, so the next "
                   "sync meets the slot guard with them as any upload does");
   }
+  if (held) {
+    log::Info(log::Event::kSyncHeld,
+              "rom " + std::to_string(kept.first) +
+                  ": a game is running, so Keep local is held -- nothing is written until it "
+                  "closes, and the kept bytes then land ahead of their upload");
+  }
   if (woken) {
+    Wake();
+  }
+}
+
+void SdEngine::UnholdLocked(const state::Baseline::Key& key) {
+  keep_local_held_.erase(std::remove(keep_local_held_.begin(), keep_local_held_.end(), key),
+                         keep_local_held_.end());
+  if (keep_local_held_.empty()) {
+    // Its storage too, not only its keys: `kHeapKeepLocal` counts the held
+    // list's slots only while a game holds every tick off, so an empty one
+    // may not keep them into the tick that follows.
+    std::vector<state::Baseline::Key>().swap(keep_local_held_);
+  }
+}
+
+void SdEngine::LandHeldKeepLocal(bool ask_tick) {
+  std::vector<state::Baseline::Key> held;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (keep_local_held_.empty()) {
+      return;
+    }
+    held = keep_local_held_;
+  }
+
+  // One at a time, as `RunRestore` runs one: a single report alive at once,
+  // and each save's line written before the next is copied.
+  bool asked = false;
+  for (const state::Baseline::Key& key : held) {
+    std::vector<state::Baseline::Key> armed;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      armed = keep_local_;
+    }
+    // The same restore as `RunRestore`'s, run later.
+    const conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
+      // The save's newest entry, which is the one it was held on unless a
+      // tick has recorded another since -- and then `KeepLocal` refuses it
+      // as it would have at the press. No game now: the probe said so, and
+      // `Restore`'s own `UnchangedSinceBackup` still covers a write in
+      // between (#270). The game's write on close is what it backs up first.
+      const conflicts::Entry* entry = conflicts::NewestSaveEntry(history_, key);
+      state::Baseline::Key landed{0, std::nullopt};
+      return conflicts::KeepLocal(card, history_, entry != nullptr ? entry->id : 0, armed,
+                                  &landed);
+    });
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      UnholdLocked(key);
+      // Armed only once the bytes are on the card, as `RunRestore` arms. The
+      // bound counted this key while it was held, so there is room.
+      if (report.ok() && sync::ArmKeepLocal(&keep_local_, key)) {
+        asked = true;
+      }
+    }
+    const std::string rom = "rom " + std::to_string(key.first);
+    if (report.ok()) {
+      log::Info(log::Event::kSyncHeld,
+                rom + ": the game closed, so the Keep local held for it landed -- " +
+                    report.message);
+    } else {
+      // Dropped rather than tried again every poll: each try would back the
+      // card up once more. The row is open again, and the press can be repeated.
+      log::Warn(log::Event::kSaveFailed,
+                rom + ": the Keep local held for the game did not land, and is dropped (" +
+                    conflicts::ToString(report.outcome) + "): " + report.message);
+    }
+  }
+
+  if (asked && ask_tick) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      scheduler_.RequestNow();
+    }
     Wake();
   }
 }

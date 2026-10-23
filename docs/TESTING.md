@@ -1056,13 +1056,7 @@ ctest --test-dir build --output-on-failure
   makes to one copy — `ATMOSPHERE_TARGET` and the guide line in
   [INSTALL.md](INSTALL.md) that quotes it — and derives its Horizon number from
   the `hosversionAtLeast` gates in `sysmodule/source` and `overlay/source`
-  rather than trusting the constant. `release.procedure` holds the last of it
-  that is not a script -- the steps a person follows: the `VERSION` bump is an
-  ordinary pull request, so it meets `merge-gate` like any other, and the
-  procedure has to quote what that gate will ask of its body. It reads the
-  required phrases out of `merge_gate.py`'s own `LOCAL_PASSES`, so renaming a
-  pass turns the guide red instead of leaving it asking for something the gate
-  no longer accepts. See
+  rather than trusting the constant. See
   [DEVELOPMENT.md](DEVELOPMENT.md#releases) for the procedure they hold.
 
 ### Provisioning the fixture
@@ -1199,16 +1193,17 @@ be *refused*) or `core.token_store`, so none of them ever skips: a body that
 should have been rejected is a bug with or without a server to have sent it.
 
 The Python tooling lives in a per-worktree `.venv` built from
-`server/requirements.txt` by `setup.sh`. The C++ build needs none of it.
+`server/requirements.txt` by `scripts/orca/setup.sh`. The C++ build needs none of it.
 
 ### Worktree isolation
 
 Several agents work in parallel worktrees, and sync tests mutate saves by design.
 Each worktree therefore gets its **own** RomM: `scripts/orca/env.sh` derives a
 compose project name and three ports from the worktree path and writes them to
-`.env`, so no two worktrees share a port or a database. The derivation is the
-fleet's (`scripts/fleet/env.sh`, bases in `.autofleet/config`); the wrapper adds
-the `*_BASE_URL`s and the two shared caches. Only immutable, expensive things
+`.env`, so no two worktrees share a port or a database, together with the
+`*_BASE_URL`s and the two shared caches. `scripts/orca/setup.sh` runs it first
+thing, and `orca.env_derivation` holds the name and ports to the rule every
+existing stack was created under. Only immutable, expensive things
 are shared between worktrees — the checksum-pinned ROM downloads and the
 content-addressed ccache under `.cache/`.
 
@@ -1226,8 +1221,8 @@ that has not activated its profile, so a bare `down` left the TLS terminator
 running — `restart: unless-stopped` brought it back on every docker start, and
 it held that worktree's `TLS_PORT` and, because a running container pins it, the
 network the rest of the teardown was waiting on (`Resource is still in use`).
-The fleet's `archive.sh` and `reap.sh` name it through `AUTOFLEET_COMPOSE_DOWN_ARGS`
-in `.autofleet/config`; this is the same hole in the path a person types.
+`archive.sh` and `reap.sh` name the profile on their own `down` too; this is
+the same hole in the path a person types.
 
 `up -d` is deliberately left alone: it still starts neither the terminator nor
 anything else profiled, which is what keeps the host suite talking plain HTTP to
@@ -1235,23 +1230,23 @@ the fault proxy. And the profile is named rather than wildcarded — `--profile
 '*'` would cover a profile added later without a second edit, but it needs
 Compose 2.24 and an older one reads `*` as a literal profile name, activating
 nothing and restoring the leak in silence. A profile added to the compose file
-has to be added to `AUTOFLEET_COMPOSE_DOWN_ARGS` and to `compose.sh` by hand.
+has to be named in `compose.sh` and in `orca_stack_down` (`lib.sh`, which
+`archive.sh` and `reap.sh` share) by hand, and `orca.teardown_profiles` fails
+until both do.
 
-Removing a worktree runs `scripts/fleet/archive.sh`, which takes that worktree's
-stack and volumes down with it (`AUTOFLEET_COMPOSE_FILE` and
-`AUTOFLEET_COMPOSE_DOWN_ARGS` in `.autofleet/config` say which file and which
-profiles). It derives the project name from the worktree path rather than
-reading `.env` back, so a worktree whose `.env` never got written still tears
-down cleanly. The dispatcher runs it before `git worktree remove` and sweeps once
-the directory is confirmed gone.
+Removing a worktree runs `scripts/orca/archive.sh` (Orca runs it through
+`orca.yaml`; run it yourself before a plain `git worktree remove`), which takes
+that worktree's stack and volumes down with it. It derives the project name from
+the worktree path rather than reading `.env` back, so a worktree whose `.env`
+never got written still tears down cleanly.
 
 Stacks can still outlive their worktree — one deleted with `rm -rf`, or removed
 while Docker was stopped. The fixture restarts `unless-stopped`, so those come
 back on every docker start and hold three ports each. Sweep them up with:
 
 ```bash
-./scripts/fleet/reap.sh          # list stacks with no worktree, change nothing
-./scripts/fleet/reap.sh --yes    # remove them, volumes included
+./scripts/orca/reap.sh          # list stacks with no worktree, change nothing
+./scripts/orca/reap.sh --yes    # remove them, volumes included
 ```
 
 It protects two sets of stacks: those belonging to a live worktree of this repo,

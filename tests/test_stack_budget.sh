@@ -35,6 +35,48 @@ SCRATCH=""
 cleanup() { [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"; return 0; }
 trap cleanup EXIT
 
+# The walk with one constant shrunk in the scratch copy, put back before it
+# returns. The edit, the walk and the restore run in ONE toolchain container:
+# a file the host renames over inside a Docker Desktop bind mount can read as
+# missing to the next container on macOS, which made the walk after a restore
+# fail on a header it said defined nothing. Exits 3 if the edit did not take.
+walk_shrunk() {
+  toolchain_run "$SCRATCH" '
+    file="$1" name="$2" value="$3"
+    cp "$file" "$file.orig"
+    sed -i "s/$name = 0x[0-9A-Fa-f]*;/$name = $value;/" "$file"
+    if ! grep -q "$name = $value;" "$file"; then
+      mv "$file.orig" "$file"
+      echo "could not shrink $name in the scratch copy of $file"
+      exit 3
+    fi
+    rc=0
+    python3 scripts/stack-budget.py measured --repo . --ci sysmodule 2>&1 || rc=$?
+    mv "$file.orig" "$file"
+    exit "$rc"' "$@"
+}
+
+# The walk with FILE's NAME shrunk to VALUE must fail, and its output must say
+# so on the line PATTERN matches. A shrink that did not take is its own
+# failure: the walk that follows ran on the real constant, and calling that
+# "failed, but not on the worker" sends the reader after the wrong half.
+expect_shrunk_failure() {
+  local file="$1" name="$2" value="$3" pattern="$4" what="$5" out rc=0
+  out="$(walk_shrunk "$file" "$name" "$value")" || rc=$?
+  if [ "$rc" -eq 3 ]; then
+    echo "$out" >&2
+    fail "could not shrink $name to $value in the scratch copy of $file"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    echo "$out" >&2
+    fail "the walk passed with $name shrunk to $value; it is not holding $what"
+  fi
+  grep -q "$pattern" <<<"$out" || {
+    echo "$out" >&2
+    fail "the walk failed with $name shrunk, but not on $what"
+  }
+}
+
 phase_measured() {
   local missing
   missing="$(toolchain_missing)" && skip "$missing"
@@ -78,41 +120,15 @@ phase_measured() {
   # worker stack shrunk to 0x2000 -- half of it under the worker's measured
   # chain -- must fail, and fail on the worker. The script reads the constant
   # out of the header text, so no rebuild; the frames are the ones just measured.
-  local header="$SCRATCH/sysmodule/source/sized_thread.hpp" out
-  cp "$header" "$header.orig"
-  sed 's/kThreadStackBytes = 0x[0-9A-Fa-f]*;/kThreadStackBytes = 0x2000;/' "$header" >"$header.new" &&
-    mv "$header.new" "$header"
-  grep -q 'kThreadStackBytes = 0x2000;' "$header" ||
-    fail "could not shrink kThreadStackBytes in the scratch copy of sized_thread.hpp"
-  if out="$(toolchain_run "$SCRATCH" \
-              'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' 2>&1)"; then
-    echo "$out" >&2
-    fail "the walk passed with the worker's stack shrunk to 0x2000; it is not holding the worker to its stack"
-  fi
-  grep -q "the worker thread's deepest" <<<"$out" || {
-    echo "$out" >&2
-    fail "the walk failed with the worker's stack shrunk, but not on the worker"
-  }
+  expect_shrunk_failure sysmodule/source/sized_thread.hpp kThreadStackBytes 0x2000 \
+    "the worker thread's deepest" "the worker to its stack"
   echo "ok: with kThreadStackBytes shrunk to 0x2000 the walk fails on the worker thread"
-  mv "$header.orig" "$header"
 
   # And on the ceiling sized_thread.hpp points a reader to rather than quoting a
   # figure: `kWorkerRestBytes` shrunk under the worker's measured chain, with
   # its stack as it is, must fail on that ceiling.
-  local budget="$SCRATCH/sysmodule/source/stack_budget.hpp"
-  sed 's/kWorkerRestBytes = 0x[0-9A-Fa-f]*;/kWorkerRestBytes = 0x100;/' "$budget" >"$budget.new" &&
-    mv "$budget.new" "$budget"
-  grep -q 'kWorkerRestBytes = 0x100;' "$budget" ||
-    fail "could not shrink kWorkerRestBytes in the scratch copy of stack_budget.hpp"
-  if out="$(toolchain_run "$SCRATCH" \
-              'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' 2>&1)"; then
-    echo "$out" >&2
-    fail "the walk passed with kWorkerRestBytes shrunk to 0x100; it is not holding the worker to its ceiling"
-  fi
-  grep -q "the worker thread spends .*(kWorkerRestBytes)" <<<"$out" || {
-    echo "$out" >&2
-    fail "the walk failed with kWorkerRestBytes shrunk, but not on that ceiling"
-  }
+  expect_shrunk_failure sysmodule/source/stack_budget.hpp kWorkerRestBytes 0x100 \
+    "the worker thread spends .*(kWorkerRestBytes)" "the worker to its ceiling"
   echo "ok: with kWorkerRestBytes shrunk to 0x100 the walk fails on the worker's ceiling"
 }
 

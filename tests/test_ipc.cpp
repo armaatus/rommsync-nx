@@ -214,9 +214,11 @@ int Version() {
   // a v9 decoder refuses. 11 since M10-31 (#271): `ConfigView` gained `slot`,
   // `map_state_slots`, a `tico` object and a platform's `play_with`. 12 since
   // M10-33 (#273): a restore's outcome gained Keep local's `superseded`,
-  // `game_running` and `keep_local_full`. What is frozen is command 0's
-  // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{12},
+  // `game_running` and `keep_local_full`. 13 since M10-34 (#275): `held`
+  // replaced `game_running`, and a conflict row gained a required
+  // `keep_local`. What is frozen is command 0's *encoding*, asserted above --
+  // not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{13},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -625,6 +627,50 @@ int RoundTrip() {
     checks.Expect(ipc::Fits(ipc::EncodeLogTail(hostile)), "what it stopped at fits");
   }
 
+  // A conflict row says whether a Keep local is chosen for it (#275): held for
+  // a game to close, or on the card and waiting for its upload. Required, so a
+  // row from a build that does not say is refused rather than drawn as open.
+  {
+    ipc::ConflictPage sent;
+    sent.total = 3;
+    for (const ipc::KeepLocalState state :
+         {ipc::KeepLocalState::kOpen, ipc::KeepLocalState::kHeld,
+          ipc::KeepLocalState::kWaiting}) {
+      ipc::ConflictRow row;
+      row.entry.id = static_cast<std::int64_t>(sent.entries.size()) + 1;
+      row.entry.kind = conflicts::EntryKind::kSave;
+      row.entry.event = conflicts::Event::kConflict;
+      row.entry.rom_id = 4;
+      row.entry.slot = "autosave";
+      row.entry.file_name = "game.srm";
+      row.entry.sd_path = "/saves/game.srm";
+      row.entry.backup_sd_path = "/config/rommsync/.backup/4-autosave-1.srm";
+      row.backup_present = true;
+      row.keep_local = state;
+      sent.entries.push_back(row);
+    }
+    const std::string text = ipc::EncodeConflictPage(sent);
+    checks.Expect(text.find("\"keep_local\":\"held\"") != std::string::npos &&
+                      text.find("\"keep_local\":\"waiting\"") != std::string::npos &&
+                      text.find("\"keep_local\":\"open\"") != std::string::npos,
+                  "a row's Keep local is spelt by name: " + text);
+    const ipc::Decoded<ipc::ConflictPage> back = ipc::DecodeConflictPage(text);
+    checks.Expect(back.ok() && back.value.entries.size() == 3,
+                  "the page round trips: " + back.error.Describe());
+    for (std::size_t at = 0; back.ok() && at < back.value.entries.size(); ++at) {
+      checks.Expect(back.value.entries[at].keep_local == sent.entries[at].keep_local,
+                    std::string("and so does each row's Keep local: ") +
+                        ipc::ToString(sent.entries[at].keep_local));
+    }
+    std::string without = text;
+    for (std::size_t at = without.find(",\"keep_local\":\"open\""); at != std::string::npos;
+         at = without.find(",\"keep_local\":\"open\"")) {
+      without.erase(at, std::string(",\"keep_local\":\"open\"").size());
+    }
+    checks.Expect(!ipc::DecodeConflictPage(without).ok(),
+                  "a row that does not say is refused, not drawn as open");
+  }
+
   // Where a restore stands (M9-6, #209): every phase, and the report whole --
   // the outcome a screen draws when it is done, and the backup it names.
   {
@@ -644,6 +690,22 @@ int RoundTrip() {
     checks.ExpectEq(back.value.report.message, sent.report.message, "...and its sentence");
     checks.ExpectEq(back.value.report.backup_sd_path, sent.report.backup_sd_path,
                     "...and the backup it names");
+    // #275: a Keep local held under a game is an outcome of its own.
+    {
+      ipc::RestoreState held = sent;
+      held.report.outcome = conflicts::RestoreOutcome::kHeld;
+      const std::string text = ipc::EncodeRestoreState(held);
+      checks.Expect(text.find("\"outcome\":\"held\"") != std::string::npos,
+                    "held is spelt held on the wire: " + text);
+      checks.Expect(ipc::DecodeRestoreState(text).value.report.outcome ==
+                        conflicts::RestoreOutcome::kHeld,
+                    "and reads back as itself");
+      checks.Expect(!ipc::DecodeRestoreState("{\"phase\":\"done\",\"entry_id\":1,"
+                                             "\"report\":{\"outcome\":\"game_running\","
+                                             "\"message\":\"\",\"backup_sd_path\":\"\"}}")
+                         .ok(),
+                    "and #273's game_running, which it replaced, is no longer a word");
+    }
     for (const ipc::RestorePhase phase :
          {ipc::RestorePhase::kIdle, ipc::RestorePhase::kRunning, ipc::RestorePhase::kDone}) {
       ipc::RestoreState state;

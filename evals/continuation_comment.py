@@ -13,7 +13,7 @@ the next line was meant to add. The line under the comment then runs as a
 command of its own: `--jq` is not a command, rc 127, and the `|| exit 2` fires.
 
 `bash -n` is happy with all of it, which is why this needs a scanner. It cost
-`scripts/fleet/review-status.sh` its verdict: from armaatus/autofleet#121 until
+the fleet's old review-status script its verdict: from armaatus/autofleet#121 until
 armaatus/autofleet#69 it answered every invocation with 97 KB of unfiltered
 JSON on stdout and exit 2, and exit 2 is "could not read" -- the step of the
 brief where an agent finds out whether its threads are resolved.
@@ -38,12 +38,9 @@ import sys
 # that are payload too, but a PR editing a workflow cannot merge itself, so
 # widening the glob here would red the lint on a file the change may not fix.
 PATTERNS = (
-    "scripts/fleet/*.sh",
-    "scripts/fleet/runner/*.sh",
+    "scripts/orca/*.sh",
     "evals/*.sh",
-    ".github/scripts/*.sh",
     ".claude/hooks/*.sh",
-    "install.sh",
 )
 
 

@@ -97,7 +97,7 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 | `switch.mk` | Shared devkitPro rules for both Switch targets |
 | `core/` | The portable engine — auth, sync, downloads, config, state. Builds and is tested natively. |
 | `server/` | API snapshot (source of truth), contract-probe script, and the docker RomM test fixture |
-| `.autofleet/` | This project's answers to autofleet: ports, compose file, test command, and the setup hook that gives a worktree its own RomM, seeded fixtures and a ready-to-run build |
+| `scripts/orca/` | Per-worktree provisioning: `setup.sh` gives a worktree its own ports, RomM, seeded fixtures and a ready-to-run build; `archive.sh` and `reap.sh` take stacks down |
 | `ISSUES.md` | The full milestone + issue backlog |
 | `scripts/create_issues.sh` | Creates the GitHub milestones/labels/issues via `gh` |
 | `CLAUDE.md` | Working agreement for agents and contributors — rules, commands, PR flow |
@@ -114,11 +114,11 @@ understanding before the code) → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md
 the off-console test harness (host + real docker RomM) that every later milestone
 is developed and proven against before any hardware.
 
-Quick start once a worktree exists:
+Quick start in a fresh clone or `git worktree add` (Orca runs the first line
+itself, through `orca.yaml`):
 
 ```bash
-cmake -S . -B build && cmake --build build
-./scripts/orca/compose.sh up -d
+./scripts/orca/setup.sh                       # ports, fixtures, build, venv, this worktree's RomM
 ctest --test-dir build --output-on-failure
 ```
 

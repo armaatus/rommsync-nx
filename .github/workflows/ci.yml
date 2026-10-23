@@ -47,7 +47,7 @@ jobs:
         run: ./scripts/orca/compose.sh config --quiet
 
       # An invalid workflow file is silent: GitHub creates a run with no jobs and
-      # the check it was meant to report never appears at all. With `merge-gate`
+      # the check it was meant to report never appears at all. With that check
       # required, that reads as "pending forever" and nothing can merge. Cheap to
       # check, and it has already caught one.
       - name: Workflows are valid
@@ -167,7 +167,7 @@ jobs:
 
       # A running RomM is not a usable one: the staged roms are not imported
       # until something drives the socket.io scan, and rig.provisioned fails on
-      # the empty library that leaves behind. Mirrors .autofleet/setup.sh.
+      # the empty library that leaves behind. Mirrors scripts/orca/setup.sh.
       - name: Provision the fixture
         run: |
           set -a; . ./.env; set +a

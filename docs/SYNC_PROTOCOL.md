@@ -449,23 +449,54 @@ and it is the only thing that ever sends `overwrite=true`:
 1. `KeepLocal` (IPC command 18) restores the conflict's backup onto the card
    through `conflicts::KeepLocal` -- `Restore` itself, so the server's copy it
    replaces is backed up first. It is refused before anything is written
-   (#273), in this order, so a choice that can never be taken says why before
-   it says "close the game":
+   (#273), in this order -- and only then held for a running game (step 1a),
+   so a choice that can never be taken says why rather than waiting for a game
+   to close first:
    - `not_a_conflict`: the entry is not a save conflict with a slot;
    - `superseded`: a newer entry of the same `(rom_id, slot)` -- another
      conflict, a download over it, a deletion -- has moved the card on since.
      Only a save's newest entry is Keep local's;
    - `keep_local_full`: `sync::kMaxKeepLocal` choices already wait (sync off or
-     held). Refused rather than letting the oldest go, because that one's bytes
-     are already on the card and its upload without the override would resolve
-     as Keep server without a word;
-   - `game_running`: an application is in the foreground. It holds its save in
-     memory and writes it on close, over the kept bytes, and the tick #242
-     holds would then send *that* with `overwrite=true`. Asked at the write, of
-     any application: `pm` names a title, not the save it holds, and RetroArch
-     runs every rom under one, so the save's own game cannot be told apart. A
-     game started after the restore lands loads the kept bytes, so what it
-     saves on close is play on top of the player's choice.
+     held), held and armed counted together. Refused rather than letting the
+     oldest go, because that one's bytes are already on the card and its upload
+     without the override would resolve as Keep server without a word.
+
+   1a. **Under a running game it is held, not written** (#275; until then
+   #273 refused it as `game_running`). An application in the foreground holds
+   its save in memory and writes it on close, over the kept bytes, and the
+   tick #242 holds would then send *that* with `overwrite=true`. Asked at the
+   press, of any application: `pm` names a title, not the save it holds, and
+   RetroArch runs every rom under one, so the save's own game cannot be told
+   apart. So `KeepLocal` answers `held` with nothing written -- not even a
+   backup -- and the sysmodule keeps the conflict's `(rom_id, slot)` in
+   `SdEngine::keep_local_held_`, in memory like an armed choice, counted
+   against the same bound and carrying nothing more: the entry is found again
+   as the save's newest (`conflicts::NewestSaveEntry`). The conflicts page
+   draws the row `held` ("lands when you close the game") rather than open,
+   and `waiting` once it lands, until its upload spends it.
+
+   The worker asks the foreground probe every `foreground_poll_` while one is
+   held -- the only time it asks between ticks -- and the first answer of no
+   **lands** it: `conflicts::KeepLocal` again on that entry, with no game, so
+   step 1's whole restore runs then, `UnchangedSinceBackup` after the staged
+   copy included (#270). It lands whether or not a tick is owed, so a
+   switched-off sync still puts the bytes on the card when the screen said.
+   Then it is armed (step 2) and a tick asked for; a tick that falls due as
+   the game closes lands it first, so that tick is the one that sends it.
+
+   **A game that saves before the held choice lands is backed up and
+   overwritten, not obeyed.** Decided for #275, and the reason is the press:
+   the player chose Keep local *under that game*, so its write on close --
+   the server's copy it loaded, plus whatever was played since -- is exactly
+   the write the choice exists to beat; obeying it would make Keep local under
+   a game a no-op for every game that saves on exit. The write is not
+   discarded: `Restore` copies it under `.backup/` before the kept bytes go
+   over it, the `sync.held` line naming the landing says where, and that
+   backup is reachable from a card reader. A held choice that does not land
+   (its backup gone, the card refusing a write, a newer entry recorded since)
+   is dropped with a `save.failed` warning, the row is open again, and nothing
+   was written. A reboot before it lands forgets it, as it forgets an armed
+   one -- with nothing written to undo.
 2. Once the bytes are on the card -- never before -- the sysmodule arms the
    conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
    `sync::kMaxKeepLocal`) and asks for a tick.
@@ -691,8 +722,9 @@ that back up and then overwrite make the same comparison last:
   between its staged copy and its `io::CommitStaged`. It is the likelier of the
   two to meet a late write: it starts from the overlay, over a game that may be
   running, and `SdEngine::RunRestore` takes the save-write lock but not #242's
-  hold -- only Keep local asks whether a game is running, and is refused under
-  one ([Keep local](#keep-local-249), #273). A file written since stops it with
+  hold -- only Keep local asks whether a game is running, and is held under
+  one until it closes ([Keep local](#keep-local-249), #273, #275). A file
+  written since stops it with
   `changed_since_backup` and nothing written — the file holds the game's write,
   the restore's own backup what was there before, and the entry's backup is
   untouched, so the press can be repeated once the game is closed. Keep local

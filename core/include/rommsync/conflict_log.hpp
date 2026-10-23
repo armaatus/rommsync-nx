@@ -480,22 +480,24 @@ enum class RestoreOutcome {
   /// local's. Nothing was written.
   kSuperseded,
 
-  /// **Keep local was asked while a game is in the foreground** (#273). The
-  /// game holds its save in memory and writes it on close, over the kept bytes
-  /// -- and #242's hold would then send *those* with `overwrite=true`, bytes the
-  /// player never chose. Nothing was written; the press can be repeated once
-  /// the game is closed.
-  kGameRunning,
-
   /// **Keep local was asked while `sync::kMaxKeepLocal` choices already wait
   /// for their upload** (#273), sync being off or held. Refused rather than
   /// letting the oldest go: that one's bytes are already on the card, and its
   /// upload without the override would meet the slot guard and resolve as Keep
   /// server -- the player's answer undone without a word. Nothing was written.
   ///
-  /// The three are appended together, and bumped `ipc::kVersion` to 12 for
-  /// `kNotAConflict`'s reason.
+  /// Appended with `kSuperseded` and a refusal under a running game that #275
+  /// replaced with `kHeld`; they bumped `ipc::kVersion` to 12.
   kKeepLocalFull,
+
+  /// **Keep local was taken under a running game, and is held** (#275).
+  /// Nothing was written: the game holds its save in memory and writes it on
+  /// close, so the kept bytes land only once no application is running -- the
+  /// game's last write backed up first, as any overwrite's -- and their
+  /// `overwrite=true` upload follows. Not `ok()`: the bytes are not on the
+  /// card yet. It replaced #273's refusal, `game_running`, and bumped
+  /// `ipc::kVersion` to 13.
+  kHeld,
 };
 const char* ToString(RestoreOutcome outcome);
 

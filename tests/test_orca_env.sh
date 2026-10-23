@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Covers scripts/orca/env.sh -- this project's wrapper over the fleet's
-# scripts/fleet/env.sh, the first thing .autofleet/setup.sh runs, and the one
-# step whose failure costs the whole worktree.
+# Covers scripts/orca/env.sh -- which derives this worktree's ports and compose
+# project into .env, the first thing scripts/orca/setup.sh runs after picking
+# its Python, and the one step whose failure costs the whole worktree.
 #
 # env.sh is not the only caller of itself: compose.sh generates a missing .env
 # before it does anything, so a second shell in the worktree writes .env too, at
@@ -24,7 +24,7 @@
 #                                 `python -m venv` over it exits 1 -- every
 #                                 re-run, forever.
 #   test_orca_env.sh setup_fails_fast
-#                                 .autofleet/setup.sh itself stops on the
+#                                 scripts/orca/setup.sh itself stops on the
 #                                 interpreter before seeding or building, and
 #                                 says why.
 #   test_orca_env.sh python       setup installs server/requirements.txt with
@@ -53,14 +53,13 @@ trap cleanup EXIT
 
 # env.sh derives everything from its own location, so a copy of the scripts in a
 # throwaway directory derives that directory's ports and touches nothing real.
-# The fleet's half comes along whole: scripts/fleet/env.sh sources lib.sh, which
-# sources config.sh, which reads .autofleet/config for the prefix and the ports.
+# Only scripts/orca/ is copied: provisioning needs nothing outside it (#277),
+# and a fixture that brought more along would let a dependency on a deleted
+# directory pass here and fail in the next fresh worktree.
 make_fixture() {
   FIXTURE="$(mktemp -d)"
-  mkdir -p "$FIXTURE/scripts/orca" "$FIXTURE/.autofleet"
-  cp "$REPO_ROOT"/scripts/orca/{env.sh,lib.sh,compose.sh} "$FIXTURE/scripts/orca/"
-  cp -R "$REPO_ROOT/scripts/fleet" "$FIXTURE/scripts/fleet"
-  cp "$REPO_ROOT/.autofleet/config" "$FIXTURE/.autofleet/config"
+  mkdir -p "$FIXTURE/scripts/orca"
+  cp "$REPO_ROOT"/scripts/orca/{env.sh,lib.sh,compose.sh,setup.sh} "$FIXTURE/scripts/orca/"
 }
 
 WRITERS=6
@@ -212,7 +211,6 @@ case "${1:-}" in
     # check itself goes unnoticed -- the picker can be perfect and the hook
     # still broken.
     make_fixture
-    cp "$REPO_ROOT/.autofleet/setup.sh" "$FIXTURE/.autofleet/setup.sh"
     fake_python python3 3.9
 
     # PATH holds nothing but the old interpreter. If the check is not first,
@@ -221,16 +219,16 @@ case "${1:-}" in
     # would need `env` and `bash` resolvable on the stripped PATH, and failing
     # to exec is not the failure this phase is about.
     fake_path="$(fake_only_path)"
-    out="$(cd "$FIXTURE" && PATH="$fake_path" "$BASH" ./.autofleet/setup.sh 2>&1)"
+    out="$(cd "$FIXTURE" && PATH="$fake_path" "$BASH" ./scripts/orca/setup.sh 2>&1)"
     rc=$?
-    [ "$rc" -ne 0 ] || fail ".autofleet/setup.sh carried on with an interpreter too old to install requirements.txt"
+    [ "$rc" -ne 0 ] || fail "scripts/orca/setup.sh carried on with an interpreter too old to install requirements.txt"
     grep -qi "python" <<<"$out" \
-      || fail ".autofleet/setup.sh failed without mentioning Python, which is the whole diagnosis: $out"
+      || fail "scripts/orca/setup.sh failed without mentioning Python, which is the whole diagnosis: $out"
     # Nothing expensive may have happened first: no .env means it stopped before
     # env.sh, which is what makes the failure fast as well as clear.
     [ -e "$FIXTURE/.env" ] \
-      && fail ".autofleet/setup.sh got as far as deriving .env before checking the interpreter"
-    echo "PASS: .autofleet/setup.sh stops on the interpreter before doing any work, and says why"
+      && fail "scripts/orca/setup.sh got as far as deriving .env before checking the interpreter"
+    echo "PASS: scripts/orca/setup.sh stops on the interpreter before doing any work, and says why"
     ;;
 
   concurrent)
@@ -283,6 +281,67 @@ case "${1:-}" in
     echo "PASS: .env is never observed partially written"
     ;;
 
+  derivation)
+    # Moving provisioning out of scripts/fleet/ (#277) must not rename a single
+    # stack: a worktree whose compose project changed name would lose its RomM
+    # database to a fresh `up -d`, and the old stack would leak. The rule is
+    # written out here independently of the code -- sha1 of the absolute path,
+    # its first four hex characters mod 2000, `rmx-<slug>-<offset>`, ports at
+    # 21000, 23000 and 25000 plus the offset -- so a change to either side shows.
+    make_fixture
+    "$FIXTURE/scripts/orca/env.sh" >/dev/null 2>&1 || fail "env.sh failed"
+    root="$(cd "$FIXTURE" && pwd)"
+    want="$(python3 - "$root" <<'PY'
+import hashlib, os, re, sys
+root = sys.argv[1]
+offset = int(hashlib.sha1(root.encode()).hexdigest()[:4], 16) % 2000
+slug = re.sub(r"[^a-z0-9]+", "-", os.path.basename(root).lower()).strip("-")
+print(f"COMPOSE_PROJECT_NAME=rmx-{slug}-{offset}")
+print(f"ROMM_PORT={21000 + offset}")
+print(f"PROXY_PORT={23000 + offset}")
+print(f"TLS_PORT={25000 + offset}")
+print(f"ROMM_BASE_URL=http://127.0.0.1:{21000 + offset}")
+PY
+)"
+    while IFS= read -r line; do
+      grep -Fqx "$line" "$FIXTURE/.env" \
+        || fail ".env does not carry $line: $(cat "$FIXTURE/.env")"
+    done <<<"$want"
+    # Teardown re-derives rather than reading .env back, so the two derivations
+    # have to agree or archive.sh and reap.sh aim at a stack nobody started.
+    . "$FIXTURE/scripts/orca/lib.sh"
+    orca_derive_env "$root" || fail "orca_derive_env found no sha1 tool"
+    grep -Fqx "COMPOSE_PROJECT_NAME=$orca_project" "$FIXTURE/.env" \
+      || fail "teardown would derive $orca_project, which is not the stack env.sh named"
+    echo "PASS: .env names the stack and ports the way every existing worktree's stack was named"
+    ;;
+
+  teardown_profiles)
+    # `down` only touches services whose profile is active, so a profile any
+    # teardown path does not name survives it, comes back on every docker start
+    # under `restart: unless-stopped`, and holds the worktree's port (#122).
+    # Two places take a stack down: compose.sh (by hand), and orca_stack_down
+    # in lib.sh, which archive.sh (on worktree removal) and reap.sh (orphans)
+    # share. Read the profiles out of the compose file, so adding one fails
+    # here until both name it.
+    compose="$REPO_ROOT/server/testing/docker-compose.yml"
+    profiles="$(sed -n 's/.*profiles:[[:space:]]*\[\(.*\)\].*/\1/p' "$compose" \
+                | tr ',' '\n' | tr -d ' "'"'" | sort -u)"
+    [ -n "$profiles" ] || fail "found no profiles in $compose; this phase would assert nothing"
+    for script in compose.sh lib.sh; do
+      [ -f "$REPO_ROOT/scripts/orca/$script" ] || fail "scripts/orca/$script is missing"
+      for profile in $profiles; do
+        grep -q -- "--profile $profile" "$REPO_ROOT/scripts/orca/$script" \
+          || fail "scripts/orca/$script never activates profile '$profile', so its down leaves that service running"
+      done
+    done
+    for script in archive.sh reap.sh; do
+      grep -q 'orca_stack_down' "$REPO_ROOT/scripts/orca/$script" \
+        || fail "scripts/orca/$script takes stacks down without orca_stack_down, so this phase cannot see its profiles"
+    done
+    echo "PASS: every teardown path activates every profile: $(echo $profiles)"
+    ;;
+
   romm_version)
     make_fixture
     # Which RomM the fixture runs is a property of the worktree, not of one
@@ -312,7 +371,7 @@ case "${1:-}" in
     ;;
 
   *)
-    echo "usage: $0 concurrent|readable|python|venv|setup_fails_fast|romm_version" >&2
+    echo "usage: $0 concurrent|readable|python|venv|setup_fails_fast|derivation|teardown_profiles|romm_version" >&2
     exit 2
     ;;
 esac
