@@ -205,6 +205,38 @@ struct PairingBackend {
   auth::IdentitySeed identity_seed;
 };
 
+/// The engine's clocks, and how long its worker really blocks to see a span of
+/// them pass (#250).
+///
+/// **The console's is the default and the only one it uses**: `steady_clock`,
+/// `system_clock`, and a wait that is the span itself. What this exists for is
+/// the soak, which has to see days of the schedule -- an interval of thirty
+/// minutes, a backoff that climbs to its cap over a day offline, a token that
+/// stops working on day two -- in minutes of a test run. A clock that runs a
+/// thousand times fast has to make the *waits* a thousand times shorter too, or
+/// the worker sleeps thirty real minutes on a fast clock's say-so; so the wait
+/// is part of the interface rather than something the worker works out.
+///
+/// What it does **not** reach: the transport's own timeouts, which are real
+/// time on a real socket; the pairing poll, which `pairing.hpp` clocks itself;
+/// the boot-time network wait; and `Quiesce`'s budget, which PSC enforces in
+/// real time whatever this says. A save's `updated_at` comes from
+/// `ExecuteOptions::now`, as it always has.
+class Clock {
+ public:
+  virtual ~Clock() = default;
+  virtual std::chrono::steady_clock::time_point Steady() const {
+    return std::chrono::steady_clock::now();
+  }
+  virtual std::chrono::system_clock::time_point Wall() const {
+    return std::chrono::system_clock::now();
+  }
+  /// The real time to block for `span` of `Steady()` to pass.
+  virtual std::chrono::milliseconds RealFor(std::chrono::milliseconds span) const {
+    return span;
+  }
+};
+
 /// The engine as far as it is built.
 ///
 /// Constructed once at start and driven from the IPC thread -- and, since M1-6,
@@ -241,38 +273,6 @@ struct PairingBackend {
 /// holding. So the worker never calls it: it takes a `ConfigSnapshot` at an
 /// operation boundary and reads it to the end, never swapped mid-sync or
 /// mid-download (M7-2, #37).
-/// The engine's clocks, and how long its worker really blocks to see a span of
-/// them pass (#250).
-///
-/// **The console's is the default and the only one it uses**: `steady_clock`,
-/// `system_clock`, and a wait that is the span itself. What this exists for is
-/// the soak, which has to see days of the schedule -- an interval of thirty
-/// minutes, a backoff that climbs to its cap over a day offline, a token that
-/// stops working on day two -- in minutes of a test run. A clock that runs a
-/// thousand times fast has to make the *waits* a thousand times shorter too, or
-/// the worker sleeps thirty real minutes on a fast clock's say-so; so the wait
-/// is part of the interface rather than something the worker works out.
-///
-/// What it does **not** reach: the transport's own timeouts, which are real
-/// time on a real socket; the pairing poll, which `pairing.hpp` clocks itself;
-/// the boot-time network wait; and `Quiesce`'s budget, which PSC enforces in
-/// real time whatever this says. A save's `updated_at` comes from
-/// `ExecuteOptions::now`, as it always has.
-class Clock {
- public:
-  virtual ~Clock() = default;
-  virtual std::chrono::steady_clock::time_point Steady() const {
-    return std::chrono::steady_clock::now();
-  }
-  virtual std::chrono::system_clock::time_point Wall() const {
-    return std::chrono::system_clock::now();
-  }
-  /// The real time to block for `span` of `Steady()` to pass.
-  virtual std::chrono::milliseconds RealFor(std::chrono::milliseconds span) const {
-    return span;
-  }
-};
-
 class SdEngine : public ipc::Engine, public power::Sink {
  public:
   SdEngine();

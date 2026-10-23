@@ -54,8 +54,10 @@ jobs:
   soak:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    # Write, for the one thing that writes: benchmark-action pushing the night's
-    # numbers to the `benchmarks` branch. Nothing else here pushes anything.
+    # Write, for the one thing that writes: the night's numbers going to the
+    # `benchmarks` branch. The token is handed to those steps alone -- the
+    # checkout keeps no credentials -- so the rig, the devkitPro container and
+    # the build never hold it.
     permissions:
       contents: write
     env:
@@ -64,6 +66,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -168,16 +171,26 @@ jobs:
       # for a person to remember.
       - name: The benchmarks branch exists
         if: github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # One empty commit, made without touching the checkout: its working
-          # tree holds tonight's numbers, which the steps below still read.
-          if ! git ls-remote --exit-code --heads origin benchmarks >/dev/null; then
+          remote="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # `--exit-code` answers 2 for "no such branch" and something else for
+          # a network that failed; only the first is a branch to make.
+          status=0
+          git ls-remote --exit-code --heads "$remote" benchmarks >/dev/null || status=$?
+          if [ "$status" -eq 2 ]; then
+            # One empty commit, made without touching the checkout: its working
+            # tree holds tonight's numbers, which the steps below still read.
             empty="$(git hash-object -t tree /dev/null)"
             first="$(git -c user.name='github-actions[bot]' \
                          -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
                        commit-tree "$empty" \
                          -m 'benchmarks: the soak and the image, night by night (#250)')"
-            git push origin "$first:refs/heads/benchmarks"
+            git push "$remote" "$first:refs/heads/benchmarks"
+          elif [ "$status" -ne 0 ]; then
+            echo "::error::could not ask GitHub whether the benchmarks branch exists"
+            exit 1
           fi
 
       # Tracked, not gated: each number already has its gate -- `Judge` for the

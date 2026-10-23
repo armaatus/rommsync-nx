@@ -369,16 +369,19 @@ inline void Info(Event event, std::string_view detail) { Write(Level::kInfo, eve
 ///
 /// **It allocates nothing**, because what calls it is `std::terminate`, and on
 /// the console that is most often a `bad_alloc`: a line that needed a
-/// `std::string` would be the second allocation to fail. So it differs from
+/// `std::string` would be the second allocation to fail. (The sink's own
+/// `FILE` is the sink's business: `FileSink::WriteLast` says what it costs.)
+/// So it differs from
 /// `Write` in exactly the ways that cost memory or could deadlock:
 ///
 ///   * `detail` is not redacted. The caller passes text it built itself -- an
 ///     exception's type name -- never a value that came off the network.
 ///   * The ring is not written: nothing can read it after the process ends.
-///   * The log's lock is only *tried*. The thread that ran out of memory may be
-///     inside `Write` holding it, and waiting for it would hang the console
-///     instead of ending the process; without it the ordinal is the last one
-///     written, read without the lock.
+///   * The log's lock is not taken, not even tried. The thread that ran out of
+///     memory may be inside `Write` holding it: waiting would hang the console
+///     instead of ending the process, and a `try_lock` by the thread that owns
+///     a `std::mutex` is undefined. The ordinal is one past the last line
+///     written, read from an atomic copy `Write` keeps.
 ///
 /// Honours `SetSinkEnabled(false)`: a sleeping console's card is off-limits
 /// even to its last words.
@@ -528,7 +531,12 @@ class FileSink : public Sink {
 
   /// Appends without `mutex_` and without rotating -- the file may run one line
   /// past `max_bytes`, which beats a hang -- and unbuffered, so `stdio` never
-  /// allocates a buffer for it.
+  /// allocates a buffer for it. The `FILE` itself is the one thing it may
+  /// need: newlib hands out a slot an earlier `fclose` freed -- and this sink
+  /// opens and closes the file for every line, so after the first there is
+  /// always one -- while glibc `malloc`s it, outside the C++ heap a failed
+  /// `new` ran out of. A heap so spent that a `FILE` will not fit loses the
+  /// line, and the process ends as it would have without it.
   void WriteLast(Level level, std::string_view line) noexcept override;
 
   const std::string& path() const { return path_; }

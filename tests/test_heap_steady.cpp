@@ -971,7 +971,7 @@ struct Stretch {
 ///              keeps trying, and it does not storm. Then the network comes
 ///              back and the next tick completes within one capped backoff;
 ///   wall +1y   the console's clock jumps a year ahead and monotonic does not:
-///              one catch-up tick, not a year of them, and the interval holds;
+///              the interval holds -- no catching up a year of ticks;
 ///   wall -2y   and two years back, to before the last tick: no storm, and no
 ///              stall waiting for a wall clock to catch up -- monotonic drives;
 ///   expired    the server starts answering 401 to every request, as it does to
@@ -1060,7 +1060,7 @@ void Schedule(checks::Checks& c, http::HttpClient& client, const std::string& ba
     const Stretch ahead = stretch(hours);
     say("wall +1y", ahead);
     c.Expect(about(ahead.ticks) && ahead.completed == ahead.ticks,
-             "a wall clock a year ahead is one catch-up tick, not a year of them: " +
+             "a wall clock a year ahead does not catch up a year of ticks: " +
                  std::to_string(ahead.ticks) + " ticks for " + std::to_string(expected) +
                  " intervals");
 

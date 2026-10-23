@@ -32,8 +32,8 @@ struct State {
   std::uint64_t written = 0;
 
   /// `sink`, `sink_enabled` and `written` again, stored on every change for
-  /// `WriteLast` alone: it cannot wait for the lock above, and these are what
-  /// it reads when it cannot have it.
+  /// `WriteLast` alone, which may not take the lock above (log.hpp says why)
+  /// and reads these instead.
   std::atomic<Sink*> last_sink{nullptr};
   std::atomic<bool> last_enabled{true};
   std::atomic<std::uint64_t> last_written{0};
@@ -485,21 +485,14 @@ void Write(Level level, Event event, std::string_view detail) {
 }
 
 void WriteLast(Event event, std::string_view detail) noexcept {
+  // The mirrors only, never `state.mutex`: the thread that ran out of memory
+  // may be inside `Write` holding it, and even a `try_lock` by the thread that
+  // owns a `std::mutex` is undefined. The ordinal is one past the last line
+  // written, and is not handed out again: nothing writes after this.
   State& state = TheLog();
-  std::uint64_t ordinal = 0;
-  Sink* sink = nullptr;
-  bool enabled = false;
-  if (state.mutex.try_lock()) {
-    ordinal = ++state.written;
-    state.last_written.store(ordinal, std::memory_order_relaxed);
-    sink = state.sink;
-    enabled = state.sink_enabled;
-    state.mutex.unlock();
-  } else {
-    ordinal = state.last_written.load(std::memory_order_relaxed) + 1;
-    sink = state.last_sink.load(std::memory_order_relaxed);
-    enabled = state.last_enabled.load(std::memory_order_relaxed);
-  }
+  const std::uint64_t ordinal = state.last_written.load(std::memory_order_relaxed) + 1;
+  Sink* const sink = state.last_sink.load(std::memory_order_relaxed);
+  const bool enabled = state.last_enabled.load(std::memory_order_relaxed);
   if (sink == nullptr || !enabled) {
     return;
   }
