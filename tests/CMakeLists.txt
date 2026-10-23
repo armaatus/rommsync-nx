@@ -1146,6 +1146,7 @@ endforeach()
 set(SCAN_RIG_SCENARIOS
   library  # a Sandbox scanned against the docker library, end to end
   paging   # limit=1 over the seeded library still finds a rom on the last page
+  retried  # #251: a page lost in transit is asked again after a backoff; a cancel stops between pages
 )
 foreach(scenario IN LISTS SCAN_RIG_SCENARIOS)
   add_test(NAME scan.${scenario} COMMAND test_save_scan ${scenario})
