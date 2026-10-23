@@ -538,36 +538,45 @@ bool ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local,
 std::vector<OvertakenKeepLocal> SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
                                                const std::vector<state::Baseline::Key>& sent,
                                                const ExecutionReport& executed) {
-  std::vector<OvertakenKeepLocal> overtaken;
-  const auto answered = [&executed, &sent, &overtaken](const state::Baseline::Key& key) {
+  // The result that spent `key`'s override, or null while it is still owed.
+  const auto spent_by = [&executed,
+                         &sent](const state::Baseline::Key& key) -> const OperationResult* {
     if (FindByKey(sent, key) == nullptr) {
-      return false;  // armed after this plan went out: it carried no override
+      return nullptr;  // armed after this plan went out: it carried no override
     }
     const OperationResult* result = FindByKey(executed.operations, key);
     if (result == nullptr) {
-      return false;  // not in this plan: a later one may name it
+      return nullptr;  // not in this plan: a later one may name it
     }
     // Only what never reached the server is still owed its override: a
     // cancelled operation, or an upload that failed before its request was
     // made or while it was in flight. Anything the server saw -- or a plan
     // that asked for something other than an upload -- has spent it.
     if (result->outcome == OperationOutcome::kCanceled) {
-      return false;
+      return nullptr;
     }
     const bool unsent = result->action == Action::kUpload &&
                         result->outcome == OperationOutcome::kFailed &&
                         (result->error == OperationError::kTransferFailed ||
                          result->error == OperationError::kUnreadableCard ||
                          result->error == OperationError::kNoLocalSave);
+    return unsent ? nullptr : result;
+  };
+  std::vector<OvertakenKeepLocal> overtaken;
+  std::vector<state::Baseline::Key> owed;
+  for (state::Baseline::Key& key : *keep_local) {
+    const OperationResult* spent = spent_by(key);
+    if (spent == nullptr) {
+      owed.push_back(std::move(key));
+      continue;
+    }
     // A no-op is, after a restore, the server already holding these bytes:
     // spent, but nothing overtook it.
-    if (!unsent && result->action != Action::kUpload && result->action != Action::kNoOp) {
-      overtaken.push_back({key, result->action});
+    if (spent->action != Action::kUpload && spent->action != Action::kNoOp) {
+      overtaken.push_back({key, spent->action});
     }
-    return !unsent;
-  };
-  keep_local->erase(std::remove_if(keep_local->begin(), keep_local->end(), answered),
-                    keep_local->end());
+  }
+  *keep_local = std::move(owed);
   return overtaken;
 }
 
@@ -774,9 +783,17 @@ void Wait(const ExecuteOptions& options, std::chrono::milliseconds delay) {
   }
 }
 
-/// After a Keep local upload wrote `own_id` in the second `landed`: rewrite that
-/// row with the bytes it already holds once the second has turned, so it is the
-/// slot's newest by a whole second (#272).
+/// A Keep local upload the server took: what went up, and where it landed.
+struct LandedUpload {
+  std::string source;               ///< the file on the card, resolved
+  std::string sent_digest;          ///< the MD5 of the bytes that went up
+  std::int64_t own_id = 0;          ///< the row the upload wrote
+  std::optional<Timestamp> second;  ///< the second it landed in, off the answer
+};
+
+/// After a Keep local upload wrote `upload.own_id` in `upload.second`: rewrite
+/// that row with the bytes it already holds once the second has turned, so it
+/// is the slot's newest by a whole second (#272).
 ///
 /// RomM 5.4.0 stores `updated_at` to the whole second. Its slot guard and
 /// `promote_to_slot_head` order a slot by `updated_at`, then id, but negotiate
@@ -801,10 +818,8 @@ void Wait(const ExecuteOptions& options, std::chrono::milliseconds delay) {
 /// choice.
 void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
                       const SyncOperation& operation, const SaveTarget& target,
-                      const std::string& source, const std::string& sent_digest,
-                      std::int64_t own_id, std::optional<Timestamp> landed,
-                      const ExecuteOptions& options, OperationResult* uploaded,
-                      std::vector<std::string>* warnings) {
+                      const LandedUpload& upload, const ExecuteOptions& options,
+                      OperationResult* uploaded, std::vector<std::string>* warnings) {
   const std::string not_moved =
       Describe(operation) + ": the Keep local upload may share its second with another "
                             "device's upload of this save, and was not moved past it ";
@@ -816,8 +831,8 @@ void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
       warnings->push_back(not_moved + "(the tick was cancelled)");
       return;
     }
-    const state::HashOutcome digest = state::HashFile(source);
-    if (!digest.ok() || digest.content_hash != sent_digest) {
+    const state::HashOutcome digest = state::HashFile(upload.source);
+    if (!digest.ok() || digest.content_hash != upload.sent_digest) {
       // The card moved since the upload. Those are new bytes, and the next tick
       // offers them like any -- in a later second.
       warnings->push_back(not_moved + "(the save changed on the card since)");
@@ -827,7 +842,7 @@ void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
     // `device_id` and `content_hash` keep this device's history against the row
     // as the upload left it.
     std::string url = http::JoinUrl(token.server_url, std::string(kSavesPath) + "/" +
-                                                          std::to_string(own_id)) +
+                                                          std::to_string(upload.own_id)) +
                       "?device_id=" + http::EncodeQueryValue(token.device_id);
     if (options.send_content_hash) {
       url += "&content_hash=" + digest.content_hash;
@@ -836,7 +851,7 @@ void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
         Authed(http::Method::kPut, std::move(url), token, options.timeout, options.cancel);
     http::FormPart part;
     part.name = "saveFile";
-    part.file_path = source;
+    part.file_path = upload.source;
     part.file_name = target.file_name;
     part.content_type = "application/octet-stream";
     request.form.push_back(std::move(part));
@@ -855,13 +870,13 @@ void OutlastTheSecond(http::HttpClient& client, const auth::StoredToken& token,
       continue;
     }
     const std::optional<Timestamp> moved_to = UpdatedAtOf(rewritten.response.body);
-    if (landed.has_value() && moved_to.has_value() && *moved_to <= *landed) {
+    if (upload.second.has_value() && moved_to.has_value() && *moved_to <= *upload.second) {
       // The two clocks' phase was off by more than the margin: still the same
       // second, and the next attempt waits longer.
       last_failure = "it is still in that second";
       continue;
     }
-    uploaded->message += landed.has_value() && moved_to.has_value()
+    uploaded->message += upload.second.has_value() && moved_to.has_value()
                              ? ", and rewritten a second later to be the slot's newest"
                              : ", and rewritten a second later";
     return;
@@ -971,9 +986,9 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
     // the second another device's did (#272). The second it landed in is read
     // off the answer: MariaDB truncates the fraction the answer still carries,
     // and `ParseTimestamp` drops it the same way.
-    OutlastTheSecond(client, token, operation, *target, source, sent_digest,
-                     *uploaded.save_id, UpdatedAtOf(result.response.body), options, &uploaded,
-                     warnings);
+    const LandedUpload landed{source, sent_digest, *uploaded.save_id,
+                              UpdatedAtOf(result.response.body)};
+    OutlastTheSecond(client, token, operation, *target, landed, options, &uploaded, warnings);
   }
   return uploaded;
 }
