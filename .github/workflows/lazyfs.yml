@@ -1,0 +1,79 @@
+name: lazyfs
+
+# The check on tests/crash_disk.hpp (#250, from #203). The suite proves hard
+# rule 2 -- a save is backed up before it is overwritten, durably -- against a
+# model of what a card that does not journal keeps after a power cut. This runs
+# the same overwrite on lazyfs, a FUSE filesystem with a real page cache that
+# can be told to forget what was never synced, or to persist half a write and
+# die, and holds what reaches its root to the same judge (tests/test_lazyfs.sh).
+#
+# Nightly rather than per push: FUSE needs a Linux runner and lazyfs is built
+# from source, and the model it checks changes rarely. A skip is a failure here
+# (ROMMSYNC_REQUIRE_LAZYFS): on this runner nothing it needs can be missing.
+
+on:
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+  # Once when this file changes on main, so the first run is the push that adds
+  # or changes it rather than the next night's.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/lazyfs.yml
+
+concurrency:
+  group: lazyfs
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  lazyfs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # dsrhaslab/lazyfs has no release tags; a commit is the pin. Moving it is
+      # a decision made here, with the run that proved the new one green.
+      LAZYFS_REF: fa7d32ee9710d55a7e529ac3c375f6616563c78b
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev libfuse3-dev fuse3
+
+      - name: Build lazyfs at its pin
+        run: |
+          git clone https://github.com/dsrhaslab/lazyfs.git "$RUNNER_TEMP/lazyfs"
+          git -C "$RUNNER_TEMP/lazyfs" checkout --detach "$LAZYFS_REF"
+          (cd "$RUNNER_TEMP/lazyfs/libs/libpcache" && ./build.sh)
+          (cd "$RUNNER_TEMP/lazyfs/lazyfs" && ./build.sh)
+          test -x "$RUNNER_TEMP/lazyfs/lazyfs/build/lazyfs"
+
+      - name: Build the driver
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build --target test_lazyfs
+
+      # The script itself rather than `ctest -R lazyfs`, so its lines are this
+      # run's log whether it passes or not.
+      - name: The overwrite on lazyfs
+        run: |
+          set -o pipefail
+          LAZYFS="$RUNNER_TEMP/lazyfs/lazyfs/build/lazyfs" ROMMSYNC_REQUIRE_LAZYFS=1 \
+            bash tests/test_lazyfs.sh build/tests/test_lazyfs 2>&1 | tee lazyfs.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### The save-overwrite protocol on lazyfs ($LAZYFS_REF)"
+            echo
+            echo '```'
+            grep -E '^(ok|FAIL|skip):' lazyfs.log 2>/dev/null || echo "(the check wrote no log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

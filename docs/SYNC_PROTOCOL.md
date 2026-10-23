@@ -600,8 +600,11 @@ that land on a save; the first and last also run with `.backup/` unconfirmed
 one with no backup, and a rename of bytes nothing synced. The `backup` row of
 `scripts/v1-gate.sh` counts them. What the model assumes — a sync that says yes
 did persist, a directory's own updates land in order, no flying writes — is
-listed at the top of that header; a kernel-level injector such as lazyfs is the
-check on those assumptions, and is not in the suite. Every replay drives the
+listed at the top of that header. lazyfs, a filesystem with a page cache that
+can be told to forget, is the check on its data half: `lazyfs.overwrite` runs
+the same overwrites on it, cut at every call and torn, nightly on Linux (#250).
+lazyfs makes every name durable at once, so the directory half is the model's
+alone. Every replay drives the
 host backend; the Horizon one (`http_wire.cpp`) syncs its `.part` through the
 same `io::Sync`, and nothing off a console runs it under the replay (#44).
 

@@ -2680,6 +2680,22 @@ foreach(scenario tick download)
   set_tests_properties(oom.${scenario} PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endforeach()
 
+# --- M9-23 (#250): the overwrite on lazyfs, the check on crash_disk.hpp ----------
+# The driver builds everywhere; the script skips, with its reason, anywhere that
+# is not Linux with FUSE and a lazyfs built (LAZYFS). .github/workflows/lazyfs.yml
+# is where it runs, nightly, and where ROMMSYNC_REQUIRE_LAZYFS makes a skip red.
+# `lazyfs.workflow` holds that job to existing.
+add_executable(test_lazyfs test_lazyfs.cpp)
+target_link_libraries(test_lazyfs PRIVATE rommsync::host)
+target_include_directories(test_lazyfs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME lazyfs.overwrite
+         COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_lazyfs.sh"
+                 "$<TARGET_FILE:test_lazyfs>")
+set_tests_properties(lazyfs.overwrite PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+add_test(NAME lazyfs.workflow
+         COMMAND "${BASH_PROGRAM}" "${CMAKE_CURRENT_SOURCE_DIR}/test_lazyfs.sh" --workflow)
+set_tests_properties(lazyfs.workflow PROPERTIES TIMEOUT 60)
+
 # The nightly soak's two halves that are not the soak itself: the workflow that
 # runs it on a schedule and keeps what it measured, and the check on main that
 # goes red when it has stopped passing (scripts/soak-fresh.sh), and that check's

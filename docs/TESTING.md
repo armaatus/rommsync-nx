@@ -925,9 +925,26 @@ ctest --test-dir build --output-on-failure
   reordered within one directory, and `fseek`/`ftruncate` (no save path reaches
   them). A durability call made *beside* the seam is invisible to it, which is
   how the host backend's descriptor `fsync` was found -- so a backend that makes
-  something durable does it through `io::Sync`. A kernel-level injector
-  ([lazyfs](https://github.com/dsrhaslab/lazyfs), Linux and FUSE) is the check
-  on the model's assumptions and is not part of this suite.
+  something durable does it through `io::Sync`.
+
+  The check on the model is [lazyfs](https://github.com/dsrhaslab/lazyfs), a
+  FUSE filesystem that holds writes in its own page cache until an `fsync` and
+  can be told to drop what is unsynced, or to persist half of one write or one
+  of a run of them and die (#250). `lazyfs.overwrite` (`tests/test_lazyfs.sh`)
+  runs two overwrites on a lazyfs mount -- `BackUpFirst` then `WriteAtomically`,
+  and a download's order, its body staged in pieces then `CommitStaged` -- cuts
+  the power in front of every call each makes to `io::Disk` and after the last,
+  tears the writes of every file the save's bytes pass through, and holds what
+  reaches lazyfs's root to the same `crash::OldOrNew` after the same sweep. A
+  download renamed into place unsynced has to be caught, and is: a zero-byte
+  save, as the model predicts. It needs Linux and FUSE, so it skips here and
+  everywhere else; `.github/workflows/lazyfs.yml` runs it nightly on a GitHub
+  runner against lazyfs built at a pinned commit, where a skip is a failure,
+  and `lazyfs.workflow` holds that job to existing. What lazyfs does not model
+  is the model's directory half: it passes create, rename and unlink straight
+  through, so a name is durable the moment it is made, and the per-directory
+  loss of unsynced names is checked by nothing but the model. Flying writes and
+  a sync that lies are beyond both.
 - **What the sysmodule holds, measured** (M9-15, #204). The heap's table in
   `sysmodule/source/main.cpp` is a bound added up from constants, and two things
   measure what it describes. `scripts/image-budget.sh` reads the linked image --
@@ -1290,7 +1307,7 @@ two cannot drift.
 | `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
 | `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol, and since M9-7 (#198) they prove it through the overlay's own `ipc_client.cpp` as well as through `ipc::Dispatch` -- `overlay.wire`, `overlay.roundtrip`, `overlay.errors`. What no test reaches is the libnx `cmif`/`hipc` glue: `sysmodule/source/ipc/server.cpp` and the message unpacking in `service.cpp`, verified with the rest of the Horizon glue at M8-2. |
 | `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
-| `backup` | Every save-overwrite path shown to back up first, durably (SYNC_PROTOCOL hard rule) -- verified by tests, a power cut replayed at every call. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `states.crash`, `conflicts.crash`, `tick.newer_download`, `tick.newer_conflict`, `tick.migrated`, `tick.backupdir`, `tick.durable` — **a crash-prefix replay** of each of the three paths that land on a save (`execute.crash`, `states.crash`, `conflicts.crash`; `tests/crash_disk.hpp`), and of the tick that resolves a 409 from RomM's slot guard by taking the server's head (`tick.newer_download`, `tick.newer_conflict`, #232), and of the first tick after an upgrade from rc1, whose migrated save takes the shared slot's newer head (`tick.migrated`, #236), which makes "first" an order of *persistence* rather than of calls: every point of the recorded overwrite is cut, every card a non-journalling FAT may keep is swept by the boot sweep, and each must hold the old bytes or the new, never the new without the old under `.backup/` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
+| `backup` | Every save-overwrite path shown to back up first, durably (SYNC_PROTOCOL hard rule) -- verified by tests, a power cut replayed at every call. | `harness.backup`, `oom.tick`, `execute.*`, `states.overwrite`, `states.keeps_both`, `states.crash`, `conflicts.crash`, `tick.newer_download`, `tick.newer_conflict`, `tick.migrated`, `tick.backupdir`, `tick.durable` — **a crash-prefix replay** of each of the three paths that land on a save (`execute.crash`, `states.crash`, `conflicts.crash`; `tests/crash_disk.hpp`), and of the tick that resolves a 409 from RomM's slot guard by taking the server's head (`tick.newer_download`, `tick.newer_conflict`, #232), and of the first tick after an upgrade from rc1, whose migrated save takes the shared slot's newer head (`tick.migrated`, #236), which makes "first" an order of *persistence* rather than of calls: every point of the recorded overwrite is cut, every card a non-journalling FAT may keep is swept by the boot sweep, and each must hold the old bytes or the new, never the new without the old under `.backup/` — **the same judgement after a death by running out of heap** at every allocation a tick makes (`oom.tick`, #250) — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
 | `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
 | `media` | A known-good NAND/SD backup exists; testing will be on a spare/backup SD or emuMMC, not the daily driver. | **Nothing in a repository can attest to this**, and a checkbox that says otherwise is worse than none. See *what the first console decides*. |
 
