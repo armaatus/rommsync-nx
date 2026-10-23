@@ -6179,9 +6179,14 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   conflict(theirs_again, mine_again, "the second conflict");
   const std::int64_t second_conflict = newest_conflict();
   c.Expect(second_conflict > first_conflict, "the second conflict is the save's newest entry");
+  // Asked under a game too: the refusal that holds whatever the player does is
+  // the one said, not "close the game" and then this one after they have.
+  running = true;
   const ipc::RestoreState stale = keep_local(first_conflict);
+  running = false;
   c.Expect(stale.report.outcome == conflicts::RestoreOutcome::kSuperseded,
-           std::string("Keep local on the first conflict is refused as superseded: ") +
+           std::string("Keep local on the first conflict is refused as superseded, game or "
+                       "none: ") +
                conflicts::ToString(stale.report.outcome) + " -- " + stale.report.message);
   c.ExpectEq(console.sandbox.Read(save), theirs_again, "and wrote nothing");
 
