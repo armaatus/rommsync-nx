@@ -48,7 +48,6 @@ namespace crypto = rommsync::crypto;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace io = rommsync::io;
-namespace json = rommsync::json;
 namespace place = rommsync::place;
 namespace sync = rommsync::sync;
 
@@ -109,40 +108,51 @@ bool PlanFor(rig::Checks& checks, http::HttpClient& client, const std::string& b
   return true;
 }
 
-/// `GET /api/saves/{id}`, and whether RomM has a sync row for this device.
+/// Expect RomM to arbitrate `slot` against a sync row this device holds for
+/// `save_id`; `what` names the call that should have written it.
 ///
 /// That row is the whole point of passing `device_id` on an upload and of
 /// `POST /api/saves/{id}/downloaded` after a download: without it every later
 /// negotiation for the save falls into the no-sync-history branch
 /// (docs/API_CONTRACT.md).
 ///
-/// **`device_id` on the read is not optional either.** Verified against the
-/// live 5.2.0: `GET /api/saves/{id}` and `GET /api/saves` answer
-/// `device_syncs: []` unless the query names a device, and an empty array reads
-/// exactly like "this device has never synced this save" -- which is the state
-/// the whole arbitration hangs on. It is a filter and not a write: the
-/// `last_synced_at` it answers with is the one the upload wrote.
-bool DeviceIsSynced(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-                    std::int64_t save_id) {
-  const http::Result result = client.Send(
-      harness::Authed(http::Method::kGet,
-                      base + "/api/saves/" + std::to_string(save_id) + "?device_id=" +
-                          fixture.device_id,
-                      fixture));
-  if (!result.successful()) {
-    return false;
+/// **Reading the row back proves nothing on 5.4.0, so this does not.**
+/// `GET /api/saves/{id}?device_id=` answers an entry for the calling device
+/// whether or not one exists -- RomM synthesizes it, at the save's own
+/// `updated_at` and `is_current: false`, which is also what a real one looks
+/// like (#265). The witness is the thing the row exists for: the next
+/// negotiation. Offered a copy changed after the save was written -- a later
+/// mtime *and* different bytes -- a device with a row is answered `Client save
+/// is newer than last sync` and one without `Client save is newer (no sync
+/// history)`. The bytes have to differ because `Content is identical` is
+/// answered before history is read at all. Nothing is executed, and `PlanFor`
+/// closes the session, so the scenario's own plan is untouched.
+void ExpectDeviceSynced(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                        const Fixture& fixture, std::int64_t rom_id, const std::string& slot,
+                        std::int64_t save_id, const std::string& what) {
+  const std::string changed = "a copy this device changed after save " +
+                              std::to_string(save_id) + " was written\n";
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(rom_id, "witness.srm", slot, "m2-5",
+                                             crypto::Md5Hex(changed),
+                                             std::chrono::system_clock::now() +
+                                                 std::chrono::hours{1},
+                                             static_cast<std::int64_t>(changed.size())));
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    return;
   }
-  const json::ParseResult document = json::Parse(result.response.body);
-  const json::Value* rows = document.ok() ? document.value.Find("device_syncs") : nullptr;
-  if (rows == nullptr) {
-    return false;
-  }
-  for (const json::Value& row : rows->elements()) {
-    if (harness::Field(row, "device_id") == fixture.device_id) {
-      return true;
-    }
-  }
-  return false;
+  const sync::SyncOperation& operation = plan.operations[0];
+  // Arbitrated against `save_id` and no other row: a row this device holds
+  // for some other save in the slot is not the one the scenario wrote.
+  checks.Expect(operation.action == sync::Action::kUpload &&
+                    operation.reason == sync::Reason::kClientNewer &&
+                    operation.save_id == save_id,
+                what + ": negotiate answered " + sync::ToString(operation.action) + ", \"" +
+                    operation.reason_text + "\", save " +
+                    (operation.save_id.has_value() ? std::to_string(*operation.save_id)
+                                                   : std::string("null")));
 }
 
 /// The options every rig scenario runs with: the sandbox's own `.backup/`, and
@@ -1646,8 +1656,8 @@ void Upload(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   // The row `device_id` on the upload wrote. It is what the *next* negotiation
   // arbitrates against, so an upload that skipped it leaves this device in the
   // no-history branch forever.
-  checks.Expect(DeviceIsSynced(client, base, fixture, *done.save_id),
-                "the upload wrote a device_syncs row for this device");
+  ExpectDeviceSynced(checks, client, base, fixture, rom.id, slot, *done.save_id,
+                     "the upload wrote a device_syncs row for this device");
 
   harness::DeleteSave(client, base, fixture, *done.save_id);
 }
@@ -1724,8 +1734,8 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
   checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name))),
                 "the staged copy is consumed, not left beside the save");
 
-  checks.Expect(DeviceIsSynced(client, base, fixture, server.id),
-                "POST /api/saves/{id}/downloaded recorded that this device holds it");
+  ExpectDeviceSynced(checks, client, base, fixture, rom.id, slot, server.id,
+                     "POST /api/saves/{id}/downloaded recorded that this device holds it");
 
   // A save this client has no local file for -- the `Save exists on server but
   // not on client` case, and the only way a client ever learns a save exists.
@@ -2646,6 +2656,15 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   }
 
   // "Keep local": the player's override, and the only thing that sends the flag.
+  //
+  // A second has to pass first, or the row it writes is not the slot's head.
+  // Negotiate takes the newest row per slot by `updated_at`, which 5.4.0 stores
+  // to the whole second, and a tie goes to whichever row its unordered query
+  // returns first -- the occupant. Arbitrating against the occupant, this device
+  // has no history, and the sync-history check below would fail for a reason
+  // that has nothing to do with whether the upload recorded one (#265; the
+  // product's side of the tie is #272).
+  harness::PassASecond();
   sync::ExecuteOptions keep = OptionsAt(1'757'000'011);
   keep.keep_local = {{rom.id, slot}};
   const sync::ExecutionReport report =
@@ -2713,8 +2732,8 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
                 "the row the upload wrote is readable");
   checks.ExpectEq(written.file_size_bytes, static_cast<std::int64_t>(bytes.size()),
                   "and holds this device's bytes");
-  checks.Expect(DeviceIsSynced(client, base, fixture, uploaded_id),
-                "and carries this device's sync history");
+  ExpectDeviceSynced(checks, client, base, fixture, rom.id, slot, uploaded_id,
+                     "and carries this device's sync history");
 
   // Now the part that decides whether a slot accretes a row per tick. A second
   // has to have passed for this to be a fact rather than a coin toss, which is

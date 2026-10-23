@@ -493,11 +493,14 @@ device `a` uploads with its hash, device `b` replaces that row's bytes (`PUT`),
 and `a` offers the same bytes under a 2099 mtime — `download`, `"Server save is
 newer than last sync"`, where without the baseline both sides changed and it
 would be `conflict`. A baseline belongs to a save *row*, though, and negotiate
-only reads syncs against each slot's newest row. Another device's upload is a
-new row, so the device that uploaded before it has no history against the head
-and falls back to timestamps: `captures/sync-negotiate-other-device-version.json`
-is `upload`, `"Client save is newer (no sync history)"` — for bytes the server
-has already seen from this very device.
+only reads syncs against each slot's newest row — newest by an `updated_at`
+stored to the whole second, so two rows written in one second tie, and the tie
+goes to whichever the unordered query returns first, observed on the fixture to
+be the older (#265, #272). Another device's upload is a new row, so the device
+that uploaded before it has no history against the head and falls back to
+timestamps: `captures/sync-negotiate-other-device-version.json` is `upload`,
+`"Client save is newer (no sync history)"` — for bytes the server has already
+seen from this very device.
 
 An `action` or a `reason` that is not in the tables above is a server that moved.
 `ClassifyAction` pins the unknown action to `no_op` and reports it, because on a
@@ -778,8 +781,8 @@ fixture: a save uploaded with no `device_id`, read back naming a device created
 a moment earlier, comes back with an entry for that device. So neither answer is
 evidence of history on its own: an empty array is a read that named nobody, and
 an entry for the caller exists whether or not anything was recorded. Negotiate,
-which reads the real rows, is the only reliable witness. `DeviceIsSynced` in
-`tests/test_sync_execute.cpp` still reads the entry as proof; #265 fixes it.
+which reads the real rows, is the only reliable witness, and it is the one
+`ExpectDeviceSynced` in `tests/test_sync_execute.cpp` asks (#265).
 
 **`GET /api/saves/{id}/content` takes `device_id` and `session_id` too, and the
 client must not use them.** Passing `device_id` there records the download at the
