@@ -436,8 +436,23 @@ and it is the only thing that ever sends `overwrite=true`:
 
 1. `KeepLocal` (IPC command 18) restores the conflict's backup onto the card
    through `conflicts::KeepLocal` -- `Restore` itself, so the server's copy it
-   replaces is backed up first. An entry that is not a save conflict with a slot
-   is refused with `not_a_conflict` before anything is written.
+   replaces is backed up first. It is refused before anything is written
+   (#273):
+   - `not_a_conflict`: the entry is not a save conflict with a slot;
+   - `superseded`: a newer entry of the same `(rom_id, slot)` -- another
+     conflict, a download over it, a deletion -- has moved the card on since.
+     Only a save's newest entry is Keep local's;
+   - `game_running`: an application is in the foreground. It holds its save in
+     memory and writes it on close, over the kept bytes, and the tick #242
+     holds would then send *that* with `overwrite=true`. Asked at the write, of
+     any application: `pm` names a title, not the save it holds, and RetroArch
+     runs every rom under one, so the save's own game cannot be told apart. A
+     game started after the restore lands loads the kept bytes, so what it
+     saves on close is play on top of the player's choice;
+   - `keep_local_full`: `sync::kMaxKeepLocal` choices already wait (sync off or
+     held). Refused rather than letting the oldest go, because that one's bytes
+     are already on the card and its upload without the override would resolve
+     as Keep server without a word.
 2. Once the bytes are on the card -- never before -- the sysmodule arms the
    conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
    `sync::kMaxKeepLocal`) and asks for a tick.
@@ -448,6 +463,13 @@ and it is the only thing that ever sends `overwrite=true`:
    keeps it for the next, as does a choice armed after the plan went out. So
    the choice is one upload's: a later upload of the save meets the guard as
    every upload does.
+
+   A plan that answers with anything but an upload -- most often a download,
+   because another device wrote the slot after the restore -- spends the choice
+   with nothing sent: the server asked for no upload, so its copy lands, backed
+   up like any, and the kept bytes are under `.backup/`. The log says so, as a
+   `sync.refused` warning naming the save and the action, rather than letting
+   the choice vanish (#273, `engine.keep_local_overtaken`).
 4. Once that upload has landed, the tick waits for the second to turn and
    rewrites the row it wrote with the same bytes (`PUT /api/saves/{id}`, #272).
    RomM stores `updated_at` to the whole second and negotiate breaks a
@@ -656,11 +678,12 @@ that back up and then overwrite make the same comparison last:
   between its staged copy and its `io::CommitStaged`. It is the likelier of the
   two to meet a late write: it starts from the overlay, over a game that may be
   running, and `SdEngine::RunRestore` takes the save-write lock but not #242's
-  hold. A file written since stops it with `changed_since_backup` and nothing
-  written — the file holds the game's write, the restore's own backup what was
-  there before, and the entry's backup is untouched, so the press can be
-  repeated once the game is closed. Keep local arms nothing for a restore that
-  did not land.
+  hold -- only Keep local asks whether a game is running, and is refused under
+  one ([Keep local](#keep-local-249), #273). A file written since stops it with
+  `changed_since_backup` and nothing written — the file holds the game's write,
+  the restore's own backup what was there before, and the entry's backup is
+  untouched, so the press can be repeated once the game is closed. Keep local
+  arms nothing for a restore that did not land.
 - **A save state's download** ([below](#backups-and-verification)), between its
   backup and its `io::CommitStaged`: RetroArch writes a state on a hotkey. A
   state written since fails the download `changed_since_backup`, its staged

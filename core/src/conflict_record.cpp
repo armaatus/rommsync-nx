@@ -292,15 +292,38 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 }
 
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
+                        const std::vector<state::Baseline::Key>& armed,
                         state::Baseline::Key* key, const RestoreOptions& options) {
   const Entry* entry = history.Find(entry_id);
-  if (entry != nullptr && !entry->save_conflict()) {
+  const auto refuse = [entry](RestoreOutcome outcome, const std::string& why) {
     RestoreReport refused;
-    refused.outcome = RestoreOutcome::kNotAConflict;
-    refused.message = entry->file_name +
-                      ": not a save conflict, so there is no server copy to keep this console's "
-                      "over -- nothing was written";
+    refused.outcome = outcome;
+    refused.message = entry->file_name + ": " + why + " -- nothing was written";
     return refused;
+  };
+  if (entry != nullptr && !entry->save_conflict()) {
+    return refuse(RestoreOutcome::kNotAConflict,
+                  "not a save conflict, so there is no server copy to keep this console's over");
+  }
+  if (entry != nullptr) {
+    // Ids only grow, so a later entry of the same save is one with a larger id
+    // -- of any event: a download or a deletion moved the card on as surely as
+    // a second conflict did.
+    for (const Entry& other : history.entries()) {
+      if (other.id > entry->id && other.kind == EntryKind::kSave &&
+          other.rom_id == entry->rom_id && other.slot == entry->slot) {
+        return refuse(RestoreOutcome::kSuperseded,
+                      "a newer entry of this save is in the history, so these bytes are not the "
+                      "ones on the card to keep; choose on the newest one");
+      }
+    }
+    const state::Baseline::Key wanted{entry->rom_id, entry->slot};
+    if (armed.size() >= sync::kMaxKeepLocal && sync::FindByKey(armed, wanted) == nullptr) {
+      return refuse(RestoreOutcome::kKeepLocalFull,
+                    std::to_string(sync::kMaxKeepLocal) +
+                        " Keep local choices are already waiting for a sync to send them, and "
+                        "this would be one more");
+    }
   }
   // A missing entry falls through: `Restore` names that refusal itself.
   RestoreReport report = Restore(files, history, entry_id, options);

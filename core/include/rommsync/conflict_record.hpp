@@ -135,15 +135,26 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 /// explicitly and for one save, that the local copy should win. It is
 /// `Restore`, steps and backup and all, with two differences:
 ///
-///   - it is refused with `kNotAConflict`, before anything is written, for an
-///     entry that is not a save `kConflict` with a slot. A download that
-///     replaced a save had no local side the server weighed, a state has no
-///     slot an upload could go over, and a deletion was RomM's own -- plain
-///     `Restore` is what those have;
+///   - it is refused, before anything is written:
+///       - with `kNotAConflict` for an entry that is not a save `kConflict` with
+///         a slot. A download that replaced a save had no local side the server
+///         weighed, a state has no slot an upload could go over, and a deletion
+///         was RomM's own -- plain `Restore` is what those have;
+///       - with `kSuperseded` for a conflict that is not the newest entry of its
+///         `(rom_id, slot)` (#273). A later conflict, download or deletion of
+///         the save has put other bytes on the card since, and the server a
+///         head nobody weighed this backup against; the newest entry is the
+///         one the player can still mean;
+///       - with `kKeepLocalFull` when `armed` -- the choices already waiting --
+///         holds `sync::kMaxKeepLocal` keys and not this one (#273), so that
+///         `sync::ArmKeepLocal` never has to refuse bytes already restored;
 ///   - on `kRestored` only, `*key` is the conflict's `(rom_id, slot)`, which the
 ///     caller arms (`sync::ArmKeepLocal`) for the next tick. That upload is then
 ///     the one sent with `overwrite=true` (`sync::ExecuteOptions::keep_local`);
 ///     every other upload still meets RomM's slot guard.
+///
+/// Whether a game is running is the caller's to ask (`kGameRunning`): `core/`
+/// has no foreground to look at.
 ///
 /// **Hard rule 3 holds**: the server stays the source of truth because the
 /// override is the player's, named, once -- never inferred. And it is still
@@ -152,6 +163,7 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 /// lineage, even one this console does not load (#236), stays on the server as
 /// that lineage's newest save.
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
+                        const std::vector<state::Baseline::Key>& armed,
                         state::Baseline::Key* key, const RestoreOptions& options = {});
 
 }  // namespace rommsync::conflicts

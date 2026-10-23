@@ -212,9 +212,11 @@ int Version() {
   // 9 since M10-20 (#249): a restore's outcome gained `not_a_conflict`, which a
   // v8 decoder refuses. 10 since M9-32 (#270): and `changed_since_backup`, which
   // a v9 decoder refuses. 11 since M10-31 (#271): `ConfigView` gained `slot`,
-  // `map_state_slots`, a `tico` object and a platform's `play_with`. What is
-  // frozen is command 0's *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{11},
+  // `map_state_slots`, a `tico` object and a platform's `play_with`. 12 since
+  // M10-33 (#273): a restore's outcome gained Keep local's `superseded`,
+  // `game_running` and `keep_local_full`. What is frozen is command 0's
+  // *encoding*, asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{12},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");

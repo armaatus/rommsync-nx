@@ -522,21 +522,23 @@ void Declines::EndTick(const std::vector<std::int64_t>& unasked_roms) {
   }
 }
 
-void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+bool ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local,
                   const state::Baseline::Key& key) {
   if (FindByKey(*keep_local, key) != nullptr) {
-    return;
+    return true;
   }
   if (keep_local->size() >= kMaxKeepLocal) {
-    keep_local->erase(keep_local->begin());
+    return false;
   }
   keep_local->push_back(key);
+  return true;
 }
 
-void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
-                    const std::vector<state::Baseline::Key>& sent,
-                    const ExecutionReport& executed) {
-  const auto answered = [&executed, &sent](const state::Baseline::Key& key) {
+std::vector<OvertakenKeepLocal> SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                                               const std::vector<state::Baseline::Key>& sent,
+                                               const ExecutionReport& executed) {
+  std::vector<OvertakenKeepLocal> overtaken;
+  const auto answered = [&executed, &sent, &overtaken](const state::Baseline::Key& key) {
     if (FindByKey(sent, key) == nullptr) {
       return false;  // armed after this plan went out: it carried no override
     }
@@ -556,10 +558,16 @@ void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
                         (result->error == OperationError::kTransferFailed ||
                          result->error == OperationError::kUnreadableCard ||
                          result->error == OperationError::kNoLocalSave);
+    // A no-op is, after a restore, the server already holding these bytes:
+    // spent, but nothing overtook it.
+    if (!unsent && result->action != Action::kUpload && result->action != Action::kNoOp) {
+      overtaken.push_back({key, result->action});
+    }
     return !unsent;
   };
   keep_local->erase(std::remove_if(keep_local->begin(), keep_local->end(), answered),
                     keep_local->end());
+  return overtaken;
 }
 
 void Recount(ExecutionReport* report) {

@@ -785,10 +785,13 @@ struct ExecuteOptions {
 /// How many Keep local choices wait for their upload at once (#249).
 ///
 /// A choice is armed when the overlay's restore lands and spent by the next plan
-/// that names its save, so the list is normally one long. It is bounded because
-/// a save whose rom has left the card is never named again: the oldest choice is
-/// let go first, which costs that save its override and nothing else -- its
-/// next upload meets the slot guard like any other.
+/// that names its save, so the list is normally one long. At the bound a fifth
+/// is **refused before its restore writes anything** (`conflicts::KeepLocal`,
+/// `kKeepLocalFull`, #273) rather than the oldest let go: that one's bytes are
+/// already on the card, and its upload without the override would meet the
+/// slot guard and resolve as Keep server -- an explicit answer undone with no
+/// word said. The list is in memory, so a reboot empties it; a choice whose
+/// save has left the card holds its place until then.
 ///
 /// Four, because the sysmodule's heap pays for it four times over -- the list
 /// and the three copies a tick holds (`kHeapKeepLocal`, sysmodule main.cpp) --
@@ -797,8 +800,21 @@ struct ExecuteOptions {
 inline constexpr std::size_t kMaxKeepLocal = 4;
 
 /// Arm Keep local for `key`: once, however often it is chosen, and at most
-/// `kMaxKeepLocal` of them, the oldest let go first.
-void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Baseline::Key& key);
+/// `kMaxKeepLocal` of them. False, with nothing changed, for a key that would
+/// be one past the bound -- which `conflicts::KeepLocal` refuses before its
+/// restore, so a caller that asked it first never sees this.
+bool ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Baseline::Key& key);
+
+/// A Keep local a plan spent without sending it (#273): the plan asked for
+/// `action` -- a download, a conflict, a deletion -- rather than an upload of
+/// the save, so its override never went. A no-op is not one: after a restore
+/// it is the server already holding the kept bytes. Answered so the caller can
+/// say so: a choice the player made that the server overtook is worth a line,
+/// not a silent drop.
+struct OvertakenKeepLocal {
+  state::Baseline::Key key;
+  Action action = Action::kNoOp;
+};
 
 /// Drop every Keep local `executed` answered, and keep the rest (#249).
 ///
@@ -814,9 +830,12 @@ void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Ba
 /// the list the plan was executed with -- is kept whatever the plan did: it was
 /// armed after the plan went out, so the plan's upload of it carried no
 /// override.
-void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
-                    const std::vector<state::Baseline::Key>& sent,
-                    const ExecutionReport& executed);
+///
+/// Answers the choices spent by an action other than an upload (#273): the
+/// server overtook them, and nothing went over its copy.
+std::vector<OvertakenKeepLocal> SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                                               const std::vector<state::Baseline::Key>& sent,
+                                               const ExecutionReport& executed);
 
 /// Execute `plan`, one operation at a time, in the order the server sent them.
 ///

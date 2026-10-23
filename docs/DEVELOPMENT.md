@@ -938,8 +938,8 @@ A removed command leaves a hole.
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` | never fails; an empty history is a page |
 | 15 | `RestoreBackup` | `entry_id` -> `RestoreState` (phase + which entry) | never fails, never waits for the copy; a press while one runs answers that one |
 | 16 | `GetLog` | `lines` -> the last N log lines + how many were ever written | never fails; an empty tail is an answer |
-| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed \| not_a_conflict \| changed_since_backup` |
-| 18 | `KeepLocal` | `entry_id` -> `RestoreState` | never fails; `RestoreBackup` for a save conflict, and the next upload of it goes with `overwrite=true` |
+| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed \| not_a_conflict \| changed_since_backup \| superseded \| game_running \| keep_local_full` |
+| 18 | `KeepLocal` | `entry_id` -> `RestoreState` | never fails; `RestoreBackup` for a save conflict, and the next upload of it goes with `overwrite=true`; refused, nothing written, when superseded, under a running game, or with `sync::kMaxKeepLocal` waiting |
 
 `RestoreBackup` and `GetRestoreState` are one restore in two calls, since M9-6
 (#209). A restore copies a whole save, and a save is as large as a game makes
@@ -958,7 +958,9 @@ it 8, and `KeepLocal`'s refusal `not_a_conflict` (M10-20, #249) made it 9, and
 a restore standing down over a file written after its backup,
 `changed_since_backup` (M9-32, #270), made it 10, and `GetConfig` carrying
 `[sync] slot`, `map_state_slots`, `[tico] account` with the accounts the last
-tick found, and each platform's `play_with` (M10-31, #271) made it 11.
+tick found, and each platform's `play_with` (M10-31, #271) made it 11, and Keep
+local's refusals `superseded`, `game_running` and `keep_local_full` (M10-33,
+#273) made it 12.
 
 `KeepLocal` is the conflicts screen's Keep local (#249): a restore of a save
 conflict's backup, polled the same way, after which the sysmodule arms that

@@ -396,8 +396,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// **And which application it is, when `pm` will say** (M10-26, #261). Every
   /// answer that names one is a sighting (`play::Sightings`), and the tick after
   /// the game gives each play session the application seen when its save was
-  /// written -- "unknown" when none was. Only a tick that falls due, its hold
-  /// and a "Sync now" press ask, so a game played entirely between two ticks is
+  /// written -- "unknown" when none was. Only a tick that falls due, its hold,
+  /// a "Sync now" press and a Keep local's restore (#273) ask, so a game played
+  /// entirely between two ticks is
   /// never seen: deliberately, because asking between ticks would be a poll on
   /// a console with nothing owed, which #242 keeps at none.
   using ForegroundProbe = std::function<play::Foreground()>;
@@ -646,7 +647,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// #249: `RequestRestore`, taken and run the same way, through
   /// `conflicts::KeepLocal`. Once the bytes are back, the conflict's
   /// `(rom_id, slot)` is armed in `keep_local_` and a tick is asked for, whose
-  /// upload of that save is the one sent with `overwrite=true`.
+  /// upload of that save is the one sent with `overwrite=true`. Refused with
+  /// nothing written while a game is in the foreground (`application_running`,
+  /// asked at the write), and by `conflicts::KeepLocal` for a superseded entry
+  /// or with `sync::kMaxKeepLocal` already waiting (#273).
   ipc::RestoreState RequestKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
 

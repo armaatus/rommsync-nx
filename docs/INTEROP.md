@@ -295,6 +295,10 @@ the file instead and stops offering it
   the backup and on RomM, and the Conflicts screen offers **Keep local**: your
   bytes back on the card, and the next sync uploads them over the server's copy
   (which RomM does not delete). **Keep server** and **Skip** change
-  nothing.
+  nothing. Keep local is refused with nothing written while a game is
+  running, on a conflict a newer entry of the same save has replaced, and
+  while four choices still wait for a sync; and if another device writes the
+  save before that sync, its copy wins and the log says your choice was
+  overtaken.
 - **PSP saves are not synced**, and the Switch-only systems above sync with no
   other emulator, until #44 has captured real files to build adapters from.

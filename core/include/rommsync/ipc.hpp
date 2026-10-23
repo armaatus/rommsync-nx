@@ -161,7 +161,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// `ConfigView`'s `sync`, a `tico` object beside it, and `play_with` to each
 /// platform of the folder map -- required fields, so a v11 overlay reading a
 /// v10 sysmodule's `GetConfig` fails to decode it.
-inline constexpr std::uint32_t kVersion = 11;
+///
+/// **12** since M10-33 (#273), which added Keep local's three refusals,
+/// `kSuperseded`, `kGameRunning` and `kKeepLocalFull`: outcomes a v11 overlay
+/// would refuse to decode in a `RestoreState`.
+inline constexpr std::uint32_t kVersion = 12;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -1254,8 +1258,11 @@ class Engine {
   /// The player's Keep local for a save conflict (#249): `RequestRestore`'s
   /// shape, answered the same way and polled through the same
   /// `restore_state()`, with two differences an implementation owes the wire.
-  /// It is refused with `conflicts::RestoreOutcome::kNotAConflict`, before
-  /// anything is written, for an entry that is not a save conflict; and once
+  /// It is refused, before anything is written, for an entry that is not a
+  /// save conflict (`kNotAConflict`), one a newer entry of the same save
+  /// replaced (`kSuperseded`), while a game is in the foreground
+  /// (`kGameRunning`), and while `sync::kMaxKeepLocal` choices already wait
+  /// (`kKeepLocalFull`, #273); and once
   /// the bytes are back on the card, the conflict's `(rom_id, slot)` goes into
   /// the next tick's `sync::ExecuteOptions::keep_local` -- the one upload sent
   /// with `overwrite=true` -- and a tick is asked for, so the choice goes up
