@@ -132,6 +132,13 @@ struct RestoreOptions {
 RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_t entry_id,
                       const RestoreOptions& options = {});
 
+/// The newest `kSave` entry of `key`'s save, of any event, or null (#273).
+///
+/// The one Keep local applies to: an older conflict is `kSuperseded`. Also how
+/// a held choice (#275), which keeps only its key, finds its entry again, and
+/// how the conflicts page tells which row a waiting choice belongs to.
+const Entry* NewestSaveEntry(const History& history, const state::Baseline::Key& key);
+
 /// The player's **Keep local** for a save conflict (#249): the local bytes back
 /// on the card, and the key whose next upload goes over the server's copy.
 ///
@@ -172,13 +179,6 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 /// this console's lineage; it deletes no other row. A head written by another
 /// lineage, even one this console does not load (#236), stays on the server as
 /// that lineage's newest save.
-/// The newest `kSave` entry of `key`'s save, of any event, or null (#273).
-///
-/// The one Keep local applies to: an older conflict is `kSuperseded`. Also how
-/// a held choice (#275), which keeps only its key, finds its entry again, and
-/// how the conflicts page tells which row a waiting choice belongs to.
-const Entry* NewestSaveEntry(const History& history, const state::Baseline::Key& key);
-
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
                         const std::vector<state::Baseline::Key>& armed,
                         state::Baseline::Key* key, const RestoreOptions& options = {});

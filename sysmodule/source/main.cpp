@@ -795,12 +795,15 @@ constexpr size_t kHeapTitleSightings =
 // their upload (`SdEngine::keep_local_`, #249), at their bound -- and, while a
 // plan runs, the three copies a tick holds of them: the tick's options, and
 // `RunTick`'s per-plan options and its resolution's. The choices held under a
-// running game (`SdEngine::keep_local_held_`, #275) share that bound with the
-// armed ones -- a key moves from one list to the other as it lands -- so the
-// resident keys are still at most `kMaxKeepLocal`. A Keep local's restore
-// holds one copy too, for its bound (#273), and a held one's landing a copy
-// of each list, but both run on the worker between ticks, so they never stand
-// beside those three. A key's slot is budgeted at a
+// running game (`SdEngine::keep_local_held_`, #275) share the keys' bound with
+// the armed ones, and their list's slots exist only while a game runs -- when
+// no tick does, and a held one lands before the tick after it, which frees the
+// list (`UnholdLocked`). So a tick still stands beside one resident list. While
+// one is held: the two lists' slots (at most twice the bound), plus a Keep
+// local's restore's copy for its bound (#273) or a landing's copy of the held
+// list, is the row's four lists again. The conflicts page reads the lists in
+// place rather than copying them, because it runs on the IPC thread beside
+// whatever the worker holds. A key's slot is budgeted at a
 // name's chunk; `autosave` itself fits the string and allocates nothing.
 constexpr size_t kHeapKeepLocal = RoundUpToKiB(
     4 * rommsync::sync::kMaxKeepLocal *

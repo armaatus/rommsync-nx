@@ -1071,6 +1071,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// to the worker or run it here (#209). `keep_local` is which of the two.
   ipc::RestoreState TakeRestore(std::int64_t entry_id, bool keep_local);
 
+  /// `ListConflicts`' page, read under `history_mutex_` (which the caller
+  /// holds). Every row Keep local could be chosen for -- a save conflict that
+  /// is its save's newest entry -- comes back marked `kWaiting`, the longest
+  /// spelling, for the caller to settle under `mutex_` (#275).
+  void BuildConflictPage(const ipc::ConflictQuery& query, ipc::ConflictPage* page);
+
   /// #275: land every Keep local held under a game, on the worker, once the
   /// probe has said no application runs. Each is `conflicts::KeepLocal` again
   /// on its save's newest entry, with no game: the card's bytes -- what the
@@ -1080,6 +1086,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// repeated. `ask_tick` asks for the tick that uploads them, which the
   /// caller about to run one does not need.
   void LandHeldKeepLocal(bool ask_tick);
+
+  /// `key` is held no longer. Caller holds `mutex_`.
+  void UnholdLocked(const state::Baseline::Key& key);
 
   /// The restore `TakeRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when
@@ -1400,7 +1409,15 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `sync::kMaxKeepLocal` -- and a key moves from here to there as it lands,
   /// so the heap row holds no more keys than before (`kHeapKeepLocal`). In
   /// memory, like `keep_local_`: a reboot forgets it, and nothing was written.
+  ///
+  /// Only the worker lands one (`RunWorker`). With no worker -- a build or a
+  /// boot whose worker never started, where a restore runs on the caller -- a
+  /// held choice waits for one that does; a console always starts it.
   std::vector<state::Baseline::Key> keep_local_held_;
+
+  /// When the worker next asks the foreground probe for a held Keep local
+  /// (#275), on `clock_->Steady()`. Guarded by `mutex_`.
+  std::chrono::steady_clock::time_point held_poll_due_{};
 
   /// Roms downloaded since the last tick that negotiated, whose saves that tick
   /// asks for with `restore_unlisted` (#241). Guarded by `mutex_`; at most
