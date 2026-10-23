@@ -2437,6 +2437,13 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
   // What a save RomM deleted does here (#233): backed up, then removed, unless
   // `keep` says leave it.
   options.execute.on_server_delete = config.sync.on_server_delete;
+  // The player's Keep local, and nothing else, sends `overwrite=true` (#249).
+  // A copy: the plans spend what they answer (`TallyPlan`), and a restore taken
+  // while this tick runs arms a choice the next tick sends.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    options.execute.keep_local = keep_local_;
+  }
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = inputs.cancel.get();
   // The save folders and `.backup/`, and deliberately **not** `/config/rommsync`
@@ -2561,6 +2568,12 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
 void SdEngine::TallyPlan(const sync::SyncPlan& plan, const sync::ExecutionReport& executed,
                          const std::vector<sync::ClientSaveState>& reported,
                          const conflicts::RecordOptions& record, SavesTally* tally) {
+  // A Keep local this plan answered has had its one upload (#249).
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sync::SpendKeepLocal(&keep_local_, executed);
+  }
+
   // A rom whose restore was cut off -- the link, the server, the card -- keeps
   // its place in `fresh_roms_`, or the next tick would read its save as one the
   // user deleted and never bring it. A refusal that asking again cannot change
@@ -3185,6 +3198,14 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
 }
 
 ipc::RestoreState SdEngine::RequestRestore(std::int64_t entry_id) {
+  return TakeRestore(entry_id, /*keep_local=*/false);
+}
+
+ipc::RestoreState SdEngine::RequestKeepLocal(std::int64_t entry_id) {
+  return TakeRestore(entry_id, /*keep_local=*/true);
+}
+
+ipc::RestoreState SdEngine::TakeRestore(std::int64_t entry_id, bool keep_local) {
   bool handed = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -3197,6 +3218,7 @@ ipc::RestoreState SdEngine::RequestRestore(std::int64_t entry_id) {
     restore_ = ipc::RestoreState{};
     restore_.phase = ipc::RestorePhase::kRunning;
     restore_.entry_id = entry_id;
+    restore_keeps_local_ = keep_local;
     if (worker_live_) {
       restore_pending_ = true;
       // The press must not wait out a rom, for `RequestSync`'s reason: the drain
@@ -3225,6 +3247,12 @@ ipc::RestoreState SdEngine::restore_state() const {
 
 void SdEngine::RunRestore(std::int64_t entry_id) {
   conflicts::RestoreReport report;
+  bool keep_local = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    keep_local = restore_keeps_local_;
+  }
+  state::Baseline::Key kept{0, std::nullopt};
   {
     // **Held for the whole check-and-act**, which on the worker is the same
     // thread as every tick and so cannot contend with one; it is taken anyway
@@ -3246,19 +3274,38 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
       // that cannot open the card is certain of.
       report.outcome = conflicts::RestoreOutcome::kBackupFailed;
       report.message = "this build cannot open the SD card, so nothing was written";
+    } else if (keep_local) {
+      report = conflicts::KeepLocal(*card_, history_, entry_id, &kept);
     } else {
       report = conflicts::Restore(*card_, history_, entry_id);
     }
   }
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (restore_.entry_id != entry_id) {
-    // Not reachable while only one restore runs at a time, and it is cheap to
-    // refuse rather than write one restore's outcome under another's id.
-    return;
+  bool armed = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (restore_.entry_id != entry_id) {
+      // Not reachable while only one restore runs at a time, and it is cheap to
+      // refuse rather than write one restore's outcome under another's id.
+      return;
+    }
+    if (keep_local && report.ok()) {
+      // Armed only once the bytes are on the card: an override for a restore
+      // that did not land would send whatever is there now over the server's
+      // copy. A tick is asked for at once, so the choice goes up while the
+      // player is still looking at it rather than at the next interval --
+      // under a switched-off sync, the scheduler drops the ask and the choice
+      // waits for the next tick that runs.
+      sync::ArmKeepLocal(&keep_local_, kept);
+      scheduler_.RequestNow();
+      armed = true;
+    }
+    restore_.phase = ipc::RestorePhase::kDone;
+    restore_.report = std::move(report);
   }
-  restore_.phase = ipc::RestorePhase::kDone;
-  restore_.report = std::move(report);
+  if (armed) {
+    Wake();
+  }
 }
 
 }  // namespace rommsync::sysmodule

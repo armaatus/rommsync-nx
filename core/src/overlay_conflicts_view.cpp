@@ -178,6 +178,8 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
              "backed up first";
     case conflicts::RestoreOutcome::kWriteFailed:
       return "The backup was made and the restore did not land. The file is as it was.";
+    case conflicts::RestoreOutcome::kNotAConflict:
+      return "Nothing was written: Keep local is only for a save conflict";
   }
   return "The restore did not happen";
 }
@@ -192,6 +194,7 @@ Tone RestoreOutcomeTone(conflicts::RestoreOutcome outcome) {
     case conflicts::RestoreOutcome::kBackupMissing:
     case conflicts::RestoreOutcome::kBackupFailed:
     case conflicts::RestoreOutcome::kWriteFailed:
+    case conflicts::RestoreOutcome::kNotAConflict:
       return Tone::kBad;
   }
   return Tone::kBad;

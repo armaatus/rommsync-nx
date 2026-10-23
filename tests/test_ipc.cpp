@@ -202,9 +202,10 @@ int Version() {
   // conflict entry's `event` gained `deleted`, which a v6 decoder refuses. 8
   // since M10-23 (#264): `ConfigView` gained `on_server_delete` and `sources`,
   // required fields a v7 decoder never reads and a v8 one will not do without.
-  // What is frozen is command 0's *encoding*, asserted above -- not the number
-  // in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{8},
+  // 9 since M10-20 (#249): a restore's outcome gained `not_a_conflict`, which a
+  // v8 decoder refuses. What is frozen is command 0's *encoding*, asserted
+  // above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{9},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -653,6 +654,28 @@ int RoundTrip() {
     checks.Expect(done.report.message.size() < ipc::kMaxRestoreMessageBytes + 8,
                   "with the sentence bounded for the wire");
     checks.Expect(ipc::Fits(ipc::EncodeRestoreState(done)), "so the answer fits a payload");
+
+    // #249: Keep local is the same restore, asked for as itself -- the engine is
+    // told which, because only Keep local arms the next upload's override.
+    FakeEngine keep;
+    keep.restore_report.outcome = rommsync::conflicts::RestoreOutcome::kNotAConflict;
+    ipc::ServiceCore keeper(keep);
+    std::string response;
+    checks.Expect(ipc::Dispatch(keeper, static_cast<std::uint32_t>(ipc::Command::kKeepLocal),
+                                ipc::EncodeEntryId(11), &response) == ipc::Error::kOk,
+                  "KeepLocal never fails at the transport");
+    checks.ExpectEq(keep.last_keep_local_id, std::int64_t{11}, "it asks the engine for Keep local");
+    checks.ExpectEq(keep.restore_requests, 0, "and not for a plain restore");
+    const ipc::Decoded<ipc::RestoreState> kept = ipc::DecodeRestoreState(response);
+    checks.Expect(kept.ok() && kept.value.entry_id == 11 &&
+                      kept.value.report.outcome ==
+                          rommsync::conflicts::RestoreOutcome::kNotAConflict,
+                  "answering a restore state, whose refusal names itself: " +
+                      kept.error.Describe());
+    checks.Expect(ipc::Dispatch(keeper, static_cast<std::uint32_t>(ipc::Command::kKeepLocal),
+                                ipc::EncodeRomId(11), &response) ==
+                      ipc::Error::kMalformedRequest,
+                  "and a rom id where an entry id belongs is refused, not acted on");
   }
 
   // Every string field is user data and may hold anything a filesystem allows.
@@ -942,6 +965,7 @@ int Secrets() {
       {ipc::Command::kRestoreBackup, ipc::EncodeEntryId(3)},
       {ipc::Command::kGetLog, ipc::EncodeLogRequest(ipc::kMaxLogLines)},
       {ipc::Command::kGetRestoreState, ipc::EncodeEmpty()},
+      {ipc::Command::kKeepLocal, ipc::EncodeEntryId(3)},
   };
 
   // The log is the newest way a credential could reach this wire: a call site
@@ -1820,6 +1844,7 @@ class HarnessEngine : public ipc::Engine {
     return ipc::Error::kOk;
   }
   ipc::RestoreState RequestRestore(std::int64_t) override { return {}; }
+  ipc::RestoreState RequestKeepLocal(std::int64_t) override { return {}; }
   ipc::RestoreState restore_state() const override { return {}; }
 
   auth::StoredToken token() const {

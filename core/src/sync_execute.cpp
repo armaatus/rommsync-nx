@@ -508,6 +508,38 @@ void Declines::EndTick(const std::vector<std::int64_t>& unasked_roms) {
   }
 }
 
+void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                  const state::Baseline::Key& key) {
+  if (FindByKey(*keep_local, key) != nullptr) {
+    return;
+  }
+  if (keep_local->size() >= kMaxKeepLocal) {
+    keep_local->erase(keep_local->begin());
+  }
+  keep_local->push_back(key);
+}
+
+void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                    const ExecutionReport& executed) {
+  const auto answered = [&executed](const state::Baseline::Key& key) {
+    const OperationResult* result = FindByKey(executed.operations, key);
+    if (result == nullptr) {
+      return false;  // not in this plan: a later one may name it
+    }
+    // Only what never reached the server is still owed its override: a
+    // cancelled operation, or an upload whose transfer failed. Anything the
+    // server saw -- or a plan that asked for something other than an upload --
+    // has spent it.
+    const bool unsent = result->outcome == OperationOutcome::kCanceled ||
+                        (result->action == Action::kUpload &&
+                         result->outcome == OperationOutcome::kFailed &&
+                         result->error == OperationError::kTransferFailed);
+    return !unsent;
+  };
+  keep_local->erase(std::remove_if(keep_local->begin(), keep_local->end(), answered),
+                    keep_local->end());
+}
+
 void Recount(ExecutionReport* report) {
   report->completed = 0;
   report->failed = 0;

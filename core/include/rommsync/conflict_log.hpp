@@ -447,6 +447,15 @@ enum class RestoreOutcome {
   /// is what was there before -- `io::CopyAtomically` stages and commits, so
   /// there is no third state.
   kWriteFailed,
+
+  /// **Keep local was asked of an entry that is not a save conflict** (#249):
+  /// a download that replaced a save, a deletion, a state, or a conflict with
+  /// no slot. Keep local is the one route to `overwrite=true`, and an entry
+  /// whose server copy nobody arbitrated against this console's has nothing
+  /// to override. Nothing was written. Appended, because the wire spells an
+  /// outcome by name and an older overlay refuses one it does not know --
+  /// which is why it bumped `ipc::kVersion` to 9.
+  kNotAConflict,
 };
 const char* ToString(RestoreOutcome outcome);
 

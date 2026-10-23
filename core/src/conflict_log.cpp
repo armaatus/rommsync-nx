@@ -321,6 +321,8 @@ const char* ToString(RestoreOutcome outcome) {
       return "backup_failed";
     case RestoreOutcome::kWriteFailed:
       return "write_failed";
+    case RestoreOutcome::kNotAConflict:
+      return "not_a_conflict";
   }
   return "no_such_entry";
 }

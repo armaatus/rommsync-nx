@@ -19,6 +19,9 @@
 //                   consulted anywhere in the recording path
 //   restore      -- the old bytes exactly, **and a new backup written first**,
 //                   which the sandbox audit checks rather than this file
+//   keep_local   -- #249: a save conflict's Keep local restores the local bytes
+//                   and arms its (rom_id, slot); anything else is refused, and a
+//                   plan that answered the key spends it
 //   interrupted  -- a restore killed mid-write leaves the old bytes, never a
 //                   splice, and no `.tmp` after the sweep
 //   service      -- both commands through `ipc::Dispatch` over a real `SdEngine`
@@ -80,6 +83,7 @@ namespace io = rommsync::io;
 namespace ipc = rommsync::ipc;
 namespace overlay = rommsync::overlay;
 namespace scan = rommsync::scan;
+namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 namespace sysmodule = rommsync::sysmodule;
 
@@ -763,6 +767,157 @@ void Restore(checks::Checks& c) {
     c.Expect(put_back.backup_sd_path.find("-state-nine-") != std::string::npos,
              "and the backup it wrote first carries the state discriminator: " +
                  put_back.backup_sd_path);
+  }
+}
+
+// --- keep_local ---------------------------------------------------------------
+//
+// #249: the player's Keep local on a save conflict. The local bytes go back on
+// the card through the restore -- backed up first, as any overwrite -- and the
+// conflict's `(rom_id, slot)` is what the next upload of them goes over the
+// server's copy with. Anything that is not a save conflict is refused before a
+// byte is written, and the armed keys are spent by the plan that answered them.
+
+/// One operation's result, for `SpendKeepLocal`.
+sync::OperationResult Ran(std::int64_t rom_id, std::string slot, sync::Action action,
+                          sync::OperationOutcome outcome,
+                          sync::OperationError error = sync::OperationError::kNone) {
+  sync::OperationResult result;
+  result.rom_id = rom_id;
+  result.slot = std::move(slot);
+  result.action = action;
+  result.outcome = outcome;
+  result.error = error;
+  return result;
+}
+
+void KeepLocal(checks::Checks& c) {
+  const std::string previous = "the bytes this console had, and chose to keep\n";
+  const std::string server = "the server's copy, which the conflict put here\n";
+  conflicts::RestoreOptions options;
+  options.backup_dir = harness::kBackupDir;
+  options.now = []() { return Moment(kWhen + 500); };
+
+  // A save conflict: the local bytes go back, the server's copy is backed up
+  // first, and the key the next upload goes over the server's copy with is
+  // handed back.
+  {
+    Sandbox sandbox(c, "conflicts-keep-local");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    const std::string backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+    c.Expect(sandbox.Write(backup, previous), "the conflict's backup is on the card");
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+    conflicts::Entry entry = SaveEntry(4, "game.srm");
+    entry.backup_sd_path = backup;
+    const std::int64_t id = history.Append(entry).id;
+
+    state::Baseline::Key key{0, std::nullopt};
+    const conflicts::RestoreReport kept = conflicts::KeepLocal(*files, history, id, &key, options);
+    c.Expect(kept.ok(), std::string("Keep local restored the local bytes: ") +
+                            conflicts::ToString(kept.outcome) + " -- " + kept.message);
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), previous, "the local bytes are back, exactly");
+    c.Expect(!kept.backup_sd_path.empty() && sandbox.Read(kept.backup_sd_path) == server,
+             "and the server's copy it replaced was backed up first: " + kept.message);
+    c.Expect(key == state::Baseline::Key{4, std::string("retroarch-srm")},
+             "the key is the conflict's (rom_id, slot)");
+    c.Expect(kept.message.find("over the server's copy") != std::string::npos,
+             "and the sentence says the next sync puts them over the server's copy: " +
+                 kept.message);
+  }
+
+  // Not a save conflict: refused, nothing written, no key.
+  {
+    Sandbox sandbox(c, "conflicts-keep-local-refused");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    const std::string backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+    c.Expect(sandbox.Write(backup, previous), "a backup is on the card");
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+
+    conflicts::Entry replaced = SaveEntry(4, "game.srm");
+    replaced.event = conflicts::Event::kReplaced;
+    replaced.backup_sd_path = backup;
+    conflicts::Entry state_entry = SaveEntry(4, "game.state");
+    state_entry.kind = conflicts::EntryKind::kState;
+    state_entry.event = conflicts::Event::kReplaced;
+    state_entry.slot.reset();
+    state_entry.backup_sd_path = backup;
+    conflicts::Entry slotless = SaveEntry(4, "game.srm");
+    slotless.slot.reset();
+    slotless.backup_sd_path = backup;
+    for (const auto& [what, entry] :
+         {std::pair<std::string, conflicts::Entry>{"a download that replaced a save", replaced},
+          {"a save state", state_entry},
+          {"a conflict with no slot", slotless}}) {
+      state::Baseline::Key key{0, std::nullopt};
+      const conflicts::RestoreReport refused =
+          conflicts::KeepLocal(*files, history, history.Append(entry).id, &key, options);
+      c.Expect(refused.outcome == conflicts::RestoreOutcome::kNotAConflict,
+               what + " is not a conflict Keep local applies to: " +
+                   conflicts::ToString(refused.outcome));
+      c.Expect(key.first == 0, what + ": and no key is armed");
+    }
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and nothing was written");
+
+    // A conflict whose backup is gone is the restore's own refusal.
+    conflicts::Entry orphan = SaveEntry(4, "game.srm");
+    orphan.backup_sd_path = std::string(harness::kBackupDir) + "/4-retroarch-srm-9.srm";
+    state::Baseline::Key key{0, std::nullopt};
+    const conflicts::RestoreReport missing =
+        conflicts::KeepLocal(*files, history, history.Append(orphan).id, &key, options);
+    c.Expect(missing.outcome == conflicts::RestoreOutcome::kBackupMissing,
+             std::string("a conflict whose backup is gone is named: ") +
+                 conflicts::ToString(missing.outcome));
+    c.Expect(key.first == 0, "and arms nothing");
+  }
+
+  // Armed once per save, and bounded: the oldest falls off.
+  {
+    std::vector<state::Baseline::Key> keep;
+    sync::ArmKeepLocal(&keep, {4, std::string("autosave")});
+    sync::ArmKeepLocal(&keep, {4, std::string("autosave")});
+    c.ExpectEq(keep.size(), std::size_t{1}, "a second Keep local of one save arms it once");
+    for (std::int64_t rom = 100; rom < 100 + static_cast<std::int64_t>(sync::kMaxKeepLocal);
+         ++rom) {
+      sync::ArmKeepLocal(&keep, {rom, std::string("autosave")});
+    }
+    c.ExpectEq(keep.size(), sync::kMaxKeepLocal, "at most kMaxKeepLocal are held");
+    c.Expect(sync::FindByKey(keep, state::Baseline::Key{4, std::string("autosave")}) == nullptr,
+             "and the oldest is the one let go");
+  }
+
+  // Spent by the plan that answered it -- an upload that went or was refused,
+  // or any other action, which means the server asked for no upload -- and
+  // kept by one that never reached the server or never named it.
+  {
+    const auto key = [](std::int64_t rom) {
+      return state::Baseline::Key{rom, std::string("autosave")};
+    };
+    std::vector<state::Baseline::Key> keep = {key(1), key(2), key(3), key(4), key(5), key(6)};
+    sync::ExecutionReport executed;
+    executed.operations = {
+        Ran(1, "autosave", sync::Action::kUpload, sync::OperationOutcome::kUploaded),
+        Ran(2, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kTransferFailed),
+        Ran(3, "autosave", sync::Action::kDownload, sync::OperationOutcome::kDownloaded),
+        Ran(5, "autosave", sync::Action::kUpload, sync::OperationOutcome::kCanceled,
+            sync::OperationError::kCanceled),
+        Ran(6, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kRefused),
+        Ran(7, "autosave", sync::Action::kUpload, sync::OperationOutcome::kUploaded),
+    };
+    sync::SpendKeepLocal(&keep, executed);
+    c.Expect(keep == std::vector<state::Baseline::Key>{key(2), key(4), key(5)},
+             "the upload that went, the refused one and the download spend theirs; the "
+             "transfer that failed, the cancelled one and the save the plan never named keep "
+             "theirs (" + std::to_string(keep.size()) + " left)");
   }
 }
 
@@ -1886,7 +2041,7 @@ int main(int argc, char** argv) {
 
   if (scenario == "store" || scenario == "record" || scenario == "restore" ||
       scenario == "interrupted" || scenario == "service" || scenario == "overlay" ||
-      scenario == "crash") {
+      scenario == "crash" || scenario == "keep_local") {
     checks::Checks checks;
     if (scenario == "store") {
       Store(checks);
@@ -1898,6 +2053,8 @@ int main(int argc, char** argv) {
       Interrupted(checks);
     } else if (scenario == "crash") {
       Crash(checks);
+    } else if (scenario == "keep_local") {
+      KeepLocal(checks);
     } else if (scenario == "service") {
       Service(checks);
     } else {

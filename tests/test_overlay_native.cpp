@@ -397,6 +397,11 @@ constexpr ClientCall kClientCalls[] = {
        ipc::LogTail out;
        return c.GetLog(ipc::kMaxLogLines, &out);
      }},
+    {ipc::Command::kKeepLocal, "KeepLocal",
+     [](overlay::IpcClient& c) {
+       ipc::RestoreState out;
+       return c.KeepLocal(3, &out);
+     }},
 };
 
 int RunWire(Checks& checks) {

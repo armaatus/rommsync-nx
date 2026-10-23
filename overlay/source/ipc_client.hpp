@@ -239,6 +239,11 @@ class IpcClient {
   Result RestoreBackup(std::int64_t entry_id, ipc::RestoreState* state);
   Result GetRestoreState(ipc::RestoreState* state);
 
+  /// Keep local for a save conflict (#249): `RestoreBackup`'s shape, polled
+  /// with `GetRestoreState`, and the next upload of that save goes over the
+  /// server's copy.
+  Result KeepLocal(std::int64_t entry_id, ipc::RestoreState* state);
+
   /// The last `lines` lines of the sysmodule's log, from memory (M7-3, #38).
   /// The log screen's, since #209 wired it: until then it was the one command
   /// the sysmodule dispatched with nothing here to send it.

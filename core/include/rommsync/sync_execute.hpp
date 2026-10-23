@@ -62,6 +62,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -703,9 +704,11 @@ struct ExecuteOptions {
   /// wrote since this one last synced is answered with a 409
   /// (`OperationError::kNewerOnServer`) rather than silently replaced. The
   /// override is the player's to make, per save, knowing what it replaces --
-  /// never the engine's. Empty, which is every tick today: the overlay choice
-  /// that fills it was split out of #240 into a later PR, so a conflict is
-  /// always resolved Keep server (with the local copy archived on the server).
+  /// never the engine's. Filled by the engine from the overlay's Keep local
+  /// (#249: `conflicts::KeepLocal`, then `ArmKeepLocal`), and spent by the plan
+  /// that answers it (`SpendKeepLocal`), so it is one upload's and no more.
+  /// Empty on every other tick: a conflict is resolved Keep server (with the
+  /// local copy archived on the server) unless the player says otherwise.
   std::vector<state::Baseline::Key> keep_local;
 
   /// Whether an upload and a `/downloaded` carry `content_hash`: the MD5 of the
@@ -760,6 +763,32 @@ struct ExecuteOptions {
   /// boundary rather than mid-write.
   const http::CancelToken* cancel = nullptr;
 };
+
+/// How many Keep local choices wait for their upload at once (#249).
+///
+/// A choice is armed when the overlay's restore lands and spent by the next plan
+/// that names its save, so the list is normally one long. It is bounded because
+/// a save whose rom has left the card is never named again: the oldest choice is
+/// let go first, which costs that save its override and nothing else -- its
+/// next upload meets the slot guard like any other.
+inline constexpr std::size_t kMaxKeepLocal = 16;
+
+/// Arm Keep local for `key`: once, however often it is chosen, and at most
+/// `kMaxKeepLocal` of them, the oldest let go first.
+void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Baseline::Key& key);
+
+/// Drop every Keep local `executed` answered, and keep the rest (#249).
+///
+/// **One upload, and only that one.** An upload of the key that went, or that
+/// the server refused, has had its `overwrite=true`; so has a plan that asked
+/// for anything but an upload of it -- a download, a conflict, a no-op -- which
+/// is the server saying it wants no upload from this save, and a choice left
+/// armed past that would let some later upload, days on, supersede a save
+/// nobody chose to replace. An upload that never reached the server -- a
+/// transfer that failed, a cancellation -- keeps its key for the next plan, as
+/// does a key no operation of `executed` names.
+void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                    const ExecutionReport& executed);
 
 /// Execute `plan`, one operation at a time, in the order the server sent them.
 ///

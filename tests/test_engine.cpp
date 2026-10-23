@@ -67,6 +67,8 @@
 //   install_settle -- a report the link did not carry stops the pass; the rest are
 //                reported once it does
 //   install_wake -- a refused claim is asked again after a wake, not only a boot
+//   keep_local -- #249: Keep local on the conflicts screen is the one upload
+//                with overwrite=true, over another lineage's head, and only once
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -5735,6 +5737,188 @@ int InstallWake(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #249's acceptance, through the real engine against RomM 5.4.0: the player's
+/// Keep local on the conflicts screen is the one thing that sends an upload
+/// with `overwrite=true`, and only that one upload.
+///
+/// It is also #236's question, answered and tested: the head the conflict lost
+/// to is written by a lineage this console does not load (`gpsp`, where the
+/// console's gba saves are mGBA's), so the filtered negotiate never offers it,
+/// and only the slot guard's 409 and the unfiltered resolution see it. Keep
+/// local goes over it all the same -- the player saw that copy land on the card
+/// and chose theirs -- and RomM keeps lineages apart: `overwrite=true` lifts the
+/// guard and adds a version in this console's lineage, and the other lineage's
+/// rows stay on the server.
+///
+///   1. the console's save goes up into an empty `autosave`;
+///   2. another device writes the slot under `gpsp`, the console's save moves on,
+///      and the tick's upload meets the guard: a conflict -- gpsp's bytes on the
+///      card, the console's under `.backup/`;
+///   3. the other device writes again, so an upload *without* the override would
+///      meet the guard a second time;
+///   4. Keep local over the wire: the console's bytes are back, and the tick the
+///      engine asks for sends them with `overwrite=true` -- exactly once -- and
+///      they are the slot's head, with both gpsp rows still beside them;
+///   5. the next upload of that save goes with `overwrite=false` again.
+int KeepLocalChoice(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee_mb.gba", &rom),
+           "the fixture library has 240pee_mb.gba");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-keep-local");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  // Unique bytes per run: RomM remembers what a slot lost.
+  const std::string stamp = harness::UniqueSlot("keep-local");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Intercepting wire(client);
+  Console console(c, "engine-keep-local");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::string save = "/tico/saves/gba/240pee_mb.srm";
+  console.sandbox.MakeDirs("/tico/saves/gba");
+  const std::string first = "the switch's save, first synced " + stamp + "\n";
+  console.sandbox.SeedSave(save, first);
+
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.Boot();
+  console.engine.UseServer(&wire, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  // Another device's upload, in a lineage this console does not load.
+  harness::Sandbox staging(c, "engine-keep-local-other");
+  const auto other_device = [&](const std::string& bytes, const std::string& what) {
+    const std::string staged = staging.Host("/config/rommsync/other.srm");
+    rig::WriteFile(staged, bytes);
+    harness::Save written;
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "gpsp", staged,
+                                 "240pee_mb.srm", /*with_device=*/false, &written),
+             what + ": another device writes the slot under gpsp");
+  };
+  const auto rows_with = [&](const std::string& bytes) {
+    std::vector<ServerRow> found;
+    for (ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+      if (row.content_hash == crypto::Md5Hex(bytes)) {
+        found.push_back(std::move(row));
+      }
+    }
+    return found;
+  };
+  const auto overrides = [&wire] { return wire.Asked(http::Method::kPost, "overwrite=true"); };
+
+  // 1.
+  TickOnce(console, ticks, c, "the first tick");
+  c.ExpectEq(rows_with(first).size(), std::size_t{1}, "the console's save went up");
+
+  // 2.
+  harness::PassASecond();
+  const std::string theirs = "the other device's progress, under gpsp " + stamp + "\n";
+  other_device(theirs, "before the conflict");
+  harness::PassASecond();
+  const std::string mine = "the switch played on: the copy the player keeps " + stamp + "\n";
+  console.sandbox.Reseed(save, mine);
+  TickOnce(console, ticks, c, "the conflict's tick");
+  c.ExpectEq(console.sandbox.Read(save), theirs,
+             "Keep server, the default: the slot's head is on the card" +
+                 Rendered(console.Log()));
+  c.Expect(console.sandbox.HasBackupOf(mine), "and the console's bytes are under .backup/");
+  c.Expect(overrides().empty(), "nothing has gone with overwrite=true without a choice");
+
+  std::string response;
+  console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
+               &response);
+  const ipc::ConflictPage page = ipc::DecodeConflictPage(response).value;
+  std::int64_t entry_id = 0;
+  for (const ipc::ConflictRow& row : page.entries) {
+    if (row.entry.rom_id == rom.id && row.entry.event == conflicts::Event::kConflict) {
+      entry_id = row.entry.id;
+    }
+  }
+  c.Expect(entry_id != 0, "the conflict is on the conflicts screen");
+  const std::int32_t conflicts_before = page.total;
+
+  // 3.
+  harness::PassASecond();
+  const std::string theirs_again = "the other device again, newer still " + stamp + "\n";
+  other_device(theirs_again, "after the conflict");
+
+  // 4.
+  const int ticks_before = ticks.ticks();
+  c.Expect(console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(entry_id), &response) ==
+               ipc::Error::kOk,
+           "KeepLocal is answered");
+  const ipc::RestoreState kept = console.AwaitRestore(entry_id);
+  c.Expect(kept.phase == ipc::RestorePhase::kDone && kept.report.ok(),
+           std::string("Keep local put the console's bytes back: ") +
+               conflicts::ToString(kept.report.outcome) + " -- " + kept.report.message);
+  // The tick the engine asks for itself, not a press.
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((ticks.ticks() <= ticks_before || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.Expect(ticks.ticks() > ticks_before, "Keep local starts a tick of its own");
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kOk,
+           std::string("which runs clean: ") +
+               ipc::ToString(console.Status().last_sync_result) + Rendered(console.Log()));
+
+  const std::vector<std::string> sent = overrides();
+  c.ExpectEq(sent.size(), std::size_t{1}, "exactly one upload went with overwrite=true");
+  for (const std::string& url : sent) {
+    c.Expect(url.find("rom_id=" + std::to_string(rom.id) + "&") != std::string::npos &&
+                 url.find("slot=autosave") != std::string::npos,
+             "and it is this save's, in its slot: " + url);
+  }
+  c.ExpectEq(console.sandbox.Read(save), mine, "the console's bytes are on the card");
+  const std::vector<ServerRow> uploaded = rows_with(mine);
+  c.Expect(uploaded.size() == 1 && uploaded[0].emulator == "mgba",
+           "and on the server, in the console's own lineage");
+  std::int64_t head = 0;
+  for (const ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+    head = std::max(head, row.id);
+  }
+  c.Expect(!uploaded.empty() && uploaded[0].id == head, "as the slot's newest save");
+  c.ExpectEq(rows_with(theirs).size(), std::size_t{1},
+             "#236: the other lineage's row the conflict lost to is still on the server");
+  c.ExpectEq(rows_with(theirs_again).size(), std::size_t{1},
+             "and so is the one the override went over -- RomM keeps lineages apart");
+  console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
+               &response);
+  c.ExpectEq(ipc::DecodeConflictPage(response).value.total, conflicts_before,
+             "and the override was not itself a conflict");
+
+  // 5.
+  harness::PassASecond();
+  const std::string later = "the switch's next save, an ordinary upload " + stamp + "\n";
+  console.sandbox.Reseed(save, later);
+  TickOnce(console, ticks, c, "the tick after");
+  c.ExpectEq(overrides().size(), std::size_t{1},
+             "the choice was one upload's: the next one sends no overwrite=true");
+  c.ExpectEq(rows_with(later).size(), std::size_t{1}, "and goes up all the same");
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -5771,6 +5955,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"states_guard", StatesGuarded},
       {"install_settle", InstallSettle},
       {"install_wake", InstallWake},
+      {"keep_local", KeepLocalChoice},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

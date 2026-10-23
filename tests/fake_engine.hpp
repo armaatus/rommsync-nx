@@ -152,6 +152,19 @@ class FakeEngine : public ipc::Engine {
     std::lock_guard<std::mutex> lock(restore_mutex_);
     last_restore_id = entry_id;
     ++restore_requests;
+    return TakeLocked(entry_id);
+  }
+
+  /// Keep local (#249): the same restore, counted apart, so a test can tell
+  /// which of the two the wire asked for.
+  ipc::RestoreState RequestKeepLocal(std::int64_t entry_id) override {
+    std::lock_guard<std::mutex> lock(restore_mutex_);
+    last_keep_local_id = entry_id;
+    ++keep_local_requests;
+    return TakeLocked(entry_id);
+  }
+
+  ipc::RestoreState TakeLocked(std::int64_t entry_id) {
     if (restore_.phase == ipc::RestorePhase::kRunning) {
       return restore_;
     }
@@ -186,6 +199,8 @@ class FakeEngine : public ipc::Engine {
   ipc::ConflictQuery last_conflict_query;
   std::int64_t last_restore_id = 0;
   int restore_requests = 0;
+  std::int64_t last_keep_local_id = 0;
+  int keep_local_requests = 0;
   conflicts::RestoreReport restore_report;
   bool restore_runs_inline = true;
 

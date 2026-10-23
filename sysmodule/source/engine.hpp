@@ -603,6 +603,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// the cost every restore had before. `StartWorker` failing is logged
   /// (`kBoot`), so that console says why.
   ipc::RestoreState RequestRestore(std::int64_t entry_id) override;
+
+  /// #249: `RequestRestore`, taken and run the same way, through
+  /// `conflicts::KeepLocal`. Once the bytes are back, the conflict's
+  /// `(rom_id, slot)` is armed in `keep_local_` and a tick is asked for, whose
+  /// upload of that save is the one sent with `overwrite=true`.
+  ipc::RestoreState RequestKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
 
   /// Serialises `history_` -- the vector, and nothing else.
@@ -1014,7 +1020,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// the worker, outside `mutex_`.
   void SettleInstalls(const InstallLink& link);
 
-  /// The restore `RequestRestore` took, start to finish, and its outcome
+  /// `RequestRestore` and `RequestKeepLocal`: take the one restore, hand it
+  /// to the worker or run it here (#209). `keep_local` is which of the two.
+  ipc::RestoreState TakeRestore(std::int64_t entry_id, bool keep_local);
+
+  /// The restore `TakeRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when
   /// there is no worker; `mutex_` not held, because a restore is card I/O.
   void RunRestore(std::int64_t entry_id);
@@ -1299,6 +1309,20 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `restore_.phase`, which says `kRunning` from the press onward: the overlay
   /// has no use for "queued" as distinct from "copying", and the worker does.
   bool restore_pending_ = false;
+
+  /// The restore `restore_` names is a Keep local (#249). Guarded by `mutex_`.
+  bool restore_keeps_local_ = false;
+
+  /// The saves whose next upload goes over the server's copy: the player's
+  /// Keep local, armed when its restore lands and spent by the plan that
+  /// answers it (`sync::ArmKeepLocal`, `sync::SpendKeepLocal`). Guarded by
+  /// `mutex_`; at most `sync::kMaxKeepLocal`.
+  ///
+  /// **In memory only.** A reboot before the next tick forgets the choice; the
+  /// restored bytes then meet the slot guard like any other upload, and a 409
+  /// ends in a conflict with them backed up and archived -- the player is asked
+  /// again rather than anything being lost.
+  std::vector<state::Baseline::Key> keep_local_;
 
   /// Roms downloaded since the last tick that negotiated, whose saves that tick
   /// asks for with `restore_unlisted` (#241). Guarded by `mutex_`; at most

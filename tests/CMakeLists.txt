@@ -1248,6 +1248,7 @@ set(CONFLICT_UNIT_SCENARIOS
   restore      # the old bytes exactly, and a new backup written FIRST (the sandbox audit checks it)
   interrupted  # a restore killed mid-write leaves old or new, never a splice, and no .tmp
   crash        # M9-14: a power cut at every call of a restore, and one the card would not confirm
+  keep_local   # #249: Keep local restores a save conflict's bytes and arms its key; the plan spends it
   service      # both commands through ipc::Dispatch over a real SdEngine
   overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
 )
@@ -2400,6 +2401,7 @@ set(ENGINE_RIG_SCENARIOS
   install_settle     # review: an install report the link did not carry stops the pass, not each claim
   install_wake       # review: a refused remote-install claim is asked again after a wake
   declined           # #257: a save the placer will not place costs one line, never a failed save
+  keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

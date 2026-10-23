@@ -350,6 +350,12 @@ Result IpcClient::RestoreBackup(std::int64_t entry_id, ipc::RestoreState* state)
                        ipc::DecodeRestoreState, state);
 }
 
+Result IpcClient::KeepLocal(std::int64_t entry_id, ipc::RestoreState* state) {
+  // `RestoreBackup`'s reason: what became of the press is in the answer.
+  return CallAndDecode(ipc::Command::kKeepLocal, ipc::EncodeEntryId(entry_id),
+                       ipc::DecodeRestoreState, state);
+}
+
 Result IpcClient::GetRestoreState(ipc::RestoreState* state) {
   return CallAndDecode(ipc::Command::kGetRestoreState, ipc::EncodeEmpty(),
                        ipc::DecodeRestoreState, state);

@@ -935,7 +935,8 @@ A removed command leaves a hole.
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` | never fails; an empty history is a page |
 | 15 | `RestoreBackup` | `entry_id` -> `RestoreState` (phase + which entry) | never fails, never waits for the copy; a press while one runs answers that one |
 | 16 | `GetLog` | `lines` -> the last N log lines + how many were ever written | never fails; an empty tail is an answer |
-| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed` |
+| 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed \| not_a_conflict` |
+| 18 | `KeepLocal` | `entry_id` -> `RestoreState` | never fails; `RestoreBackup` for a save conflict, and the next upload of it goes with `overwrite=true` |
 
 `RestoreBackup` and `GetRestoreState` are one restore in two calls, since M9-6
 (#209). A restore copies a whole save, and a save is as large as a game makes
@@ -950,7 +951,13 @@ as long as the card took. That change of answer made `ipc::kVersion` 3;
 it 6, and a conflict entry's `deleted` event -- a save RomM deleted, taken off
 the card after a backup (M10-7, #233) -- made it 7, and `GetConfig` carrying
 `on_server_delete` and `[sources]` for the settings screen (M10-23, #264) made
-it 8.
+it 8, and `KeepLocal`'s refusal `not_a_conflict` (M10-20, #249) made it 9.
+
+`KeepLocal` is the conflicts screen's Keep local (#249): a restore of a save
+conflict's backup, polled the same way, after which the sysmodule arms that
+`(rom_id, slot)` for the next tick and asks for one. That tick's upload of it is
+the only one sent with `overwrite=true`; the plan that answers it spends it,
+whatever it planned.
 
 The overlay bounds every call anyway: `IpcClient` dispatches on a worker thread
 of its own and the draw thread waits at most `kCallBudget` (half a second) for

@@ -247,6 +247,7 @@ constexpr conflicts::RestoreOutcome kAllRestoreOutcomes[] = {
     conflicts::RestoreOutcome::kRestored,      conflicts::RestoreOutcome::kNoSuchEntry,
     conflicts::RestoreOutcome::kNothingToRestore, conflicts::RestoreOutcome::kBackupMissing,
     conflicts::RestoreOutcome::kBackupFailed,  conflicts::RestoreOutcome::kWriteFailed,
+    conflicts::RestoreOutcome::kNotAConflict,
 };
 
 constexpr RestorePhase kAllRestorePhases[] = {
@@ -527,6 +528,8 @@ const char* ToString(Command command) {
       return "GetLog";
     case Command::kGetRestoreState:
       return "GetRestoreState";
+    case Command::kKeepLocal:
+      return "KeepLocal";
   }
   return "Unknown";
 }
