@@ -5857,6 +5857,12 @@ int KeepLocalChoice(http::HttpClient& client, const std::string& base) {
   harness::PassASecond();
   const std::string theirs_again = "the other device again, newer still " + stamp + "\n";
   other_device(theirs_again, "after the conflict");
+  // RomM 5.4.0 stores `updated_at` to the whole second and picks a slot's
+  // newest row with no tie-break, so an override landing in the same second as
+  // that write could lose the head to it -- and the next tick's guard would
+  // then 409 on a row this console never synced (M10-32). A second between
+  // them keeps this test about the override rather than the tie.
+  harness::PassASecond();
 
   // 4.
   const int ticks_before = ticks.ticks();
