@@ -340,6 +340,7 @@ bool TakesRequest(Command command) {
     case Command::kListConflicts:
     case Command::kRestoreBackup:
     case Command::kGetLog:
+    case Command::kKeepLocal:
       return true;
     case Command::kGetInterfaceVersion:
     case Command::kGetStatus:
@@ -397,6 +398,11 @@ RestoreState ServiceCore::RestoreBackup(std::int64_t entry_id) {
   // where the restore stands the instant it was taken -- or, while one is
   // already running, that one -- and both are answers rather than refusals.
   return Bounded(engine_.RequestRestore(entry_id));
+}
+
+RestoreState ServiceCore::KeepLocal(std::int64_t entry_id) {
+  // `RestoreBackup`'s shape and its reason: taken, answered at once, polled.
+  return Bounded(engine_.RequestKeepLocal(entry_id));
 }
 
 RestoreState ServiceCore::GetRestoreState() const { return Bounded(engine_.restore_state()); }
@@ -597,6 +603,16 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
     case Command::kGetRestoreState:
       payload = EncodeRestoreState(core.GetRestoreState());
       break;
+
+    case Command::kKeepLocal: {
+      const Decoded<std::int64_t> entry_id = DecodeEntryId(request);
+      if (!entry_id.ok()) {
+        return Error::kMalformedRequest;
+      }
+      // `kRestoreBackup`'s reason: a refusal is an outcome in the answer.
+      payload = EncodeRestoreState(core.KeepLocal(entry_id.value));
+      break;
+    }
 
     case Command::kGetLog: {
       const Decoded<std::int32_t> lines = DecodeLogRequest(request);

@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "checks.hpp"
@@ -503,6 +504,69 @@ void Emulator(checks::Checks& c) {
              "removing the override puts the built-in id back");
 }
 
+// --- the M10 settings a player changes from the overlay (#264) -------------------
+
+void Sources(checks::Checks& c) {
+  const std::string before = Busy();
+
+  // `[sync] on_server_delete` lands in the section that is there, one line.
+  const std::string keep =
+      Applied(c, before, One("sync", "on_server_delete", "KEEP"), "on_server_delete = keep");
+  c.Expect(Parsed(keep).sync.on_server_delete == config::OnServerDelete::kKeep,
+           "on_server_delete set from the overlay reads back");
+  c.Expect(keep.find("on_server_delete = keep\r\n") != std::string::npos,
+           "stored lowercase, the way the parser's own word is spelled");
+  const std::string removed =
+      Applied(c, keep, One("sync", "on_server_delete", "remove"), "on_server_delete = remove");
+  c.Expect(Parsed(removed).sync.on_server_delete == config::OnServerDelete::kRemove,
+           "and back to remove");
+
+  // `[sources]` is not in the file at all: the section is appended.
+  const std::string on =
+      Applied(c, before, One("sources", "retroarch", "on"), "[sources] retroarch = on");
+  c.Expect(Parsed(on).sources.retroarch == config::SourceMode::kOn, "retroarch = on reads back");
+  c.Expect(on.find("[sources]\r\nretroarch = on") != std::string::npos,
+           "in a [sources] section of its own");
+  const std::string off = Applied(c, on, One("sources", "retroarch", "no"), "retroarch = off");
+  c.Expect(Parsed(off).sources.retroarch == config::SourceMode::kOff,
+           "a boolean spelling of off reads back as off");
+  c.Expect(off.find("retroarch = off\r\n") != std::string::npos,
+           "and is stored as the word the setting documents");
+  const std::string automatic =
+      Applied(c, off, One("sources", "retroarch", " Auto "), "retroarch = auto");
+  c.Expect(Parsed(automatic).sources.retroarch == config::SourceMode::kAuto, "auto reads back");
+
+  const std::string beside = Applied(c, automatic, One("sources", "retroarch_content_dir", "yes"),
+                                     "retroarch_content_dir = true");
+  c.Expect(Parsed(beside).sources.retroarch_content_dir, "retroarch_content_dir reads back");
+  c.Expect(beside.find("retroarch_content_dir = true") != std::string::npos,
+           "stored as true, the way every other flag is");
+
+  // Refused, with nothing written: a word neither setting has.
+  const std::pair<config::Edit, const char*> refused[] = {
+      {One("sync", "on_server_delete", "delete"), "on_server_delete"},
+      {One("sync", "on_server_delete", "true"), "on_server_delete"},
+      {One("sources", "retroarch", "sometimes"), "retroarch"},
+      {One("sources", "retroarch_content_dir", "auto"), "retroarch_content_dir"},
+      {One("sources", "tico", "off"), "tico"},
+  };
+  for (const auto& [edit, key] : refused) {
+    std::string after = "untouched";
+    std::vector<config::Diagnostic> diagnostics;
+    c.Expect(!config::ApplyEdit(before, edit, &after, &diagnostics),
+             std::string("refused: [") + edit.assignments[0].section + "] " + key + " = " +
+                 edit.assignments[0].value);
+    c.ExpectEq(after, std::string("untouched"), std::string("nothing written for ") + key);
+    c.Expect(!diagnostics.empty() && diagnostics.back().key == key,
+             std::string("and the refusal names ") + key);
+  }
+
+  // Reset to default removes the line, and the default is back.
+  const std::string reset = Applied(c, beside, Remove("sources", "retroarch_content_dir"),
+                                    "retroarch_content_dir removed");
+  c.Expect(!Parsed(reset).sources.retroarch_content_dir, "removing it turns it back off");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -519,6 +583,8 @@ int main(int argc, char** argv) {
     Removes(checks);
   } else if (scenario == "emulator") {
     Emulator(checks);
+  } else if (scenario == "sources") {
+    Sources(checks);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

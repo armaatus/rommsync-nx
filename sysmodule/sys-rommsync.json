@@ -20,6 +20,7 @@
 	"service_access": ["fsp-srv", "set:sys", "ssl", "bsd:u", "sfdnsres", "nifm:u", "time:s", "psc:m", "pm:dmnt"],
 	"service_host": ["rommsync"],
 	"//handle_table_size": "Derived, not the template's: kHandleTableSize in source/handle_budget.hpp is twice the handles this process holds, rounded up to a power of two, and npdm.grants fails when the two disagree (#210).",
+	"//syscalls": "Exactly the SVCs the linked image issues, no more: npdm.svcs scans sys-rommsync.elf for svc instructions and fails on any SVC issued and not listed here, or listed and not issued. A call that needs a new one turns that test red; add its line then, not before (#196, #256).",
 	"kernel_capabilities": [{
 			"type": "kernel_flags",
 			"value": {
@@ -31,7 +32,6 @@
 		}, {
 			"type": "syscalls",
 			"value": {
-				"svcSetHeapSize": "0x01",
 				"svcSetMemoryPermission": "0x02",
 				"svcSetMemoryAttribute": "0x03",
 				"svcMapMemory": "0x04",
@@ -42,13 +42,7 @@
 				"svcStartThread": "0x09",
 				"svcExitThread": "0x0a",
 				"svcSleepThread": "0x0b",
-				"svcGetThreadPriority": "0x0c",
-				"svcSetThreadPriority": "0x0d",
-				"svcGetThreadCoreMask": "0x0e",
 				"svcSetThreadCoreMask": "0x0f",
-				"svcGetCurrentProcessorNumber": "0x10",
-				"svcSignalEvent": "0x11",
-				"svcClearEvent": "0x12",
 				"svcMapSharedMemory": "0x13",
 				"svcUnmapSharedMemory": "0x14",
 				"svcCreateTransferMemory": "0x15",
@@ -60,24 +54,15 @@
 				"svcArbitrateUnlock": "0x1b",
 				"svcWaitProcessWideKeyAtomic": "0x1c",
 				"svcSignalProcessWideKey": "0x1d",
-				"svcGetSystemTick": "0x1e",
 				"svcConnectToNamedPort": "0x1f",
 				"svcSendSyncRequest": "0x21",
-				"svcGetProcessId": "0x24",
-				"svcGetThreadId": "0x25",
 				"svcBreak": "0x26",
 				"svcOutputDebugString": "0x27",
 				"svcReturnFromException": "0x28",
 				"svcGetInfo": "0x29",
-				"svcWaitForAddress": "0x34",
-				"svcSignalToAddress": "0x35",
-				"svcCreateSession": "0x40",
 				"svcAcceptSession": "0x41",
 				"svcReplyAndReceive": "0x43",
-				"svcCreateEvent": "0x45",
-				"svcUnmapTransferMemory": "0x52",
-				"svcManageNamedPort": "0x71",
-				"svcConnectToPort": "0x72"
+				"svcUnmapTransferMemory": "0x52"
 			}
 		}, {
 			"type": "min_kernel_version",

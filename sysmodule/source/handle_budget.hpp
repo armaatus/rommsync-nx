@@ -83,7 +83,8 @@ inline constexpr std::size_t kDnsInFlight = 2;
 
 /// `pm:dmnt`, the foreground-application probe (M10-16, #242). One session and
 /// no event: it is polled, because the event pm:dmnt could hand back is the
-/// application-launch hook `dmnt:cht` holds (`main.cpp`).
+/// application-launch hook `dmnt:cht` holds (`main.cpp`). Naming the
+/// application for a play session (#261) asks the same session, so still one.
 inline constexpr std::size_t kPm = 1;
 
 /// The peak. `set:sys` is not in it: `__appInit` closes it before anything

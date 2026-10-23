@@ -31,8 +31,8 @@ SettingsRow Value(std::string label, std::string value) {
   row.label = std::move(label);
   row.value = std::move(value);
   // Every scalar in `[server]`, `[sync]` and `[downloads]` is a key
-  // `config::ApplyEdit` accepts, so every one of them is marked. Nothing here
-  // offers the edit -- see the header note.
+  // `config::ApplyEdit` accepts, so every one of them is marked. Only
+  // `Changeable` offers the edit -- see the header note.
   row.editable = true;
   return row;
 }
@@ -54,7 +54,78 @@ SettingsRow Navigate(std::string label, std::string value, Destination destinati
   row.value = std::move(value);
   row.selectable = true;
   row.destination = destination;
+  row.press_label = "Open";
   return row;
+}
+
+/// One value of a setting the screen changes in place: what the row shows for
+/// it, the word `config.ini` stores, and what the row says it means.
+struct Choice {
+  const char* shown;
+  const char* stored;
+  const char* note;
+};
+
+/// A row showing the value `in_force` names, whose press sends the one after it.
+///
+/// The values are the setting's whole cycle, in the order presses visit them,
+/// so the last one's press comes round to the first. The value in force is
+/// found by the word `config.ini` stores -- `config::ToString`'s, the one
+/// `ApplyEdit` reads back -- rather than by a position kept in step by hand.
+template <std::size_t N>
+SettingsRow Changeable(const char* section, const char* key, const Choice (&values)[N],
+                       std::string_view in_force) {
+  std::size_t current = 0;
+  for (std::size_t index = 0; index < N; ++index) {
+    if (in_force == values[index].stored) {
+      current = index;
+    }
+  }
+  const Choice& now = values[current];
+  const Choice& next = values[(current + 1) % N];
+  SettingsRow row = Value(key, now.shown);
+  row.note = now.note;
+  row.selectable = true;
+  row.change = config::Assignment{section, key, next.stored, /*remove=*/false};
+  row.press_label = std::string("Set to ") + next.shown;
+  return row;
+}
+
+/// `[sync] on_server_delete` (#233, #264). Either value is safe to land on: a
+/// removal is backed up first, and `keep` only withholds the deleted bytes.
+SettingsRow OnServerDeleteRow(config::OnServerDelete in_force) {
+  static constexpr Choice kValues[] = {
+      {"Remove", "remove", "a save deleted in RomM is backed up, then removed from the card"},
+      {"Keep", "keep", "a save deleted in RomM stays on the card and is not uploaded again"},
+  };
+  return Changeable("sync", "on_server_delete", kValues, config::ToString(in_force));
+}
+
+/// `[sources]` (#230, #264).
+SettingsSection SourcesSection(const config::SourcesConfig& sources) {
+  SettingsSection section;
+  section.title = "[sources]";
+  {
+    // Auto, then on, then off: a press from the default first reaches the value
+    // that syncs *more*, and the warning `on` earns while Cloud Sync is on
+    // arrives with the next `GetConfig` (`retroarch::Notes`).
+    static constexpr Choice kValues[] = {
+        {"Auto", "auto", "RetroArch's saves sync unless RetroArch's own Cloud Sync is on"},
+        {"On", "on", "RetroArch's saves sync, even while RetroArch's own Cloud Sync is on"},
+        {"Off", "off", "no RetroArch folder is read"},
+    };
+    section.rows.push_back(
+        Changeable("sources", "retroarch", kValues, config::ToString(sources.retroarch)));
+  }
+  {
+    static constexpr Choice kValues[] = {
+        {"Off", "false", "RetroArch saves kept beside the roms are not read"},
+        {"On", "true", "RetroArch saves kept beside the roms are read"},
+    };
+    section.rows.push_back(Changeable("sources", "retroarch_content_dir", kValues,
+                                      sources.retroarch_content_dir ? "true" : "false"));
+  }
+  return section;
 }
 
 /// The menu the overlay did not have until this screen.
@@ -122,6 +193,7 @@ SettingsSection SyncSection(const config::SyncConfig& sync) {
                                   : "the Conflicts screen is hidden; conflicts are still recorded";
     section.rows.push_back(std::move(row));
   }
+  section.rows.push_back(OnServerDeleteRow(sync.on_server_delete));
   return section;
 }
 
@@ -283,8 +355,8 @@ bool Any(const std::vector<config::Diagnostic>& diagnostics, config::Severity se
 void SetHeadline(SettingsView* view, const ipc::ConfigView& config) {
   if (!config.config.configured()) {
     view->headline = "No server set";
-    // Not "set it here": this screen is read-only in this build, and a hint
-    // that offers what the screen cannot do is worse than none.
+    // Not "set it here": this screen does not edit the url, and a hint that
+    // offers what the screen cannot do is worse than none.
     view->hint = "Set url under [server] in config.ini";
     view->tone = Tone::kBad;
     return;
@@ -370,6 +442,38 @@ void SetRepair(SettingsView* view, const ipc::ConfigView& config, const RepairSt
   }
 }
 
+/// The sentence for what the last setting press produced.
+void SetChange(SettingsView* view, const ChangeState& change) {
+  if (!change.sent) {
+    return;
+  }
+  const std::string setting =
+      "[" + change.assignment.section + "] " + change.assignment.key;
+  switch (change.result.outcome) {
+    case ipc::WriteOutcome::kApplied:
+      view->notice = setting + " is now " + change.assignment.value;
+      view->notice_tone = Tone::kGood;
+      return;
+    case ipc::WriteOutcome::kInvalid:
+      // The sysmodule's own reason, exactly: it is `ApplyEdit`'s, which already
+      // names the key and the words it takes.
+      for (const config::Diagnostic& diagnostic : change.result.diagnostics) {
+        if (diagnostic.severity == config::Severity::kError) {
+          view->notice = diagnostic.Describe();
+          view->notice_tone = Tone::kBad;
+          return;
+        }
+      }
+      view->notice = setting + " was refused; nothing was changed";
+      view->notice_tone = Tone::kBad;
+      return;
+    case ipc::WriteOutcome::kWriteFailed:
+      break;
+  }
+  view->notice = "config.ini could not be written; nothing was changed";
+  view->notice_tone = Tone::kBad;
+}
+
 }  // namespace
 
 const char* ToString(Destination destination) {
@@ -448,7 +552,8 @@ std::string FormatInterval(int interval_min) {
   return std::to_string(interval_min) + (interval_min == 1 ? " minute" : " minutes");
 }
 
-SettingsView RenderSettings(const ipc::ConfigView& config, const RepairState& repair) {
+SettingsView RenderSettings(const ipc::ConfigView& config, const RepairState& repair,
+                            const ChangeState& change) {
   SettingsView view;
   view.link = Link::kOk;
   SetHeadline(&view, config);
@@ -458,8 +563,13 @@ SettingsView RenderSettings(const ipc::ConfigView& config, const RepairState& re
   view.sections.push_back(ServerSection(config.config));
   view.sections.push_back(SyncSection(config.config.sync));
   view.sections.push_back(DownloadsSection(config.config.downloads));
+  view.sections.push_back(SourcesSection(config.config.sources));
   AddPlatformSections(&view, config);
 
+  // A change first, so a re-pair's sentence -- set after it -- is the one that
+  // stands: the screen drops either state when the other button is pressed, and
+  // a pending confirmation is a warning no older answer may hide.
+  SetChange(&view, change);
   SetRepair(&view, config, repair);
   return view;
 }

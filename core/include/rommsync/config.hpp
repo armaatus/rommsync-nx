@@ -147,6 +147,9 @@ enum class OnServerDelete {
   kKeep,
 };
 
+/// `remove` or `keep`: the word `config.ini` spells it with. Never null.
+const char* ToString(OnServerDelete on_server_delete);
+
 /// `[sync]`.
 
 struct SyncConfig {
@@ -200,6 +203,10 @@ enum class SourceMode {
   kOn,   ///< yes, even alongside RetroArch's Cloud Sync -- two writers, said so
   kOff,  ///< no RetroArch folder is read, wherever the folder map lists one
 };
+
+/// `auto`, `on` or `off`: the words docs/CONFIG.md documents, which is also
+/// what an edit stores whichever boolean spelling it arrived as. Never null.
+const char* ToString(SourceMode mode);
 
 /// `[sources]`: which emulators' saves this client syncs, where the answer is
 /// not simply "the folders the map lists" (#230).

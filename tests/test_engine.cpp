@@ -67,6 +67,8 @@
 //   install_settle -- a report the link did not carry stops the pass; the rest are
 //                reported once it does
 //   install_wake -- a refused claim is asked again after a wake, not only a boot
+//   keep_local -- #249: Keep local on the conflicts screen is the one upload
+//                with overwrite=true, over another lineage's head, and only once
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -125,6 +127,7 @@ namespace ipc = rommsync::ipc;
 // redeclares it (clang accepts it, which is how this reached CI once).
 namespace crypto = rommsync::crypto;
 namespace rlog = rommsync::log;
+namespace play = rommsync::play;
 namespace power = rommsync::sysmodule::power;
 namespace sysmodule = rommsync::sysmodule;
 
@@ -551,6 +554,26 @@ void ConfigWrites(checks::Checks& c) {
   c.ExpectEq(console.sandbox.Read("/config/rommsync/config.ini"), before,
              "and config.ini is byte-identical");
   c.ExpectEq(console.Configured().config.sync.interval_min, 45, "as is the running engine");
+
+  // The edits the settings screen's rows send (#264), through the same path:
+  // each lands on the running engine and on the card, `[sources]` in a section
+  // of its own because the file had none.
+  ipc::ConfigEdit m10;
+  m10.assignments.push_back({"sync", "on_server_delete", "keep", false});
+  m10.assignments.push_back({"sources", "retroarch", "off", false});
+  m10.assignments.push_back({"sources", "retroarch_content_dir", "true", false});
+  c.Expect(console.Set(m10).outcome == ipc::WriteOutcome::kApplied,
+           "on_server_delete and [sources] are edits SetConfig applies");
+  const ipc::ConfigView live = console.Configured();
+  c.Expect(live.config.sync.on_server_delete == config::OnServerDelete::kKeep,
+           "on_server_delete = keep is in force with no restart");
+  c.Expect(live.config.sources.retroarch == config::SourceMode::kOff,
+           "so is [sources] retroarch = off");
+  c.Expect(live.config.sources.retroarch_content_dir, "and retroarch_content_dir");
+  c.Expect(console.sandbox.Read("/config/rommsync/config.ini")
+                   .find("[sources]\nretroarch = off\nretroarch_content_dir = true\n") !=
+               std::string::npos,
+           "and the card holds them");
 
   // A `config.ini` this console cannot read is not one to replace: the user's
   // settings are probably still in it. A directory where the file should be
@@ -3629,6 +3652,91 @@ void RommForgotten(checks::Checks& c) {
   c.ExpectEq(server.negotiations(), negotiated, "so the second tick negotiated nothing");
 }
 
+/// A server whose heartbeat answers and whose library is never there: every
+/// `GET /api/roms` is a connection that failed. Counts them, and says when the
+/// first has been answered.
+class NoLibrary final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      result.response.status = 200;
+      result.response.body = R"({"SYSTEM":{"VERSION":"5.4.0"}})";
+      return result;
+    }
+    if (request.url.find("/api/roms") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++pages_;
+      arrived_.notify_all();
+    }
+    result.error = http::Error::kConnectFailed;
+    result.message = "nothing behind this test server";
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    return Send({});
+  }
+
+  bool AwaitPage() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return arrived_.wait_for(lock, std::chrono::seconds{10}, [this] { return pages_ > 0; });
+  }
+
+  int pages() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pages_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable arrived_;
+  int pages_ = 0;
+};
+
+/// #251: the library fetch backs off between attempts now, and a console put to
+/// sleep in that backoff cancels the tick. That has to end the tick as
+/// cancelled -- one request, no retry after it, and nothing recorded -- rather
+/// than as a server that is down: `kOffline` would be a failed tick on the
+/// status screen and a `net.offline` line about a link nobody was using.
+void IndexCanceled(checks::Checks& c) {
+  rommsync::log::Reset();
+  // Before the console, so it outlives the worker: a fetch that ignores the
+  // cancel is still asking it for pages when the scenario ends.
+  NoLibrary server;
+  Console console(c, "engine-index-canceled");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n\n[sync]\n"
+                                 "enabled = true\ninterval_min = 0\non_boot = false\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-index-canceled";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one");
+  console.engine.UseMinimumServerVersion(rommsync::server::kMinimumVersion);
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  c.Expect(server.AwaitPage(), "and its first page of the library failed");
+  // The tick is in its backoff now, or about to be: either way the sleep ends it.
+  console.engine.Quiesce();
+
+  const ipc::Status status = console.Status();
+  c.ExpectEq(server.pages(), 1, "the sleep stopped the fetch before its retry");
+  c.Expect(status.last_sync_result == ipc::SyncResult::kNever,
+           "and the tick is not recorded as failed: it was cancelled");
+  const ipc::LogTail tail = console.Log();
+  c.Expect(!Logged(tail, "net.offline"),
+           "nor logged as a server that is down:" + Rendered(tail));
+}
+
 /// #231: a card where Tico 0.8 keeps saves for two accounts and `config.ini`
 /// names neither. The scan syncs no Tico save there (`scan.tico`); what this adds
 /// is that the settings screen -- `GetConfig`, which is where a user goes to pick
@@ -3896,12 +4004,23 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   c.Expect(console.sandbox.Write(save, played), "a save on the card the server does not have");
 
   std::atomic<bool> running{true};
+  // Which application `pm` names, for the third game (#261). Zero is one it
+  // would not name, which is what the first two games are.
+  std::atomic<std::uint64_t> title{0};
   LaunchesMidTick counted(client, running);
   const std::unique_ptr<fs::FileSystem> card =
       rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
   console.Boot();
-  console.engine.UseForegroundProbe([&running] { return running.load(); },
-                                    std::chrono::milliseconds{50});
+  console.engine.UseForegroundProbe(
+      [&running, &title] {
+        play::Foreground foreground;
+        foreground.running = running.load();
+        if (foreground.running && title.load() != 0) {
+          foreground.program_id = title.load();
+        }
+        return foreground;
+      },
+      std::chrono::milliseconds{50});
   console.engine.UseServer(&counted, token.access_token);
   console.engine.UseCard(card.get());
   console.engine.StartWorker();
@@ -4015,6 +4134,42 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(heartbeats, std::size_t{1},
              "one heartbeat in the whole run: the tick that ran after the first game read "
              "it, the held ticks never did, and the second tick reused the answer (#228)");
+
+  // **Which title was played** (M10-26, #261). A third game, one `pm` names,
+  // writes nova's save while a press is held for it -- the module's exit write
+  // -- and closes. The tick after it derives the session from the save and
+  // names the application seen writing it. Past a whole second first, so the
+  // save's mtime lands after the window the second tick stamped.
+  std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+  title = 0x0100'0000'00AB'C000ULL;
+  running = true;
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kDeferred, "a third game holds a press");
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  c.Expect(console.sandbox.Write(save, "what the third game wrote as it closed\n"),
+           "the game writes its save");
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  running = false;
+  const std::chrono::steady_clock::time_point third_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 3 && std::chrono::steady_clock::now() < third_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  const ipc::LogTail titled_log = console.Log();
+  c.ExpectEq(ticks.ticks(), 3, "the tick after the third game runs" + Rendered(titled_log));
+  bool named = false;
+  for (const std::string& line : titled_log.lines) {
+    named = named || (line.find(" play.recorded rom " + std::to_string(rom.id) + " slot ") !=
+                          std::string::npos &&
+                      line.find(", title 0100000000ABC000") != std::string::npos);
+  }
+  c.Expect(named, "and records nova's session under the title seen writing it" +
+                      Rendered(titled_log));
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+    if (std::find(before.begin(), before.end(), id) == before.end() &&
+        std::find(uploaded.begin(), uploaded.end(), id) == uploaded.end()) {
+      uploaded.push_back(id);
+    }
+  }
 
   for (const std::int64_t id : uploaded) {
     harness::DeleteSave(client, base, fixture, id);
@@ -4669,6 +4824,134 @@ int Placement(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// The lines one slot's save is named in, and how each tick ended -- counted at
+/// the sink, for `TickLines`' reason.
+class SlotLines final : public rlog::Sink {
+ public:
+  explicit SlotLines(std::string slot) : slot_(std::move(slot)), previous_(rlog::GetSink()) {
+    rlog::SetSink(this);
+  }
+  ~SlotLines() override { rlog::SetSink(previous_); }
+
+  void Write(rlog::Level, std::string_view line) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (line.find(" sync.tick ") != std::string_view::npos) {
+      ticks_.emplace_back(line);
+    } else if (line.find(slot_) != std::string_view::npos) {
+      named_.emplace_back(line);
+    }
+  }
+
+  std::vector<std::string> ticks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ticks_;
+  }
+  std::vector<std::string> named() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return named_;
+  }
+
+ private:
+  const std::string slot_;
+  rlog::Sink* previous_;
+  mutable std::mutex mutex_;
+  std::vector<std::string> ticks_;
+  std::vector<std::string> named_;
+};
+
+/// #257, through the real engine: a save the placer will not place -- another
+/// device's, in a slot the scan would not read it back in -- costs one log line
+/// on the first tick that meets it, none on the second, is never written as a
+/// failed save, and neither tick is partial on its account.
+int Declined(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-declined");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  // A `.srm` the scan would read back in `autosave`, kept in a slot of its own:
+  // placed, it would be a second save of the game (`place::Placer::Save`).
+  const std::string slot = harness::UniqueSlot("m10-21");
+  harness::Save server;
+  {
+    harness::Sandbox staging(c, "engine-declined-upload");
+    const std::string staged = staging.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "nova's save, in a slot of its own " + slot + "\n");
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, slot, "fceumm", staged,
+                                 "nova.srm", /*with_device=*/false, &server),
+             "another device's save is on the server");
+  }
+
+  rlog::Reset();
+  const SlotLines lines(slot);
+  Console console(c, "engine-declined");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return c.failures();
+  }
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseCard(card.get());
+  console.engine.UseServer(&client, std::string());
+  console.sandbox.Write("/tico/roms/nes/nova.nes", "nova's rom\n");
+  console.Boot();
+  console.engine.StartWorker();
+
+  const auto tick = [&console, &lines, &c](std::size_t number) {
+    c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+    const std::chrono::steady_clock::time_point by =
+        std::chrono::steady_clock::now() + std::chrono::seconds{120};
+    while ((lines.ticks().size() < number || console.Status().sync_in_progress) &&
+           std::chrono::steady_clock::now() < by) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+    const std::vector<std::string> ended = lines.ticks();
+    c.Expect(ended.size() == number && ended.back().find("outcome=completed") != std::string::npos,
+             "tick " + std::to_string(number) + " completed, not partial: " +
+                 (ended.empty() ? std::string("no tick") : ended.back()) +
+                 Rendered(console.Log()));
+  };
+  const auto failed_lines = [&lines]() {
+    std::size_t failed = 0;
+    for (const std::string& line : lines.named()) {
+      failed += line.find(" save.failed ") != std::string::npos ? 1 : 0;
+    }
+    return failed;
+  };
+
+  tick(1);
+  std::vector<std::string> named = lines.named();
+  c.ExpectEq(named.size(), std::size_t{1},
+             "the first tick says it once" + Rendered(console.Log()));
+  c.Expect(!named.empty() && named[0].find(" warn ") != std::string::npos,
+           "as a warning, not an error: " + (named.empty() ? std::string() : named[0]));
+  c.ExpectEq(failed_lines(), std::size_t{0}, "and never as a failed save");
+  c.ExpectEq(console.Status().failed, std::int64_t{0}, "the status screen counts no failure");
+  c.Expect(!console.sandbox.Exists("/tico/saves/nes/nova.srm"), "and nothing was placed");
+
+  tick(2);
+  c.ExpectEq(lines.named().size(), std::size_t{1},
+             "the second tick says nothing more" + Rendered(console.Log()));
+  c.ExpectEq(console.Status().failed, std::int64_t{0}, "and counts no failure either");
+
+  harness::DeleteSave(client, base, fixture, server.id);
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// #241's acceptance, through the real engine: the server holds a save, the
 /// console downloads the rom, and the save is in the folder the emulator reads
 /// before the next scheduled tick -- of which there is none: `interval_min = 0`
@@ -5022,8 +5305,13 @@ int StatesGuarded(http::HttpClient& client, const std::string& base) {
       return std::nullopt;
     });
     console.Boot();
-    console.engine.UseForegroundProbe([&running] { return running.load(); },
-                                      std::chrono::milliseconds{50});
+    console.engine.UseForegroundProbe(
+        [&running] {
+          play::Foreground foreground;
+          foreground.running = running.load();
+          return foreground;
+        },
+        std::chrono::milliseconds{50});
     console.engine.UseServer(&wire, std::string());
     console.engine.UseCard(card.get());
     console.engine.StartWorker();
@@ -5449,6 +5737,194 @@ int InstallWake(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #249's acceptance, through the real engine against RomM 5.4.0: the player's
+/// Keep local on the conflicts screen is the one thing that sends an upload
+/// with `overwrite=true`, and only that one upload.
+///
+/// It is also #236's question, answered and tested: the head the conflict lost
+/// to is written by a lineage this console does not load (`gpsp`, where the
+/// console's gba saves are mGBA's), so the filtered negotiate never offers it,
+/// and only the slot guard's 409 and the unfiltered resolution see it. Keep
+/// local goes over it all the same -- the player saw that copy land on the card
+/// and chose theirs -- and RomM keeps lineages apart: `overwrite=true` lifts the
+/// guard and adds a version in this console's lineage, and the other lineage's
+/// rows stay on the server.
+///
+///   1. the console's save goes up into an empty `autosave`;
+///   2. another device writes the slot under `gpsp`, the console's save moves on,
+///      and the tick's upload meets the guard: a conflict -- gpsp's bytes on the
+///      card, the console's under `.backup/`;
+///   3. the other device writes again, so an upload *without* the override would
+///      meet the guard a second time;
+///   4. Keep local over the wire: the console's bytes are back, and the tick the
+///      engine asks for sends them with `overwrite=true` -- exactly once -- and
+///      they are the slot's head, with both gpsp rows still beside them;
+///   5. the next upload of that save goes with `overwrite=false` again.
+int KeepLocalChoice(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee_mb.gba", &rom),
+           "the fixture library has 240pee_mb.gba");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-keep-local");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  // Unique bytes per run: RomM remembers what a slot lost.
+  const std::string stamp = harness::UniqueSlot("keep-local");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Intercepting wire(client);
+  Console console(c, "engine-keep-local");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::string save = "/tico/saves/gba/240pee_mb.srm";
+  console.sandbox.MakeDirs("/tico/saves/gba");
+  const std::string first = "the switch's save, first synced " + stamp + "\n";
+  console.sandbox.SeedSave(save, first);
+
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.Boot();
+  console.engine.UseServer(&wire, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  // Another device's upload, in a lineage this console does not load.
+  harness::Sandbox staging(c, "engine-keep-local-other");
+  const auto other_device = [&](const std::string& bytes, const std::string& what) {
+    const std::string staged = staging.Host("/config/rommsync/other.srm");
+    rig::WriteFile(staged, bytes);
+    harness::Save written;
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "gpsp", staged,
+                                 "240pee_mb.srm", /*with_device=*/false, &written),
+             what + ": another device writes the slot under gpsp");
+  };
+  const auto rows_with = [&](const std::string& bytes) {
+    std::vector<ServerRow> found;
+    for (ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+      if (row.content_hash == crypto::Md5Hex(bytes)) {
+        found.push_back(std::move(row));
+      }
+    }
+    return found;
+  };
+  const auto overrides = [&wire] { return wire.Asked(http::Method::kPost, "overwrite=true"); };
+
+  // 1.
+  TickOnce(console, ticks, c, "the first tick");
+  c.ExpectEq(rows_with(first).size(), std::size_t{1}, "the console's save went up");
+
+  // 2.
+  harness::PassASecond();
+  const std::string theirs = "the other device's progress, under gpsp " + stamp + "\n";
+  other_device(theirs, "before the conflict");
+  harness::PassASecond();
+  const std::string mine = "the switch played on: the copy the player keeps " + stamp + "\n";
+  console.sandbox.Reseed(save, mine);
+  TickOnce(console, ticks, c, "the conflict's tick");
+  c.ExpectEq(console.sandbox.Read(save), theirs,
+             "Keep server, the default: the slot's head is on the card" +
+                 Rendered(console.Log()));
+  c.Expect(console.sandbox.HasBackupOf(mine), "and the console's bytes are under .backup/");
+  c.Expect(overrides().empty(), "nothing has gone with overwrite=true without a choice");
+
+  std::string response;
+  console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
+               &response);
+  const ipc::ConflictPage page = ipc::DecodeConflictPage(response).value;
+  std::int64_t entry_id = 0;
+  for (const ipc::ConflictRow& row : page.entries) {
+    if (row.entry.rom_id == rom.id && row.entry.event == conflicts::Event::kConflict) {
+      entry_id = row.entry.id;
+    }
+  }
+  c.Expect(entry_id != 0, "the conflict is on the conflicts screen");
+  const std::int32_t conflicts_before = page.total;
+
+  // 3.
+  harness::PassASecond();
+  const std::string theirs_again = "the other device again, newer still " + stamp + "\n";
+  other_device(theirs_again, "after the conflict");
+  // RomM 5.4.0 stores `updated_at` to the whole second and picks a slot's
+  // newest row with no tie-break, so an override landing in the same second as
+  // that write could lose the head to it -- and the next tick's guard would
+  // then 409 on a row this console never synced (M10-32). A second between
+  // them keeps this test about the override rather than the tie.
+  harness::PassASecond();
+
+  // 4.
+  const int ticks_before = ticks.ticks();
+  c.Expect(console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(entry_id), &response) ==
+               ipc::Error::kOk,
+           "KeepLocal is answered");
+  const ipc::RestoreState kept = console.AwaitRestore(entry_id);
+  c.Expect(kept.phase == ipc::RestorePhase::kDone && kept.report.ok(),
+           std::string("Keep local put the console's bytes back: ") +
+               conflicts::ToString(kept.report.outcome) + " -- " + kept.report.message);
+  // The tick the engine asks for itself, not a press.
+  const std::chrono::steady_clock::time_point deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{120};
+  while ((ticks.ticks() <= ticks_before || console.Status().sync_in_progress) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.Expect(ticks.ticks() > ticks_before, "Keep local starts a tick of its own");
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kOk,
+           std::string("which runs clean: ") +
+               ipc::ToString(console.Status().last_sync_result) + Rendered(console.Log()));
+
+  const std::vector<std::string> sent = overrides();
+  c.ExpectEq(sent.size(), std::size_t{1}, "exactly one upload went with overwrite=true");
+  for (const std::string& url : sent) {
+    c.Expect(url.find("rom_id=" + std::to_string(rom.id) + "&") != std::string::npos &&
+                 url.find("slot=autosave") != std::string::npos,
+             "and it is this save's, in its slot: " + url);
+  }
+  c.ExpectEq(console.sandbox.Read(save), mine, "the console's bytes are on the card");
+  const std::vector<ServerRow> uploaded = rows_with(mine);
+  c.Expect(uploaded.size() == 1 && uploaded[0].emulator == "mgba",
+           "and on the server, in the console's own lineage");
+  std::int64_t head = 0;
+  for (const ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+    head = std::max(head, row.id);
+  }
+  c.Expect(!uploaded.empty() && uploaded[0].id == head, "as the slot's newest save");
+  c.ExpectEq(rows_with(theirs).size(), std::size_t{1},
+             "#236: the other lineage's row the conflict lost to is still on the server");
+  c.ExpectEq(rows_with(theirs_again).size(), std::size_t{1},
+             "and so is the one the override went over -- RomM keeps lineages apart");
+  console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
+               &response);
+  c.ExpectEq(ipc::DecodeConflictPage(response).value.total, conflicts_before,
+             "and the override was not itself a conflict");
+
+  // 5.
+  harness::PassASecond();
+  const std::string later = "the switch's next save, an ordinary upload " + stamp + "\n";
+  console.sandbox.Reseed(save, later);
+  TickOnce(console, ticks, c, "the tick after");
+  c.ExpectEq(overrides().size(), std::size_t{1},
+             "the choice was one upload's: the next one sends no overwrite=true");
+  c.ExpectEq(rows_with(later).size(), std::size_t{1}, "and goes up all the same");
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -5480,10 +5956,12 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"interop", Interop},
       {"upgrade", Upgrade},
       {"placement", Placement},
+      {"declined", Declined},
       {"remote_install", RemoteInstall},
       {"states_guard", StatesGuarded},
       {"install_settle", InstallSettle},
       {"install_wake", InstallWake},
+      {"keep_local", KeepLocalChoice},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -5543,6 +6021,8 @@ int main(int argc, char** argv) {
     LogsMisconfiguration(checks);
   } else if (scenario == "romm_forgotten") {
     RommForgotten(checks);
+  } else if (scenario == "index_canceled") {
+    IndexCanceled(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {
     // The scenarios that need the fixture RomM. `server` pins that a *live*
     // credential stops being on the card, and the M1-6 three drive a real

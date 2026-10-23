@@ -60,8 +60,9 @@ class ConflictsScreen : public tsl::Gui {
   /// leaves nothing behind (`ipc::ConflictQuery`).
   void update() override;
 
-  /// Up/Down move the selection, A opens an entry and then confirms the
-  /// restore, B steps back out.
+  /// Up/Down move the selection -- or, on a save conflict's choice, between
+  /// Keep server, Keep local and Skip (#249) -- A opens an entry and then
+  /// confirms the restore or the choice, B steps back out.
   ///
   /// A press on an entry the model already knows cannot be restored sends
   /// nothing and leaves the reason on the screen -- the rule every screen here

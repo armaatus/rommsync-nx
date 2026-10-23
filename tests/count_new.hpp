@@ -54,6 +54,11 @@ struct Counters {
   std::atomic<std::int64_t> outstanding{0};   ///< blocks allocated and not yet freed
   std::atomic<std::int64_t> outstanding_bytes{0};
   std::atomic<std::int64_t> peak_bytes{0};    ///< highest `outstanding_bytes` since `ResetPeak`
+
+  /// `FailAt`'s countdown: the allocation that takes it from 1 to 0 fails.
+  /// Zero or less is disarmed.
+  std::atomic<std::int64_t> fail_countdown{0};
+  std::atomic<std::int64_t> injected{0};      ///< allocations `FailAt` has failed, ever
 };
 
 Counters& Get();
@@ -82,6 +87,23 @@ inline void ResetPeak() {
   Counters& counters = Get();
   counters.peak_bytes.store(counters.outstanding_bytes.load(std::memory_order_relaxed),
                             std::memory_order_relaxed);
+}
+
+/// curl's "fail allocation N on run N" (#250): the `n`th allocation from now
+/// fails, once, and every one after it succeeds again. `n <= 0` disarms.
+///
+/// A failed allocation is what the console's own `operator new` does when the
+/// 1.5 MiB heap is spent: a throwing form throws `bad_alloc` -- which under the
+/// sysmodule's `-fno-exceptions` nothing catches, so it is `std::terminate` --
+/// and a `nothrow` form returns null. Counted across every thread, like
+/// everything else here, so a run that wants a repeatable N has to be one thread.
+inline void FailAt(std::int64_t n) {
+  Get().fail_countdown.store(n, std::memory_order_relaxed);
+}
+
+/// How many allocations `FailAt` has failed in this process.
+inline std::int64_t InjectedFailures() {
+  return Get().injected.load(std::memory_order_relaxed);
 }
 
 /// llvm's `RequireAllocationGuard`, as a value rather than an RAII assertion:

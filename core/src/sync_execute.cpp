@@ -12,7 +12,9 @@
 //
 // A conflict puts one more step between 3 and 4: the bytes step 3 preserved go
 // up as an archival save (`Archive`, #240). It writes nothing local and cannot
-// stop the overwrite.
+// stop the overwrite. And the last thing before 4 is asking whether the save is
+// still what 3 copied (`UnchangedSinceBackup`, #263): a game that wrote it in
+// between would otherwise lose that write to a commit its backup never saw.
 //
 // Every step before 4 can fail without the save changing at all, and step 4
 // cannot start until step 3 has succeeded. That is docs/SYNC_PROTOCOL.md's hard
@@ -20,6 +22,7 @@
 // `harness::Sandbox`'s teardown audit is what holds it to it.
 #include "rommsync/sync_execute.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -80,11 +83,19 @@ std::string Describe(const SyncOperation& operation) {
          ", slot " + (operation.slot.has_value() ? *operation.slot : "<archival>");
 }
 
-OperationResult Fail(const SyncOperation& operation, OperationError error, std::string message) {
+/// A result for `operation`, naming the action and the save it is about and
+/// nothing else yet. Every result starts here, so a field that identifies an
+/// operation is filled in one place.
+OperationResult ResultFor(const SyncOperation& operation) {
   OperationResult result;
   result.action = operation.action;
   result.rom_id = operation.rom_id;
   result.slot = operation.slot;
+  return result;
+}
+
+OperationResult Fail(const SyncOperation& operation, OperationError error, std::string message) {
+  OperationResult result = ResultFor(operation);
   // A cancellation is not a failure -- the caller stopped this, and nothing
   // about the save went wrong. It gets its own outcome so the accounting M2-6
   // reports cannot call it either completed or failed.
@@ -93,6 +104,59 @@ OperationResult Fail(const SyncOperation& operation, OperationError error, std::
   result.error = error;
   result.message = Describe(operation) + ": " + std::move(message);
   return result;
+}
+
+/// A save this console will not take (`OperationOutcome::kDeclined`, #257):
+/// the shape `Fail` gives a failure, for the two refusals only a file moving
+/// changes.
+OperationResult Decline(const SyncOperation& operation, OperationError error,
+                        std::string message) {
+  OperationResult result = Fail(operation, error, std::move(message));
+  result.outcome = OperationOutcome::kDeclined;
+  return result;
+}
+
+/// Whether `outcome` is the plan obeyed, which `Recount` counts `completed`.
+bool Obeyed(OperationOutcome outcome) {
+  switch (outcome) {
+    case OperationOutcome::kNoOp:
+    case OperationOutcome::kUploaded:
+    case OperationOutcome::kDownloaded:
+    case OperationOutcome::kKeptBoth:
+    case OperationOutcome::kRemoved:
+    case OperationOutcome::kKept:
+      return true;
+    case OperationOutcome::kFailed:
+    case OperationOutcome::kNotUnderstood:
+    case OperationOutcome::kCanceled:
+    case OperationOutcome::kDeclined:
+      break;
+  }
+  return false;
+}
+
+/// FNV-1a, 64-bit, continued from `hash`: what `Declines` keeps of a string.
+/// Its own rather than `std::hash` so the value means the same on every build.
+constexpr std::uint64_t kFnvOffset = 0xcbf29ce484222325ULL;
+
+std::uint64_t Fnv(std::string_view text, std::uint64_t hash = kFnvOffset) {
+  for (const char character : text) {
+    hash ^= static_cast<unsigned char>(character);
+    hash *= 0x100000001b3ULL;
+  }
+  return hash;
+}
+
+/// One field of a fingerprint, absent told apart from empty, and each ended so
+/// that two fields cannot run into each other.
+std::uint64_t FnvField(const std::optional<std::string>& field, std::uint64_t hash) {
+  hash = Fnv(field.has_value() ? std::string_view("+") : std::string_view("-"), hash);
+  return Fnv(std::string_view("\0", 1), Fnv(field.value_or(std::string()), hash));
+}
+
+/// What `Declines` keys a save's slot by.
+std::uint64_t SlotKey(const SyncOperation& operation) {
+  return FnvField(operation.slot, kFnvOffset);
 }
 
 /// The reason an exchange did not produce a usable answer, or empty when it did.
@@ -231,6 +295,8 @@ const char* ToString(OperationOutcome outcome) {
       return "removed";
     case OperationOutcome::kKept:
       return "kept";
+    case OperationOutcome::kDeclined:
+      return "declined";
   }
   return "failed";
 }
@@ -386,12 +452,137 @@ std::string StateBackupDiscriminator(std::string_view file_name) {
 
 const SaveTarget* MatchTarget(const std::vector<SaveTarget>& targets,
                               const SyncOperation& operation) {
-  for (const SaveTarget& target : targets) {
-    if (target.rom_id == operation.rom_id && target.slot == operation.slot) {
-      return &target;
+  return FindByKey(targets, KeyOf(operation));
+}
+
+bool Declines::Note(const SyncOperation& operation, const OperationResult& declined,
+                    const std::optional<std::string>& local_digest) {
+  const std::uint64_t slot = SlotKey(operation);
+  std::uint64_t fingerprint = Fnv(ToString(declined.error));
+  fingerprint = FnvField(operation.save_id.has_value()
+                             ? std::optional<std::string>(std::to_string(*operation.save_id))
+                             : std::nullopt,
+                         fingerprint);
+  fingerprint = FnvField(operation.server_updated_at, fingerprint);
+  fingerprint = FnvField(operation.server_content_hash, fingerprint);
+  fingerprint = FnvField(operation.emulator, fingerprint);
+  fingerprint = FnvField(local_digest, fingerprint);
+  fingerprint = Fnv(declined.message, fingerprint);
+
+  for (Entry& entry : entries_) {
+    if (entry.rom_id == operation.rom_id && entry.slot == slot) {
+      entry.met = true;
+      const bool news = entry.fingerprint != fingerprint;
+      entry.fingerprint = fingerprint;
+      return news;
     }
   }
-  return nullptr;
+  if (entries_.size() < kMaxDeclines) {
+    // Reserved once, to the bound, so it never doubles past what
+    // `kHeapDeclines` counts.
+    entries_.reserve(kMaxDeclines);
+    entries_.push_back(Entry{operation.rom_id, slot, fingerprint, true});
+  }
+  return true;
+}
+
+void Declines::Forget(const SyncOperation& operation) {
+  const std::uint64_t slot = SlotKey(operation);
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&](const Entry& entry) {
+                                  return entry.rom_id == operation.rom_id && entry.slot == slot;
+                                }),
+                 entries_.end());
+}
+
+void Declines::EndTick(const std::vector<std::int64_t>& unasked_roms) {
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&unasked_roms](const Entry& entry) {
+                                  return !entry.met &&
+                                         !std::binary_search(unasked_roms.begin(),
+                                                             unasked_roms.end(), entry.rom_id);
+                                }),
+                 entries_.end());
+  for (Entry& entry : entries_) {
+    entry.met = false;
+  }
+}
+
+void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                  const state::Baseline::Key& key) {
+  if (FindByKey(*keep_local, key) != nullptr) {
+    return;
+  }
+  if (keep_local->size() >= kMaxKeepLocal) {
+    keep_local->erase(keep_local->begin());
+  }
+  keep_local->push_back(key);
+}
+
+void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                    const std::vector<state::Baseline::Key>& sent,
+                    const ExecutionReport& executed) {
+  const auto answered = [&executed, &sent](const state::Baseline::Key& key) {
+    if (FindByKey(sent, key) == nullptr) {
+      return false;  // armed after this plan went out: it carried no override
+    }
+    const OperationResult* result = FindByKey(executed.operations, key);
+    if (result == nullptr) {
+      return false;  // not in this plan: a later one may name it
+    }
+    // Only what never reached the server is still owed its override: a
+    // cancelled operation, or an upload that failed before its request was
+    // made or while it was in flight. Anything the server saw -- or a plan
+    // that asked for something other than an upload -- has spent it.
+    if (result->outcome == OperationOutcome::kCanceled) {
+      return false;
+    }
+    const bool unsent = result->action == Action::kUpload &&
+                        result->outcome == OperationOutcome::kFailed &&
+                        (result->error == OperationError::kTransferFailed ||
+                         result->error == OperationError::kUnreadableCard ||
+                         result->error == OperationError::kNoLocalSave);
+    return !unsent;
+  };
+  keep_local->erase(std::remove_if(keep_local->begin(), keep_local->end(), answered),
+                    keep_local->end());
+}
+
+void Recount(ExecutionReport* report) {
+  report->completed = 0;
+  report->failed = 0;
+  report->not_understood = 0;
+  report->declined = 0;
+  for (const OperationResult& result : report->operations) {
+    // Enumerated rather than defaulted: a `default` here would count whatever
+    // outcome is added next as work the client completed, which is the one
+    // direction this accounting must not be wrong in (M2-6 reports it).
+    switch (result.outcome) {
+      case OperationOutcome::kFailed:
+        ++report->failed;
+        break;
+      case OperationOutcome::kNotUnderstood:
+        ++report->not_understood;
+        break;
+      case OperationOutcome::kDeclined:
+        ++report->declined;
+        break;
+      case OperationOutcome::kCanceled:
+        // Counted nowhere: the caller stopped this one, and the rest are not
+        // attempted at all.
+        break;
+      case OperationOutcome::kNoOp:
+      case OperationOutcome::kUploaded:
+      case OperationOutcome::kDownloaded:
+      case OperationOutcome::kKeptBoth:
+      case OperationOutcome::kRemoved:
+      case OperationOutcome::kKept:
+        // A kept delete is the plan obeyed too: the server's ruling was that
+        // this copy is not to be uploaded, and it is not.
+        ++report->completed;
+        break;
+    }
+  }
 }
 
 OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
@@ -458,6 +649,43 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
   return OperationError::kBackupFailed;
 }
 
+OperationError UnchangedSinceBackup(fs::FileSystem& files, const std::string& sd_path,
+                                    const std::string& backup_sd_path, std::string* message) {
+  const std::string source = files.Resolve(sd_path);
+  if (source.empty()) {
+    *message = "the local file " + sd_path + " is not a path on this card";
+    return OperationError::kUnreadableCard;
+  }
+  if (backup_sd_path.empty()) {
+    std::string unread;
+    if (io::ReadBounded(source, 0, &unread) == io::BoundedRead::kMissing) {
+      return OperationError::kNone;
+    }
+    *message = sd_path +
+               " was written after it was found empty, and nothing holds a copy of it; it was "
+               "left as it is";
+    return OperationError::kUnverified;
+  }
+
+  const std::string backup = files.Resolve(backup_sd_path);
+  const state::HashOutcome kept =
+      backup.empty() ? state::HashOutcome{} : state::HashFile(backup);
+  if (backup.empty() || !kept.ok()) {
+    *message = "the backup at " + backup_sd_path +
+               " could not be read back to compare the save with, so " + sd_path +
+               " was left as it is" + (kept.message.empty() ? "" : ": " + kept.message);
+    return OperationError::kUnreadableCard;
+  }
+  const state::HashOutcome now = state::HashFile(source);
+  if (!now.ok() || now.content_hash != kept.content_hash) {
+    *message = sd_path + " was written after it was backed up to " + backup_sd_path +
+               ", and no copy holds what was written since; it was left as it is, and the "
+               "backup beside it";
+    return OperationError::kUnverified;
+  }
+  return OperationError::kNone;
+}
+
 namespace {
 
 /// `BackUpFirst` with a save's discriminator and this execution's clock filled
@@ -481,12 +709,12 @@ OperationError BackUp(fs::FileSystem& files, const ExecuteOptions& options,
 
 /// Whether the player chose "Keep local" for this save (`ExecuteOptions::keep_local`).
 bool KeepsLocal(const ExecuteOptions& options, const SyncOperation& operation) {
-  for (const auto& key : options.keep_local) {
-    if (key.first == operation.rom_id && key.second == operation.slot) {
-      return true;
-    }
-  }
-  return false;
+  return FindByKey(options.keep_local, KeyOf(operation)) != nullptr;
+}
+
+/// What step 0 reported for `target`, or nullptr -- also when nothing was.
+const ClientSaveState* ReportedFor(const ExecuteOptions& options, const SaveTarget& target) {
+  return options.reported != nullptr ? FindByKey(*options.reported, KeyOf(target)) : nullptr;
 }
 
 /// `POST /api/saves?...&content_hash=<md5>&overwrite=false` with the local file
@@ -568,10 +796,7 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
     return Fail(operation, refused->first, refused->second);
   }
 
-  OperationResult uploaded;
-  uploaded.action = operation.action;
-  uploaded.rom_id = operation.rom_id;
-  uploaded.slot = operation.slot;
+  OperationResult uploaded = ResultFor(operation);
   uploaded.outcome = OperationOutcome::kUploaded;
   uploaded.sd_path = target->sd_path;
   uploaded.message = Describe(operation) + ": uploaded " + target->sd_path;
@@ -588,14 +813,8 @@ OperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
 
 /// The emulator step 0 reported for `target`, or empty.
 std::string ReportedEmulator(const ExecuteOptions& options, const SaveTarget& target) {
-  if (options.reported != nullptr) {
-    for (const ClientSaveState& save : *options.reported) {
-      if (save.rom_id == target.rom_id && save.slot == target.slot) {
-        return save.emulator.value_or(std::string());
-      }
-    }
-  }
-  return {};
+  const ClientSaveState* save = ReportedFor(options, target);
+  return save != nullptr ? save->emulator.value_or(std::string()) : std::string();
 }
 
 /// A conflict's losing local copy, put on the server as an archival save before
@@ -736,12 +955,7 @@ std::string OtherEmulator(const SyncOperation& operation, const SaveTarget& targ
   } else if (placed && options.reads_as != nullptr) {
     local = options.reads_as(operation, target.sd_path);
   } else if (!placed && options.reported != nullptr) {
-    for (const ClientSaveState& save : *options.reported) {
-      if (save.rom_id == target.rom_id && save.slot == target.slot) {
-        local = save.emulator.value_or(std::string());
-        break;
-      }
-    }
+    local = ReportedEmulator(options, target);
   } else {
     known = false;
   }
@@ -783,17 +997,20 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // has never seen needs one invented, which the plan cannot do -- the server's
   // `file_name` is tagged and the directory depends on the rom's platform.
   SaveTarget placed;
+  // Declared before the staged file, so a failure removes that first and then
+  // the folders made for it (#258).
+  fs::MadeFolders folders(files);
   if (target == nullptr) {
     const place::Placement placement =
         options.place != nullptr ? options.place(operation) : place::Placement{};
     const std::string& sd_path = placement.sd_path;
     if (sd_path.empty()) {
-      return Fail(operation, OperationError::kNoLocalSave,
-                  placement.reason.empty()
-                      ? "there is no local save for this (rom_id, slot) and nothing said where a "
-                        "new one should go"
-                      : "there is no local save for this (rom_id, slot), and none was placed: " +
-                            placement.reason);
+      return Decline(operation, OperationError::kNoLocalSave,
+                     placement.reason.empty()
+                         ? "there is no local save for this (rom_id, slot) and nothing said "
+                           "where a new one should go"
+                         : "there is no local save for this (rom_id, slot), and none was "
+                           "placed: " + placement.reason);
     }
     // **A placement only creates.** "No local save matched" is not "nothing is
     // at that path": a save the scan skipped, or one it read in another slot,
@@ -806,9 +1023,9 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                   "the save path " + sd_path + " is not a path on this card");
     }
     if (io::Exists(resolved)) {
-      return Fail(operation, OperationError::kNoLocalSave,
-                  "there is no local save for this (rom_id, slot), and " + sd_path +
-                      " is already a file this sync did not pair with it; it was not touched");
+      return Decline(operation, OperationError::kNoLocalSave,
+                     "there is no local save for this (rom_id, slot), and " + sd_path +
+                         " is already a file this sync did not pair with it; it was not touched");
     }
     placed.rom_id = operation.rom_id;
     placed.slot = operation.slot;
@@ -816,15 +1033,16 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // A format only one emulator reads is never placed where another reads it
     // (#238) -- asked before the folder is made, so a refusal leaves nothing.
     if (std::string why = OtherEmulator(operation, placed, &placement, options); !why.empty()) {
-      OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+      OperationResult refused = Decline(operation, OperationError::kOtherEmulator, std::move(why));
       refused.sd_path = sd_path;
       return refused;
     }
     // The emulator makes a system's folder the first time it saves one, which
-    // for a save the console has never held is after this.
+    // for a save the console has never held is after this. Taken back if the
+    // save then does not land: an empty folder is one the emulator did not make.
     const std::size_t parent = sd_path.rfind('/');
     if (parent != std::string::npos && parent > 0) {
-      const fs::MakeDirResult made = files.CreateDirectory(sd_path.substr(0, parent));
+      const fs::MakeDirResult made = folders.Make(sd_path.substr(0, parent));
       if (!made.ok()) {
         return Fail(operation, OperationError::kUnreadableCard,
                     "the folder for " + sd_path + " could not be made: " + made.message);
@@ -839,7 +1057,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
              !why.empty()) {
     // Nor is one written over a save another emulator reads (#238) -- whatever
     // the slot pairing put in the plan.
-    OperationResult refused = Fail(operation, OperationError::kOtherEmulator, std::move(why));
+    OperationResult refused = Decline(operation, OperationError::kOtherEmulator, std::move(why));
     refused.sd_path = target->sd_path;
     return refused;
   }
@@ -920,10 +1138,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                 "not touched");
   }
 
-  OperationResult result;
-  result.action = operation.action;
-  result.rom_id = operation.rom_id;
-  result.slot = operation.slot;
+  OperationResult result = ResultFor(operation);
   result.sd_path = target->sd_path;
   result.save_id = save_id;
 
@@ -948,6 +1163,22 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     Archive(client, files, token, operation, *target, options, stamp, &result, warnings);
   }
 
+  // The backup is of the save as it was when copied, and a conflict's archival
+  // upload has just held that moment open for a round trip. A game that wrote
+  // the save since would lose the write to the commit (#263), so the save is
+  // compared with its backup last of all. A mismatch repeats the operation next
+  // tick -- a conflict's archive with it, which is what a failed commit costs too.
+  if (const OperationError unchanged =
+          UnchangedSinceBackup(files, target->sd_path, result.backup_sd_path, &message);
+      unchanged != OperationError::kNone) {
+    OperationResult failed = Fail(operation, unchanged, std::move(message));
+    failed.sd_path = target->sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
+    failed.archive = result.archive;
+    failed.archive_save_id = result.archive_save_id;
+    return failed;
+  }
+
   const std::string staged_path = staged.path();
   // Consumed by the commit whether it succeeds or fails, so the guard is done.
   staged.Release();
@@ -962,6 +1193,7 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     failed.archive_save_id = result.archive_save_id;
     return failed;
   }
+  folders.Keep();
 
   // The save is on the card. What is left is telling the server so -- without
   // it, this device has no sync row for the save and every later negotiation
@@ -1026,21 +1258,11 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   return result;
 }
 
-/// The digest step 0 reported for `target`, or empty when it reported none.
-std::string ReportedDigest(const std::vector<ClientSaveState>& reported,
-                           const SaveTarget& target) {
-  for (const ClientSaveState& save : reported) {
-    if (save.rom_id == target.rom_id && save.slot == target.slot) {
-      return save.content_hash.value_or(std::string());
-    }
-  }
-  return {};
-}
-
 /// A `delete` (#233): back up, check the backup is the bytes the server ruled
-/// on, remove. Hard rule 2 with the overwrite replaced by a removal, and the
-/// same `BackUpFirst` -- so a power cut at any call leaves the save on the card
-/// or its bytes under `.backup/`, never neither (`execute.crash_delete`).
+/// on and the save is still the backup (#263), remove. Hard rule 2 with the
+/// overwrite replaced by a removal, and the same `BackUpFirst` -- so a power cut
+/// at any call leaves the save on the card or its bytes under `.backup/`, never
+/// neither (`execute.crash_delete`).
 OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
                        const SaveTarget* target, const ExecuteOptions& options) {
   if (target == nullptr) {
@@ -1052,10 +1274,7 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
                 "there is no local save for this (rom_id, slot) to remove; nothing was touched");
   }
 
-  OperationResult result;
-  result.action = operation.action;
-  result.rom_id = operation.rom_id;
-  result.slot = operation.slot;
+  OperationResult result = ResultFor(operation);
   result.sd_path = target->sd_path;
 
   if (options.on_server_delete == config::OnServerDelete::kKeep) {
@@ -1073,8 +1292,9 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
   }
   // Asked before anything is copied: with no digest to hold the backup to,
   // the removal will not happen, and a copy made first would only be litter.
+  const ClientSaveState* reported = ReportedFor(options, *target);
   const std::string expected =
-      options.reported != nullptr ? ReportedDigest(*options.reported, *target) : std::string();
+      reported != nullptr ? reported->content_hash.value_or(std::string()) : std::string();
   if (expected.empty()) {
     OperationResult failed =
         Fail(operation, OperationError::kUnverified,
@@ -1118,6 +1338,18 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
     return failed;
   }
 
+  // The backup is the reported bytes; the save has to still be them too, or the
+  // removal takes a write that landed after the copy (#263). Both stay: the
+  // backup is the copy the ruling was about, and the save is newer than it.
+  if (const OperationError unchanged =
+          UnchangedSinceBackup(files, target->sd_path, result.backup_sd_path, &message);
+      unchanged != OperationError::kNone) {
+    OperationResult failed = Fail(operation, unchanged, std::move(message));
+    failed.sd_path = target->sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
+    return failed;
+  }
+
   if (io::Remove(source) != 0) {
     OperationResult failed =
         Fail(operation, OperationError::kCommitFailed,
@@ -1158,15 +1390,12 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       break;
     }
 
-    OperationResult result;
+    OperationResult result = ResultFor(operation);
     if (!operation.known_action) {
       // M2-4 hands an action this build does not know over as a `no_op` so that
       // the default branch cannot overwrite a save. Counting it as an ordinary
       // completed no-op would report that the client did what was asked, and it
       // does not know what was asked.
-      result.action = operation.action;
-      result.rom_id = operation.rom_id;
-      result.slot = operation.slot;
       result.outcome = OperationOutcome::kNotUnderstood;
       result.message = "rom " + std::to_string(operation.rom_id) + ", slot " +
                        (operation.slot.has_value() ? *operation.slot : "<archival>") +
@@ -1190,9 +1419,6 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
                          OperationOutcome::kKeptBoth, &report.warnings);
           break;
         case Action::kNoOp:
-          result.action = operation.action;
-          result.rom_id = operation.rom_id;
-          result.slot = operation.slot;
           result.outcome = OperationOutcome::kNoOp;
           result.message = Describe(operation) + ": nothing to do (" +
                            ToString(operation.reason) + ")";
@@ -1201,9 +1427,6 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
           if (!options.delete_action) {
             // A server that does not say it means `delete` (#228): obeyed as
             // nothing, and counted with the actions this build does not know.
-            result.action = operation.action;
-            result.rom_id = operation.rom_id;
-            result.slot = operation.slot;
             result.outcome = OperationOutcome::kNotUnderstood;
             result.message = Describe(operation) +
                              ": this server does not offer delete, so it was not acted on";
@@ -1214,37 +1437,32 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       }
     }
 
-    // Enumerated rather than defaulted: a `default` here would count whatever
-    // outcome is added next as work the client completed, which is the one
-    // direction this accounting must not be wrong in (M2-6 reports it).
-    switch (result.outcome) {
-      case OperationOutcome::kFailed:
-        ++report.failed;
-        report.warnings.push_back(result.message);
-        break;
-      case OperationOutcome::kNotUnderstood:
-        ++report.not_understood;
-        report.warnings.push_back(result.message);
-        break;
-      case OperationOutcome::kCanceled:
-        // Counted nowhere: the caller stopped this one, and the rest are not
-        // attempted at all.
-        report.canceled = true;
-        break;
-      case OperationOutcome::kNoOp:
-      case OperationOutcome::kUploaded:
-      case OperationOutcome::kDownloaded:
-      case OperationOutcome::kKeptBoth:
-      case OperationOutcome::kRemoved:
-      case OperationOutcome::kKept:
-        // A kept delete is the plan obeyed too: the server's ruling was that
-        // this copy is not to be uploaded, and it is not.
-        ++report.completed;
-        break;
+    // A failure and an action not understood are each a line of their own, and
+    // the result keeps where its line is (`OperationResult::warning`). The
+    // totals are `Recount`'s, below.
+    if (result.outcome == OperationOutcome::kFailed ||
+        result.outcome == OperationOutcome::kNotUnderstood) {
+      result.warning = static_cast<std::int32_t>(report.warnings.size());
+      report.warnings.push_back(result.message);
     }
+    // A decline is said when it is news and not when it is met again (#257);
+    // the plan obeyed for a save makes its next decline news. The line leads
+    // with the word a user searches the log for, as the scan's skips do.
+    if (result.outcome == OperationOutcome::kDeclined) {
+      const ClientSaveState* local =
+          options.reported != nullptr ? FindByKey(*options.reported, KeyOf(operation)) : nullptr;
+      if (options.declines == nullptr ||
+          options.declines->Note(operation, result,
+                                 local != nullptr ? local->content_hash : std::nullopt)) {
+        report.declines.push_back("declined " + result.message);
+      }
+    } else if (options.declines != nullptr && Obeyed(result.outcome)) {
+      options.declines->Forget(operation);
+    }
+    report.canceled = report.canceled || result.outcome == OperationOutcome::kCanceled;
     // The two failures that are not about one operation. A cancellation was
-    // never attempted; a 401 or a 403 was, and failed -- so it is counted above,
-    // and only the operations *after* it go unattempted.
+    // never attempted; a 401 or a 403 was, and failed -- so it is counted, and
+    // only the operations *after* it go unattempted.
     const bool refused_the_token = result.error == OperationError::kUnauthorized ||
                                    result.error == OperationError::kForbidden;
     report.unauthorized = report.unauthorized || refused_the_token;
@@ -1255,6 +1473,7 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
     }
   }
 
+  Recount(&report);
   return report;
 }
 

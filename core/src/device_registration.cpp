@@ -72,7 +72,7 @@ std::optional<Registration> Refused(const http::Result& result, std::string_view
   // fall through they would land on `kMalformed`, which is neither retryable
   // nor re-pairable -- so a rate-limited boot would wedge registration until
   // the console was rebooted, instead of backing off for a minute.
-  if (status >= 500 || status == 429 || status == 408) {
+  if (http::TransientStatus(status)) {
     return Fail(RegistrationError::kServerError,
                 std::string(what) + ": HTTP " + std::to_string(status) +
                     (status == 429 ? "; the server is rate limiting" : ""));

@@ -109,9 +109,32 @@ bool Mentions(const std::vector<rs::config::Diagnostic>& diagnostics, const std:
   return false;
 }
 
-bool Mentions(const std::vector<std::string>& diagnostics, const std::string& what) {
+/// Whether `text` is the one "newer release" sentence every record says (#255):
+/// the file, the version it is, that a newer release wrote it, and what to
+/// install. Spelled out rather than built with `records::NewerRelease`, so a
+/// record that phrased it its own way -- as `state.db` once said "does not begin
+/// with", which reads as corruption -- fails here.
+bool SaysNewer(const std::string& text, const std::string& file, int version) {
+  return text.find(file + " is version " + std::to_string(version) +
+                   ", written by a newer release than this sys-rommsync, which reads version ") !=
+             std::string::npos &&
+         text.find("install sys-rommsync and the overlay from the release that wrote it") !=
+             std::string::npos;
+}
+
+bool SaysNewer(const std::vector<std::string>& diagnostics, const std::string& file, int version) {
   for (const std::string& one : diagnostics) {
-    if (one.find(what) != std::string::npos) {
+    if (SaysNewer(one, file, version)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SaysNewer(const std::vector<rs::config::Diagnostic>& diagnostics, const std::string& file,
+               int version) {
+  for (const rs::config::Diagnostic& one : diagnostics) {
+    if (SaysNewer(one.Describe(), file, version)) {
       return true;
     }
   }
@@ -200,8 +223,9 @@ void ConfigIni(checks::Checks& c) {
   c.ExpectEq(refused.version, rs::config::kConfigVersion + 1, "config.ini newer: its version");
   c.ExpectEq(Count(refused, rs::config::Severity::kError), std::size_t{1},
              "config.ini newer: exactly one error -- " + refused.DescribeDiagnostics());
-  c.Expect(Mentions(refused.diagnostics, "newer") && Mentions(refused.diagnostics, "sys-rommsync"),
-           "config.ini newer: the error says what to update -- " + refused.DescribeDiagnostics());
+  c.Expect(SaysNewer(refused.diagnostics, "config.ini", rs::config::kConfigVersion + 1),
+           "config.ini newer: the error is the one newer-release sentence -- " +
+               refused.DescribeDiagnostics());
   c.Expect(!refused.value.configured(), "config.ini newer: none of it is in force");
   c.ExpectEq(refused.value.sync.interval_min, rs::config::Defaults().sync.interval_min,
              "config.ini newer: not even the keys this build knows");
@@ -283,7 +307,9 @@ void StateDb(checks::Checks& c) {
       Bumped(rc1, "rommsync-state " + std::to_string(kRc1State),
              "rommsync-state " + std::to_string(rs::state::kFormatVersion + 1)));
   c.Expect(newer.value.empty(), "state.db newer: discarded");
-  c.Expect(!newer.diagnostics.empty(), "state.db newer: and said");
+  c.Expect(SaysNewer(newer.diagnostics, "state.db", rs::state::kFormatVersion + 1),
+           "state.db newer: said as a newer release's, not as a file that is not one -- " +
+               newer.DescribeDiagnostics());
 }
 
 // --- queue.json: discard, both ways ---------------------------------------------------
@@ -351,7 +377,8 @@ void ConflictsDb(checks::Checks& c) {
   rs::conflicts::History history(path.string());
   const std::vector<std::string> complaints = history.Load();
   c.Expect(history.entries().empty(), "conflicts.db newer: not read");
-  c.Expect(Mentions(complaints, "newer"), "conflicts.db newer: and said so");
+  c.Expect(SaysNewer(complaints, "conflicts.db", rs::conflicts::kFormatVersion + 1),
+           "conflicts.db newer: and said as the one newer-release sentence");
 
   rs::conflicts::Entry entry = read.entries.empty() ? rs::conflicts::Entry{} : read.entries[1];
   const rs::conflicts::StoreResult appended = history.Append(entry);
@@ -384,10 +411,18 @@ void PlayDb(checks::Checks& c) {
                "play.db: written differently under rc1's version -- bump kFormatVersion");
   }
 
+  // Version 2 (#261) added a title to each row; rc1's are read above, with
+  // their titles unknown.
+  if (read.sessions.size() == 2) {
+    c.Expect(!read.sessions[0].session.title_id.has_value(),
+             "play.db rc1: a session from before titles has none");
+  }
   const rs::play::LoadedBuffer newer = rs::play::ParseBuffer(
-      Bumped(rc1, "rommsync-play-sessions " + std::to_string(rs::play::kFormatVersion) + " ",
+      Bumped(rc1, "rommsync-play-sessions " + std::to_string(kRc1Play) + " ",
              "rommsync-play-sessions " + std::to_string(rs::play::kFormatVersion + 1) + " "));
   c.Expect(newer.sessions.empty() && !newer.diagnostics.empty(), "play.db newer: discarded");
+  c.Expect(SaysNewer(newer.diagnostics, "play.db", rs::play::kFormatVersion + 1),
+           "play.db newer: said as a newer release's, not as a file that is not one");
 }
 
 // --- auth.json: discard, both ways ---------------------------------------------------
@@ -444,9 +479,8 @@ void TokenDat(checks::Checks& c) {
   c.Expect(refused.error == rs::auth::StoreError::kNewerFormat,
            std::string("token.dat newer: refused as newer, not read from .old -- ") +
                rs::auth::ToString(refused.error));
-  c.Expect(refused.message.find("newer") != std::string::npos &&
-               refused.message.find("sys-rommsync") != std::string::npos,
-           "token.dat newer: the message says what to update -- " + refused.message);
+  c.Expect(SaysNewer(refused.message, "token.dat", rs::auth::kTokenFormatVersion + 1),
+           "token.dat newer: the message is the one newer-release sentence -- " + refused.message);
   c.Expect(refused.message.find("fixture-token-not-a-secret") == std::string::npos,
            "token.dat newer: and never quotes the token");
   c.ExpectEq(Slurp(path), newer, "token.dat newer: untouched");

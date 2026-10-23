@@ -226,6 +226,17 @@ constexpr WriteOutcome kAllWriteOutcomes[] = {
     WriteOutcome::kWriteFailed,
 };
 
+constexpr config::OnServerDelete kAllOnServerDeletes[] = {
+    config::OnServerDelete::kRemove,
+    config::OnServerDelete::kKeep,
+};
+
+constexpr config::SourceMode kAllSourceModes[] = {
+    config::SourceMode::kAuto,
+    config::SourceMode::kOn,
+    config::SourceMode::kOff,
+};
+
 constexpr ListKind kAllListKinds[] = {
     ListKind::kPlatforms,
     ListKind::kRoms,
@@ -236,6 +247,7 @@ constexpr conflicts::RestoreOutcome kAllRestoreOutcomes[] = {
     conflicts::RestoreOutcome::kRestored,      conflicts::RestoreOutcome::kNoSuchEntry,
     conflicts::RestoreOutcome::kNothingToRestore, conflicts::RestoreOutcome::kBackupMissing,
     conflicts::RestoreOutcome::kBackupFailed,  conflicts::RestoreOutcome::kWriteFailed,
+    conflicts::RestoreOutcome::kNotAConflict,
 };
 
 constexpr RestorePhase kAllRestorePhases[] = {
@@ -516,6 +528,8 @@ const char* ToString(Command command) {
       return "GetLog";
     case Command::kGetRestoreState:
       return "GetRestoreState";
+    case Command::kKeepLocal:
+      return "KeepLocal";
   }
   return "Unknown";
 }
@@ -838,6 +852,13 @@ std::string EncodeConfigView(const ConfigView& view) {
   AppendBool(&out, "saves", view.config.sync.saves);
   AppendBool(&out, "states", view.config.sync.states);
   AppendBool(&out, "conflict_show", view.config.sync.conflict_show);
+  AppendText(&out, "on_server_delete", config::ToString(view.config.sync.on_server_delete));
+  out += '}';
+
+  AppendKey(&out, "sources");
+  out += '{';
+  AppendText(&out, "retroarch", config::ToString(view.config.sources.retroarch), /*first=*/true);
+  AppendBool(&out, "retroarch_content_dir", view.config.sources.retroarch_content_dir);
   out += '}';
 
   AppendKey(&out, "downloads");
@@ -876,7 +897,18 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
             !ReadBool(*sync_section, "on_boot", &out->config.sync.on_boot, error) ||
             !ReadBool(*sync_section, "saves", &out->config.sync.saves, error) ||
             !ReadBool(*sync_section, "states", &out->config.sync.states, error) ||
-            !ReadBool(*sync_section, "conflict_show", &out->config.sync.conflict_show, error)) {
+            !ReadBool(*sync_section, "conflict_show", &out->config.sync.conflict_show, error) ||
+            !ReadEnum(*sync_section, "on_server_delete", kAllOnServerDeletes, config::ToString,
+                      "remove or keep", &out->config.sync.on_server_delete, error)) {
+          return;
+        }
+
+        const json::Value* sources = ReadObject(object, "sources", error);
+        if (sources == nullptr ||
+            !ReadEnum(*sources, "retroarch", kAllSourceModes, config::ToString,
+                      "auto, on or off", &out->config.sources.retroarch, error) ||
+            !ReadBool(*sources, "retroarch_content_dir",
+                      &out->config.sources.retroarch_content_dir, error)) {
           return;
         }
         out->config.sync.interval_min = static_cast<int>(interval);

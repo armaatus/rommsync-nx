@@ -84,6 +84,22 @@ const char* EventText(conflicts::Event event, conflicts::EntryKind kind) {
   return "overwritten";
 }
 
+constexpr ConflictChoice kChoices[] = {ConflictChoice::kKeepServer, ConflictChoice::kKeepLocal,
+                                       ConflictChoice::kSkip};
+constexpr int kLastChoice = static_cast<int>(std::size(kChoices)) - 1;
+
+const char* ChoiceLabel(ConflictChoice choice) {
+  switch (choice) {
+    case ConflictChoice::kKeepServer:
+      return "Keep server";
+    case ConflictChoice::kKeepLocal:
+      return "Keep local";
+    case ConflictChoice::kSkip:
+      return "Skip";
+  }
+  return "Skip";
+}
+
 Restorability RestorabilityOf(const ipc::ConflictRow& row) {
   if (!conflicts::Overwrote(row.entry.event)) {
     // Nothing was replaced -- a state both sides kept. The only case where
@@ -124,6 +140,35 @@ const char* ToString(Restorability restorability) {
       return "backup_gone";
   }
   return "ready";
+}
+
+const char* ToString(ConflictChoice choice) {
+  switch (choice) {
+    case ConflictChoice::kKeepServer:
+      return "keep_server";
+    case ConflictChoice::kKeepLocal:
+      return "keep_local";
+    case ConflictChoice::kSkip:
+      return "skip";
+  }
+  return "skip";
+}
+
+std::string_view ChoiceMeaning(ConflictChoice choice) {
+  // Hard rule 3, three ways. Keep server is what already happened; Keep local
+  // is the player overruling the server, and says so in those words, because
+  // it is the one press on this console that does.
+  switch (choice) {
+    case ConflictChoice::kKeepServer:
+      return "The server's copy stays on the card, as the sync left it. Nothing is sent.";
+    case ConflictChoice::kKeepLocal:
+      return "This console's bytes go back on the card, and the next sync uploads them over "
+             "the server's copy. RomM deletes nothing: that copy stays on the server behind "
+             "this one.";
+    case ConflictChoice::kSkip:
+      return "Decide later. Nothing changes, and this choice stays here.";
+  }
+  return {};
 }
 
 std::string_view RestoreMeaning() {
@@ -178,6 +223,8 @@ std::string RestoreOutcomeText(const conflicts::RestoreReport& report) {
              "backed up first";
     case conflicts::RestoreOutcome::kWriteFailed:
       return "The backup was made and the restore did not land. The file is as it was.";
+    case conflicts::RestoreOutcome::kNotAConflict:
+      return "Nothing was written: Keep local is only for a save conflict";
   }
   return "The restore did not happen";
 }
@@ -192,6 +239,7 @@ Tone RestoreOutcomeTone(conflicts::RestoreOutcome outcome) {
     case conflicts::RestoreOutcome::kBackupMissing:
     case conflicts::RestoreOutcome::kBackupFailed:
     case conflicts::RestoreOutcome::kWriteFailed:
+    case conflicts::RestoreOutcome::kNotAConflict:
       return Tone::kBad;
   }
   return Tone::kBad;
@@ -216,6 +264,11 @@ void ConflictsModel::Reset() {
   lost_ = 0;
   restored_ = false;
   last_restore_ = {};
+  keep_local_wanted_ = false;
+  keeping_local_ = false;
+  last_kept_local_ = false;
+  choice_ = 0;
+  kept_server_ = 0;
   issued_ = Command::Kind::kNone;
   stale_ = false;
 }
@@ -239,9 +292,10 @@ ConflictsModel::Command ConflictsModel::Next() {
   // they have already answered, and a page fetch in front of it would be a
   // frame of nothing happening.
   if (restore_wanted_ != 0) {
-    command.kind = Command::Kind::kRestore;
+    command.kind = keep_local_wanted_ ? Command::Kind::kKeepLocal : Command::Kind::kRestore;
     command.entry_id = restore_wanted_;
     restoring_ = restore_wanted_;
+    keeping_local_ = keep_local_wanted_;
     issued_ = command.kind;
     return command;
   }
@@ -311,7 +365,8 @@ void ConflictsModel::OnPage(const ipc::ConflictPage& page) {
 
 void ConflictsModel::OnRestoreState(const ipc::RestoreState& state) {
   const Command::Kind asked = issued_;
-  if (asked != Command::Kind::kRestore && asked != Command::Kind::kRestoreState) {
+  const bool pressed = asked == Command::Kind::kRestore || asked == Command::Kind::kKeepLocal;
+  if (!pressed && asked != Command::Kind::kRestoreState) {
     return;
   }
   issued_ = Command::Kind::kNone;
@@ -330,7 +385,7 @@ void ConflictsModel::OnRestoreState(const ipc::RestoreState& state) {
     FinishRestore(state.report);
     return;
   }
-  if (asked == Command::Kind::kRestore && state.phase == ipc::RestorePhase::kRunning) {
+  if (pressed && state.phase == ipc::RestorePhase::kRunning) {
     // Another restore is out -- one started by an earlier open of this overlay
     // -- and this press started nothing. `kBackupFailed`'s promise is exactly
     // what holds: nothing was written.
@@ -354,7 +409,9 @@ void ConflictsModel::OnRestoreState(const ipc::RestoreState& state) {
 
 void ConflictsModel::FinishRestore(const conflicts::RestoreReport& report) {
   const std::int64_t restored = restoring_;
+  const bool kept_local = keeping_local_;
   restoring_ = 0;
+  keeping_local_ = false;
   awaiting_ = false;
   // The outcome is drawn on the entry it is about, and only there: a user who
   // left for the list while it copied is not pulled back to it, and one who
@@ -362,6 +419,7 @@ void ConflictsModel::FinishRestore(const conflicts::RestoreReport& report) {
   if (opened_ == restored) {
     restored_ = true;
     last_restore_ = report;
+    last_kept_local_ = kept_local;
     // Back to the entry, with the outcome on it. Staying on the confirmation
     // would invite a second press of a thing that has already happened.
     if (mode_ == ConflictsMode::kConfirm) {
@@ -393,11 +451,13 @@ void ConflictsModel::FinishRestore(const conflicts::RestoreReport& report) {
 void ConflictsModel::OnRefused(ipc::Error error) {
   const Command::Kind refused = issued_;
   issued_ = Command::Kind::kNone;
-  if (refused == Command::Kind::kRestore || refused == Command::Kind::kRestoreState) {
-    // Neither command is documented to fail at the transport (ipc.hpp), so a
+  if (refused == Command::Kind::kRestore || refused == Command::Kind::kRestoreState ||
+      refused == Command::Kind::kKeepLocal) {
+    // None of them is documented to fail at the transport (ipc.hpp), so a
     // refusal here is the two halves disagreeing about the contract. Reported
     // as a restore that did not happen, which is the true and actionable half.
     restore_wanted_ = 0;
+    keep_local_wanted_ = false;
     conflicts::RestoreReport report;
     report.outcome = conflicts::RestoreOutcome::kWriteFailed;
     report.message = ipc::ToString(error);
@@ -426,9 +486,11 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
         loading_ = false;  // asked again once it answers
         break;
       case Command::Kind::kRestore:
+      case Command::Kind::kKeepLocal:
         // It may have been taken. Asked about, never sent again: a second
         // press the user did not make is a second overwrite of their save.
         restore_wanted_ = 0;
+        keep_local_wanted_ = false;
         awaiting_ = true;
         break;
       case Command::Kind::kRestoreState:
@@ -441,7 +503,9 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
   issued_ = Command::Kind::kNone;
   loading_ = false;
   restore_wanted_ = 0;
+  keep_local_wanted_ = false;
   restoring_ = 0;
+  keeping_local_ = false;
   awaiting_ = false;
   stale_ = true;
 }
@@ -459,6 +523,13 @@ void ConflictsModel::OnLinkRestored() {
 }
 
 void ConflictsModel::MoveSelection(int delta) {
+  if (mode_ == ConflictsMode::kConfirm) {
+    const ipc::ConflictRow* row = Current();
+    if (row != nullptr && row->entry.save_conflict()) {
+      choice_ = std::clamp(choice_ + delta, 0, kLastChoice);
+    }
+    return;
+  }
   if (mode_ != ConflictsMode::kList || rows_.empty()) {
     return;
   }
@@ -520,6 +591,10 @@ void ConflictsModel::Activate() {
       }
       restored_ = false;
       lost_ = 0;
+      kept_server_ = 0;
+      // Keep server first: it is what the sync already did, so an A pressed
+      // through without reading changes nothing.
+      choice_ = 0;
       mode_ = ConflictsMode::kConfirm;
       return;
     }
@@ -529,8 +604,27 @@ void ConflictsModel::Activate() {
         mode_ = ConflictsMode::kDetail;
         return;
       }
+      bool keep_local = false;
+      if (row->entry.save_conflict()) {
+        switch (kChoices[choice_]) {
+          case ConflictChoice::kKeepServer:
+            // Already done: the sync put the server's copy on the card. The
+            // detail says so, and nothing goes to the sysmodule.
+            kept_server_ = row->entry.id;
+            mode_ = ConflictsMode::kDetail;
+            return;
+          case ConflictChoice::kSkip:
+            mode_ = ConflictsMode::kList;
+            opened_ = 0;
+            return;
+          case ConflictChoice::kKeepLocal:
+            keep_local = true;
+            break;
+        }
+      }
       if (restoring_ == 0 && restore_wanted_ == 0) {
         restore_wanted_ = row->entry.id;
+        keep_local_wanted_ = keep_local;
       }
       return;
     }
@@ -546,6 +640,7 @@ bool ConflictsModel::Back() {
       mode_ = ConflictsMode::kList;
       opened_ = 0;
       restored_ = false;
+      kept_server_ = 0;
       return true;
     case ConflictsMode::kList:
       return false;
@@ -715,7 +810,19 @@ ConflictsView ConflictsModel::Render() const {
   }
 
   view.can_restore = restorable == Restorability::kReady && !restored_ && restoring_ == 0;
+  view.keep_choice = entry.save_conflict();
 
+  if (mode_ == ConflictsMode::kConfirm && view.keep_choice) {
+    for (const ConflictChoice choice : kChoices) {
+      view.choices.push_back(
+          {choice, ChoiceLabel(choice), std::string(ChoiceMeaning(choice))});
+    }
+    view.choice = choice_;
+    view.headline = "Which copy of " + view.title + " do you keep?";
+    view.hint = std::string(ChoiceMeaning(kChoices[choice_])) + " A chooses, B cancels.";
+    view.tone = Tone::kWarn;
+    return view;
+  }
   if (mode_ == ConflictsMode::kConfirm) {
     view.headline = "Put this console's bytes back at " + entry.sd_path + "?";
     view.hint = std::string(RestoreMeaning()) + " A confirms, B cancels.";
@@ -726,7 +833,7 @@ ConflictsView ConflictsModel::Render() const {
   if (restoring_ != 0 && restoring_ == entry.id) {
     // Taken, and copying on the sysmodule's worker. A frame is never held for
     // it (#209); this is what the screen says while it is not.
-    view.headline = "Restoring...";
+    view.headline = keeping_local_ ? "Keeping this console's copy..." : "Restoring...";
     view.hint = "The bytes there now are backed up first. B goes back to the list.";
     return view;
   }
@@ -737,11 +844,30 @@ ConflictsView ConflictsModel::Render() const {
     view.tone = Tone::kWarn;
     return view;
   }
+  if (restored_ && last_kept_local_ && last_restore_.ok()) {
+    view.headline = "Kept this console's copy. The next sync uploads it over the server's.";
+    view.tone = Tone::kGood;
+    view.hint = last_restore_.message.empty() ? std::string("B goes back to the list")
+                                              : last_restore_.message;
+    return view;
+  }
   if (restored_) {
     view.headline = RestoreOutcomeText(last_restore_);
     view.tone = RestoreOutcomeTone(last_restore_.outcome);
     view.hint = last_restore_.message.empty() ? std::string("B goes back to the list")
                                               : last_restore_.message;
+    return view;
+  }
+  if (restorable == Restorability::kReady && view.keep_choice) {
+    if (kept_server_ == entry.id) {
+      view.headline = "Kept the server's copy: it stays on the card, and nothing was sent";
+      view.hint = "This console's bytes stay under " + entry.backup_sd_path +
+                  ". A chooses again; B goes back to the list";
+      return view;
+    }
+    view.headline = "The server's copy is on the card; this console's is under " +
+                    entry.backup_sd_path;
+    view.hint = "A chooses which to keep; B goes back to the list";
     return view;
   }
   if (restorable == Restorability::kReady) {

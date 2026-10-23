@@ -67,13 +67,16 @@
 // state is kept on both sides forever -- and every save's digest. Its states and
 // archival rows are in force as they were; its slotted rows are held apart in
 // `LoadedBaseline::legacy_saves` and moved by `AdoptLegacySaves` to the slot
-// each file is synced in now. A newer file than this build's is discarded.
+// each file is synced in now. A newer file than this build's is discarded, and
+// said as every record says one (`records::NewerRelease`, #255).
 //
 // rc1 wrote it at rc1's bounds, 512 rows and 128 KiB, four times this build's
 // (#246). So a v2 file is read at those -- streamed a line at a time past
 // `kMaxStateBytes`, its text never held whole -- and kept to `kMaxRecords`
-// rows: states and archival rows first, then slotted rows while there is
-// room. A slotted row let go costs its save one re-hash, and is said.
+// rows: states and archival rows first, then the slotted rows first in
+// `(rom_id, slot)` order, whatever order the file has them in (#255). A slotted
+// row let go costs its save one re-hash, and is said; a row repeating one let
+// go is a second row, and discards the file as any second row does.
 //
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two
@@ -437,7 +440,24 @@ std::size_t AdoptLegacySaves(
 /// intact under `state.db.old`. A file that exists and will not open does not
 /// take it -- that is a bad moment, not a commit window -- and yields an empty
 /// baseline, which is safe here in a way it would not be for `device.dat`.
+///
+/// A file past `kMaxStateBytes` is read twice -- bounded, then streamed, for an
+/// rc1 file -- through **one** open (#255). Reopening it left a window in which
+/// `WriteAtomically`'s first rename made the file absent, and the second open's
+/// failure was then read as an unreadable file rather than the commit window
+/// `.old` exists for.
 LoadedBaseline LoadBaseline(const std::string& path);
+
+namespace testing {
+
+/// Called by `LoadBaseline` with the path after the bounded read of a file past
+/// `kMaxStateBytes` and before it is streamed: the moment another writer's
+/// rename could land, made reachable by a test. Null, the default, is nothing.
+/// Returns the hook it replaced.
+using BetweenReads = void (*)(const std::string& path);
+BetweenReads SetBetweenReads(BetweenReads hook);
+
+}  // namespace testing
 
 /// Why writing the baseline did not work. Mirrors `auth::StoreError`.
 ///

@@ -20,6 +20,7 @@
 #include <string_view>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include "checks.hpp"
 #include "scratch.hpp"
@@ -123,6 +124,23 @@ state::StateRecord FullState() {
   record.server_updated_at = At(1757000090);
   record.server_file_size_bytes = 4 * 1024 * 1024;
   return record;
+}
+
+/// A slotted save row as rc1 wrote it: version 2, keyed on the slot #236 moved.
+std::string Rc1SlottedRow(std::int64_t rom_id) {
+  return "{\"rom_id\":" + std::to_string(rom_id) +
+         ",\"slot\":\"retroarch-srm\",\"content_hash\":\"" +
+         crypto::Md5Hex(std::to_string(rom_id)) +
+         "\",\"mtime\":1757000000,\"file_size_bytes\":32768,\"server_updated_at\":1757000100,"
+         "\"server_content_hash\":null}\n";
+}
+
+/// rc1's state row for rom 1000: the kind of row nothing rebuilds.
+std::string Rc1StateRow() {
+  return "{\"kind\":\"state\",\"rom_id\":1000,\"file_name\":\"Game (USA).state\",\"emulator\":"
+         "\"tico\",\"content_hash\":\"" + crypto::Md5Hex("state") +
+         "\",\"mtime\":1757000100,\"file_size_bytes\":4,\"server_state_id\":1,"
+         "\"server_updated_at\":1757000090,\"server_file_size_bytes\":4}\n";
 }
 
 bool Mentions(const state::LoadedBaseline& loaded, const std::string& fragment) {
@@ -908,6 +926,105 @@ void ARc1FileOverTheBoundsKeepsItsStates(checks::Checks& c) {
   c.Expect(state::ParseBaseline(past).value.empty(), "a v2 file past rc1's 512 rows is discarded");
 }
 
+/// Which of an rc1 file's slotted rows survive its bound is a rule, not an
+/// accident of the order rc1 happened to write them in (#255): the first in
+/// `(rom_id, slot)` order -- the order `AdoptLegacySaves` settles a contest in
+/// -- and a row repeating one already let go is as much a second row as one
+/// repeating a row that was kept.
+void AnRc1FilesSurvivorsAreARule(checks::Checks& c) {
+  const auto row = Rc1SlottedRow;
+  const std::string state_row = Rc1StateRow();
+  // 200 slotted rows and a state: the state and 127 slotted rows fit.
+  std::string forward = "rommsync-state 2\n";
+  std::string backward = "rommsync-state 2\n" + state_row;
+  for (std::int64_t at = 0; at < 200; ++at) {
+    forward += row(1000 + at);
+    backward += row(1199 - at);
+  }
+  forward += state_row;
+
+  const auto survivors = [](const state::LoadedBaseline& loaded) {
+    std::vector<std::int64_t> ids;
+    for (const state::SaveRecord& record : loaded.legacy_saves) {
+      ids.push_back(record.rom_id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  };
+  std::vector<std::int64_t> expected;
+  for (std::int64_t at = 1000; at < 1127; ++at) {
+    expected.push_back(at);
+  }
+  const state::LoadedBaseline in_order = state::ParseBaseline(forward);
+  const state::LoadedBaseline reversed = state::ParseBaseline(backward);
+  c.Expect(in_order.value.FindState(1000, "Game (USA).state") != nullptr &&
+               reversed.value.FindState(1000, "Game (USA).state") != nullptr,
+           "the state stands either way");
+  c.Expect(survivors(in_order) == expected,
+           "written in key order, roms 1000 to 1126 survive -- " + in_order.DescribeDiagnostics());
+  c.Expect(survivors(reversed) == expected,
+           "written backwards, the same rows survive -- " + reversed.DescribeDiagnostics());
+  c.Expect(Mentions(in_order, "73 row(s)"), "and the 73 let go are counted -- " +
+                                               in_order.DescribeDiagnostics());
+
+  // rom 1150 was let go; a second row for it is a damaged file, as a second row
+  // for a kept one is.
+  const state::LoadedBaseline repeated = state::ParseBaseline(forward + row(1150));
+  c.Expect(repeated.value.empty() && repeated.legacy_saves.empty(),
+           "a row repeating one let go discards the file, like any second row");
+  c.Expect(Mentions(repeated, "a second row for the same (rom_id, slot)"),
+           "and is said -- " + repeated.DescribeDiagnostics());
+}
+
+/// `WriteAtomically`'s first rename, landing between the bounded read of a file
+/// past `kMaxStateBytes` and the streamed read of it (#255). It used to reopen
+/// the path there, find nothing, and call the file unreadable -- skipping the
+/// `.old` recovery a missing file gets, and costing the library a re-hash and
+/// rc1's states their rows.
+void ACommitWindowMidReadStillYieldsTheBaseline(checks::Checks& c) {
+  std::string v2 = "rommsync-state 2\n";
+  for (std::int64_t at = 0; at < 200; ++at) {
+    v2 += Rc1SlottedRow(1000 + at);
+  }
+  v2 += Rc1StateRow();
+  c.Expect(v2.size() > state::kMaxStateBytes, "the fixture is past this build's byte bound");
+
+  const std::filesystem::path path = FreshPath("mid-read.db");
+  WriteWhole(path.string(), v2);
+  const state::testing::BetweenReads previous =
+      state::testing::SetBetweenReads([](const std::string& at) {
+        std::error_code ignored;
+        std::filesystem::rename(at, io::PreviousPathFor(at), ignored);
+      });
+  const state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  state::testing::SetBetweenReads(previous);
+
+  c.Expect(!std::filesystem::exists(path) &&
+               std::filesystem::exists(io::PreviousPathFor(path.string())),
+           "the rename did land mid-read");
+  c.ExpectEq(loaded.version, state::kSourceSlotVersion,
+             "the baseline is still read -- " + loaded.DescribeDiagnostics());
+  c.Expect(loaded.value.FindState(1000, "Game (USA).state") != nullptr,
+           "with rc1's state row, which nothing rebuilds");
+  c.Expect(!Mentions(loaded, "could not be read"),
+           "and not called unreadable -- " + loaded.DescribeDiagnostics());
+}
+
+/// A later release's file past this build's byte bound is still a later
+/// release's file, said as one -- not "larger than a baseline can be".
+void ANewerFilePastTheBoundIsStillNewer(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("newer-huge.db");
+  std::string text = "rommsync-state " + std::to_string(state::kFormatVersion + 1) + "\n";
+  while (text.size() <= state::kMaxStateBytes) {
+    text += "{\"a row\":\"of a format this build has never seen\"}\n";
+  }
+  WriteWhole(path.string(), text);
+  const state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  c.Expect(loaded.value.empty(), "a newer state.db past the bound is discarded");
+  c.Expect(Mentions(loaded, "written by a newer release"),
+           "as a newer release's -- " + loaded.DescribeDiagnostics());
+}
+
 void TooManyRowsIsRefused(checks::Checks& c) {
   std::string text = std::string(state::kFormatMagic) + " " +
                      std::to_string(state::kFormatVersion) + "\n";
@@ -1070,6 +1187,9 @@ int main() {
   AnUnusableOldIsNotABrandNewCard(c);
   OversizedFilesAreRefusedBySize(c);
   ARc1FileOverTheBoundsKeepsItsStates(c);
+  AnRc1FilesSurvivorsAreARule(c);
+  ACommitWindowMidReadStillYieldsTheBaseline(c);
+  ANewerFilePastTheBoundIsStillNewer(c);
   TooManyRowsIsRefused(c);
   AMissingFileIsReportedAndNotAFailure(c);
   HashesAFileTheWayTheServerWill(c);

@@ -84,6 +84,20 @@ phase_ci() {
     fail "switch-build still reports a skipped build as a notice"
   fi
 
+  # M9-29 (#256): the uploaded artifacts are read by scripts/artifact-check.py,
+  # the parser the toolchain entries use, and not by a second, hand-kept one in
+  # YAML -- `head -c 4` for PFS0, `tail -c 4` for ULTR, `dd skip=16` for NRO0.
+  # Each of the three files is named to it, so none can be dropped quietly.
+  local artifact
+  for artifact in sysmodule/sys-rommsync.nsp overlay/ovl-rommsync.ovl \
+                  tlsprobe/rommsync-tlsprobe.nro; do
+    grep -A4 'scripts/artifact-check.py container' <<<"$job" | grep -q "$artifact" ||
+      fail "switch-build does not hold $artifact to its container with scripts/artifact-check.py (#256)"
+  done
+  if grep -qE 'head -c|tail -c|dd if=' <<<"$job"; then
+    fail "switch-build reads an artifact's magic by hand; scripts/artifact-check.py is the parser (#256)"
+  fi
+
   # A green job that uploaded nothing is the same failure wearing a different
   # hat, so the upload has to be the thing that goes red.
   grep -q 'if-no-files-found: error' <<<"$job" ||
@@ -131,39 +145,75 @@ check_no_warnings() {
   fi
 }
 
-# M9-9 (#200): every object this build compiles -- ours, core/'s and the
-# vendored libultrahand alike -- carries no unwind table. The targets are
+# M9-9 (#200): the code this build compiles -- ours, core/'s and the vendored
+# libultrahand alike -- carries no unwind table. The targets are
 # -fno-exceptions, so nothing ever unwinds through them, and `.eh_frame` sits in
 # the rodata segment, resident for as long as the process is
-# (docs/DEVELOPMENT.md#what-the-image-costs). Checked per object rather than
-# only on the linked total, because the total also holds libnx's, newlib's and
-# libstdc++'s prebuilt tables, which no flag of ours can remove -- a flag lost
-# from one compile would hide inside them.
+# (docs/DEVELOPMENT.md#what-the-image-costs). Checked per input file rather
+# than only on the linked total, because the total also holds libnx's, newlib's
+# and libstdc++'s prebuilt tables, which no flag of ours can remove -- a flag
+# lost from one compile would hide inside them.
 #
-# The container reports every object it inspected, and the count has to match
-# the objects on this side: an empty "found none" from a container that never
-# ran, or a readelf that failed, is the vacuous pass this file keeps refusing.
+# Read off the link map, not the objects (#253): under LTO an object is GIMPLE
+# with no code in it, and the code that ships is generated at the link, into
+# LTRANS objects that are gone by the time the link returns. The map still names
+# every input section the image took and which file it came from -- an
+# `*.ltrans.o` under LTO, a `json.o` without it -- so "ours" is any file not
+# under devkitPro's own tree, and an `.eh_frame` of any size from one is the
+# failure. A map that names no code of ours at all is refused too: that is the
+# vacuous pass this file keeps refusing.
+
+# unwind_report MAP -- `code N`, the input .text sections from files of ours,
+# then `unwind FILE SIZE` for each .eh_frame one of them contributed.
+unwind_report() {
+  awk '
+    function input(name, size, file) {
+      if (file ~ /\/devkitpro\//) return
+      if (name ~ /^\.text/ && size !~ /^0x0+$/) code++
+      if (name == ".eh_frame" && size !~ /^0x0+$/) unwind[++n] = file " " size
+    }
+    /^Linker script and memory map/ { body = 1; next }
+    !body { next }
+    # A long section name is wrapped: alone on its line, the rest on the next.
+    NF == 4 && $1 ~ /^\./ && $2 ~ /^0x/ && $3 ~ /^0x/ { input($1, $3, $4); pending = ""; next }
+    NF == 1 && $1 ~ /^\./ { pending = $1; next }
+    NF == 3 && pending != "" && $1 ~ /^0x/ && $2 ~ /^0x/ { input(pending, $2, $3) }
+    { pending = "" }
+    END { print "code", code + 0; for (i = 1; i <= n; i++) print "unwind", unwind[i] }
+  ' "$1"
+}
+
 check_unwind_tables() {
-  local target expected=0 report
+  local target maps report
   for target in "$@"; do
-    local objects=("$SCRATCH/$target/build/"*.o)
-    [ -f "${objects[0]}" ] ||
-      fail "no objects in $target/build; the unwind-table check would pass vacuously"
-    expected=$(( expected + ${#objects[@]} ))
-  done
-  report="$(toolchain_run "$SCRATCH" 'for t in "$@"; do for o in "$t"/build/*.o; do
-                  sections="$("$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-readelf -SW "$o")" ||
-                    { echo "unreadable $o"; continue; }
-                  if grep -q "\.eh_frame" <<<"$sections"; then echo "unwind $o"; else echo "clean $o"; fi
-                done; done' "$@")" || fail "the toolchain inspecting the objects failed"
-  [ "$(grep -c '^clean \|^unwind ' <<<"$report")" -eq "$expected" ] ||
-    fail "inspected $(grep -c '^clean \|^unwind ' <<<"$report") of $expected objects:
-$report"
-  if grep -q '^unwind ' <<<"$report"; then
-    fail "these objects were compiled with unwind tables (switch.mk lost \
--fno-unwind-tables -fno-asynchronous-unwind-tables for them):
+    maps=("$SCRATCH/$target/build/"*.map)
+    [ "${#maps[@]}" -eq 1 ] && [ -s "${maps[0]}" ] ||
+      fail "no single link map in $target/build; the unwind-table check would pass vacuously"
+    report="$(unwind_report "${maps[0]}")"
+    [ "$(awk '$1 == "code" { print $2 }' <<<"$report")" -gt 0 ] ||
+      fail "$target's link map names no code this build compiled; is it still a map of ours?"
+    if grep -q '^unwind ' <<<"$report"; then
+      fail "$target links unwind tables from code this build compiled (switch.mk lost \
+-fno-unwind-tables -fno-asynchronous-unwind-tables for it):
 $(sed -n 's/^unwind //p' <<<"$report")"
-  fi
+    fi
+  done
+}
+
+# ...and the check, shown to bite: the sysmodule's own map with one unwind table
+# from an LTRANS object appended, as a build that lost the flags would link it.
+check_unwind_tables_bite() {
+  local out
+  mkdir -p "$SCRATCH/doctored/build"
+  cp "$SCRATCH"/sysmodule/build/*.map "$SCRATCH/doctored/build/doctored.map"
+  printf ' .eh_frame      0x0000000000091d00       0x40 /tmp/ccDOCTOR.ltrans0.ltrans.o\n' \
+    >>"$SCRATCH/doctored/build/doctored.map"
+  # A subshell, because `fail` exits: here that exit is the result wanted.
+  out="$( (check_unwind_tables doctored) 2>&1 )" &&
+    fail "an LTRANS object's unwind table in the link map passed the check"
+  grep -q 'ccDOCTOR.ltrans0.ltrans.o 0x40' <<<"$out" ||
+    { echo "$out" >&2; fail "the doctored map failed, but not on the unwind table put in it"; }
+  rm -rf "$SCRATCH/doctored"
 }
 
 # image_budget [ARGS] -- scripts/image-budget.sh over the build in $SCRATCH,
@@ -261,10 +311,11 @@ phase_builds() {
   local ovl="$SCRATCH/overlay/ovl-rommsync.ovl"
   [ -s "$nsp" ] || fail "no sys-rommsync.nsp"
   [ -s "$ovl" ] || fail "no ovl-rommsync.ovl"
-  [ "$(head -c 4 "$nsp")" = "PFS0" ] || fail "sys-rommsync.nsp is not a PFS0 archive"
-  # Without this Ultrahand does not list the overlay, and nothing else about the
-  # file looks wrong -- see overlay/README.md.
-  [ "$(tail -c 4 "$ovl")" = "ULTR" ] || fail "ovl-rommsync.ovl has no ULTR signature"
+  # A PFS0 holding the NSO and the NPDM, and an NRO with ULTR at its end --
+  # without which Ultrahand does not list the overlay, and nothing else about
+  # the file looks wrong (overlay/README.md). Read by the one parser (#256).
+  "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" container "$nsp" "$ovl" ||
+    fail "an artifact is not the container its name says"
 
   # switch.mk generates version.hpp the way CMake does for the host build, from
   # the same VERSION file and the same template.
@@ -283,8 +334,11 @@ phase_builds() {
   done
 
   # ...and core code reached the image, not just the linker's input. The .lst is
-  # the toolchain's own demangled symbol dump of the linked ELF.
-  grep -q 'rommsync::version()' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
+  # the toolchain's own demangled symbol dump of the linked ELF. `json::Parse`,
+  # not `version()` (#253): under LTO a function small enough is inlined into
+  # every caller and has no symbol left, and the parser, called from every
+  # corner of the engine, is not one.
+  grep -q 'rommsync::json::Parse(' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
     fail "no core/ symbol in the linked sysmodule"
 
   # No printf formatter. newlib's `_svfprintf_r` comes in only through a
@@ -295,14 +349,35 @@ phase_builds() {
   ! grep -qE '(^| )_svfprintf_r$' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
     fail "the sysmodule links newlib's _svfprintf_r: something calls snprintf; build the line with std::to_chars instead"
 
+  # No floating-point parser in either image (#253). libstdc++'s
+  # `from_chars(..., double&)` is fast_float, ~23 KiB of code and tables, and
+  # json.cpp was its only caller, converting numbers nothing read as doubles.
+  # json.hpp records the decision; this is what keeps a `from_chars` into a
+  # double from quietly bringing it back.
+  local listing
+  for listing in sysmodule/build/sys-rommsync.lst overlay/build/ovl-rommsync.lst; do
+    [ -s "$SCRATCH/$listing" ] || fail "no $listing; the from_chars check would pass vacuously"
+    ! grep -qE 'std::from_chars\(char const\*, char const\*, (double|float|long double)&' \
+        "$SCRATCH/$listing" ||
+      fail "$listing links libstdc++'s floating-point from_chars (fast_float); json.hpp says \
+why the image does without it"
+  done
+
   check_unwind_tables sysmodule overlay
+  check_unwind_tables_bite
   check_image_budget
 
   # The sysmodule hosts the service the overlay opens (M4-1). Nothing in this
   # repo can run it before the M8-1 gate, so this is the only automated check
-  # that the loop is still in the image at all.
-  grep -q 'rommsync::sysmodule::ServiceServer::Serve' "$SCRATCH/sysmodule/build/sys-rommsync.lst" ||
-    fail "the sysmodule does not host the IPC service"
+  # that the loop is still in the image at all: it claims the name, and it
+  # answers commands. Named by what LTO cannot inline away (#253) --
+  # `ServiceServer::Serve` has one caller, and is folded into `main` -- libnx's
+  # registration call and the dispatcher every command goes through.
+  local lst="$SCRATCH/sysmodule/build/sys-rommsync.lst" symbol
+  for symbol in 'smRegisterServiceCmif' 'rommsync::ipc::Dispatch('; do
+    grep -qF "$symbol" "$lst" ||
+      fail "the sysmodule does not host the IPC service: no $symbol in the linked image"
+  done
   # The name it registers has to be in the NPDM's service_host or the kernel
   # refuses the registration at boot, and the failure is a process that is not
   # there rather than an error anyone sees.
@@ -390,10 +465,9 @@ phase_tlsprobe() {
 
   local nro="$SCRATCH/tlsprobe/rommsync-tlsprobe.nro"
   [ -s "$nro" ] || fail "no rommsync-tlsprobe.nro"
-  # NRO0 sits at 0x10; the first 16 bytes are the entry branch and the mod0
-  # offset. A .nro without it is a file hbmenu will not launch.
-  [ "$(dd if="$nro" bs=1 skip=16 count=4 2>/dev/null)" = "NRO0" ] ||
-    fail "rommsync-tlsprobe.nro has no NRO0 magic"
+  # An NRO, which is what hbmenu launches -- read by the one parser (#256).
+  "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" container "$nro" ||
+    fail "rommsync-tlsprobe.nro is not an NRO"
   # hbmenu launches it on the same HOS 21.0.0 kernel the shipped two run on.
   "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" lny2 "$nro" ||
     fail "the probe lacks libnx's LNY2 stamp"
@@ -414,9 +488,17 @@ phase_tlsprobe() {
   # check: an absent file makes grep exit 1, which reads as "no core symbol
   # found" and passes. The path comes from devkitPro's base_rules rather than
   # from switch.mk, so it can move without anything in this repo changing.
-  local lst="$SCRATCH/tlsprobe/build/rommsync-tlsprobe.lst"
+  #
+  # No symbol of core/'s at all, rather than the absence of one core/
+  # function: under LTO (#253) a small function is inlined away whether or not
+  # its unit was linked. Every core/ unit defines its code in a namespace
+  # nested in `rommsync::`, or is `rommsync::version()`; the probe itself names
+  # only the generated `rommsync::kVersion` constant, which neither pattern
+  # matches.
+  local lst="$SCRATCH/tlsprobe/build/rommsync-tlsprobe.lst" core='rommsync::(version\(|[A-Za-z_]+::)'
   [ -s "$lst" ] || fail "no symbol listing at $lst; the core/ check would pass vacuously"
-  if grep -q 'rommsync::version()' "$lst"; then
+  if grep -qE "$core" "$lst"; then
+    grep -E "$core" "$lst" | head -n 5 >&2
     fail "core/ was linked into the probe; its footprint no longer means what it says"
   fi
 
@@ -429,7 +511,73 @@ phase_tlsprobe() {
   toolchain_run "$SCRATCH" \
     '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size tlsprobe/rommsync-tlsprobe.elf'
 
+  # The footprint measurement compiles with what make makes of switch.mk, and
+  # that is every flag switch.mk spells (#256). make's answer against the
+  # file's text: a derivation that came back empty, or lost a flag, fails here.
+  local derived cxxflags ldflags flag
+  derived="$(bash "$REPO_ROOT/tlsprobe/measure-footprint.sh" --flags)" ||
+    fail "measure-footprint.sh --flags could not read switch.mk's flags"
+  cxxflags=" $(sed -n 's/^CXXFLAGS=//p' <<<"$derived") "
+  ldflags=" $(sed -n 's/^LDFLAGS=//p' <<<"$derived") "
+  [[ "$ldflags" == *" -specs="*"/switch.specs "* ]] ||
+    fail "measure-footprint.sh would link without libnx's switch.specs: $derived"
+  while read -r flag; do
+    [[ "$cxxflags" == *" $flag "* ]] ||
+      fail "measure-footprint.sh would compile without switch.mk's $flag: $derived"
+  done < <(switch_mk_flags)
+  while read -r flag; do
+    [[ "$ldflags" == *" $flag "* ]] ||
+      fail "measure-footprint.sh would link without switch.mk's $flag: $derived"
+  done < <(switch_mk_ldflags)
+  echo "$derived"
+
   echo "ok: the M0-1 probe builds as an NRO carrying $version, without core/"
+}
+
+# --- the footprint measurement's flags -------------------------------------------
+
+# The same for LDFLAGS: its literal flags, leaving out any that spells a make
+# variable -- `-specs=$(DEVKITPRO)/...` is a path in the image, and the map is
+# named per target.
+switch_mk_ldflags() {
+  sed -n 's/^LDFLAGS[[:space:]]*[:+]\{0,1\}=//p' "$REPO_ROOT/switch.mk" |
+    tr -s ' \t' '\n\n' | grep -E '^-' | grep -v '\$(' | sort -u
+}
+
+# The literal flags switch.mk's own definitions of ARCH, ROMMSYNC_WARNINGS,
+# CFLAGS and CXXFLAGS spell, continuation lines included, one a line. Read as
+# text, so it is an account of switch.mk independent of the make that evaluates
+# it -- which is what lets phase_tlsprobe hold one to the other.
+switch_mk_flags() {
+  awk '/^(ARCH|ROMMSYNC_WARNINGS|CFLAGS|CXXFLAGS)[[:space:]]*[:+]?=/ { grab = 1 }
+       grab { print; if ($0 !~ /\\$/) grab = 0 }' "$REPO_ROOT/switch.mk" |
+    sed 's/^[^=]*=//' | tr -s ' \t\\' '\n\n\n' | grep -E '^-' | sort -u
+}
+
+# M9-29 (#256): tlsprobe/measure-footprint.sh compiles three images to measure
+# what TLS costs a sysmodule, and the numbers mean that only with switch.mk's
+# flags. It used to carry a copy "verbatim" that was not: -Wall for
+# ROMMSYNC_WARNINGS. It now asks make for them, and this keeps a copy from
+# coming back -- none of switch.mk's flags may be spelled in the script itself.
+phase_footprint() {
+  local script="$REPO_ROOT/tlsprobe/measure-footprint.sh"
+  [ -f "$script" ] || fail "no tlsprobe/measure-footprint.sh"
+  local flags
+  flags="$(switch_mk_flags; switch_mk_ldflags; echo '-specs=')"
+  # Asserted, because an empty list would make the check below pass over a
+  # script holding the whole copy.
+  grep -qx -- '-fno-exceptions' <<<"$flags" && grep -qx -- '-Werror' <<<"$flags" ||
+    fail "read no flags out of switch.mk; the check below would pass vacuously: $flags"
+
+  # The script's words, outside its comments, split the way a shell would --
+  # and `-specs=` by its prefix, since its path is the image's to spell.
+  local spelled
+  spelled="$(grep -v '^[[:space:]]*#' "$script" | tr -s " \t\"'\\\\" '\n\n\n\n\n' |
+             sed 's/^-specs=.*/-specs=/' | sort -u | comm -12 - <(sort -u <<<"$flags"))"
+  [ -z "$spelled" ] ||
+    fail "tlsprobe/measure-footprint.sh spells switch.mk's flags itself ($(echo $spelled)); \
+read them from switch.mk, or the measurement drifts from the build (#256)"
+  echo "ok: tlsprobe/measure-footprint.sh holds no copy of switch.mk's flags"
 }
 
 # --- the entries that need the toolchain, and where they run -------------------
@@ -526,9 +674,10 @@ nothing in CI runs them: $(sed -n 's/^UNLABELLED //p' <<<"$labelled" | tr '\n' '
 }
 
 case "${1:-}" in
-  ci)       phase_ci ;;
-  builds)   phase_builds ;;
-  tlsprobe) phase_tlsprobe ;;
-  suite)    shift; phase_suite "$@" ;;
-  *)        echo "usage: $0 {ci|builds|tlsprobe|suite CTEST BUILD_DIR}" >&2; exit 2 ;;
+  ci)        phase_ci ;;
+  builds)    phase_builds ;;
+  tlsprobe)  phase_tlsprobe ;;
+  footprint) phase_footprint ;;
+  suite)     shift; phase_suite "$@" ;;
+  *)         echo "usage: $0 {ci|builds|tlsprobe|footprint|suite CTEST BUILD_DIR}" >&2; exit 2 ;;
 esac

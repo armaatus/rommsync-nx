@@ -262,7 +262,16 @@ emulator reads (an isolated `tico-*` format never goes to RetroArch, nor a
 RetroArch core's save to a Tico module that is not that core), in a file the next
 sync reads back as the same rom in the same slot, and where no file is already.
 Anything else is a failed operation with the reason in the log — never a guess,
-and never a file written over.
+and never a file written over. "Reads back" is the sync's own rule for where it
+looks, so nothing is placed in a rom folder under a name a rom folder is not
+read for, or past the first 512 entries of a folder. A `.sav` the server keeps
+in a slot of its own (`autosave-sav`) stays there: as the `.srm` the emulator
+loads, it would come back in `autosave` as a second save. A download that fails
+takes back the folders it made for the save.
+
+**`play_with` also decides which copy syncs** when one game has a save in both
+Tico's and RetroArch's folders on this card — one slot to RomM: the copy in the
+emulator it names, and the other is skipped as a *duplicate slot*.
 
 ### RetroArch: read from `retroarch.cfg`
 
@@ -275,7 +284,7 @@ Where RetroArch keeps saves is RetroArch's setting, so every sync reads it from
 | `sort_savefiles_enable = true` (the default) | each folder one level under it, `<folder>/<CoreFolder>/`, named by RomM's core table: `mGBA` is `mgba`. A folder RomM does not know is RetroArch's with no emulator id. A file directly in the parent is skipped as *outside layout*: RetroArch does not read it |
 | `sort_savefiles_enable = false` | the folder itself, every system in it, with the table above's RetroArch column |
 | `savefiles_in_content_dir = true` | the `roms` folders of the map, and in them only `.srm`/`.rtc` (`.state`, `.stateN`) — **only** with `[sources] retroarch_content_dir = true`; otherwise nothing, and a `warning` says so |
-| `sort_savefiles_by_content_enable = true` | nothing: that layout is not read, and a `warning` says so |
+| `sort_savefiles_by_content_enable = true` | nothing: that layout is not read, and a `warning` names the RetroArch setting to turn off — see below |
 | `cloud_sync_enable = true` (with `cloud_sync_sync_saves`) | nothing, unless `[sources] retroarch = on`: **RetroArch syncs itself** |
 
 A folder holds at most 512 entries as far as the client is concerned, the first
@@ -316,8 +325,26 @@ retroarch_content_dir = false  ; true reads saves RetroArch keeps beside the rom
 - `retroarch_content_dir` is off by default because the folders it reads are
   rom folders.
 
-`[sources]` is edited by hand; the overlay does not offer it. v1.0.0-rc1 warns
-that it is not a section it knows and ignores it.
+The overlay's settings screen shows `[sources]`, and a press on either row sets
+it to its next value — `auto`, `on`, `off`, and round again; `false`, `true` —
+through the sysmodule like any other edit ([below](#editing-from-the-overlay)).
+v1.0.0-rc1 warns that it is not a section it knows and ignores it.
+
+#### Sorted by content directory: not read
+
+RetroArch's **Sort Saves into Folders by Content Directory**
+(`sort_savefiles_by_content_enable`, and *Sort Save States into Folders by
+Content Directory* for states) puts each save in a folder named after the
+folder its rom is in: `<folder>/snes/Game.srm`, or `<folder>/snes/Snes9x/Game.srm`
+with sorting by core on as well. This client does not read that layout, so
+those saves are not synced, and the settings screen's `warning` says which
+setting to change: in RetroArch, **Settings > Saving > Sort Saves into Folders
+by Content Directory**, off.
+
+Turning it off does not move what RetroArch already wrote there. Move each
+save up one folder — `<folder>/snes/Snes9x/Game.srm` to
+`<folder>/Snes9x/Game.srm` — before you next play that game, or RetroArch starts
+it without its save.
 
 ### Tico: per-account saves
 
@@ -453,8 +480,9 @@ asks it not to upload that copy again ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#a-sav
 | `remove` (default) | copied under `/config/rommsync/.backup/` **first**, then removed. Listed on the **Conflicts** screen as *deleted on RomM*, from where it can be put back. |
 | `keep` | left exactly as it is. `state.db` remembers it as deleted on the server, and while the file holds those bytes it is not offered to RomM at all — not even when an emulator writes the same bytes back on closing. Once you play and it changes, it is new progress and syncs as usual. |
 
-Anything else is a `warning` and the current value stays. The overlay does not
-show or edit this key yet; set it in this file.
+Anything else is a `warning` and the current value stays. The overlay's
+settings screen shows it under `[sync]`, and a press switches it between
+`remove` and `keep`.
 
 ### Where a rom lands
 
@@ -629,6 +657,13 @@ The overlay never writes this file. It sends the sysmodule one `SetConfig` — a
 short list of `section`, `key`, `value` — and the sysmodule validates it,
 rewrites the file and re-reads it, so the change is in force before the call
 comes back. No restart, and no second copy of the settings anywhere.
+
+The settings screen offers this for the settings that are a choice between a
+few words — `[sync] on_server_delete` and `[sources]` — where a press steps the
+row to its next value and pressing again undoes it. The sync switch is on the
+**Sync** screen. Every other key is still set in this file: `[sync] slot` and
+`[tico]` are refused from the overlay on purpose, since the one moves every save
+to a new slot on the server and the other names an account by a 32-digit id.
 
 **Your file survives the edit.** One line changes; every other byte is the byte
 you typed. Comments, blank lines, the order of your `[platform.x]` sections, a

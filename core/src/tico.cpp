@@ -14,14 +14,7 @@ namespace {
 
 using config::text::LowerAscii;
 
-std::string Join(std::string_view directory, std::string_view name) {
-  std::string path(directory);
-  if (path.empty() || path.back() != '/') {
-    path.push_back('/');
-  }
-  path.append(name);
-  return path;
-}
+using fs::JoinPath;
 
 std::string Listed(const std::vector<std::string>& accounts, std::size_t dropped) {
   std::string out;
@@ -62,7 +55,8 @@ std::string FolderIn(const Resolution& resolved, std::string_view folder) {
     case Layout::kLegacy:
       return std::string(folder);
     case Layout::kAccount:
-      return Join(Join(resolved.users_dir, resolved.uid), folder.substr(folder.rfind('/') + 1));
+      return JoinPath(JoinPath(resolved.users_dir, resolved.uid),
+                      folder.substr(folder.rfind('/') + 1));
     case Layout::kUndecided:
       break;
   }
@@ -71,7 +65,7 @@ std::string FolderIn(const Resolution& resolved, std::string_view folder) {
 
 Resolution Resolve(const config::TicoConfig& tico, fs::FileSystem& files, std::string_view root) {
   Resolution resolved;
-  resolved.users_dir = Join(root, kUsersFolder);
+  resolved.users_dir = JoinPath(root, kUsersFolder);
   if (tico.account == config::TicoAccount::kLegacy) {
     return resolved;
   }

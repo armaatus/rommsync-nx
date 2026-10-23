@@ -36,7 +36,24 @@ std::size_t HeaderFor(std::size_t alignment) {
   return alignment < kDefaultAlignment ? kDefaultAlignment : alignment;
 }
 
+/// True when `FailAt` says this allocation is the one that fails. Only an
+/// armed countdown pays for the read-modify-write.
+bool Injected() noexcept {
+  Counters& counters = Get();
+  if (counters.fail_countdown.load(std::memory_order_relaxed) <= 0) {
+    return false;
+  }
+  if (counters.fail_countdown.fetch_sub(1, std::memory_order_relaxed) != 1) {
+    return false;
+  }
+  counters.injected.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 void* Allocate(std::size_t size, std::size_t alignment) noexcept {
+  if (Injected()) {
+    return nullptr;
+  }
   const std::size_t header = HeaderFor(alignment);
   if (size > std::numeric_limits<std::size_t>::max() - header) {
     return nullptr;

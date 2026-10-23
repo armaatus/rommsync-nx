@@ -397,6 +397,11 @@ constexpr ClientCall kClientCalls[] = {
        ipc::LogTail out;
        return c.GetLog(ipc::kMaxLogLines, &out);
      }},
+    {ipc::Command::kKeepLocal, "KeepLocal",
+     [](overlay::IpcClient& c) {
+       ipc::RestoreState out;
+       return c.KeepLocal(3, &out);
+     }},
 };
 
 int RunWire(Checks& checks) {
@@ -675,10 +680,16 @@ int RunVersion(Checks& checks) {
                   "a fresh session on a registered port is ready");
   }
   {
+    const int deferred = hostswitch::DeferredRequests();
     overlay::IpcClient orphan;
     overlay::ScreenFrame orphan_frame(orphan);
     checks.Expect(orphan_frame.Ready() == overlay::Link::kNotRunning,
                   "and with no rommsync port, the same first call is kNotRunning");
+    // ...without asking sm for a name nobody registered, which on Atmosphere is
+    // a request parked until the sysmodule appears -- the draw thread with it,
+    // forever, for the user who simply has it switched off (#254).
+    checks.ExpectEq(hostswitch::DeferredRequests(), deferred,
+                    "kNotRunning is learned without a request sm would defer");
   }
 
   // **A passed handshake is not re-run while the session lives.** So `Ready()`

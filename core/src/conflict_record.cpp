@@ -20,22 +20,6 @@ std::int64_t NowSeconds(const std::function<sync::Timestamp()>& clock) {
   return sync::UnixSeconds(clock ? clock() : std::chrono::system_clock::now());
 }
 
-/// The client's reported copy for `(rom_id, slot)`, or nullptr.
-///
-/// Matched the way the server pairs them and the way `sync::MatchTarget` does:
-/// on `(rom_id, slot)` and never on a name, because the name on an operation is
-/// the server's (sync_execute.hpp).
-const sync::ClientSaveState* ReportedFor(const std::vector<sync::ClientSaveState>& reported,
-                                        std::int64_t rom_id,
-                                        const std::optional<std::string>& slot) {
-  for (const sync::ClientSaveState& save : reported) {
-    if (save.rom_id == rom_id && save.slot == slot) {
-      return &save;
-    }
-  }
-  return nullptr;
-}
-
 /// The scanned state for `(rom_id, file_name)`, which is how RomM keys one.
 const scan::StateFile* ScannedFor(const scan::ScanResult& scan, std::int64_t rom_id,
                                   const std::string& file_name) {
@@ -98,8 +82,9 @@ std::size_t RecordSaves(History* history, const sync::SyncPlan& plan,
     }
 
     // The local facts are the ones step 0 reported, not the ones on the card:
-    // the card now holds the server's copy.
-    if (const sync::ClientSaveState* local = ReportedFor(reported, result.rom_id, result.slot);
+    // the card now holds the server's copy. Matched on `(rom_id, slot)`, never on
+    // a name: the name on an operation is the server's (sync_execute.hpp).
+    if (const sync::ClientSaveState* local = sync::FindByKey(reported, sync::KeyOf(result));
         local != nullptr) {
       entry.file_name = local->file_name;
       entry.emulator = local->emulator.value_or(std::string());
@@ -274,6 +259,33 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
            : ", and what was there is under " + report.backup_sd_path) +
       ". The server still holds its own copy: the next sync arbitrates, and will most likely "
       "offer these bytes to it.";
+  return report;
+}
+
+RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
+                        state::Baseline::Key* key, const RestoreOptions& options) {
+  const Entry* entry = history.Find(entry_id);
+  if (entry != nullptr && !entry->save_conflict()) {
+    RestoreReport refused;
+    refused.outcome = RestoreOutcome::kNotAConflict;
+    refused.message = entry->file_name +
+                      ": not a save conflict, so there is no server copy to keep this console's "
+                      "over -- nothing was written";
+    return refused;
+  }
+  // A missing entry falls through: `Restore` names that refusal itself.
+  RestoreReport report = Restore(files, history, entry_id, options);
+  if (!report.ok()) {
+    return report;
+  }
+  *key = {entry->rom_id, entry->slot};
+  report.message =
+      entry->file_name + ": this console's bytes are back at " + entry->sd_path +
+      (report.backup_sd_path.empty()
+           ? std::string(", and there was nothing there to keep")
+           : ", and the server's copy that was there is under " + report.backup_sd_path) +
+      ". The next sync uploads them over the server's copy; RomM deletes nothing, so that copy "
+      "stays on the server behind this one.";
   return report;
 }
 

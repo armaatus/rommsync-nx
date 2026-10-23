@@ -54,10 +54,40 @@ found two (#196), both now declared:
 | `svcReturnFromException` (0x28) | libnx's exception entry | It is the last thing the handler does. Undeclared, the process dies at the exact moment something else has already gone wrong, and the crash that would have been reported is replaced by one that cannot be. |
 | `svcUnmapTransferMemory` (0x52) | `socketExit` → `bsdExit` → `_bsdCleanup` → `tmemClose` | `NetworkExit` calls `socketExit`, so this path runs. Whether the SVC is *issued* rests on libnx leaving `TransferMemory::map_addr` NULL for the bsd transfer memory — an internal of libnx's bsd client, not ours to guarantee. There is no structural way to drop it either: `_bsdCleanup` also runs on `bsdInitialize`'s own failure path. `svcCreateTransferMemory` (0x15) is already granted for the same object. |
 
-The other direction — 16 SVCs are declared that nothing in the image calls — is
-reported and not failed. M9-11 (#210) narrowed the filesystem mask, the handle
-table and the address space (below) and left this set alone; nothing owns
-narrowing it yet, and the script prints the list to start from.
+The other direction fails too, since M9-29 (#256): the NPDM grants **exactly**
+the 31 SVCs the image issues. It used to grant 47, the devkitPro template's
+list plus #196's two, and the 16 nothing called went: `svcSetHeapSize`,
+`svcGet/SetThreadPriority`, `svcGetThreadCoreMask`,
+`svcGetCurrentProcessorNumber`, `svcSignalEvent`, `svcClearEvent`,
+`svcGetSystemTick`, `svcGetProcessId`, `svcGetThreadId`, `svcWaitForAddress`,
+`svcSignalToAddress`, `svcCreateSession`, `svcCreateEvent`,
+`svcManageNamedPort` and `svcConnectToPort`. A change that needs one back turns
+`npdm.svcs` red on the push that adds the call, and the fix is the line in
+`sys-rommsync.json`.
+
+The static scan is enough to narrow on, and not just a lower bound, because
+nothing outside it can issue an SVC:
+
+- **The number is in the instruction.** AArch64's `svc` takes its number as an
+  immediate, with no register form, so issuing SVC *n* means executing a
+  `svc #n` that is somewhere in the code.
+- **The image is all the code there is.** The process cannot make anything new
+  executable: `svcCreateCodeMemory`, `svcControlCodeMemory` and
+  `svcMapProcessCodeMemory` are not granted, and `svcSetMemoryPermission` never
+  grants execute. The `.nsp`'s NSO is elf2nso's copy of the ELF the scan reads.
+- **Nothing branches on the grant itself.** This was read in October 2026,
+  against Atmosphère's `master` and the pinned image's libnx 4.12.0, so check it
+  again when either moves. Mesosphère reads the SVC mask in three places: at dispatch, for `svcGetInfo(InfoType_IsSvcPermitted)`, and
+  when it pins or unpins a thread, where it keeps `ReturnFromException` (0x28)
+  and `GetInfo` (0x29). Both of those are issued, so both stay. libnx's one
+  branch on what is permitted is `jit.c`, on loader hints a sysmodule does not
+  get, and `jit.c` is not linked.
+
+`--gc-sections` is what makes a rarely taken libnx path safe here: if the path
+is in the image, its `svc` is scanned, and if it is not in the image, nothing
+can run it. A literal-pool word that happens to decode as an `svc` (see
+`Elf.svc_calls`) is the one way the scan can be wrong, and it errs towards
+granting more, not less.
 
 ## The two switches
 
@@ -239,6 +269,9 @@ guess, and is still wrong to make now.
   application-launch hook `pm:dmnt` also offers is the single one
   `dmnt:cht` holds, and pm does not start a hooked application until its hooker
   says so, so taking it would make every game launch wait on this process.
+  M10-26 (#261) asks the same session which application it is
+  (`pmdmntGetProgramId`), so a play session names the title seen writing its
+  save, at no new grant or handle.
 
 ## Where the work is
 

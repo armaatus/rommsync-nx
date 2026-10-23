@@ -14,6 +14,9 @@
 # The other three phases of the same script read the tree only, and are run
 # straight from tests/CMakeLists.txt. This one cannot: frame sizes exist only
 # once the compiler has decided them, and the compiler is in the container.
+# The script runs there too (#253): the build is LTO, so the graph is the LTRANS
+# step's, whose nodes are named only by their mangled titles, and the c++filt
+# that reads them is the toolchain's.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -39,7 +42,12 @@ phase_measured() {
   SCRATCH="$(mktemp -d)"
   cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
   cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$SCRATCH/"
+  mkdir -p "$SCRATCH/scripts"
+  cp "$REPO_ROOT/scripts/stack-budget.py" "$SCRATCH/scripts/"
+  # A worktree's own build leaves .ci files beside its ELF as well as in build/,
+  # and the walk reads every one under sysmodule/.
   rm -rf "$SCRATCH/sysmodule/build"
+  rm -f "$SCRATCH"/sysmodule/*.ci "$SCRATCH"/sysmodule/*.su
 
   local log="$SCRATCH/build.log"
   # Through the environment rather than on make's command line: a command-line
@@ -53,12 +61,13 @@ phase_measured() {
     fail "the sysmodule cross-compile failed"
   fi
   # Asserted: a build that left no call graph would make every ceiling pass
-  # over an empty walk.
-  compgen -G "$SCRATCH/sysmodule/build/*.ci" >/dev/null ||
+  # over an empty walk. Under LTO the graph is written by the link, beside the
+  # ELF (`sys-rommsync.elf.ltransN.ltrans.ci`); without it, by each compile,
+  # in build/. The script reads whichever is there, and refuses both.
+  [ -n "$(find "$SCRATCH/sysmodule" -name '*.ci' | head -n 1)" ] ||
     fail "the cross-compile left no .ci files; -fcallgraph-info=su did not reach the compiler"
 
-  "${PYTHON:-python3}" "$REPO_ROOT/scripts/stack-budget.py" measured \
-      --repo "$REPO_ROOT" --ci "$SCRATCH/sysmodule/build" ||
+  toolchain_run "$SCRATCH" 'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' ||
     fail "the main thread's measured stack is outside its budget"
 }
 

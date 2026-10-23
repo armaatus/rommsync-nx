@@ -8,10 +8,11 @@
 // ## The console cannot see which rom is running, and this is the honest answer
 //
 // Horizon will name the foreground *application* -- `pmdmntGetApplicationProcessId`
-// plus `pminfoGetProgramId` -- but on this console that application is RetroArch
+// plus `pmdmntGetProgramId` -- but on this console that application is RetroArch
 // or Tico, never the rom. No Horizon API says which file an emulator loaded, so
-// a title id cannot produce a `rom_id`. None of it is testable off a console
-// either, which hard rule 1 settles: no title id is in this build.
+// a title id cannot produce a `rom_id`. Since M10-26 (#261) a session carries
+// the title id beside the rom its save names, when the console saw one --
+// "which titles", below -- and the console half of that is #44's to confirm.
 //
 // **What the foreground does give this module, since M10-16 (#242)**, is the
 // window's lower half. `pm:dmnt` is granted now, and the sysmodule holds every
@@ -85,6 +86,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -106,7 +108,13 @@ inline constexpr const char* kBufferFileName = "play.db";
 
 /// The first line of a well-formed file, `<magic> <version> <next id> <last seen>`.
 inline constexpr const char* kFormatMagic = "rommsync-play-sessions";
-inline constexpr int kFormatVersion = 1;
+
+/// The version this build writes. Version 2 (#261) added each row's `title`; a version 1 file is still read,
+/// its sessions' titles unknown.
+inline constexpr int kFormatVersion = 2;
+
+/// The oldest version still read: rc1's, whose rows have no title.
+inline constexpr int kOldestReadVersion = 1;
 
 /// How many unsent sessions are kept, and the largest file that will be read.
 ///
@@ -117,11 +125,12 @@ inline constexpr int kFormatVersion = 1;
 /// forever. At the default half-hour interval, forty-eight rows is a day of
 /// play nobody could sync, which is more than a play-time total ever needs.
 ///
-/// A row is a rom id, a slot, two timestamps and a duration. The realistic one
-/// is ~120 bytes -- `retroarch-srm` is a thirteen-character slot -- but the
-/// bound has to hold for the **worst** row this code will store: `kMaxSlotBytes`
-/// of slot and an `int64_t` at full width in each of the four numbers is 215
-/// bytes, so `kMaxSessions` of them is 10,384 with the header.
+/// A row is a rom id, a slot, two timestamps, a duration and a title. The
+/// realistic one is ~150 bytes -- `retroarch-srm` is a thirteen-character slot
+/// -- but the bound has to hold for the **worst** row this code will store:
+/// `kMaxSlotBytes` of slot, an `int64_t` at full width in each of the four
+/// numbers and a sixteen-digit title is 242 bytes, so `kMaxSessions` of them is
+/// 11,680 with the header.
 ///
 /// That is the number `kMaxBufferBytes` is set against, and it is not academic:
 /// a serialization over the bound makes `Persist` refuse, which writes *nothing*
@@ -249,6 +258,110 @@ Derivation DeriveSessions(const std::vector<SaveObservation>& previous,
                           const std::vector<SaveObservation>& current,
                           sync::Timestamp last_seen, sync::Timestamp now,
                           const DeriveOptions& options = {});
+
+// --- which titles: the application in the foreground (#261) -------------------
+//
+// What `pm:dmnt` names is the **application**, not the rom, and that is as far
+// as this goes. The rom is already known -- it is the save that moved -- and the
+// title is the other half: what wrote it. It does not go the other way. A Tico
+// module is one application per platform core, not per rom, and RetroArch
+// launched over a title runs *as* that title, so the program id is the borrowed
+// game's; no Horizon call says which file either loaded. So a title is recorded
+// beside the rom, never used to find one.
+//
+// The console only looks when a tick falls due, while it is held for a running
+// game (#242's poll, every `kForegroundPollInterval`) and at a "Sync now" press
+// -- never between ticks. A session whose save
+// was written while nothing was looking -- a short game between two ticks -- is
+// "unknown", which is the honest answer rather than a gap to fill.
+
+/// What a session with no title says, in `play.db` and anywhere it is shown.
+inline constexpr const char* kUnknownTitle = "unknown";
+
+/// One answer to "what is in the foreground".
+struct Foreground {
+  /// An application is up. What #242's hold reads.
+  bool running = false;
+
+  /// Which one, when `pm` could say. Empty while running is a console whose
+  /// `pm` would not name it, and is no sighting.
+  std::optional<std::uint64_t> program_id;
+};
+
+/// One stretch of time one application was seen in the foreground.
+struct TitleSpan {
+  std::uint64_t program_id = 0;
+  sync::Timestamp first_seen{};
+  sync::Timestamp last_seen{};
+};
+
+/// How many stretches a window keeps. A hold sees one game, or a game and the
+/// library it quits back to; sixteen is an evening of flipping between them,
+/// and the oldest go first because the save the next tick finds is the newest.
+inline constexpr std::size_t kMaxTitleSpans = 16;
+
+/// What the foreground said since the play window last moved, as stretches.
+///
+/// Not thread-safe, like `Buffer`: the engine notes a sighting from the worker
+/// and from the IPC thread, so it holds this under its own lock.
+class Sightings {
+ public:
+  /// `slack` is how far apart two sightings of the same application may be
+  /// and still be one stretch, and how long after the last sighting a save may
+  /// land and still be that application's: its exit write falls between the
+  /// last poll that saw it and the first that did not. The engine passes twice
+  /// its poll interval.
+  explicit Sightings(std::chrono::seconds slack) : slack_(slack) {}
+
+  /// One answer, at `at` on the wall clock. Nothing running, or a program id
+  /// `pm` would not give, is not a sighting.
+  void Note(const Foreground& seen, sync::Timestamp at);
+
+  /// Forget everything: the play window moved, and nothing seen before it can
+  /// have written a save the next window finds.
+  void Clear() { spans_.clear(); }
+
+  /// Oldest first.
+  const std::vector<TitleSpan>& spans() const { return spans_; }
+  std::chrono::seconds slack() const { return slack_; }
+
+ private:
+  std::chrono::seconds slack_;
+  std::vector<TitleSpan> spans_;
+};
+
+/// The `slack` for a probe asked every `poll`: twice it -- a poll the worker
+/// ran late, behind a list page, is not a game that closed -- in whole seconds,
+/// because an mtime is.
+std::chrono::seconds SlackFor(std::chrono::milliseconds poll);
+
+/// The granularity of the mtime a session ends at: FAT keeps two seconds. A
+/// save stamped up to this much before an application's first sighting can
+/// still be its write.
+inline constexpr std::chrono::seconds kMtimeGranularity{2};
+
+/// Give each session the application that was in the foreground when its save
+/// was written: the one whose stretch holds `end_time`, from
+/// `kMtimeGranularity` before its first sighting to `slack` after its last.
+///
+/// **One application or none.** A stretch already seen by `end_time` wins over
+/// one that reaches back to it only through `kMtimeGranularity`: the library a
+/// module quits to is first seen after the module's exit write, and must not
+/// make that write ambiguous. Two applications both up at the write -- seen
+/// either side of it inside `slack` -- leave it unknown rather than given to
+/// either, and so does a write no stretch reaches.
+void AttributeTitles(std::vector<sync::PlaySession>* sessions, const Sightings& sightings);
+
+/// `session.title_id` as sixteen upper-case hex digits -- how Atmosphere names
+/// a title's folder -- or `kUnknownTitle`.
+std::string TitleOf(const sync::PlaySession& session);
+
+/// One recorded session as a log line: `rom 12 slot tico-srm: played up to 31
+/// min, title 0100000000ABC000`. "Up to" because `duration_ms` is the window,
+/// an upper bound (see the header note). The log is where the title is seen at
+/// all: a session the completion carries is released from `play.db` in the
+/// tick that derived it.
+std::string Describe(const sync::PlaySession& session);
 
 // --- the buffer on the card ---------------------------------------------------
 

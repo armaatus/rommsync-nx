@@ -37,9 +37,12 @@
 // (bytes landing in a file nothing touched; docs/SYNC_PROTOCOL.md says what
 // `state.db` does about them), metadata reordered *within* a directory, a
 // rename across directories (refused loudly: no save path makes one), or
-// `fseek`/`ftruncate`, which no save-overwrite path reaches. A kernel-level
-// injector (lazyfs) is the check on these assumptions; it needs Linux and FUSE,
-// and is not part of this suite.
+// `fseek`/`ftruncate`, which no save-overwrite path reaches. lazyfs, a FUSE
+// filesystem with a page cache it can be told to lose, is the check on the data
+// half of this model: tests/test_lazyfs.sh runs the same overwrites on it, cut
+// at every call and torn, nightly on Linux (#250). It passes metadata straight
+// through, so the directory half -- names lost or kept per directory -- is this
+// model's alone.
 #pragma once
 
 #include <algorithm>

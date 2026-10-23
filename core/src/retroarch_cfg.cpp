@@ -305,6 +305,26 @@ LoadResult Load(const std::string& path) {
   return reader.Finish(true);
 }
 
+Folder Settings::Saves() const {
+  return {savefile_directory, kDefaultSavefileDirectory, sort_savefiles,
+          sort_savefiles_by_content, savefiles_in_content_dir};
+}
+
+Folder Settings::States() const {
+  return {savestate_directory, kDefaultSavestateDirectory, sort_savestates,
+          sort_savestates_by_content, savestates_in_content_dir};
+}
+
+std::string EffectiveDirectory(const Folder& folder, fs::FileSystem& files) {
+  if (LowerAscii(folder.directory) == LowerAscii(folder.default_directory)) {
+    return folder.directory;
+  }
+  const fs::ListError error = files.List(folder.directory).error;
+  return error == fs::ListError::kMissing || error == fs::ListError::kNotADirectory
+             ? std::string(folder.default_directory)
+             : folder.directory;
+}
+
 bool Enabled(const config::Config& config, const Settings& settings) {
   switch (config.sources.retroarch) {
     case config::SourceMode::kOn:
@@ -349,17 +369,23 @@ std::vector<config::Diagnostic> Notes(const config::Config& config, const Settin
                          "which are not read unless [sources] retroarch_content_dir = on, so "
                          "RetroArch's states are not synced"));
   }
+  // Not read, and said with the remedy (#264): the player reads this on the
+  // console, so it names RetroArch's own menu entry (`intl/msg_hash_us.h`,
+  // v1.22.2) rather than a retroarch.cfg key. Both sentences stay under
+  // `ipc::kMaxDiagnosticTextBytes`, which would otherwise cut the remedy off.
   if (settings.sort_savefiles_by_content && config.sync.saves) {
     notes.push_back(Note(Severity::kWarning,
                          "RetroArch sorts saves by content directory "
-                         "(sort_savefiles_by_content_enable), a layout this client does not "
-                         "read, so RetroArch's saves are not synced"));
+                         "(sort_savefiles_by_content_enable), which this client does not read, "
+                         "so they are not synced: in RetroArch, turn off Settings > Saving > "
+                         "Sort Saves into Folders by Content Directory"));
   }
   if (settings.sort_savestates_by_content && config.sync.states) {
     notes.push_back(Note(Severity::kWarning,
                          "RetroArch sorts states by content directory "
-                         "(sort_savestates_by_content_enable), a layout this client does not "
-                         "read, so RetroArch's states are not synced"));
+                         "(sort_savestates_by_content_enable), which this client does not read, "
+                         "so they are not synced: in RetroArch, turn off Settings > Saving > "
+                         "Sort Save States into Folders by Content Directory"));
   }
   return notes;
 }

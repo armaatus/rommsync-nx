@@ -41,6 +41,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -630,6 +631,10 @@ int Stalled(http::HttpClient& client, const std::string& base, const Fixture& fi
     // there was one is a test nobody runs, and a sysmodule may park on its own
     // primitive anyway.
     options.wait = [&waits](std::chrono::milliseconds delay) { waits.push_back(delay); };
+    // The jitter rolled at half its range, so the delays are numbers a test can
+    // state (#251). A loop computing a delay of its own answers the bare
+    // doubling, and every console on a LAN retries in lockstep.
+    options.random = [] { return 0.5; };
 
     const sync::Negotiation negotiated =
         sync::Negotiate(client, TokenFor(base, fixture), /*saves=*/{}, options);
@@ -650,12 +655,14 @@ int Stalled(http::HttpClient& client, const std::string& base, const Fixture& fi
                     "two stalls are retried past, and the third attempt lands");
     checks.ExpectEq(waits.size(), static_cast<std::size_t>(negotiated.attempts - 1),
                     "every retry waited first");
-    std::chrono::milliseconds expected{50};
+    // 50 ms, then 100 ms, each with an eighth of itself on top: the default
+    // jitter of a quarter, rolled at half, and rounded down to the millisecond.
+    const std::int64_t expected[] = {56, 112};
     std::chrono::milliseconds total{0};
-    for (const std::chrono::milliseconds delay : waits) {
-      checks.ExpectEq(delay.count(), expected.count(), "the backoff doubles per retry");
-      total += delay;
-      expected = expected * 2 > options.max_backoff ? options.max_backoff : expected * 2;
+    for (std::size_t at = 0; at < waits.size(); ++at) {
+      checks.ExpectEq(waits[at].count(), at < std::size(expected) ? expected[at] : -1,
+                      "the backoff doubles per retry, with its jitter on top");
+      total += waits[at];
     }
     checks.ExpectEq(negotiated.waited.count(), total.count(),
                     "and the total is reported, so a caller can see a slow tick");

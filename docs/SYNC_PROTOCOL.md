@@ -1,7 +1,7 @@
 # Save sync protocol (client side)
 
 How `sys-rommsync` implements RomM's negotiate → execute → complete loop (5.4.0
-or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#520--540)
+or later; where 5.4.0 changed it, [API_CONTRACT.md](API_CONTRACT.md#since-520)
 says so).
 Endpoints and schemas: [API_CONTRACT.md](API_CONTRACT.md). The payload and
 response shapes below are the ones captured from a live 5.2.0 under
@@ -84,8 +84,12 @@ For each file under the configured save/state dirs:
    row of a slot as the head every client pairs against — which is why a
    companion such as Snes9x's `.rtc` gets a slot of its own (RomM's RetroArch path
    keeps it out of the slot too), and why a rom's RetroArch `.srm` and Tico `.srm`
-   on one card are one slot: the one found first (RetroArch's) is synced and the
-   other is skipped as a *duplicate slot*. The name the server is told is the
+   on one card are one slot: the copy in the frontend `[platform.<slug>]
+   play_with` plays the system in (Tico by default) is synced and the other is
+   skipped as a *duplicate slot* -- the copy a user is playing, and the one a
+   first-time restore is placed for (#258). A platform played in neither keeps
+   the one found first. A state's name, contested the same way under
+   `[sync] map_state_slots`, is settled the same way. The name the server is told is the
    rom's own stem, `<fs_name_no_ext><ext>`, which is the name RomM serves
    RetroArch the save under.
 6. Name the `emulator` that wrote it — the id RomM pairs lineages on and other
@@ -377,8 +381,8 @@ emulator — is newer than this device's last sync of it. That is the protection
 shared slot needs: without it, a RetroArch or Argosy upload landing between this
 tick's negotiate and its upload would be silently superseded. So the guard is
 kept, and only a player's explicit **Keep local** for one save sends
-`overwrite=true` (`ExecuteOptions::keep_local`; #240 split the overlay choice
-that fills it into a later PR, so nothing fills it yet).
+`overwrite=true` (`ExecuteOptions::keep_local`, filled from the conflicts screen
+since #249 -- see [Keep local](#keep-local-249) below).
 
 On 5.4.0 the 409 is not only a race. Every other device's upload is a new row
 and becomes the head, this device has no sync row against it, and negotiate
@@ -418,6 +422,50 @@ conflict, with the guard's own sentence as the reason. `tick.newer_download` and
 `tick.newer_conflict` have a second device upload between negotiate and upload
 against the real RomM, under the crash replay.
 
+### Keep local (#249)
+
+A conflict is resolved **Keep server** as the tick runs, because nobody is there
+to ask: the head on the card, the local bytes under `.backup/` and archived on
+the server. The overlay's conflicts screen then offers each save conflict three
+answers -- **Keep server** (what already happened; it sends nothing), **Keep
+local**, and **Skip** (decide later; nothing changes). A replaced save, a
+deletion and a state keep the plain restore, which overrules nothing.
+
+Keep local is the player overruling the server, explicitly and for one save,
+and it is the only thing that ever sends `overwrite=true`:
+
+1. `KeepLocal` (IPC command 18) restores the conflict's backup onto the card
+   through `conflicts::KeepLocal` -- `Restore` itself, so the server's copy it
+   replaces is backed up first. An entry that is not a save conflict with a slot
+   is refused with `not_a_conflict` before anything is written.
+2. Once the bytes are on the card -- never before -- the sysmodule arms the
+   conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
+   `sync::kMaxKeepLocal`) and asks for a tick.
+3. That tick's upload of the save goes with `overwrite=true`. The plan that
+   answers the key **spends** it (`sync::SpendKeepLocal`): an upload that went or
+   was refused, or any other action -- the server asking for no upload. Only an
+   upload that never reached the server, or a plan that did not name the save,
+   keeps it for the next, as does a choice armed after the plan went out. So
+   the choice is one upload's: a later upload of the save meets the guard as
+   every upload does.
+
+The choice is held in memory. A reboot before its tick forgets it, and the
+restored bytes then meet the guard like any upload: a 409 is resolved as a
+conflict, backed up and archived, and the player is asked again.
+
+**Over a lineage this console does not load (#236's question): yes.** With the
+`emulators` filter on, a slot head written by another core is never offered,
+but the guard and #232's unfiltered resolution do see it, so it can land on the
+card as a conflict. Keep local goes over it all the same -- the player saw that
+copy land and chose theirs -- and RomM keeps lineages apart: `overwrite=true`
+only lifts the guard and adds a version in this console's lineage, deleting no
+row (pruning is per lineage). The other core's save stays on the server as that
+core's newest, which is what RetroArch keeps being served for it.
+`engine.keep_local` proves it against 5.4.0: a `gpsp` head over the console's
+mGBA save, a second `gpsp` write after the conflict, exactly one upload with
+`overwrite=true`, both `gpsp` rows still there, and the next upload without the
+flag.
+
 ### The order every overwrite goes through
 
 `sync::ExecutePlan`
@@ -438,7 +486,9 @@ steps in this order and no other:
    (`io::WriteAtomically` takes a `string_view`, and a save state does not fit
    in the sysmodule's heap).
 4. **commit** with `io::CommitStaged`, which is `WriteAtomically`'s two-rename
-   commit for a file that arrived on disk rather than as a string.
+   commit for a file that arrived on disk rather than as a string — but only
+   once `sync::UnchangedSinceBackup` has found the save still holding the bytes
+   step 3 copied ([below](#a-write-after-the-backup-263)).
 
 Step 4 cannot start until step 3 has succeeded, and every step before it can
 fail without the save changing at all. A missing `.backup/` therefore *stops*
@@ -475,10 +525,10 @@ is injected, and the engine's is `place::Placer` (#237):
   matches to the same rom in the same slot, holding bytes the target emulator
   reads; otherwise it would be a second save of the game, uploaded on the next
   tick while the row it came from is offered again. Placing nothing is a named
-  failure with the reason.
+  decline with the reason (below).
 - **A placement only creates.** A file already at the path is one the scan did
-  not pair with this row — skipped, or another slot's — and the operation fails
-  with `kNoLocalSave` without touching it. A missing folder is made. The bytes
+  not pair with this row — skipped, or another slot's — and the operation is
+  declined with `kNoLocalSave` without touching it. A missing folder is made. The bytes
   arrive through the same stage-verify-commit as any download, and
   `execute.placed` replays a power cut at every call of it: no file, or all of
   it.
@@ -550,10 +600,50 @@ that land on a save; the first and last also run with `.backup/` unconfirmed
 one with no backup, and a rename of bytes nothing synced. The `backup` row of
 `scripts/v1-gate.sh` counts them. What the model assumes — a sync that says yes
 did persist, a directory's own updates land in order, no flying writes — is
-listed at the top of that header; a kernel-level injector such as lazyfs is the
-check on those assumptions, and is not in the suite. Every replay drives the
+listed at the top of that header. lazyfs, a filesystem with a page cache that
+can be told to forget, is the check on its data half: `lazyfs.overwrite` runs
+the same overwrites on it, cut at every call and torn, nightly on Linux (#250).
+lazyfs makes every name durable at once, so the directory half is the model's
+alone. Every replay drives the
 host backend; the Horizon one (`http_wire.cpp`) syncs its `.part` through the
 same `io::Sync`, and nothing off a console runs it under the replay (#44).
+
+A process that **runs out of memory** mid-overwrite is the same question asked
+of a death rather than a power cut, and `oom.tick` asks it at every allocation a
+tick makes (#250, docs/TESTING.md): the save is old or new, new only beside a
+backup of the old, and the log's last line says the sysmodule stopped.
+
+#### A write after the backup (#263)
+
+A backup is a copy of the save *as it was when copied*. A game that writes the
+save after that — launched mid-tick, which #242's hold is asked too coarsely to
+stop: per chunk and before a 409, not per operation — has written bytes that are
+in no copy anywhere, and the commit or removal that follows would take them. A
+conflict holds that window open longest, across its archival upload (#240).
+
+So immediately before the call by which `sync::ExecutePlan` replaces or removes
+a save — the `io::CommitStaged` of a `download` or `conflict`, the `io::Remove`
+of a `delete` — `sync::UnchangedSinceBackup` compares the save with its backup
+by MD5. A save file is kilobytes, cheap to read twice, and a size-and-mtime
+comparison misses a same-size rewrite within FAT32's two-second mtime. Anything but a
+match fails the operation `kUnverified` and leaves both files: the save, which
+is newer than any ruling about it, and the backup. Where nothing was backed up
+because nothing was there, there must still be nothing; a file that appeared is
+left alone the same way. The next tick negotiates the save as it now is.
+`execute.late_write` (a `delete`) and `execute.late_fetch` (a `download` and a
+`conflict`) write the save from inside `io::Disk` at the moment the backup's
+name is published, and the write is what is on the card afterwards.
+
+**What this does not close.** The comparison and the call after it are two
+calls, and Horizon offers no compare-and-swap on a file: a write landing in the
+instant between them is still lost. The guarantee is that no write is lost
+that landed before the comparison — which takes the window from a network round
+trip and a backup's worth of I/O down to one hash of the save. The hold
+narrows it further; nothing here closes it.
+
+**Nor is every overwrite covered yet.** A conflict restore (M7-1, from the
+overlay, over a running game) and a save state's download back up and then
+overwrite with no comparison between; #270 extends the check to both.
 
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
@@ -651,10 +741,10 @@ executor's own check behind it), else as what the scan would report for the
 path (`ExecuteOptions::reads_as`, `scan::EmulatorAt`). With nothing to say,
 a `tico-*` save is not placed at all, and the check comes before the
 placement's folder is made. A refusal is `OperationError::kOtherEmulator`: nothing fetched, nothing
-backed up, nothing touched, and counted failed — the plan asked for something
-this client will not do, and it will ask again until one of the two saves
-moves. The same holds inside #232's resolution of a 409, which executes through
-the same path. Two libretro cores in one slot are not this rule's: that is RomM's
+backed up, nothing touched, and declined rather than failed (below) — the plan
+asked for something this client will not do, and it will ask again until one of
+the two saves moves. The same holds inside #232's resolution of a 409, which
+executes through the same path. Two libretro cores in one slot are not this rule's: that is RomM's
 pairing and #236's filter.
 
 The per-system table — each Tico module, the emulator id it syncs under, and
@@ -688,7 +778,10 @@ way it obeys an overwrite, because the file is just as gone:
 3. **The backup is checked against the digest the tick reported.** The ruling
    was about those bytes; a save the player wrote to after the scan is progress
    it never saw, so it stays and its stray copy is removed. With no digest to
-   hold it to, the delete is refused before anything is copied.
+   hold it to, the delete is refused before anything is copied. **And the save
+   is checked against the backup**, last of all: one written after the copy
+   stays, with the backup beside it
+   ([A write after the backup](#a-write-after-the-backup-263)).
 4. **Then the file is removed**, and its directory synced. A power cut at any
    call leaves the save or its backup, never neither (`execute.crash_delete`).
 
@@ -1027,7 +1120,9 @@ A state that is replaced goes through the same four steps as a save, using the
 same two `io` primitives: fetch to `io::TempPathFor(<state>)`, check it, back it
 up with `io::CopyAtomically` into `.backup/`, then `io::CommitStaged` it into
 place. The `harness::Sandbox` teardown audit covers a state exactly as it covers
-a `.srm`.
+a `.srm`. One difference for now: a state is not compared with its backup
+before the commit, so a write between the two is lost
+([A write after the backup](#a-write-after-the-backup-263), #270).
 
 The backup name carries a discriminator built from the state's own name —
 `<rom_id>-state-<name>-<unix seconds>[-<n>].<ext>` — because a state has no slot.
@@ -1198,13 +1293,28 @@ bounds.
   again every few seconds (`pmdmntGetApplicationProcessId`); one tick runs once
   the game has closed, however many fell due. "Sync now" during a game is that
   same tick (`SyncOutcome::kDeferred`). The download queue is not held — a rom is
-  not a save. `engine.foreground` holds this against the real RomM.
+  not a save. `engine.foreground` holds this against the real RomM. What the
+  hold sees running is also the title a play session names (#261,
+  `play.recorded`): the application seen when the save was written, or
+  `unknown` — never used to find the rom, which is the save's.
 - Partial plan failure → complete with the accurate `operations_failed`; leave
   unsynced files for next tick. Never leave a half-written save (write to temp,
   fsync, rename). An `action` this build does not recognise is counted with
   `operations_failed` and not with `operations_completed`: the server planned
   work that did not happen, and calling it completed tells RomM the client did
   something it cannot name.
+- **A save this console will not take is declined, not failed** (#257): a
+  pairing `scan::Interchangeable` refuses, a first-time restore the placer has
+  no path for, or one whose path a file already holds. The server plans it again
+  every tick until a file moves, so counted failed it made every tick partial
+  with nothing to be done from the console. `OperationOutcome::kDeclined` is
+  neither completed nor failed, never makes a tick partial, and is written once —
+  a `scan.skipped` warning — then not again until either side changes: a new
+  server save or a moved or rewritten one, the local file moving, or the
+  placement's reason changing (`sync::Declines`, in memory for the boot, bounded
+  at `kMaxDeclines`). RomM's `complete` still counts it with `operations_failed`,
+  as it does an action this build does not know: the server planned it, and it
+  did not happen.
 - One backup per overwrite, always, before writing — and per removal, before
   removing (#233).
 - A card that refuses -- full, failing, or gone -- costs the incoming save and

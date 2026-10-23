@@ -25,6 +25,10 @@ void Send(ScreenFrame& frame, IpcClient& client, ConflictsModel& model, Link& li
       // worker's, and the model polls for the outcome (#209).
       rc = client.RestoreBackup(command.entry_id, &restore);
       break;
+    case ConflictsModel::Command::Kind::kKeepLocal:
+      // A restore asked for as Keep local (#249), polled the same way.
+      rc = client.KeepLocal(command.entry_id, &restore);
+      break;
     case ConflictsModel::Command::Kind::kRestoreState:
       rc = client.GetRestoreState(&restore);
       break;
@@ -54,6 +58,7 @@ void Send(ScreenFrame& frame, IpcClient& client, ConflictsModel& model, Link& li
       return;
     case ConflictsModel::Command::Kind::kRestore:
     case ConflictsModel::Command::Kind::kRestoreState:
+    case ConflictsModel::Command::Kind::kKeepLocal:
       model.OnRestoreState(restore);
       return;
     case ConflictsModel::Command::Kind::kNone:

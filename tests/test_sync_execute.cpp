@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -38,6 +39,7 @@
 #include "rommsync/md5.hpp"
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/sync_execute.hpp"
+#include "rommsync/sync_finish.hpp"
 
 namespace {
 
@@ -46,7 +48,6 @@ namespace crypto = rommsync::crypto;
 namespace fs = rommsync::fs;
 namespace http = rommsync::http;
 namespace io = rommsync::io;
-namespace json = rommsync::json;
 namespace place = rommsync::place;
 namespace sync = rommsync::sync;
 
@@ -107,40 +108,51 @@ bool PlanFor(rig::Checks& checks, http::HttpClient& client, const std::string& b
   return true;
 }
 
-/// `GET /api/saves/{id}`, and whether RomM has a sync row for this device.
+/// Expect RomM to arbitrate `slot` against a sync row this device holds for
+/// `save_id`; `what` names the call that should have written it.
 ///
 /// That row is the whole point of passing `device_id` on an upload and of
 /// `POST /api/saves/{id}/downloaded` after a download: without it every later
 /// negotiation for the save falls into the no-sync-history branch
 /// (docs/API_CONTRACT.md).
 ///
-/// **`device_id` on the read is not optional either.** Verified against the
-/// live 5.2.0: `GET /api/saves/{id}` and `GET /api/saves` answer
-/// `device_syncs: []` unless the query names a device, and an empty array reads
-/// exactly like "this device has never synced this save" -- which is the state
-/// the whole arbitration hangs on. It is a filter and not a write: the
-/// `last_synced_at` it answers with is the one the upload wrote.
-bool DeviceIsSynced(http::HttpClient& client, const std::string& base, const Fixture& fixture,
-                    std::int64_t save_id) {
-  const http::Result result = client.Send(
-      harness::Authed(http::Method::kGet,
-                      base + "/api/saves/" + std::to_string(save_id) + "?device_id=" +
-                          fixture.device_id,
-                      fixture));
-  if (!result.successful()) {
-    return false;
+/// **Reading the row back proves nothing on 5.4.0, so this does not.**
+/// `GET /api/saves/{id}?device_id=` answers an entry for the calling device
+/// whether or not one exists -- RomM synthesizes it, at the save's own
+/// `updated_at` and `is_current: false`, which is also what a real one looks
+/// like (#265). The witness is the thing the row exists for: the next
+/// negotiation. Offered a copy changed after the save was written -- a later
+/// mtime *and* different bytes -- a device with a row is answered `Client save
+/// is newer than last sync` and one without `Client save is newer (no sync
+/// history)`. The bytes have to differ because `Content is identical` is
+/// answered before history is read at all. Nothing is executed, and `PlanFor`
+/// closes the session, so the scenario's own plan is untouched.
+void ExpectDeviceSynced(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                        const Fixture& fixture, std::int64_t rom_id, const std::string& slot,
+                        std::int64_t save_id, const std::string& what) {
+  const std::string changed = "a copy this device changed after save " +
+                              std::to_string(save_id) + " was written\n";
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  payload.saves.push_back(harness::LocalSave(rom_id, "witness.srm", slot, "m2-5",
+                                             crypto::Md5Hex(changed),
+                                             std::chrono::system_clock::now() +
+                                                 std::chrono::hours{1},
+                                             static_cast<std::int64_t>(changed.size())));
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    return;
   }
-  const json::ParseResult document = json::Parse(result.response.body);
-  const json::Value* rows = document.ok() ? document.value.Find("device_syncs") : nullptr;
-  if (rows == nullptr) {
-    return false;
-  }
-  for (const json::Value& row : rows->elements()) {
-    if (harness::Field(row, "device_id") == fixture.device_id) {
-      return true;
-    }
-  }
-  return false;
+  const sync::SyncOperation& operation = plan.operations[0];
+  // Arbitrated against `save_id` and no other row: a row this device holds
+  // for some other save in the slot is not the one the scenario wrote.
+  checks.Expect(operation.action == sync::Action::kUpload &&
+                    operation.reason == sync::Reason::kClientNewer &&
+                    operation.save_id == save_id,
+                what + ": negotiate answered " + sync::ToString(operation.action) + ", \"" +
+                    operation.reason_text + "\", save " +
+                    (operation.save_id.has_value() ? std::to_string(*operation.save_id)
+                                                   : std::string("null")));
 }
 
 /// The options every rig scenario runs with: the sandbox's own `.backup/`, and
@@ -557,6 +569,31 @@ void Counting(rig::Checks& checks) {
     checks.Expect(report.operations[3].error == sync::OperationError::kNoSaveId,
                   std::string("a download the server named no save for is named: ") +
                       sync::ToString(report.operations[3].error));
+
+    // Each line written for an operation is that operation's by position, not by
+    // its text (#259): a resolution removes the 409's line through this.
+    checks.Expect(report.operations[0].warning == sync::kNoWarning,
+                  "a planned no-op writes no line");
+    for (std::size_t at = 1; at < report.operations.size(); ++at) {
+      const std::int32_t line = report.operations[at].warning;
+      checks.Expect(line >= 0 && static_cast<std::size_t>(line) < report.warnings.size() &&
+                        report.warnings[static_cast<std::size_t>(line)] ==
+                            report.operations[at].message,
+                    "operation " + std::to_string(at) + " names its own line in warnings");
+    }
+  }
+
+  // One mapping from an outcome to a total (#259): what `ExecutePlan` counted,
+  // recounted from the results, is the same three numbers.
+  {
+    sync::ExecutionReport recounted = report;
+    recounted.completed = 0;
+    recounted.failed = 0;
+    recounted.not_understood = 0;
+    sync::Recount(&recounted);
+    checks.Expect(recounted.completed == 1 && recounted.failed == 2 &&
+                      recounted.not_understood == 1,
+                  "Recount agrees with what ExecutePlan counted");
   }
 
   // Cancellation lands on an operation boundary. The plan above is all no-ops
@@ -813,6 +850,179 @@ sync::SyncOperation FetchOf(sync::Action action, std::int64_t rom_id, const std:
   return operation;
 }
 
+// --- declined -----------------------------------------------------------------
+//
+// #257: a save this console will not take -- a pairing across formats, a
+// first-time restore with no placement or onto a file already there -- is
+// declined rather than failed, and said once until either side changes. All of
+// it is decided before a byte moves, which `NeverCalled` asserts.
+// `tick.declined` is the same against a live 5.4.0, with the file moving.
+
+/// Whether `lines` holds the line `done` would be said with.
+bool Said(const std::vector<std::string>& lines, const sync::OperationResult& done) {
+  return std::find(lines.begin(), lines.end(), "declined " + done.message) != lines.end();
+}
+
+void Declined(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-declined");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "this-console";
+
+  const std::string card = "DuckStation's memory card\n";
+  const std::string other = "a file the scan did not pair with this row\n";
+  sandbox.SeedSave(SavePath("Card.mcd"), card);
+  sandbox.SeedSave(SavePath("Taken.mcd"), other);
+  const std::vector<sync::ClientSaveState> reported = {
+      harness::LocalSave(7, "Card.mcd", "card", "tico-duckstation", crypto::Md5Hex(card),
+                         std::chrono::system_clock::now(), 26)};
+  const std::vector<sync::SaveTarget> targets = {
+      {7, std::string("card"), SavePath("Card.mcd"), "Card.mcd"}};
+
+  sync::SyncPlan plan;
+  plan.session_id = 1;
+  // A Beetle save paired with DuckStation's card, a save with nowhere to go,
+  // and one whose place is taken.
+  plan.operations.push_back(FetchOf(sync::Action::kDownload, 7, "card", "mednafen_psx_hw"));
+  plan.operations.push_back(FetchOf(sync::Action::kDownload, 8, "unmapped", "tico-duckstation"));
+  plan.operations.push_back(FetchOf(sync::Action::kDownload, 9, "taken", "tico-duckstation"));
+
+  std::string reason = "psx is not mapped to any folder";
+  sync::ExecuteOptions options = OptionsAt(1'757'000'000);
+  options.reported = &reported;
+  options.place = [&reason](const sync::SyncOperation& operation) {
+    if (*operation.slot == "taken") {
+      return PlacedAt(SavePath("Taken.mcd"), "tico-duckstation");
+    }
+    rommsync::place::Placement nowhere;
+    nowhere.reason = reason;
+    return nowhere;
+  };
+  sync::Declines declines;
+  options.declines = &declines;
+  NeverCalled client(checks);
+
+  const sync::ExecutionReport first =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(first.declined, 3, "all three are declined");
+  checks.ExpectEq(first.failed, 0, "and none of them is a failure");
+  checks.ExpectEq(first.completed, 0, "nor work done");
+  checks.Expect(first.warnings.empty(),
+                "a decline writes no failed save's line" +
+                    (first.warnings.empty() ? std::string() : ": " + first.warnings[0]));
+  checks.ExpectEq(first.declines.size(), std::size_t{3}, "each is said, the first time");
+  if (first.operations.size() == 3) {
+    const sync::OperationError expected[] = {sync::OperationError::kOtherEmulator,
+                                             sync::OperationError::kNoLocalSave,
+                                             sync::OperationError::kNoLocalSave};
+    for (std::size_t at = 0; at < 3; ++at) {
+      const sync::OperationResult& done = first.operations[at];
+      checks.Expect(done.outcome == sync::OperationOutcome::kDeclined &&
+                        done.error == expected[at] && done.warning == sync::kNoWarning,
+                    std::string("operation ") + std::to_string(at) + " is declined as " +
+                        sync::ToString(expected[at]) + ": " + sync::ToString(done.outcome) +
+                        " " + sync::ToString(done.error) + " -- " + done.message);
+      checks.Expect(Said(first.declines, done), "in its own words: " + done.message);
+    }
+  }
+  checks.ExpectEq(std::string(sync::ToString(sync::OperationOutcome::kDeclined)),
+                  std::string("declined"), "named for the log");
+  checks.ExpectEq(sync::CountsFor(first).operations_failed, 3,
+                  "RomM is still told the three did not happen");
+  checks.ExpectEq(sandbox.Read(SavePath("Card.mcd")), card, "the card is untouched");
+  checks.ExpectEq(sandbox.Read(SavePath("Taken.mcd")), other, "and so is the file in the way");
+
+  const sync::ExecutionReport second =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(second.declined, 3, "met again, they are declined again");
+  checks.Expect(second.declines.empty(),
+                "and nothing is said" +
+                    (second.declines.empty() ? std::string() : ": " + second.declines[0]));
+
+  // Either side changing is news: a new server save in the card's slot, and the
+  // placement's reason moving. The file in the way has not moved.
+  plan.operations[0].save_id = 6;
+  reason = "Tico keeps saves for 2 accounts and [tico] account does not say whose";
+  const sync::ExecutionReport changed =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(changed.declines.size(), std::size_t{2}, "the two that changed are said again");
+  if (changed.operations.size() == 3) {
+    checks.Expect(Said(changed.declines, changed.operations[0]), "a new server save is news");
+    checks.Expect(Said(changed.declines, changed.operations[1]), "and a new reason");
+    checks.Expect(!Said(changed.declines, changed.operations[2]), "and the taken path is not");
+  }
+
+  // The local side changing in place is news too: the card played on, so what
+  // step 0 reported for it is new bytes -- which, on #232's path, is the
+  // conflict a refused upload resolves to, declined again.
+  {
+    std::vector<sync::ClientSaveState> played = reported;
+    played[0].content_hash = crypto::Md5Hex(card + "and an hour more\n");
+    sync::ExecuteOptions newer = options;
+    newer.reported = &played;
+    const sync::ExecutionReport moved_on =
+        sync::ExecutePlan(client, *files, token, plan, targets, newer);
+    checks.Expect(moved_on.declines.size() == 1 && moved_on.operations.size() == 3 &&
+                      Said(moved_on.declines, moved_on.operations[0]),
+                  "new bytes in the card are said again, and only the card's");
+    const sync::ExecutionReport same =
+        sync::ExecutePlan(client, *files, token, plan, targets, newer);
+    checks.Expect(same.declines.empty(), "once");
+    sync::ExecutePlan(client, *files, token, plan, targets, options);
+  }
+
+  // A tick that met only one of them forgets the others: their saves left the
+  // plan. One no plan asked about -- its rom in `unasked_roms` -- is kept.
+  declines.EndTick({});
+  sync::SyncPlan one;
+  one.session_id = 2;
+  one.operations.push_back(plan.operations[2]);
+  sync::ExecutePlan(client, *files, token, one, targets, options);
+  declines.EndTick({8});
+  checks.ExpectEq(declines.size(), std::size_t{2}, "the one met and the one unasked are kept");
+  const sync::ExecutionReport back =
+      sync::ExecutePlan(client, *files, token, plan, targets, options);
+  checks.ExpectEq(back.declines.size(), std::size_t{1}, "only the forgotten one is said again");
+  if (back.operations.size() == 3) {
+    checks.Expect(Said(back.declines, back.operations[0]), "which is the card's");
+  }
+
+  // With nothing to remember them in, every decline is said every time -- and
+  // still is not a failure.
+  {
+    sync::ExecuteOptions forgetful = options;
+    forgetful.declines = nullptr;
+    const sync::ExecutionReport again =
+        sync::ExecutePlan(client, *files, token, plan, targets, forgetful);
+    checks.Expect(again.declines.size() == 3 && again.failed == 0 && again.declined == 3,
+                  "with no memory each is said, and none fails");
+  }
+
+  // Past the bound, the ones remembered stay quiet and the rest are said.
+  {
+    sync::SyncPlan many;
+    many.session_id = 3;
+    for (std::size_t at = 0; at <= sync::kMaxDeclines; ++at) {
+      many.operations.push_back(FetchOf(sync::Action::kDownload,
+                                        100 + static_cast<std::int64_t>(at), "unmapped",
+                                        "tico-duckstation"));
+    }
+    sync::Declines bounded;
+    sync::ExecuteOptions full = options;
+    full.declines = &bounded;
+    const sync::ExecutionReport filled =
+        sync::ExecutePlan(client, *files, token, many, targets, full);
+    checks.ExpectEq(filled.declines.size(), sync::kMaxDeclines + 1, "every one is said once");
+    checks.ExpectEq(bounded.size(), sync::kMaxDeclines, "and the bound's worth is remembered");
+    const sync::ExecutionReport over =
+        sync::ExecutePlan(client, *files, token, many, targets, full);
+    checks.ExpectEq(over.declines.size(), std::size_t{1}, "only the one past it is said again");
+  }
+}
+
 void Isolated(rig::Checks& checks) {
   Sandbox sandbox(checks, "execute-isolated");
   const std::unique_ptr<fs::FileSystem> files =
@@ -870,7 +1080,8 @@ void Isolated(rig::Checks& checks) {
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, plan, targets, options);
 
-    checks.ExpectEq(report.failed, 6, "every write across formats is refused");
+    checks.ExpectEq(report.declined, 6, "every write across formats is declined (#257)");
+    checks.ExpectEq(report.failed, 0, "and none of them is a failure");
     for (const sync::OperationResult& done : report.operations) {
       checks.Expect(done.error == sync::OperationError::kOtherEmulator,
                     std::string("...as another emulator's save: ") + sync::ToString(done.error) +
@@ -905,7 +1116,7 @@ void Isolated(rig::Checks& checks) {
     NeverCalled client(checks);
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, token, plan, targets, options);
-    checks.Expect(report.failed == 1 && report.operations.size() == 1 &&
+    checks.Expect(report.declined == 1 && report.operations.size() == 1 &&
                       report.operations[0].error == sync::OperationError::kOtherEmulator,
                   "an isolated save is not placed blind");
     checks.Expect(!sandbox.Exists(SavePath("blind.eep")), "and nothing is on the card");
@@ -916,7 +1127,7 @@ void Isolated(rig::Checks& checks) {
     matched.operations.push_back(FetchOf(sync::Action::kDownload, 7, "card", "tico-duckstation"));
     const sync::ExecutionReport unreported = sync::ExecutePlan(
         client, *files, token, matched, targets, OptionsAt(1'757'000'001));
-    checks.Expect(unreported.failed == 1 && unreported.operations.size() == 1 &&
+    checks.Expect(unreported.declined == 1 && unreported.operations.size() == 1 &&
                       unreported.operations[0].error == sync::OperationError::kOtherEmulator,
                   "an isolated save is not written over a card nothing reported");
     checks.ExpectEq(sandbox.Read(SavePath("Card.mcd")), card, "which is untouched");
@@ -1250,6 +1461,144 @@ void CrashDelete(rig::Checks& checks) {
   }
 }
 
+// --- late_write -----------------------------------------------------------------
+//
+// #263: a game writing its save while the sync acts on it. Hard rule 2's backup
+// is a copy of the bytes the save held *at the copy*; a write that lands after it
+// and before the save is replaced or removed is in no copy anywhere, so the
+// replacement or removal has to see it and stand down. `LateWrite` is that
+// game, timed to the one call that separates the two.
+
+/// A `Disk` that writes the save the moment a backup's name is published under
+/// `.backup/` -- after the copy is complete, before anything replaces or removes
+/// the save. `write` is the game; it runs once.
+class LateWrite final : public io::Disk {
+ public:
+  explicit LateWrite(std::function<void()> write) : write_(std::move(write)) {
+    previous_ = io::SetDisk(this);
+  }
+  ~LateWrite() override { io::SetDisk(previous_); }
+
+  LateWrite(const LateWrite&) = delete;
+  LateWrite& operator=(const LateWrite&) = delete;
+
+  std::FILE* Open(const std::string& path, const char* mode) override {
+    return Inner().Open(path, mode);
+  }
+  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
+    return Inner().Write(file, data, size);
+  }
+  int Rename(const std::string& from, const std::string& to) override {
+    const int renamed = Inner().Rename(from, to);
+    // The backup's own commit: its staged copy onto its name, in `.backup/`.
+    if (renamed == 0 && !fired_ && to.find("/.backup/") != std::string::npos &&
+        from == io::TempPathFor(to)) {
+      fired_ = true;
+      write_();
+    }
+    return renamed;
+  }
+  int Remove(const std::string& path) override { return Inner().Remove(path); }
+  bool Sync(const std::string& path) override { return Inner().Sync(path); }
+
+  /// Whether the write happened, so a scenario cannot pass on one that never ran.
+  bool fired() const { return fired_; }
+
+ private:
+  io::Disk& Inner() const { return previous_ != nullptr ? *previous_ : io::StdioDisk(); }
+
+  std::function<void()> write_;
+  io::Disk* previous_ = nullptr;
+  bool fired_ = false;
+};
+
+void LateWriteDelete(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-late-delete");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  NeverCalled client(checks);
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+
+  const std::string name = "late-delete.srm";
+  const std::string bytes = "the copy RomM deleted\n";
+  const std::string late = "progress the game wrote after the backup\n";
+  sandbox.SeedSave(SavePath(name), bytes);
+  const std::vector<sync::ClientSaveState> reported = {ReportedAs(41, "late", name, bytes)};
+  sync::ExecuteOptions options = DeleteOptionsAt(1'757'000'700);
+  options.reported = &reported;
+
+  sync::ExecutionReport report;
+  {
+    // `Reseed` rather than `Write`: from here on the late bytes are the save,
+    // and the teardown audit holds the executor to *them*.
+    LateWrite game([&] { sandbox.Reseed(SavePath(name), late); });
+    report = sync::ExecutePlan(client, *files, token, DeletePlan(41, "late"),
+                               {{41, "late", SavePath(name), name}}, options);
+    checks.Expect(game.fired(), "the game wrote between the backup and the removal");
+  }
+
+  checks.ExpectEq(sandbox.Read(SavePath(name)), late,
+                  "the write that landed after the backup is still on the card");
+  checks.ExpectEq(report.failed, 1, "the removal is a failed operation, not a done one");
+  if (report.operations.size() == 1) {
+    const sync::OperationResult& done = report.operations[0];
+    checks.Expect(done.error == sync::OperationError::kUnverified,
+                  std::string("named as bytes the ruling was not about: ") +
+                      sync::ToString(done.error) + " -- " + done.message);
+    checks.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == bytes,
+                  "and the backup is left beside it, holding the bytes RomM ruled on: " +
+                      done.backup_sd_path);
+  }
+}
+
+/// `sync::UnchangedSinceBackup` on its own, for the case no call through
+/// `io::Disk` can time: `BackUpFirst` found nothing, so there is no backup to
+/// publish, and a file appears before the commit. Nothing on the way from one
+/// to the other touches the card, so the scenario is the function's answer.
+void LateWriteUnbacked(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-late-unbacked");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string save = SavePath("late-unbacked.srm");
+  const std::string backup = std::string(harness::kBackupDir) + "/late-unbacked-backup.srm";
+  std::string message;
+
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, "", &message) ==
+                    sync::OperationError::kNone,
+                "nothing backed up and still nothing there: the commit may go ahead");
+
+  sandbox.Write(save, "");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, "", &message) ==
+                    sync::OperationError::kUnverified,
+                "nothing backed up and a file there now, even an empty one, stands it down: " +
+                    message);
+
+  sandbox.Write(save, "the bytes backed up\n");
+  sandbox.Write(backup, "the bytes backed up\n");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup, &message) ==
+                    sync::OperationError::kNone,
+                "a save that is still its backup may go");
+
+  sandbox.Write(save, "the bytes backed vp\n");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup, &message) ==
+                    sync::OperationError::kUnverified,
+                "one of the same size that is not stands it down: " + message);
+
+  std::error_code error;
+  std::filesystem::remove(sandbox.Host(save), error);
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup, &message) ==
+                    sync::OperationError::kUnverified,
+                "and so does one that is gone since: " + message);
+
+  sandbox.Write(save, "the bytes backed up\n");
+  checks.Expect(sync::UnchangedSinceBackup(*files, save, backup + ".missing", &message) ==
+                    sync::OperationError::kUnreadableCard,
+                "a backup that cannot be read back is the card's failure: " + message);
+}
+
 // --- upload -------------------------------------------------------------------
 //
 // An upload that respects RomM's slot guard: `overwrite=false`, `session_id`
@@ -1307,8 +1656,8 @@ void Upload(rig::Checks& checks, http::HttpClient& client, const std::string& ba
   // The row `device_id` on the upload wrote. It is what the *next* negotiation
   // arbitrates against, so an upload that skipped it leaves this device in the
   // no-history branch forever.
-  checks.Expect(DeviceIsSynced(client, base, fixture, *done.save_id),
-                "the upload wrote a device_syncs row for this device");
+  ExpectDeviceSynced(checks, client, base, fixture, rom.id, slot, *done.save_id,
+                     "the upload wrote a device_syncs row for this device");
 
   harness::DeleteSave(client, base, fixture, *done.save_id);
 }
@@ -1385,8 +1734,8 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
   checks.Expect(!sandbox.Exists(io::TempPathFor(SavePath(name))),
                 "the staged copy is consumed, not left beside the save");
 
-  checks.Expect(DeviceIsSynced(client, base, fixture, server.id),
-                "POST /api/saves/{id}/downloaded recorded that this device holds it");
+  ExpectDeviceSynced(checks, client, base, fixture, rom.id, slot, server.id,
+                     "POST /api/saves/{id}/downloaded recorded that this device holds it");
 
   // A save this client has no local file for -- the `Save exists on server but
   // not on client` case, and the only way a client ever learns a save exists.
@@ -1416,7 +1765,8 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
     // loads, and the next tick would upload it back as a second save.
     const sync::ExecutionReport guessing = sync::ExecutePlan(
         client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, OptionsAt(1'757'000'008));
-    checks.ExpectEq(guessing.failed, 1, "with no policy it is a named failure, not a guess");
+    checks.Expect(guessing.declined == 1 && guessing.failed == 0,
+                  "with no policy it is declined, by name, rather than guessed at (#257)");
     if (!guessing.operations.empty()) {
       checks.Expect(guessing.operations[0].error == sync::OperationError::kNoLocalSave,
                     std::string("...named: ") + sync::ToString(guessing.operations[0].error));
@@ -1445,6 +1795,138 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
                   "and the save is left exactly as it was: no backup, no overwrite");
 
   harness::DeleteSave(client, base, fixture, server.id);
+}
+
+// --- late_fetch ---------------------------------------------------------------
+//
+// #263, for the two actions that write over a save: a `download` and a
+// `conflict`, each with the game writing the save between its backup and the
+// commit. The conflict's window is the wider of the two -- its archival upload
+// (#240) sits inside it -- and the write is put at its start.
+
+/// One late write against one plan: the server's copy must not land, and the
+/// write must still be the save. Returns the operation's result, if there was one.
+std::optional<sync::OperationResult> ExecuteUnderLateWrite(
+    rig::Checks& checks, Sandbox& sandbox, http::HttpClient& client, const std::string& base,
+    const Fixture& fixture, const sync::SyncPlan& plan, const sync::SaveTarget& target,
+    const sync::ExecuteOptions& options, const std::string& late, const std::string& what) {
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const std::string& save = target.sd_path;
+  sync::ExecutionReport report;
+  {
+    LateWrite game([&] { sandbox.Reseed(save, late); });
+    report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, {target}, options);
+    checks.Expect(game.fired(), what + ": the game wrote between the backup and the commit");
+  }
+  checks.ExpectEq(sandbox.Read(save), late,
+                  what + ": the write that landed after the backup is still the save");
+  checks.ExpectEq(report.failed, 1, what + ": counted failed, not done");
+  checks.Expect(!sandbox.Exists(io::TempPathFor(save)),
+                what + ": and the server's copy is not left staged beside it");
+  if (report.operations.size() != 1) {
+    return std::nullopt;
+  }
+  const sync::OperationResult& done = report.operations[0];
+  checks.Expect(done.error == sync::OperationError::kUnverified,
+                what + ": named as a save that moved since its backup: " +
+                    sync::ToString(done.error) + " -- " + done.message);
+  return done;
+}
+
+void LateWriteFetch(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                    const Fixture& fixture, const harness::Rom& rom) {
+  const std::string late = "progress the game wrote after the backup\n";
+
+  // 1. download.
+  {
+    Sandbox sandbox(checks, "execute-late-download");
+    const std::string slot = harness::UniqueSlot("m9-26-download");
+    const std::string name = "late-download.srm";
+    const std::string previous = "the local copy, one tick old\n";
+    sandbox.SeedSave(SavePath(name), previous);
+
+    const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "the server's newer copy, which would replace it\n");
+    harness::Save server;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m9-26", staged, name,
+                             /*with_device=*/false, &server)) {
+      checks.Expect(false, "the server copy was stored");
+      return;
+    }
+    sync::SyncNegotiatePayload payload;
+    payload.device_id = fixture.device_id;
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, name, slot, "m9-26", crypto::Md5Hex(previous),
+        std::chrono::system_clock::now() - std::chrono::hours{1},
+        static_cast<std::int64_t>(previous.size())));
+    sync::SyncPlan plan;
+    if (PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+      checks.Expect(plan.operations[0].action == sync::Action::kDownload,
+                    std::string("the plan is a download: ") +
+                        sync::ToString(plan.operations[0].action));
+      const auto done = ExecuteUnderLateWrite(checks, sandbox, client, base, fixture, plan,
+                                              {rom.id, slot, SavePath(name), name},
+                                              OptionsAt(1'757'000'710), late, "download");
+      if (done.has_value()) {
+        checks.Expect(!done->backup_sd_path.empty() &&
+                          sandbox.Read(done->backup_sd_path) == previous,
+                      "download: the backup is left, holding the bytes it was taken of");
+      }
+    }
+    harness::DeleteSave(client, base, fixture, server.id);
+  }
+
+  // 2. conflict, keep both.
+  {
+    Sandbox sandbox(checks, "execute-late-conflict");
+    const std::string slot = harness::UniqueSlot("m9-26-conflict");
+    const std::string name = "late-conflict.srm";
+    const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "server v1\n");
+    harness::Save server;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m9-26", staged, name,
+                             /*with_device=*/true, &server)) {
+      checks.Expect(false, "the first server copy was stored");
+      return;
+    }
+    PassASecond();
+    rig::WriteFile(staged, "server v2, longer\n");
+    harness::Save moved;
+    if (!harness::ReplaceSave(client, base, fixture, server.id, staged, name, &moved)) {
+      checks.Expect(false, "the server copy moved forward in place");
+      harness::DeleteSave(client, base, fixture, server.id);
+      return;
+    }
+    const std::string previous = "device v2\n";
+    sandbox.SeedSave(SavePath(name), previous);
+
+    sync::SyncNegotiatePayload payload;
+    payload.device_id = fixture.device_id;
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, name, slot, "m9-26", crypto::Md5Hex(previous),
+        std::chrono::system_clock::now() + std::chrono::seconds{300},
+        static_cast<std::int64_t>(previous.size())));
+    sync::SyncPlan plan;
+    if (PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+      checks.Expect(plan.operations[0].action == sync::Action::kConflict,
+                    std::string("the plan is a conflict: ") +
+                        sync::ToString(plan.operations[0].action));
+      sync::ExecuteOptions options = OptionsAt(1'757'000'711);
+      options.reported = &payload.saves;
+      const auto done = ExecuteUnderLateWrite(checks, sandbox, client, base, fixture, plan,
+                                              {rom.id, slot, SavePath(name), name}, options,
+                                              late, "conflict");
+      if (done.has_value()) {
+        checks.Expect(!done->backup_sd_path.empty() &&
+                          sandbox.Read(done->backup_sd_path) == previous,
+                      "conflict: the backup is left, holding the bytes it was taken of");
+      }
+    }
+    // The archival copy the conflict made before the write was noticed goes with
+    // `main`'s `DeleteArchivalCopies`.
+    harness::DeleteSave(client, base, fixture, server.id);
+  }
 }
 
 // --- crash --------------------------------------------------------------------
@@ -1589,6 +2071,27 @@ void Placed(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     checks.ExpectEq(sandbox.Read(target), server_bytes, "into the folder it made for it");
   }
 
+  // #258: a fetch that fails after the folder was made takes the folder away
+  // again -- every one it made, and none it did not -- rather than leaving an
+  // empty system folder behind for an emulator to find.
+  {
+    Sandbox sandbox(checks, "execute-placed-unmade");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string account = "/tico/saves/users/0123456789abcdef0123456789abcdef";
+    sandbox.MakeDirs(account);
+    sync::SyncPlan wrong = plan;
+    if (!wrong.operations.empty()) {
+      wrong.operations[0].server_content_hash = std::string(sync::kContentHashDigits, '0');
+    }
+    const sync::ExecutionReport report = sync::ExecutePlan(
+        client, *files, TokenFor(base, fixture), wrong, /*targets=*/{},
+        placing(account + "/gb/deeper/gb240p.srm", 1'757'000'305));
+    checks.ExpectEq(report.failed, 1, "bytes that are not the plan's fail the placement");
+    checks.Expect(!sandbox.Exists(account + "/gb"),
+                  "and the folders it made for them are gone again");
+    checks.Expect(sandbox.Exists(account), "but not the one that was there before");
+  }
+
   // Onto a file the scan did not pair with this row: someone else's save.
   {
     Sandbox sandbox(checks, "execute-placed-taken");
@@ -1599,7 +2102,8 @@ void Placed(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     const sync::ExecutionReport report = sync::ExecutePlan(
         client, *files, TokenFor(base, fixture), plan, /*targets=*/{},
         placing(target, 1'757'000'302));
-    checks.ExpectEq(report.failed, 1, "a placement onto a file is a failed operation");
+    checks.Expect(report.declined == 1 && report.failed == 0,
+                  "a placement onto a file is declined, not failed (#257)");
     if (!report.operations.empty()) {
       checks.Expect(report.operations[0].error == sync::OperationError::kNoLocalSave,
                     std::string("...named as having nowhere to go: ") +
@@ -1624,7 +2128,8 @@ void Placed(rig::Checks& checks, http::HttpClient& client, const std::string& ba
     };
     const sync::ExecutionReport report =
         sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, /*targets=*/{}, options);
-    checks.ExpectEq(report.failed, 1, "a refused placement is a failed operation");
+    checks.Expect(report.declined == 1 && report.failed == 0,
+                  "a refused placement is declined, not failed (#257)");
     if (!report.operations.empty()) {
       checks.Expect(report.operations[0].error == sync::OperationError::kNoLocalSave &&
                         report.operations[0].message.find("more than one account") !=
@@ -2151,6 +2656,15 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
   }
 
   // "Keep local": the player's override, and the only thing that sends the flag.
+  //
+  // A second has to pass first, or the row it writes is not the slot's head.
+  // Negotiate takes the newest row per slot by `updated_at`, which 5.4.0 stores
+  // to the whole second, and a tie goes to whichever row its unordered query
+  // returns first -- the occupant. Arbitrating against the occupant, this device
+  // has no history, and the sync-history check below would fail for a reason
+  // that has nothing to do with whether the upload recorded one (#265; the
+  // product's side of the tie is #272).
+  harness::PassASecond();
   sync::ExecuteOptions keep = OptionsAt(1'757'000'011);
   keep.keep_local = {{rom.id, slot}};
   const sync::ExecutionReport report =
@@ -2218,8 +2732,8 @@ void Occupied(rig::Checks& checks, http::HttpClient& client, const std::string& 
                 "the row the upload wrote is readable");
   checks.ExpectEq(written.file_size_bytes, static_cast<std::int64_t>(bytes.size()),
                   "and holds this device's bytes");
-  checks.Expect(DeviceIsSynced(client, base, fixture, uploaded_id),
-                "and carries this device's sync history");
+  ExpectDeviceSynced(checks, client, base, fixture, rom.id, slot, uploaded_id,
+                     "and carries this device's sync history");
 
   // Now the part that decides whether a slot accretes a row per tick. A second
   // has to have passed for this to be a fact rather than a coin toss, which is
@@ -2555,7 +3069,8 @@ int main(int argc, char** argv) {
   // The two that need no server, so they stay checked with docker stopped.
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
       scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
-      scenario == "delete" || scenario == "crash_delete" || scenario == "isolated") {
+      scenario == "delete" || scenario == "crash_delete" || scenario == "isolated" ||
+      scenario == "late_write" || scenario == "declined") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -2572,6 +3087,11 @@ int main(int argc, char** argv) {
       CrashDelete(checks);
     } else if (scenario == "isolated") {
       Isolated(checks);
+    } else if (scenario == "declined") {
+      Declined(checks);
+    } else if (scenario == "late_write") {
+      LateWriteDelete(checks);
+      LateWriteUnbacked(checks);
     } else {
       Counting(checks);
     }
@@ -2628,6 +3148,8 @@ int main(int argc, char** argv) {
     Dropped(checks, *client, base, fixture, rom);
   } else if (scenario == "collision") {
     Collision(checks, *client, base, fixture, rom);
+  } else if (scenario == "late_fetch") {
+    LateWriteFetch(checks, *client, base, fixture, rom);
   } else if (scenario == "revoked") {
     Revoked(checks, *client, base, fixture, rom);
   } else {

@@ -47,18 +47,22 @@ namespace rommsync::sysmodule::stack {
 inline constexpr std::size_t kMainThreadStackBytes = 0x8000;
 
 /// One nesting level: `Parser::ParseValue` plus the heavier of `ParseObject`
-/// and `ParseArray`. Measured at 432 bytes (144 + 288) in
-/// `devkitpro/devkita64:20260219` at `-Os`; #216 measured 496 before #201 and
-/// #204 moved the build, which is why the ceiling is not the measurement.
-inline constexpr std::size_t kJsonLevelBytes = 512;
+/// and `ParseArray`. Measured at 288 bytes under LTO (#253) in
+/// `devkitpro/devkita64:20260219` at `-Os`, where the level is one
+/// `ParseValue` with its callees inlined; 432 (144 + 288) without LTO, and
+/// #216 measured 496 before #201 and #204 moved the build. The ceiling still
+/// holds the build without LTO, so turning it off is not a stack question.
+inline constexpr std::size_t kJsonLevelBytes = 448;
 
 /// Everything on the deepest parsing chain that does not repeat per level:
-/// the frames from `main` down to `json::Parse`, and the deepest tail below the
-/// last level (`ParseString` -> `ParseUnicodeEscape` -> `ParseHex4` and a
-/// string allocation). Measured at 5,488 bytes, through `main` (2,048) ->
-/// the IPC loop -> `ipc::Dispatch` (400) -> an `SdEngine` handler ->
-/// `auth::LoadOrCreateDeviceIdentity` -> `json::Parse` (320).
-inline constexpr std::size_t kMainRestBytes = 0x1800;
+/// the frames from `main` down to the parser, and the deepest tail below the
+/// last level. Measured at 6,880 bytes under LTO (#253), through `main`
+/// (2,608) -> `SdEngine::Load` (2,320) -> `download::ParseQueue` (704) ->
+/// `json::ParseEach` (640) -> `Parser::ParseEach` (256), with a string
+/// append below the last level: cross-unit inlining folds callees' frames
+/// into `main`'s and `Load`'s, which is the cost #253 named. 5,488 without
+/// LTO, through the IPC loop -> `ipc::Dispatch` -> an `SdEngine` handler.
+inline constexpr std::size_t kMainRestBytes = 0x2000;
 
 /// The deepest document the parser accepts costs `kMaxDepth + 1` levels: one
 /// per nesting it lets through, and the frame that refuses the next.

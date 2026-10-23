@@ -27,6 +27,21 @@ ceilings, and this script holds every side of the arithmetic:
             measured level or rest outgrows the header's ceilings -- which is
             how a frame that grew is caught.
 
+Where the call graph comes from (#253). The build is LTO, so the compile of
+each unit generates no code and leaves no `.ci`: the code is generated at the
+link, and its graph is the `<elf>.ltransN.ltrans.ci` files the LTRANS step
+writes beside the ELF when the link is handed `-fcallgraph-info=su`
+(`switch.mk` puts `$(DEFINES)` on it for this). Those describe the code that
+ships -- after cross-unit inlining, which is the point of reading them -- but
+the LTO back end names each node by its bare identifier (`ParseValue`,
+`__dt_base`, `_M_copy`), with no class, namespace or signature; every rule
+below is about qualified names. Each node's title is still its assembler name,
+so the LTRANS graph is read with each label's name replaced by the demangled
+title -- `aarch64-none-elf-c++filt`, which is why this phase runs in the image.
+A per-unit graph (a build without LTO) is read as it was, by its labels; a
+directory holding both is refused, since only one of them is the code that
+ships.
+
 How a chain is costed. Each function's frame is GCC's own static figure. Every
 recursion reachable from `main` must be one `kMaxDepth` bounds -- the parser,
 and `json::Value`'s destructor, whose tree is no deeper than the document that
@@ -43,25 +58,30 @@ with no target: `fs::FileSystem` and `http::HttpClient` are interfaces, and the
 build has a few hundred such sites. One family is resolved, because the main
 thread's whole IPC surface hangs off it -- `ipc::ServiceCore` calls an
 `ipc::Engine&`, and the sysmodule's only `ipc::Engine` is `SdEngine` -- so every
-virtual `SdEngine` method is treated as callable from every indirect call in
-`ServiceCore`. Everything else, and every frame inside newlib and libnx, counts
-as zero. The measured figure is a floor on the truth, not a bound, and half the
-stack is what is left for the difference.
+`SdEngine` method overriding one `ipc::Engine` declares virtual (read out of
+`ipc.hpp`, since a demangled name does not say `virtual`) is treated as
+callable from every indirect call in `ServiceCore`, or in `ipc::Dispatch`, into
+which LTO inlines `ServiceCore`'s handlers. Everything else, and every frame
+inside newlib and libnx, counts as zero. The measured figure is a floor on the
+truth, not a bound, and half the stack is what is left for the difference.
 
-Re-deriving the numbers by hand is `make -C sysmodule DEFINES="-fstack-usage
--fcallgraph-info=su"` in the pinned image; `tests/test_stack_budget.sh measured`
-does exactly that in a scratch copy.
+Re-deriving the numbers by hand is `DEFINES="-fstack-usage -fcallgraph-info=su"
+make -C sysmodule` in the pinned image, then `stack-budget.py measured --ci
+sysmodule` there; `tests/test_stack_budget.sh measured` does exactly that in a
+scratch copy.
 """
 import argparse
 import glob
 import json
 import os
 import re
+import subprocess
 import sys
 
 NPDM = "sysmodule/sys-rommsync.json"
 BUDGET = "sysmodule/source/stack_budget.hpp"
 JSON_HPP = "core/include/rommsync/json.hpp"
+IPC_HPP = "core/include/rommsync/ipc.hpp"
 CONTRACTS = "server/contract/romm-openapi-*.json"
 
 # The functions every chain starts from. `__appInit` runs on the main thread
@@ -82,14 +102,20 @@ TREE_LEVELS = 32
 # not one of them, whatever it is named.
 MAX_RECURSION = 8
 # ...and the parser's own cycle is told apart from the destructor's by name.
-PARSER = re.compile(r"rommsync::json::Parser::Parse(Value|Object|Array)\(")
+# They are templates: GCC's own label puts the arguments after the signature
+# (`[with bool kKeeps = false]`), a demangled name before it (`ParseValue<false>(`).
+PARSER = re.compile(r"rommsync::json::Parser::Parse(Value|Object|Array)(?:<[^()]*>)?\(")
 
-# The indirect calls this walk resolves: (where the call is made, what it may
-# reach, why). See the module docstring.
-INDIRECT = (
-    ("rommsync::ipc::ServiceCore::", re.compile(r"^virtual .*rommsync::sysmodule::SdEngine::"),
-     "ipc::ServiceCore holds an ipc::Engine&, and the sysmodule's only ipc::Engine is SdEngine"),
-)
+# The indirect call this walk resolves, and why. See the module docstring.
+# Where the call is made: `ServiceCore`'s handlers, or `ipc::Dispatch` once LTO
+# has inlined them into it.
+ENGINE_CALLER = re.compile(r"rommsync::ipc::(?:ServiceCore::|Dispatch\()")
+ENGINE_WHY = "ipc::ServiceCore holds an ipc::Engine&, and the sysmodule's only ipc::Engine is SdEngine"
+# What it may reach: an `SdEngine` method named like one of `ipc::Engine`'s
+# virtuals, where the name starts or follows a return type -- so not a template
+# instantiated with one (`EnqueueAndStore<...SdEngine::Enqueue...>`). A lambda
+# inside one starts the same way, and `resolve_indirect` drops it by name.
+ENGINE_CALLEE = r"(?:^|[ *&])rommsync::sysmodule::SdEngine::(?:%s)\("
 
 NODE = re.compile(r'^node: \{ title: "(?P<title>[^"]*)" label: "(?P<label>(?:[^"\\]|\\.)*)"')
 EDGE = re.compile(r'^edge: \{ sourcename: "(?P<source>[^"]*)" targetname: "(?P<target>[^"]*)"')
@@ -97,6 +123,9 @@ FRAME = re.compile(r"\\n(\d+) bytes \((?:static|dynamic)")
 # `dynamic` without `,bounded` is an alloca or a VLA whose size GCC cannot
 # bound, so the figure beside it is a floor and no budget can hold it.
 UNBOUNDED = re.compile(r"\\n\d+ bytes \(dynamic\)")
+# An LTRANS node's title is its assembler name, prefixed `<ltrans object>:`
+# when it is local to that partition.
+LTRANS_SYMBOL = re.compile(r"^(?:.*\.o:)?(?P<symbol>_Z[^:]*)$")
 
 
 def fail(message):
@@ -136,6 +165,28 @@ def budget(repo):
     return numbers
 
 
+def engine_methods(repo):
+    """The names `ipc::Engine` declares virtual, its destructor aside: what
+    an indirect call through `ipc::Engine&` can reach."""
+    block = re.search(r"\bclass\s+Engine\s*\{(.*?)\n\};", read(repo, IPC_HPP), re.S)
+    if not block:
+        return []
+    names = set()
+    for head in re.findall(r"\bvirtual\s+([^;(]*)\(", block.group(1)):
+        name = re.search(r"(~?\w+)\s*$", head)
+        if name and not name.group(1).startswith("~"):
+            names.add(name.group(1))
+    return sorted(names)
+
+
+def indirect_rules(methods):
+    """(where the call is made, what it may reach, why), for `measure`."""
+    if not methods:
+        return [(ENGINE_CALLER, None, ENGINE_WHY)]
+    return [(ENGINE_CALLER, re.compile(ENGINE_CALLEE % "|".join(map(re.escape, methods))),
+             ENGINE_WHY)]
+
+
 def worst_case(depth, level, rest):
     return (depth + 1) * level + rest
 
@@ -150,6 +201,10 @@ class Graph:
     titled `<file>:<symbol>` by GCC already, so two units' statics cannot merge.
     A comdat inline emitted by several units is the same title in each, and
     keeps the largest frame any of them reports.
+
+    `ltrans=True` reads an LTRANS unit's graph, whose labels carry bare
+    identifiers: the node's mangled title is kept aside, and `demangle` later
+    names it by that instead.
     """
 
     def __init__(self):
@@ -157,13 +212,17 @@ class Graph:
         self.label = {}
         self.calls = {}
         self.unbounded = set()
+        self.mangled = {}
 
-    def add(self, text):
+    def add(self, text, ltrans=False):
         for line in text.splitlines():
             node = NODE.match(line)
             if node:
                 title, label = node.group("title"), node.group("label")
                 self.label.setdefault(title, label.split("\\n")[0])
+                symbol = LTRANS_SYMBOL.match(title) if ltrans else None
+                if symbol:
+                    self.mangled[title] = symbol.group("symbol")
                 frame = FRAME.search(label)
                 if frame:
                     self.frame[title] = max(self.frame.get(title, 0), int(frame.group(1)))
@@ -174,19 +233,39 @@ class Graph:
             if edge:
                 self.calls.setdefault(edge.group("source"), set()).add(edge.group("target"))
 
-    def resolve_indirect(self):
-        """Apply `INDIRECT`. Returns the problems: a rule that matched nothing
-        has rotted, and would silently stop following the IPC handlers."""
+    def demangle(self, demangler):
+        """Name every LTRANS node by its demangled title. `demangler` takes a
+        list of assembler names and returns their demangled forms, in order.
+        Returns the problems."""
+        titles = sorted(self.mangled)
+        if not titles:
+            return []
+        names = demangler([self.mangled[t] for t in titles])
+        if len(names) != len(titles):
+            return ["the demangler returned %d names for %d symbols" % (len(names), len(titles))]
+        for title, name in zip(titles, names):
+            self.label[title] = name
+        return []
+
+    def resolve_indirect(self, rules):
+        """Apply `rules` (`indirect_rules`). Returns the problems: a rule that
+        matched nothing has rotted, and would silently stop following the IPC
+        handlers."""
         problems = []
-        for caller, callee, why in INDIRECT:
+        for caller, callee, why in rules:
+            if callee is None:
+                problems.append("no virtual method found in `class Engine` in %s; the walk cannot "
+                                "say what the IPC handlers' indirect calls reach" % IPC_HPP)
+                continue
             sources = [t for t, out in self.calls.items()
-                       if "__indirect_call" in out and caller in self.label.get(t, "")]
-            targets = [t for t, label in self.label.items() if callee.search(label)]
+                       if "__indirect_call" in out and caller.search(self.label.get(t, ""))]
+            targets = [t for t, label in self.label.items()
+                       if callee.search(label) and "{lambda" not in label]
             if not sources or not targets:
                 problems.append("the indirect-call rule `%s` -> `%s` matched %d callers and %d "
                                 "callees; it exists because %s, and a rule that matches nothing "
                                 "stops the walk following the main thread's IPC handlers"
-                                % (caller, callee.pattern, len(sources), len(targets), why))
+                                % (caller.pattern, callee.pattern, len(sources), len(targets), why))
                 continue
             for source in sources:
                 self.calls[source].update(targets)
@@ -278,11 +357,11 @@ class Measured:
         self.tree = 0           # the costliest red-black tree recursion, whole
 
 
-def measure(graph, depth):
+def measure(graph, depth, rules):
     """The main thread's deepest chain, split into what scales with `depth` and
     what does not."""
     result = Measured()
-    result.problems += graph.resolve_indirect()
+    result.problems += graph.resolve_indirect(rules)
     roots = [r for r in ROOTS if r in graph.calls or r in graph.frame]
     if "main" not in roots:
         result.problems.append("no `main` in the call graph; is this a sysmodule build with "
@@ -491,20 +570,57 @@ def phase_contract(repo):
     return 0
 
 
-def load_graph(directory):
+def find_demangler():
+    """The toolchain's c++filt: the one that demangles what this GCC mangled."""
+    tool = os.path.join(os.environ.get("DEVKITPRO", "/opt/devkitpro"),
+                        "devkitA64", "bin", "aarch64-none-elf-c++filt")
+    return tool if os.access(tool, os.X_OK) else None
+
+
+def run_demangler(tool):
+    def demangle(symbols):
+        # One symbol a line on stdin, one name a line back: a single process
+        # for the whole graph rather than one per node.
+        done = subprocess.run([tool], input="\n".join(symbols) + "\n", capture_output=True,
+                              text=True, check=True)
+        return done.stdout.splitlines()
+    return demangle
+
+
+def load_graph(directory, demangler=None):
+    """Every `.ci` under `directory`. Returns (graph, files, problems)."""
     graph = Graph()
-    files = sorted(glob.glob(os.path.join(directory, "*.ci")))
+    files = sorted(os.path.join(root, name) for root, _, names in os.walk(directory)
+                   for name in names if name.endswith(".ci"))
+    ltrans = [f for f in files if f.endswith(".ltrans.ci")]
+    if ltrans and len(ltrans) != len(files):
+        return graph, files, ["%s holds both LTRANS call graphs (%d) and per-unit ones (%d); only "
+                              "one of them is the code that ships -- measure a clean build"
+                              % (directory, len(ltrans), len(files) - len(ltrans))]
     for path in files:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            graph.add(handle.read())
-    return graph, files
+            graph.add(handle.read(), ltrans=bool(ltrans))
+    if not graph.mangled:
+        return graph, files, []
+    if demangler is None:
+        return graph, files, ["these are LTRANS call graphs, named only by their mangled titles, "
+                              "and there is no devkitA64 c++filt to read them with; run this in "
+                              "the image"]
+    try:
+        return graph, files, graph.demangle(run_demangler(demangler))
+    except (OSError, subprocess.CalledProcessError) as error:
+        return graph, files, ["%s could not demangle the graph: %s" % (demangler, error)]
 
 
 def phase_measured(repo, directory):
-    graph, files = load_graph(directory)
+    graph, files, problems = load_graph(directory, find_demangler())
     if not files:
-        return fail("no .ci files in %s; build with DEFINES=\"-fstack-usage "
+        return fail("no .ci files under %s; build with DEFINES=\"-fstack-usage "
                     "-fcallgraph-info=su\"" % directory)
+    if problems:
+        for problem in problems:
+            fail(problem)
+        return 1
     depth = max_depth(repo)
     stack = npdm_stack(repo)
     if depth is None:
@@ -512,7 +628,7 @@ def phase_measured(repo, directory):
     if stack is None:
         return fail("%s has no main_thread_stack_size" % NPDM)
     numbers = budget(repo)
-    measured = measure(graph, depth)
+    measured = measure(graph, depth, indirect_rules(engine_methods(repo)))
     report(graph, measured, depth)
     failures = 0
     for problem in measured.problems:
@@ -557,10 +673,31 @@ PARSE = ("Parse", "rommsync::json::ParseResult rommsync::json::Parse(std::string
 DV = ("DV", "constexpr rommsync::json::Value::~Value()")
 DM = ("DM", "constexpr std::vector<_Tp, _Alloc>::~vector() [with _Tp = rommsync::json::Member]")
 CORE = ("Core", "rommsync::ipc::Error rommsync::ipc::ServiceCore::RestoreBackup(long)")
-RESTORE = ("Restore", "virtual rommsync::ipc::Error rommsync::sysmodule::SdEngine::Restore(long)")
+RESTORE = ("Restore",
+           "virtual rommsync::ipc::RestoreState rommsync::sysmodule::SdEngine::RequestRestore(long)")
 
 
-def _fixture(extra_nodes=(), extra_edges=(), destructor=50):
+def _ltrans(nodes, edges):
+    """The same graph as LTO's back end writes it: each C++ function titled by
+    an assembler name -- `Str` local to its partition -- and labelled by its
+    bare identifier. Returns the text and a demangler for it, which, like
+    c++filt, says nothing of `virtual`."""
+    titles, names = {}, {}
+    out = []
+    for title, label, frame in nodes:
+        if "::" not in label:
+            titles[title] = title
+            out.append((title, label, frame))
+            continue
+        symbol = "_Z" + title
+        titles[title] = ("/tmp/cc0.ltrans3.o:" if title == "Str" else "") + symbol
+        names[symbol] = label.replace("virtual ", "")
+        out.append((titles[title], re.search(r"(~?\w+)\(", label).group(1), frame))
+    text = _ci(out, [(titles[a], titles[b]) for a, b in edges])
+    return text, lambda symbols: [names[s] for s in symbols]
+
+
+def _fixture(extra_nodes=(), extra_edges=(), destructor=50, ltrans=False):
     nodes = [("main", "int main(int, char**)", 1000), ("__appInit", "void __appInit()", 300),
              ("Load", "void SdEngine::Load()", 500),
              (PARSE[0], PARSE[1], 300), (PV[0], PV[1], 100), (PO[0], PO[1], 300),
@@ -575,10 +712,12 @@ def _fixture(extra_nodes=(), extra_edges=(), destructor=50):
              ("PO", "Str"), ("PV", "Fail"), ("Str", "memcpy"),
              ("PO", "DV"), ("DV", "DM"), ("DM", "DV"),
              ("main", "Core"), ("Core", "__indirect_call")]
+    if ltrans:
+        return _ltrans(nodes + list(extra_nodes), edges + list(extra_edges))
     return _ci(list(nodes) + list(extra_nodes), edges + list(extra_edges))
 
 
-def phase_walk():
+def phase_walk(repo):
     failures = 0
 
     def check(what, observed, expected):
@@ -586,9 +725,18 @@ def phase_walk():
         if observed != expected:
             failures += fail("walk: %s: got %r, expected %r" % (what, observed, expected))
 
+    # What an `ipc::Engine&` can reach, read out of the real header.
+    methods = engine_methods(repo)
+    check("engine methods include RequestRestore", "RequestRestore" in methods, True)
+    check("engine methods leave out power::Sink's", "Quiesce" in methods, False)
+    check("engine methods leave out the destructor", [m for m in methods if "~" in m], [])
+    rules = indirect_rules(methods)
+    check("no engine methods is a problem",
+          len(Graph().resolve_indirect(indirect_rules([]))), 1)
+
     graph = Graph()
     graph.add(_fixture())
-    measured = measure(graph, 4)
+    measured = measure(graph, 4, rules)
     check("problems", measured.problems, [])
     # PV 100 + max(PO 300, PA 200): the heavier of the parser's two cycles.
     check("level", measured.level, 400)
@@ -602,10 +750,39 @@ def phase_walk():
     check("destructor level", measured.other_levels, {DV[1]: 80})
     check("worst at depth 4", worst_case(4, measured.level, measured.rest), 3860)
 
+    # The same graph as an LTRANS unit writes it (#253) measures the same,
+    # once its titles are demangled...
+    text, demangle = _fixture(ltrans=True)
+    graph = Graph()
+    graph.add(text, ltrans=True)
+    check("ltrans demangled", graph.demangle(demangle), [])
+    measured = measure(graph, 4, rules)
+    check("ltrans problems", measured.problems, [])
+    check("ltrans level", measured.level, 400)
+    check("ltrans rest", measured.rest, 1860)
+    check("ltrans other", measured.other_rest, 3100)
+    # ...and with ServiceCore's handler inlined into `ipc::Dispatch`, the
+    # indirect call is Dispatch's and still reaches the engine.
+    text, demangle = _fixture(ltrans=True)
+    graph = Graph()
+    graph.add(text, ltrans=True)
+    graph.demangle(lambda symbols: [n.replace("ipc::ServiceCore::RestoreBackup(",
+                                              "ipc::Dispatch(rommsync::ipc::ServiceCore&, ")
+                                    for n in demangle(symbols)])
+    check("ltrans dispatch other", measure(graph, 4, rules).other_rest, 3100)
+    check("a demangled parser instantiation is the parser",
+          bool(PARSER.search("bool rommsync::json::Parser::ParseObject<false, true>(int, "
+                             "rommsync::json::Value*)")), True)
+    # Read by its bare labels, as the issue found it, the parser is invisible.
+    graph = Graph()
+    graph.add(_fixture(ltrans=True)[0], ltrans=True)
+    check("ltrans undemangled loses the parser",
+          [p for p in measure(graph, 4, rules).problems if "no json::Parser" in p] != [], True)
+
     # The indirect rule has to match, or the IPC handlers vanish from the walk.
     graph = Graph()
     graph.add(_fixture().replace("ServiceCore", "SomethingElse"))
-    measured = measure(graph, 4)
+    measured = measure(graph, 4, rules)
     check("unmatched rule reported", len(measured.problems), 1)
     check("unmatched rule loses the handler", measured.other_rest, 1100)
 
@@ -614,20 +791,20 @@ def phase_walk():
     graph = Graph()
     graph.add(_fixture([("Erase", "void std::_Rb_tree<K, V>::_M_erase(_Node_ptr)", 24)],
                        [("Core", "Erase"), ("Erase", "Erase")]))
-    measured = measure(graph, 4)
+    measured = measure(graph, 4, rules)
     check("tree problems", measured.problems, [])
     check("tree cost", measured.tree, 768)
     check("tree chain", measured.other_rest, 3100)
     graph = Graph()
     graph.add(_fixture([("Erase", "void std::_Rb_tree<K, V>::_M_erase(_Node_ptr)", 100)],
                        [("Core", "Erase"), ("Erase", "Erase")]))
-    check("tree chain when it is the deepest", measure(graph, 4).other_rest, 1100 + 3200)
+    check("tree chain when it is the deepest", measure(graph, 4, rules).other_rest, 1100 + 3200)
 
     # A recursion outside the JSON reader is not one any depth bounds.
     graph = Graph()
     graph.add(_fixture([("Walk", "void rommsync::scan::Walk(Dir)", 200)],
                        [("main", "Walk"), ("Walk", "Walk")]))
-    measured = measure(graph, 4)
+    measured = measure(graph, 4, rules)
     check("unbounded recursion reported",
           [p for p in measured.problems if "does not bound" in p] != [], True)
 
@@ -636,17 +813,17 @@ def phase_walk():
     graph.add(_fixture().replace('"%s\\nfile.cpp:1:1\\n2000 bytes (static)"' % RESTORE[1],
                                  '"%s\\nfile.cpp:1:1\\n2000 bytes (dynamic)"' % RESTORE[1]))
     check("unbounded frame reported",
-          [p for p in measure(graph, 4).problems if "cannot bound" in p] != [], True)
+          [p for p in measure(graph, 4, rules).problems if "cannot bound" in p] != [], True)
     graph = Graph()
     graph.add(_fixture().replace('"%s\\nfile.cpp:1:1\\n2000 bytes (static)"' % RESTORE[1],
                                  '"%s\\nfile.cpp:1:1\\n2000 bytes (dynamic,bounded)"'
                                  % RESTORE[1]))
-    check("bounded dynamic frame counted", measure(graph, 4).problems, [])
+    check("bounded dynamic frame counted", measure(graph, 4, rules).problems, [])
 
     # A destructor heavier than the parser breaks the shared-budget argument.
     graph = Graph()
     graph.add(_fixture(destructor=900))
-    measured = measure(graph, 4)
+    measured = measure(graph, 4, rules)
     check("heavy destructor reported",
           [p for p in measured.problems if "heaviest" in p] != [], True)
 
@@ -680,7 +857,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("phase", choices=("fit", "contract", "walk", "measured"))
     parser.add_argument("--repo", default=os.path.join(os.path.dirname(__file__), ".."))
-    parser.add_argument("--ci", help="measured: the directory holding the build's .ci files")
+    parser.add_argument("--ci", help="measured: the directory the build's .ci files are under")
     args = parser.parse_args()
     repo = os.path.abspath(args.repo)
     if args.phase == "fit":
@@ -688,7 +865,7 @@ def main():
     if args.phase == "contract":
         return phase_contract(repo)
     if args.phase == "walk":
-        return phase_walk()
+        return phase_walk(repo)
     if not args.ci:
         parser.error("measured needs --ci")
     return phase_measured(repo, args.ci)

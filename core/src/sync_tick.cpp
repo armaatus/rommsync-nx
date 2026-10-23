@@ -513,6 +513,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     ++result.totals.plans;
     result.totals.completed += run.executed.completed;
     result.totals.failed += run.executed.failed;
+    result.totals.declined += run.executed.declined;
     result.totals.stored = result.totals.stored && run.finished.stored.ok();
     if (options.on_plan) {
       options.on_plan(one.plan, run.executed);
@@ -551,6 +552,13 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   }
   std::sort(result.oversized_roms.begin(), result.oversized_roms.end());
   std::sort(result.unasked_roms.begin(), result.unasked_roms.end());
+  // A decline this tick did not meet again is over (#257): the server's save
+  // went, or the rom left the card. Not after a tick a shutdown or a 401 cut
+  // short, whose plan stopped before the operations it would have met.
+  if (options.execute.declines != nullptr && result.totals.plans > 0 &&
+      outcome != TickOutcome::kCanceled && outcome != TickOutcome::kUnauthorized) {
+    options.execute.declines->EndTick(result.unasked_roms);
+  }
   result.outcome = outcome;
   result.answer = answer;
   return result;

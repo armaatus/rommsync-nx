@@ -144,6 +144,15 @@ void MakeDir(checks::Checks& c) {
   c.Expect(card->CreateDirectory("/a/../b").error == fs::MakeDirError::kNotOnThisCard,
            "a path off the card is refused before anything is tried");
 
+  // #258: taking back a folder a failed placement made -- only ever an empty one.
+  c.Expect(!card->RemoveEmptyDirectory("/config/rommsync"),
+           "a folder that holds anything is not removed");
+  c.Expect(!card->RemoveEmptyDirectory("/config/file"), "nor is a file");
+  c.Expect(card->RemoveEmptyDirectory("/config/rommsync/.backup") &&
+               !std::filesystem::exists(mount + "/config/rommsync/.backup"),
+           "an empty one is");
+  c.Expect(std::filesystem::is_directory(mount + "/config/rommsync"), "and its parent stays");
+
   // A card that will not take it. Not as root, which ignores the mode.
   if (::geteuid() != 0) {
     std::filesystem::create_directories(mount + "/locked");

@@ -953,6 +953,30 @@ void Placing(rig::Checks& checks) {
     checks.ExpectEq(sandbox.Read(target), std::string(40, 'z'), "with the server's bytes");
   }
 
+  // #258: a download that fails takes back the folders made for it, and only those.
+  {
+    Sandbox sandbox(checks, "states-placing-unmade");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    ScriptedClient client;
+    client.listing = "[" + kServerRow + "]";
+    client.content = std::string(10, 'z');  // short of the row's 40: never promoted
+    const std::string account = "/tico/states/users/0123456789abcdef0123456789abcdef";
+    sandbox.MakeDirs(account);
+    sync::StateSyncOptions options = OptionsAt(kStamp);
+    options.place = [&account](const sync::ServerState&) {
+      rommsync::place::Placement placement;
+      placement.sd_path = account + "/nes/deeper/Game.state";
+      return placement;
+    };
+    state::Baseline baseline;
+    const sync::StateSyncReport report =
+        sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.ExpectEq(report.failed, 1, "a short body fails the placement");
+    checks.Expect(!sandbox.Exists(account + "/nes"), "and the folders it made are gone again");
+    checks.Expect(sandbox.Exists(account), "but not the one that was there before");
+  }
+
   // More of the server's states than one tick places (#247): every one is an
   // operation the tick holds to its end, and a listing at its byte bound is ~220
   // rows, so one tick places at most `kMaxStatePlacements` and the next places

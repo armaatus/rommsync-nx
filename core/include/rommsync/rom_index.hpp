@@ -30,6 +30,7 @@
 #include "rommsync/auth_gate.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/sync.hpp"
 
 namespace rommsync::roms {
 
@@ -195,6 +196,18 @@ struct FetchOptions {
 
   int page_size = kDefaultPageSize;
   std::size_t max_roms = kMaxIndexRoms;
+
+  /// How hard each page is tried: its timeout, and its retries on a transport
+  /// failure or a `http::TransientStatus`, on `sync::WaitToRetry`'s curve. The
+  /// attempt budget is a page's, not the fetch's -- a library is up to 512
+  /// requests, and one lost page in them is a link's bad second, not a reason
+  /// to call the server down. `cancel` is checked before every request, so a
+  /// fetch cancelled between pages sends no other (#251).
+  ///
+  /// The halving retries a page too large to read earns are not these: the
+  /// server answered, and the same request is the same size however long it
+  /// waits (#248).
+  sync::CallPolicy policy;
 };
 
 /// A fetched index, or the reason there isn't one.
@@ -207,6 +220,9 @@ struct FetchOptions {
 struct FetchResult {
   RomIndex index;
 
+  /// The page's last attempt, once `FetchOptions::policy` had none left. Or
+  /// `kCanceled`, when its token fired: nobody is waiting for this index, and
+  /// that is not a server failing (#251).
   http::Error transport = http::Error::kNone;
 
   /// The status of the request that failed. Zero when none did.

@@ -87,6 +87,10 @@ SECTIONS = [
     "Tico saves from the wrong account, or none",
     "RomM calls a platform something else",
     "Some saves are left out: the limits",
+    # M9-23 (#250). `process.terminated` is the sysmodule's last line before a
+    # `std::terminate` -- out of memory, under `-fno-exceptions` -- and before it
+    # a sysmodule that stopped left nothing to read at all.
+    "The sysmodule stopped",
     "What to attach to a bug report",
     "What this page cannot tell you yet",
 ]
@@ -309,13 +313,14 @@ def phase_emitted(args) -> int:
 
     body = "\n".join(strip_comments(read(path)) for path in sorted(sources))
 
-    # A *call*, not a mention: one of the five entry points, an open paren, and
+    # A *call*, not a mention: one of the six entry points -- `WriteLast` is the
+    # dying process's (#250) -- an open paren, and
     # the event within the same statement. The level argument in between may be a
     # literal or a call (`LevelFor(note.severity)`), so it is matched loosely and
     # bounded by the statement's own semicolon.
     orphans = sorted(
         tag for tag, name in known.items()
-        if not re.search(rf"\b(?:Error|Warn|Info|Write|WriteEach)\s*\([^;]{{0,80}}?"
+        if not re.search(rf"\b(?:Error|Warn|Info|Write|WriteEach|WriteLast)\s*\([^;]{{0,80}}?"
                          rf"Event::{name}\b", body))
     if orphans:
         return fail(f"docs/TROUBLESHOOTING.md documents {orphans}, and nothing outside the "
@@ -515,7 +520,12 @@ def phase_sections(args) -> int:
                         "of this page by the line in their file; one with no line is a "
                         "section nobody reaches.")
 
-    reasons = skip_reasons(repo)
+    # A server's save the console will not take is the engine's line, not the
+    # scan's (#257): `ExecutePlan` leads it with `declined`.
+    if '"declined "' not in read(os.path.join(repo, "core", "src", "sync_execute.cpp")):
+        return fail("core/src/sync_execute.cpp no longer leads a decline's line with "
+                    "`declined `, which the guide quotes")
+    reasons = skip_reasons(repo) + ["declined"]
     checked = 0
     for match in quoted_lines(text):
         if match.group(3) != "scan.skipped":

@@ -17,9 +17,10 @@ Where the answers live:
 
 - `core/` -- the portable engine. Auth, sync, downloads, config, state.
 - `host/` -- desktop backends for `core/`'s interfaces.
-- `server/contract/` -- the pinned RomM API snapshots: 5.2.0, and 5.4.0 beside
-  it (captures under `captures/5.4.0/`). These, not the RomM docs and not a
-  guess, are what this project builds against.
+- `server/contract/` -- the pinned RomM API snapshots. 5.4.0's
+  (`romm-openapi-5.4.0.json`, captures under `captures/5.4.0/`), not the RomM
+  docs and not a guess, are what this project builds against; 5.2.0's, at the
+  top level, are the record of a version the client refuses.
 - `docs/` -- ARCHITECTURE, API_CONTRACT, AUTH, SYNC_PROTOCOL, TESTING, CONFIG.
 - `tests/` -- what is already proven, and how the rig is driven.
 - The issue tracker -- `GH_PAGER=cat gh issue view <n>`. Design intent lives

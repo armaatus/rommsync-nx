@@ -1,5 +1,6 @@
 #include "rommsync/host/native_file_system.hpp"
 
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #if defined(__APPLE__)
@@ -9,9 +10,11 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -146,29 +149,44 @@ class NativeFileSystem final : public fs::FileSystem {
       return listing;
     }
 
-    std::filesystem::directory_iterator iterator(resolved, error);
-    if (error) {
+    // `opendir` and not `directory_iterator`, as `card.cpp` does on the console:
+    // libstdc++ allocates inside the iterator where a `bad_alloc` cannot leave
+    // it -- GCC 13 calls `std::terminate` with nothing in flight, GCC 15
+    // segfaults -- so a heap that runs out mid-listing would die of the host's
+    // standard library rather than of the allocation (oom.tick, #250).
+    const std::unique_ptr<::DIR, int (*)(::DIR*)> directory(::opendir(resolved.c_str()),
+                                                            &::closedir);
+    if (directory == nullptr) {
       listing.error = fs::ListError::kUnreadable;
-      listing.message = std::string(sd_path) + ": " + error.message();
+      listing.message = std::string(sd_path) + ": " + std::strerror(errno);
       return listing;
     }
 
-    const std::filesystem::directory_iterator end;
     bool truncated = false;
-    for (; iterator != end; iterator.increment(error)) {
-      if (error) {
-        listing.error = fs::ListError::kUnreadable;
-        listing.message = std::string(sd_path) + ": " + error.message();
-        return listing;
+    for (;;) {
+      errno = 0;
+      const ::dirent* found = ::readdir(directory.get());
+      if (found == nullptr) {
+        if (errno != 0) {
+          listing.error = fs::ListError::kUnreadable;
+          listing.message = std::string(sd_path) + ": " + std::strerror(errno);
+          return listing;
+        }
+        break;
+      }
+      if (std::strcmp(found->d_name, ".") == 0 || std::strcmp(found->d_name, "..") == 0) {
+        continue;
       }
       fs::Entry entry;
-      entry.name = iterator->path().filename().string();
-      // `.` and `..` are not reported by `directory_iterator`, but a symlink to
-      // a directory is a directory here: the scanner does not descend, so the
-      // only thing this decides is that it is not a save file.
-      std::error_code kind_error;
-      entry.is_directory = iterator->is_directory(kind_error);
-      ReadStat(iterator->path(), &entry);
+      entry.name = found->d_name;
+      const std::filesystem::path child = resolved / entry.name;
+      // A symlink to a directory is a directory here: the scanner does not
+      // descend, so the only thing this decides is that it is not a save file.
+      struct ::stat info {};
+      if (::stat(child.c_str(), &info) == 0) {
+        entry.is_directory = S_ISDIR(info.st_mode);
+      }
+      ReadStat(child, &entry);
 
       // The bound is on what is *held*, not on how far the walk gets: keeping
       // the first `kMaxDirectoryEntries` names in order costs one heap of that
@@ -232,6 +250,21 @@ class NativeFileSystem final : public fs::FileSystem {
       result.message = std::string(sd_path) + ": " + error.message();
     }
     return result;
+  }
+
+  bool RemoveEmptyDirectory(std::string_view sd_path) override {
+    std::filesystem::path resolved;
+    if (!ResolveUnderRoot(root_, sd_path, &resolved)) {
+      return false;
+    }
+    // Asked first rather than left to `remove`, which takes a file as readily
+    // as an empty directory.
+    std::error_code error;
+    if (!std::filesystem::is_directory(resolved, error) ||
+        !std::filesystem::is_empty(resolved, error) || error) {
+      return false;
+    }
+    return std::filesystem::remove(resolved, error) && !error;
   }
 
   std::string Resolve(std::string_view sd_path) const override {

@@ -98,7 +98,7 @@ and a log is not worth it. A save is never in that position; see
 | `net.offline` | the request never completed | [Nothing syncs, and nothing is reachable](#nothing-syncs-and-nothing-is-reachable) |
 | `net.tls` | the TLS handshake or the certificate was refused | [TLS fails](#tls-fails) |
 | `auth.rejected` | the server has stopped accepting this console | [The token expired or was revoked](#the-token-expired-or-was-revoked) |
-| `scan.skipped` | a save file was not matched to a rom | [Saves are skipped: nothing matches](#saves-are-skipped-nothing-matches) |
+| `scan.skipped` | a save file was not matched to a rom, or a server's save will not be taken here | [Saves are skipped: nothing matches](#saves-are-skipped-nothing-matches) |
 | `sync.refused` | the server answered, and the answer will not change | [The server refused the sync](#the-server-refused-the-sync) |
 | `save.failed` | a save could not be written — usually a full card | [The SD card is full](#the-sd-card-is-full) |
 | `sync.tick` | how one sync ended — every tick writes one | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
@@ -110,6 +110,8 @@ and a log is not worth it. A save is never in that position; see
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
+| `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
+| `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -319,10 +321,25 @@ Two folder layouts behave differently here, and it matters:
   ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#formats-only-one-emulator-reads)).
 
 A PS1, N64, Dreamcast, NDS or Saturn save that **is** matched can still be
-refused at the download, with `other_emulator` in a `save.failed` line: the
-server's copy came from RetroArch, whose format for that system Tico's module
-does not read, so it is never written over the card. It syncs with the same
-module on another Switch only.
+declined at the download, in a `scan.skipped declined` line saying the two are
+not the same save format: the server's copy came from RetroArch, whose format for that system
+Tico's module does not read, so it is never written over the card. It syncs with
+the same module on another Switch only.
+
+The same kind of line names a save the console has never had and will not
+place — the platform has no folder for the emulator it is played in, Tico has
+several accounts and none chosen, or a file the scan did not pair is already
+where it would go:
+
+```
+8 warn scan.skipped declined download rom 6, slot autosave: there is no local save for this (rom_id, slot), and /tico/saves/psx/Game.mcd is already a file this sync did not pair with it; it was not touched
+```
+
+None of these is a failed sync, and the sync is not reported partial on their
+account. Each is said **once**, and again only when something changes — a new
+copy on the server, the file moving, or the reason the placement gave — or after
+a reboot. Moving the file in the way, or fixing what the reason names, lets the
+next sync bring the save down.
 
 ---
 
@@ -685,6 +702,22 @@ closes. Downloads from
 the queue are not held — a rom is not a save — so a rom queued from the overlay
 mid-game still comes down.
 
+**The play time it records.** The sync after the game names what you played,
+one line per save that changed, with the application the console saw in the
+foreground when the save was written — its title id:
+
+```
+22 info play.recorded rom 12 slot autosave: played up to 31 min, title 0100000000ABC000
+```
+
+"Up to", because the console knows when it last looked and when the save was
+written, not when you started. `title unknown` is not a fault: the console only
+looks while a sync is waiting for a game, so a game played entirely between two
+syncs is never seen, and neither is a save written just as a second application
+came up. The title is the *application's* — a Tico module, or for RetroArch
+launched over a game, that game's — and the rom is the one the save belongs to.
+RomM has nowhere to keep the title, so the log is the only place it appears.
+
 **When to report it.** If a `sync.held` line is never followed by a `sync.tick`
 after you have closed the game and gone back to the HOME Menu, attach the log
 ([What to attach to a bug report](#what-to-attach-to-a-bug-report)). RetroArch
@@ -903,6 +936,38 @@ folder map ([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-def
 For a game with too many saves on the server, delete old versions in RomM's web
 UI. For a library past the index, nothing on the console helps yet; the roms
 with the lowest ids are the ones matched.
+
+---
+
+## The sysmodule stopped
+
+**Symptom.** The overlay says `sys-rommsync` is not running, and the last line
+of the log is this one:
+
+```
+812 error process.terminated an uncaught St9bad_alloc: the heap is spent, and the sysmodule stopped
+```
+
+**What it means.** The sysmodule ran out of memory — it lives in a fixed heap
+of about 1.5 MiB — and stopped. Something the standard library refused ends
+the process the same way, named by its type instead (`St12length_error`). Either
+way it is a bug in the client, not in your setup: the heap is sized for the
+largest library and server answers the code accepts, and a stop means one of
+those bounds is wrong.
+
+**What it costs.** Nothing that is not picked up again. Every save is backed
+up before it is overwritten and every write is atomic, so a stop part way
+through a sync leaves each save as it was or as the server had it, with a
+backup of the old copy under `config/rommsync/.backup/`
+([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#backups)). A rom part way down is resumed
+or started again. A test runs a sync and a download with the memory running
+out at every single point they allocate, and holds each one to exactly this.
+
+**What to do.** Reboot the console to start the sysmodule again, and report it
+with the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug-report)):
+the lines before this one say what it was doing. If it happens on every boot,
+move `config/rommsync/queue.json` out of the way first — a queue is the one
+thing a boot reads that grows with what you asked for.
 
 ---
 

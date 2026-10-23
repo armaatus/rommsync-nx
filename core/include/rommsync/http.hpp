@@ -80,6 +80,12 @@ struct Result;
 /// fewer rows, or reading it as a plan too large, would not be true of it.
 bool AnsweredTooLarge(const Result& result);
 
+/// A status worth asking again: a 5xx, a 408 or a 429 -- the server, or
+/// something in front of it, declining *now*. Every retry loop in the client
+/// reads this one rule (#251); a caller with an endpoint-specific exception
+/// adds it beside its call and says why (`install::Exchange::transient`).
+bool TransientStatus(int status);
+
 /// Stable, log-friendly name for an error. Never null.
 const char* ToString(Error error);
 

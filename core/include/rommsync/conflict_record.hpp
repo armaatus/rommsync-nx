@@ -117,4 +117,32 @@ struct RestoreOptions {
 RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_t entry_id,
                       const RestoreOptions& options = {});
 
+/// The player's **Keep local** for a save conflict (#249): the local bytes back
+/// on the card, and the key whose next upload goes over the server's copy.
+///
+/// A conflict is resolved Keep server as the tick runs -- the server's copy on
+/// the card, the local bytes under `.backup/` and archived on the server (#240)
+/// -- because nobody is there to ask. This is the player answering afterwards,
+/// explicitly and for one save, that the local copy should win. It is
+/// `Restore`, steps and backup and all, with two differences:
+///
+///   - it is refused with `kNotAConflict`, before anything is written, for an
+///     entry that is not a save `kConflict` with a slot. A download that
+///     replaced a save had no local side the server weighed, a state has no
+///     slot an upload could go over, and a deletion was RomM's own -- plain
+///     `Restore` is what those have;
+///   - on `kRestored` only, `*key` is the conflict's `(rom_id, slot)`, which the
+///     caller arms (`sync::ArmKeepLocal`) for the next tick. That upload is then
+///     the one sent with `overwrite=true` (`sync::ExecuteOptions::keep_local`);
+///     every other upload still meets RomM's slot guard.
+///
+/// **Hard rule 3 holds**: the server stays the source of truth because the
+/// override is the player's, named, once -- never inferred. And it is still
+/// RomM that applies it: `overwrite=true` lifts the guard and adds a version in
+/// this console's lineage; it deletes no other row. A head written by another
+/// lineage, even one this console does not load (#236), stays on the server as
+/// that lineage's newest save.
+RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
+                        state::Baseline::Key* key, const RestoreOptions& options = {});
+
 }  // namespace rommsync::conflicts

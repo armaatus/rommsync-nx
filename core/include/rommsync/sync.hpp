@@ -69,6 +69,7 @@
 
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/backoff.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/token_store.hpp"
@@ -347,11 +348,11 @@ Action ClassifyAction(std::string_view action, bool* recognized = nullptr);
 
 /// Which arbitration produced an operation.
 ///
-/// This is the **complete** set 5.2.0 can emit, tabulated in
-/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete, plus 5.4.0's
-/// `delete` reason. Only five of the thirteen 5.2.0 ones appear in
-/// server/contract/captures/, so `contract.captures` cannot guard the rest and
-/// `sync.plan` holds this enum to the document instead.
+/// This is the **complete** set 5.4.0 can emit, tabulated in
+/// docs/API_CONTRACT.md#save-sync--negotiate--execute--complete. Only nine of
+/// its fifteen appear in server/contract/captures/5.4.0/, so
+/// `contract.captures` cannot guard the rest and `sync.plan` holds this enum to
+/// the document instead.
 ///
 /// The client obeys `action` and not `reason` -- the server is the source of
 /// truth (docs/SYNC_PROTOCOL.md). What the reason is for is everything around
@@ -379,6 +380,7 @@ enum class Reason {
   kAppearIdentical,                ///< no_op: no record, equal timestamps, hashes not comparable
   kUntracked,                      ///< no_op: the device's sync row is marked untracked
   kDeletedOnServer,                ///< delete: the slot was emptied after this copy was written
+  kHeldSinceRemoval,               ///< download: the slot lost this version after it was written
 };
 
 /// A stable slug for logs -- `both_changed`, not the server's sentence. Never
@@ -610,22 +612,36 @@ auth::Answer AnswerOf(NegotiateError error);
 
 /// How hard one call tries.
 ///
-/// Shared by the two calls in this header rather than written twice: negotiate
-/// and complete want exactly these five knobs, for exactly the same reasons,
-/// and two copies of them would be two places for a default to drift.
+/// Shared by every call that retries -- negotiate and complete here, the play
+/// session ingest, the remote-install exchanges, the heartbeat, each page of the
+/// rom index -- rather than written once each: they want exactly these knobs,
+/// for exactly the same reasons, and copies of them would be places for a
+/// default to drift.
 struct CallPolicy {
   /// Ceiling on a single request. A tick that hangs is a tick that never ends,
   /// and nothing may block boot (CLAUDE.md).
   std::chrono::milliseconds timeout = http::kDefaultTimeout;
 
-  /// Requests one negotiation may spend, including the first. Only a
-  /// `ShouldRetry` failure spends another.
+  /// Requests one call -- one page, for a paged one -- may spend, including the
+  /// first. Only a failure worth retrying (`ShouldRetry`, `http::TransientStatus`)
+  /// spends another.
   int max_attempts = 3;
 
   /// The first delay before a retry, doubled per consecutive retryable failure
-  /// and capped at `max_backoff`.
+  /// and capped at `max_backoff` -- `retry::Backoff`'s curve, walked by
+  /// `WaitToRetry`, so the cap bounds the doubling and the jitter goes on top
+  /// of it (backoff.hpp says why both). A `backoff` above `max_backoff` is read
+  /// as `max_backoff`: the ceiling is the one a caller set on purpose.
   std::chrono::milliseconds backoff{1'000};
   std::chrono::milliseconds max_backoff{8'000};
+
+  /// `retry::BackoffConfig::jitter`: up to a quarter of each delay on top, so
+  /// consoles that failed together do not retry together (#251).
+  double jitter = 0.25;
+
+  /// Where the jitter comes from (`retry::Backoff::Random`). Null is
+  /// `retry::Backoff`'s own generator; a test pins it to state a delay.
+  retry::Backoff::Random random;
 
   /// How the caller waits between attempts.
   ///
@@ -652,6 +668,19 @@ struct CallPolicy {
   /// is the same token and the same reasoning one step earlier.
   const http::CancelToken* cancel = nullptr;
 };
+
+/// The curve a `CallPolicy`'s retries walk, with no failures on it yet.
+///
+/// One per call, or per page of a paged one (`roms::FetchRomIndex`), and never
+/// shared between two loops: `retry::Backoff`'s own rule.
+retry::Backoff BackoffFor(const CallPolicy& policy);
+
+/// Wait out one retry: the next delay on `*backoff`, on `policy.wait` -- or
+/// asleep, when there is none. Answers the delay waited.
+///
+/// Every `CallPolicy` loop waits through this rather than doubling a delay of
+/// its own, which is how five of them came to retry in lockstep (#251).
+std::chrono::milliseconds WaitToRetry(const CallPolicy& policy, retry::Backoff* backoff);
 
 /// The spelling `Negotiate` takes: `CallPolicy`, plus the one thing a caller says
 /// about *what* is asked rather than how hard.
@@ -776,6 +805,16 @@ struct PlaySession {
   Timestamp start_time{};
   Timestamp end_time{};
   std::int64_t duration_ms = 0;
+
+  /// The application in the foreground when the save was written -- its
+  /// Horizon program id -- or empty when the console did not see one (M10-26,
+  /// #261; `play::AttributeTitles`).
+  ///
+  /// **Never sent.** Neither entry in the pinned snapshot has a field for it, so
+  /// `EncodePlaySessions` leaves it out and it is the client's own record, in
+  /// `play.db`. Here rather than beside the buffered row because it is attached
+  /// where the session is derived and has to survive every step after it.
+  std::optional<std::uint64_t> title_id;
 };
 
 /// Everything wrong with one session that would make it mean something other

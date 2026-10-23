@@ -6,7 +6,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 
 namespace rommsync::install {
@@ -19,10 +18,6 @@ json::Error Fail(std::string field, std::string message) {
   error.field = std::move(field);
   error.message = std::move(message);
   return error;
-}
-
-bool TransientStatus(int status) {
-  return status >= 500 || status == 408 || status == 429 || status == 409;
 }
 
 /// One exchange, retried with backoff while the failure is transient. `what`
@@ -50,8 +45,7 @@ Exchange Send(http::HttpClient& client, http::Request request, const auth::Store
   request.cancel = policy.cancel;
 
   const int attempts = policy.max_attempts > 0 ? policy.max_attempts : 1;
-  std::chrono::milliseconds backoff =
-      policy.backoff > policy.max_backoff ? policy.max_backoff : policy.backoff;
+  retry::Backoff backoff = sync::BackoffFor(policy);
   for (int attempt = 1;; ++attempt) {
     exchange = Exchange{};
     exchange.attempts = attempt;
@@ -71,12 +65,7 @@ Exchange Send(http::HttpClient& client, http::Request request, const auth::Store
         attempt >= attempts || (policy.cancel != nullptr && policy.cancel->canceled())) {
       return exchange;
     }
-    if (policy.wait != nullptr) {
-      policy.wait(backoff);
-    } else {
-      std::this_thread::sleep_for(backoff);
-    }
-    backoff = backoff * 2 > policy.max_backoff ? policy.max_backoff : backoff * 2;
+    sync::WaitToRetry(policy, &backoff);
   }
 }
 
@@ -191,8 +180,11 @@ std::string ReportBody(const Verdict& verdict) {
 }
 
 bool Exchange::transient() const {
+  // The client's one rule, and the 409 these three endpoints alone answer for a
+  // race (the header). Nowhere else is a 409 RomM losing one: a heartbeat that
+  // answers it is not RomM, so `server::Probe` does not retry it (#251).
   return (transport != http::Error::kNone && transport != http::Error::kInvalidRequest) ||
-         TransientStatus(status);
+         http::TransientStatus(status) || status == 409;
 }
 
 Exchange Register(http::HttpClient& client, std::string_view base_url,

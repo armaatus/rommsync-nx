@@ -3,6 +3,7 @@
 #include "rommsync/atomic_file.hpp"
 
 #include "rommsync/config_text.hpp"
+#include "rommsync/newer_release.hpp"
 #include "rommsync/save_source.hpp"
 
 #include <cstddef>
@@ -853,6 +854,28 @@ const char* ToString(PlayWith play_with) {
   return "tico";
 }
 
+const char* ToString(OnServerDelete on_server_delete) {
+  switch (on_server_delete) {
+    case OnServerDelete::kRemove:
+      return "remove";
+    case OnServerDelete::kKeep:
+      return "keep";
+  }
+  return "remove";
+}
+
+const char* ToString(SourceMode mode) {
+  switch (mode) {
+    case SourceMode::kAuto:
+      return "auto";
+    case SourceMode::kOn:
+      return "on";
+    case SourceMode::kOff:
+      return "off";
+  }
+  return "auto";
+}
+
 std::optional<PlayWith> Config::PlayWithFor(std::string_view slug) const {
   const auto found = play_with.find(slug);
   if (found != play_with.end()) {
@@ -1179,12 +1202,9 @@ LoadResult ParseConfig(std::string_view text) {
         refused.version = version;
         Diagnostics only;
         only.Add(Severity::kError, line_number, "", "version",
-                 "is " + std::string(value) +
-                     ": this config.ini was written by a newer release than this "
-                     "sys-rommsync, which reads version " +
-                     std::to_string(kConfigVersion) +
-                     ". None of it is in use and it is left as it is -- install sys-rommsync and "
-                     "the overlay from the release that wrote it");
+                 records::NewerRelease("config.ini", value, kConfigVersion,
+                                       "none of it is in use, it is left as it is, and the "
+                                       "overlay's settings cannot edit it"));
         refused.diagnostics = only.Take();
         return refused;
       }

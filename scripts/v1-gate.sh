@@ -202,8 +202,15 @@ T
       # `execute.placed` (#237, in `^execute\.`) is a first-time restore: the
       # same `ExecutePlan` download, onto no file -- a placement only creates --
       # replayed for no file or all of it, and nothing beside it touched.
+      #
+      # `oom.tick` (#250) is the same question asked of a process that runs out
+      # of heap instead of power: a tick downloading over a save, failed at
+      # every allocation it makes, one child each, judged old-or-new after the
+      # death. lazyfs's nightly check on the replay's model (`lazyfs.overwrite`)
+      # is not here: it needs Linux and FUSE, and skips anywhere this runs.
       cat <<'T'
 ^harness\.backup$
+^oom\.tick$
 ^execute\.
 ^states\.overwrite$
 ^states\.keeps_both$

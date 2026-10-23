@@ -22,12 +22,12 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/newer_release.hpp"
 #include "rommsync/sync.hpp"
 
 namespace rommsync::play {
@@ -106,6 +106,42 @@ std::map<ObservationKey, sync::Timestamp> IndexObservations(
 bool Plausible(sync::Timestamp when) {
   const std::int64_t seconds = sync::UnixSeconds(when);
   return seconds >= kEarliestPlausibleSeconds && seconds <= sync::kMaxTimestampSeconds;
+}
+
+/// A row's `title`: sixteen hex digits naming a program, or `kUnknownTitle`.
+/// Anything else is bytes this file did not write. Program id zero is no
+/// program, so it is refused too rather than read as one.
+bool ReadTitle(const json::Value& value, std::optional<std::uint64_t>* out) {
+  if (!value.is_string()) {
+    return false;
+  }
+  const std::string& text = value.string();
+  if (text == kUnknownTitle) {
+    out->reset();
+    return true;
+  }
+  if (text.size() != 16) {
+    return false;
+  }
+  std::uint64_t id = 0;
+  for (const char digit : text) {
+    int nibble = 0;
+    if (digit >= '0' && digit <= '9') {
+      nibble = digit - '0';
+    } else if (digit >= 'A' && digit <= 'F') {
+      nibble = digit - 'A' + 10;
+    } else if (digit >= 'a' && digit <= 'f') {
+      nibble = digit - 'a' + 10;
+    } else {
+      return false;
+    }
+    id = (id << 4) | static_cast<std::uint64_t>(nibble);
+  }
+  if (id == 0) {
+    return false;
+  }
+  *out = id;
+  return true;
 }
 
 }  // namespace
@@ -280,6 +316,91 @@ Derivation DeriveSessions(const std::vector<SaveObservation>& previous,
   return derived;
 }
 
+// --- titles -------------------------------------------------------------------
+
+void Sightings::Note(const Foreground& seen, sync::Timestamp at) {
+  if (!seen.running || !seen.program_id.has_value() || *seen.program_id == 0) {
+    return;
+  }
+  if (!spans_.empty()) {
+    TitleSpan& last = spans_.back();
+    // The same application a poll later is one stretch. Further apart than
+    // `slack`, the console was not looking in between and it may have been
+    // closed and opened again -- or something else run -- so it is a new one.
+    if (last.program_id == *seen.program_id && at >= last.last_seen &&
+        at - last.last_seen <= slack_) {
+      last.last_seen = at;
+      return;
+    }
+  }
+  if (spans_.size() >= kMaxTitleSpans) {
+    spans_.erase(spans_.begin());
+  }
+  spans_.push_back(TitleSpan{*seen.program_id, at, at});
+}
+
+std::chrono::seconds SlackFor(std::chrono::milliseconds poll) {
+  return std::chrono::ceil<std::chrono::seconds>(poll * 2);
+}
+
+void AttributeTitles(std::vector<sync::PlaySession>* sessions, const Sightings& sightings) {
+  // Two passes: stretches already up when the save was stamped, then -- only if
+  // none was -- those that reach it through the mtime's rounding alone. The
+  // application that comes up after another quits is first seen *after* the
+  // quitting one's exit write, so it must not make that write ambiguous.
+  struct Reach {
+    bool any = false;  // some stretch reached the write, even if two did
+    std::optional<std::uint64_t> title;
+  };
+  const auto reaching = [&sightings](sync::Timestamp end, bool rounding) {
+    Reach reach;
+    for (const TitleSpan& span : sightings.spans()) {
+      const sync::Timestamp from = rounding ? span.first_seen - kMtimeGranularity : span.first_seen;
+      if (end < from || end > span.last_seen + sightings.slack()) {
+        continue;
+      }
+      if (reach.any && reach.title != span.program_id) {
+        reach.title.reset();
+        return reach;
+      }
+      reach.any = true;
+      reach.title = span.program_id;
+    }
+    return reach;
+  };
+  for (sync::PlaySession& session : *sessions) {
+    const Reach up = reaching(session.end_time, false);
+    session.title_id = up.any ? up.title : reaching(session.end_time, true).title;
+  }
+}
+
+std::string TitleOf(const sync::PlaySession& session) {
+  if (!session.title_id.has_value()) {
+    return kUnknownTitle;
+  }
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string out(16, '0');
+  std::uint64_t id = *session.title_id;
+  for (std::size_t at = out.size(); at-- > 0;) {
+    out[at] = kHex[id & 0xF];
+    id >>= 4;
+  }
+  return out;
+}
+
+std::string Describe(const sync::PlaySession& session) {
+  std::string out = "rom " + (session.rom_id.has_value() ? std::to_string(*session.rom_id)
+                                                         : std::string("unknown"));
+  if (session.save_slot.has_value()) {
+    out += " slot " + *session.save_slot;
+  }
+  const std::int64_t seconds = session.duration_ms / 1000;
+  out += ": played up to ";
+  out += seconds < 60 ? std::to_string(seconds) + " s" : std::to_string(seconds / 60) + " min";
+  out += ", title " + TitleOf(session);
+  return out;
+}
+
 // --- the file -----------------------------------------------------------------
 
 std::string SerializeRow(const BufferedSession& buffered) {
@@ -296,6 +417,8 @@ std::string SerializeRow(const BufferedSession& buffered) {
   out += std::to_string(sync::UnixSeconds(session.end_time));
   out += ",\"duration_ms\":";
   out += std::to_string(session.duration_ms);
+  out += ",\"title\":";
+  out += json::Quote(TitleOf(session));
   out += '}';
   return out;
 }
@@ -322,6 +445,13 @@ bool ParseRow(const json::Value& object, BufferedSession* out, std::string* why)
   }
   if (buffered.id <= 0) {
     *why = "field id: is not a positive id";
+    return false;
+  }
+  // Absent in a version 1 row, which is a session from before titles: unknown,
+  // as it was then. Present, it is held to what `SerializeRow` writes.
+  if (const json::Value* title = object.Find("title");
+      title != nullptr && !ReadTitle(*title, &buffered.session.title_id)) {
+    *why = std::string("field title: is neither a program id nor \"") + kUnknownTitle + "\"";
     return false;
   }
   buffered.session.start_time = std::chrono::system_clock::from_time_t(static_cast<std::time_t>(start));
@@ -368,14 +498,33 @@ LoadedBuffer ParseBuffer(std::string_view text) {
     lines.pop_back();
   }
 
+  const int newer =
+      lines.empty() ? 0 : records::NewerVersion(lines.front(), kFormatMagic, kFormatVersion);
+  if (newer > 0) {
+    loaded.diagnostics.push_back(records::NewerRelease(
+        "play.db", std::to_string(newer), kFormatVersion,
+        "the play time it holds is discarded and nothing else is lost"));
+    return loaded;
+  }
+  // Version 1 is read as well: its rows are this version's without a title
+  // (`ParseRow`), and the next write moves the file to this version.
   const std::string prefix = std::string(kFormatMagic) + " " + std::to_string(kFormatVersion) + " ";
-  if (lines.empty() || lines.front().size() <= prefix.size() ||
-      lines.front().substr(0, prefix.size()) != prefix) {
+  const std::string first =
+      std::string(kFormatMagic) + " " + std::to_string(kOldestReadVersion) + " ";
+  std::size_t matched = 0;
+  for (const std::string* candidate : {&prefix, &first}) {
+    if (!lines.empty() && lines.front().size() > candidate->size() &&
+        lines.front().substr(0, candidate->size()) == *candidate) {
+      matched = candidate->size();
+      break;
+    }
+  }
+  if (matched == 0) {
     loaded.diagnostics.push_back("play.db does not begin with \"" + prefix +
                                  "<next id> <last seen>\"; the buffered play time is discarded");
     return loaded;
   }
-  const std::string_view tail = lines.front().substr(prefix.size());
+  const std::string_view tail = lines.front().substr(matched);
   const std::size_t space = tail.find(' ');
   const std::int64_t next_id = ReadDecimal(space == std::string_view::npos ? tail
                                                                           : tail.substr(0, space));
@@ -737,7 +886,7 @@ std::optional<IngestOutcome> Refused(const http::Result& result) {
                   "the play-session flush was rejected: HTTP 403; this pairing was not granted "
                   "roms.user.write");
   }
-  if (status >= 500 || status == 429 || status == 408) {
+  if (http::TransientStatus(status)) {
     return Refuse(IngestError::kServerError,
                   "the play-session flush: HTTP " + std::to_string(status) +
                       (status == 429 ? "; the server is rate limiting" : ""));
@@ -785,8 +934,7 @@ IngestOutcome IngestSessions(http::HttpClient& client, const auth::StoredToken& 
   }
 
   const int attempts = options.max_attempts > 0 ? options.max_attempts : 1;
-  std::chrono::milliseconds backoff =
-      options.backoff > options.max_backoff ? options.max_backoff : options.backoff;
+  retry::Backoff backoff = sync::BackoffFor(options);
   std::chrono::milliseconds waited{0};
 
   for (int attempt = 1;; ++attempt) {
@@ -825,13 +973,7 @@ IngestOutcome IngestSessions(http::HttpClient& client, const auth::StoredToken& 
       outcome.waited = waited;
       return outcome;
     }
-    if (options.wait != nullptr) {
-      options.wait(backoff);
-    } else {
-      std::this_thread::sleep_for(backoff);
-    }
-    waited += backoff;
-    backoff = backoff * 2 > options.max_backoff ? options.max_backoff : backoff * 2;
+    waited += sync::WaitToRetry(options, &backoff);
   }
 }
 

@@ -24,6 +24,11 @@ silent on a console:
         LTO eating it, and makes a user's uploaded file identifiable from a bug
         report. Without `--version` it prints what each file says it is.
 
+    scripts/artifact-check.py container FILE...
+        FILE is the container its name says: a `.nsp` a PFS0 holding `main` and
+        `main.npdm`, an `.nro` an NRO, an `.ovl` an NRO with `ULTR` at its end.
+        Every other check reads its file through this one first (#256).
+
     scripts/artifact-check.py --self-test
         the parsers against hand-built vectors; reads no artifact.
 
@@ -144,19 +149,51 @@ def nso_segments(nso):
     return segments
 
 
+def container(path, blob):
+    """What the file is, held to what its name says it is (#256).
+
+    The name is the claim a user and a loader act on -- Atmosphere loads
+    `exefs.nsp` as a PFS0, Ultrahand lists a `.ovl` by the four bytes at its
+    end -- so every check reads its file through this first, and a file whose
+    bytes say otherwise is refused rather than read as whatever it happens to
+    be. `ci.yml` asked the same of the uploaded artifacts with `head`, `tail`
+    and `dd` until this was the one parser.
+    """
+    ext = os.path.splitext(path)[1]
+    if ext == ".nsp":
+        if blob[:4] != b"PFS0":
+            raise Failure("not a PFS0 archive; Atmosphere would not load it")
+        files = read_pfs0(blob)
+        missing = [name for name in ("main", "main.npdm") if name not in files]
+        if missing:
+            raise Failure("a PFS0 without %s (it holds %s)"
+                          % (" or ".join(missing), ", ".join(sorted(files)) or "nothing"))
+        return "PFS0 holding %s" % ", ".join(sorted(files))
+    if ext == ".nso":
+        if blob[:4] != b"NSO0":
+            raise Failure("not an NSO (no NSO0 magic)")
+        return "NSO"
+    if ext in (".nro", ".ovl"):
+        if blob[0x10:0x14] != b"NRO0":
+            raise Failure("not an NRO (no NRO0 magic at 0x10)")
+        if ext == ".nro":
+            return "NRO"
+        if blob[-4:] != b"ULTR":
+            raise Failure("no ULTR signature at its end; Ultrahand would not list it")
+        return "NRO, ULTR-signed"
+    raise Failure("a %r file is none of .nsp, .nso, .nro or .ovl, so nothing says what "
+                  "it should be" % ext)
+
+
 def load_image(path):
     """(kind, bytes): an NRO as stored, or the main NSO's segments decompressed."""
     blob = _read(path)
+    container(path, blob)
     if blob[:4] == b"PFS0":
-        files = read_pfs0(blob)
-        if "main" not in files:
-            raise Failure("holds no `main` NSO (%s)" % ", ".join(sorted(files)))
-        return "nso", nso_segments(files["main"])
+        return "nso", nso_segments(read_pfs0(blob)["main"])
     if blob[:4] == b"NSO0":
         return "nso", nso_segments(blob)
-    if blob[0x10:0x14] == b"NRO0":
-        return "nro", [blob]
-    raise Failure("neither a PFS0, an NSO nor an NRO")
+    return "nro", [blob]
 
 
 # --- the checks --------------------------------------------------------------
@@ -210,8 +247,14 @@ def overlay_info(blob):
     return name, version
 
 
+def check_container(path):
+    return container(path, _read(path))
+
+
 def check_nacp(path, title, version):
-    name, found = overlay_info(_read(path))
+    blob = _read(path)
+    container(path, blob)
+    name, found = overlay_info(blob)
     if name != title:
         raise Failure("the NACP names %r, not %r" % (name, title))
     if found != version:
@@ -393,6 +436,27 @@ def self_test():
         two = write("two.ovl", _nro(_text() + marker + MARKER_PREFIX + b"1.0.0\0"))
         raises("two different markers", lambda: check_version(two, "9.9.9"))
 
+        # The container each name claims (#256), which ci.yml used to check by
+        # hand with head, tail and dd.
+        expect("an .nsp read as its PFS0",
+               check_container(good_nsp) == "PFS0 holding main, main.npdm")
+        expect("an .ovl read as a signed NRO", check_container(good_ovl) == "NRO, ULTR-signed")
+        good_nro = write("good.nro", _nro(_text(), ultr=False))
+        expect("an .nro read as an NRO", check_container(good_nro) == "NRO")
+        expect("an .nso read as an NSO", check_container(raw_nso) == "NSO")
+        raises("an .ovl without its ULTR signature",
+               lambda: check_container(write("unsigned.ovl", _nro(_text(), ultr=False))))
+        raises("an NRO named .nsp", lambda: check_container(write("nro.nsp", ovl)))
+        raises("a .nro with no NRO0 magic",
+               lambda: check_container(write("blank.nro", b"\0" * 0x40)))
+        raises("an empty .nsp", lambda: check_container(write("empty.nsp", b"")))
+        raises("a PFS0 without main.npdm",
+               lambda: check_container(write("nonpdm.nsp", npdm_check._pfs0({"main": b"x"}))))
+        raises("a file whose extension claims nothing", lambda: check_container(write("x.bin", ovl)))
+        # ...and the other checks hold the name to its bytes too: LNY2 read out
+        # of an NRO someone named .nsp is a statement about the wrong file.
+        raises("lny2 on an NRO named .nsp", lambda: check_lny2(write("nro2.nsp", ovl)))
+
     for failure in failures:
         print("FAIL: self-test: %s" % failure, file=sys.stderr)
     if not failures:
@@ -417,6 +481,8 @@ def main():
     version = sub.add_parser("version", help="the build marker is a string in the file")
     version.add_argument("files", nargs="+")
     version.add_argument("--version")
+    shape = sub.add_parser("container", help="the file is the container its name says")
+    shape.add_argument("files", nargs="+")
     args = parser.parse_args()
 
     if args.self_test:
@@ -429,14 +495,18 @@ def main():
         try:
             if args.check == "lny2":
                 said = check_lny2(path)
+            elif args.check == "container":
+                said = check_container(path)
             elif args.check == "nacp":
                 said = check_nacp(path, args.title, args.version)
             else:
                 said = check_version(path, args.version)
             print("ok: %s: %s" % (path, said))
         # `struct.error` and `IndexError` are a file truncated past an offset
-        # this reads; `OSError` one that is not there. All are a FAIL line.
-        except (Failure, npdm_check.Failure, struct.error, IndexError, OSError) as failure:
+        # this reads, `ValueError` a string table with no terminator; `OSError`
+        # one that is not there. All are a FAIL line.
+        except (Failure, npdm_check.Failure, struct.error, IndexError, ValueError,
+                OSError) as failure:
             print("FAIL: %s: %s" % (path, failure), file=sys.stderr)
             status = 1
     return status

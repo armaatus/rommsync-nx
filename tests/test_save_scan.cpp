@@ -28,11 +28,14 @@
 //                   alone while RetroArch's Cloud Sync is on (#230)
 //   tico         -- Tico 0.7.9, and 0.8.0 with one account and with two (#231);
 //                   backups/, .tmp, screenshots and .restart are never synced
+//   contest      -- #258: a slot RetroArch's and Tico's copy contest goes to the
+//                   frontend play_with names
 //   library      -- a Sandbox scanned against the docker library, end to end
 //   grown        -- the index is reserved from the first page's total, and a
 //                   library that grows mid-fetch stops it there, and says so
 //   paging       -- limit=1 over a six-rom library still finds the last page
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -505,8 +508,10 @@ void Unusable(::checks::Checks& checks) {
 
   // Two files for one rom land on the same `(rom_id, slot)`, which the server
   // pairs on -- so they would overwrite each other through RomM on alternating
-  // ticks. The first in scan order keeps it. Since #236 that includes one rom's
-  // `.srm` under two emulators: the shared slot holds one save per rom.
+  // ticks. One keeps it. Since #236 that includes one rom's `.srm` under two
+  // emulators: the shared slot holds one save per rom -- and since #258 the
+  // frontend `play_with` names keeps it (Tico for nes, by default), whichever
+  // folder the walk read first (`scan.contest`).
   FakeFileSystem duplicates("duplicates");
   duplicates.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
   duplicates.AddFile("/tico/saves/nes", "nova.srm", 512, kMtime);
@@ -514,8 +519,8 @@ void Unusable(::checks::Checks& checks) {
   const scan::ScanResult mixed = scan::ScanSaves(config, kRetroArchDefaults, index, duplicates, kFirstTick);
   checks.ExpectEq(mixed.saves.size(), static_cast<std::size_t>(2),
                   "two extensions are two slots, and the same rom's .srm twice is one");
-  checks.Expect(SkippedFor(mixed, "/tico/saves/nes/nova.srm", scan::SkipReason::kDuplicateSlot),
-                "the copy found second -- Tico's, after RetroArch's -- is reported, not synced");
+  checks.Expect(SkippedFor(mixed, "/retroarch/saves/nova.srm", scan::SkipReason::kDuplicateSlot),
+                "the copy outside the frontend nes is played in is reported, not synced");
   const scan::SaveFile* sav = FindSave(mixed, "nova.sav");
   checks.Expect(sav != nullptr && sav->slot == "autosave-sav",
                 "a .sav is a slot of its own beside the .srm's");
@@ -1926,6 +1931,105 @@ void Paging(::checks::Checks& checks, http::HttpClient& client, const std::strin
   checks.Expect(odd.Find("(USA)", "").matched(), "and the rom is still findable by the other");
 }
 
+// --- retried ------------------------------------------------------------------
+//
+// #251: a page that fails in transit is asked for again after a backoff -- the
+// one every retry loop shares -- and a cancel stops the fetch between pages,
+// rather than after as many as 512 requests.
+
+/// A client that fires `cancel` once it has handed back `after` answers.
+class CancelAfter final : public http::HttpClient {
+ public:
+  CancelAfter(http::HttpClient& inner, http::CancelToken& cancel, int after)
+      : inner_(inner), cancel_(cancel), after_(after) {}
+
+  http::Result Send(const http::Request& request) override {
+    http::Result result = inner_.Send(request);
+    if (++sent_ == after_) {
+      cancel_.Cancel();
+    }
+    return result;
+  }
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    return inner_.Download(request, target);
+  }
+
+  int sent() const { return sent_; }
+
+ private:
+  http::HttpClient& inner_;
+  http::CancelToken& cancel_;
+  int after_;
+  int sent_ = 0;
+};
+
+void Retried(::checks::Checks& checks, http::HttpClient& client, const std::string& base,
+             const Fixture& fixture) {
+  roms::FetchOptions whole;
+  whole.base_url = base;
+  whole.bearer_token = fixture.token;
+  const roms::FetchResult all = roms::FetchRomIndex(client, whole);
+  checks.Expect(all.ok() && all.index.size() >= 2,
+                "the fixture library fetched, with a second page to fail: " + all.message);
+  if (!all.ok() || all.index.size() < 2) {
+    return;
+  }
+
+  // A page of one, so the fault lands on the second page of several: a fetch
+  // that gave up there would hold one rom, and one that restarted would be
+  // asking for the first page again.
+  std::vector<std::chrono::milliseconds> waits;
+  roms::FetchOptions paged = whole;
+  paged.page_size = 1;
+  paged.policy.wait = [&waits](std::chrono::milliseconds delay) { waits.push_back(delay); };
+  // Rolled at half, so the delay is a number: a second and an eighth of it.
+  paged.policy.random = [] { return 0.5; };
+
+  const char* const kTransient[] = {
+      R"({"mode":"drop","bytes":0,"path":"/api/roms?limit=","after":1})",
+      R"({"mode":"status","status":503,"path":"/api/roms?limit=","after":1})",
+  };
+  for (const char* spec : kTransient) {
+    waits.clear();
+    harness::Fault fault(checks, client, base, spec);
+    const roms::FetchResult retried = roms::FetchRomIndex(client, paged);
+    checks.Expect(retried.ok(), std::string(spec) + ": the page is asked for again and the "
+                                                    "fetch completes: " + retried.message);
+    checks.ExpectEq(retried.index.size(), all.index.size(), "the whole library, not a page short");
+    checks.Expect(!retried.index.truncated(), "and not cut short");
+    checks.ExpectEq(waits.size(), std::size_t{1}, "after one backoff");
+    checks.ExpectEq(waits.empty() ? std::int64_t{0} : waits[0].count(), std::int64_t{1'125},
+                    "on the shared curve, jitter and all");
+  }
+
+  // A 401 is the token, and asking again is asking to be refused again.
+  {
+    waits.clear();
+    harness::Fault fault(checks, client, base,
+                         R"({"mode":"status","status":401,"path":"/api/roms?limit=","after":1})");
+    const roms::FetchResult refused = roms::FetchRomIndex(client, paged);
+    checks.ExpectEq(refused.status, 401, "a 401 is reported as one");
+    checks.Expect(waits.empty(), "and not retried");
+  }
+
+  // Cancelled after the first page: the fetch ends there, as a cancel.
+  http::CancelToken cancel;
+  roms::FetchOptions stoppable = paged;
+  stoppable.policy.cancel = &cancel;
+  CancelAfter after_one(client, cancel, 1);
+  const roms::FetchResult stopped = roms::FetchRomIndex(after_one, stoppable);
+  checks.Expect(!stopped.ok() && stopped.transport == http::Error::kCanceled,
+                "a cancel between pages ends the fetch as cancelled: " + stopped.message);
+  checks.ExpectEq(after_one.sent(), 1, "with no request after it");
+
+  // And a token fired before the fetch costs no request at all.
+  CancelAfter never(client, cancel, 0);
+  const roms::FetchResult unasked = roms::FetchRomIndex(never, stoppable);
+  checks.Expect(unasked.transport == http::Error::kCanceled, "a fired token is a cancel");
+  checks.ExpectEq(never.sent(), 0, "and sends nothing");
+}
+
 // --- grown --------------------------------------------------------------------
 
 /// `GET /api/roms`, answered from a script: each request takes the next body.
@@ -1997,6 +2101,86 @@ void Grown(::checks::Checks& checks) {
   checks.Expect(capped.index.truncated(), "and says so");
 }
 
+/// #258, #237's open (4): one rom's RetroArch copy and Tico copy contest one
+/// pairing key -- a save's `(rom_id, slot)` since #236, a state's name under
+/// `[sync] map_state_slots` -- and the frontend `play_with` plays the platform
+/// in keeps it, whichever folder the walk reads first. That is the copy a
+/// first-time restore is placed for, so the one a user is playing is the one
+/// that syncs. A platform played in neither keeps scan order.
+void Contest(::checks::Checks& checks) {
+  roms::RomIndex index;
+  index.Add(MakeRom(2, "nova", "nes"));
+  index.Add(MakeRom(3, "ps2 game", "ps2"));
+
+  FakeFileSystem files("contest");
+  // RetroArch's flat folder is read before Tico's, so scan order alone would
+  // keep RetroArch's copy every time.
+  files.AddFile("/retroarch/saves", "nova.srm", 512, kMtime);
+  files.AddFile("/tico/saves/nes", "nova.srm", 640, kMtime);
+  files.AddFile("/retroarch/states", "nova.state.auto", 96, kMtime);
+  files.AddFile("/tico/states/nes", "nova.state5", 128, kMtime);
+  files.AddFile("/saves/ps2", "ps2 game.ps2", 64, kMtime);
+  files.AddFile("/tico/saves/ps2", "ps2 game.ps2", 80, kMtime);
+
+  const auto saves = [&](const config::Config& config, const std::string& winner,
+                         const std::string& loser, const std::string& what) {
+    const scan::ScanResult result =
+        scan::ScanSaves(config, kRetroArchDefaults, index, files, kFirstTick);
+    const scan::SaveFile* kept = SaveAt(result, winner);
+    checks.Expect(kept != nullptr, what + ": " + winner + " keeps the slot -- " +
+                                       result.DescribeSkipped());
+    if (kept != nullptr) {
+      checks.ExpectEq(kept->content_hash, state::HashFile(files.Resolve(winner)).content_hash,
+                      what + ": with its own digest");
+    }
+    checks.Expect(SaveAt(result, loser) == nullptr &&
+                      SkippedFor(result, loser, scan::SkipReason::kDuplicateSlot),
+                  what + ": " + loser + " is the duplicate, reported and not synced");
+    checks.ExpectEq(result.saves.size(), std::size_t{1}, what + ": one save for the slot");
+  };
+
+  const config::Config tico = config::Defaults();
+  saves(tico, "/tico/saves/nes/nova.srm", "/retroarch/saves/nova.srm",
+        "nes is played in Tico by default");
+  config::LoadResult retroarch = config::ParseConfig("[platform.nes]\nplay_with = retroarch\n");
+  saves(retroarch.value, "/retroarch/saves/nova.srm", "/tico/saves/nes/nova.srm",
+        "play_with = retroarch");
+  const config::LoadResult neither = config::ParseConfig(
+      "[platform.ps2]\nroms = /roms/ps2\nsaves = /saves/ps2, /tico/saves/ps2\n");
+  const scan::ScanResult unplayed =
+      scan::ScanSaves(neither.value, kRetroArchDefaults, index, files, kFirstTick);
+  checks.Expect(SaveAt(unplayed, "/saves/ps2/ps2 game.ps2") != nullptr &&
+                    SkippedFor(unplayed, "/tico/saves/ps2/ps2 game.ps2",
+                               scan::SkipReason::kDuplicateSlot),
+                "a platform played in neither keeps the first copy in scan order");
+
+  // States contest a name only once Tico's slots carry RetroArch's names.
+  config::Config mapped = tico;
+  mapped.sync.states = true;
+  mapped.sync.map_state_slots = true;
+  const scan::ScanResult states =
+      scan::ScanStates(mapped, kRetroArchDefaults, index, files, kFirstTick);
+  const scan::StateFile* kept = nullptr;
+  for (const scan::StateFile& state : states.states) {
+    if (state.file_name == "nova.state.auto") {
+      kept = &state;
+    }
+  }
+  checks.Expect(kept != nullptr && kept->sd_path == "/tico/states/nes/nova.state5",
+                "a state's contested name goes to Tico's copy too -- " +
+                    (kept == nullptr ? std::string("none") : kept->sd_path));
+  checks.Expect(SkippedFor(states, "/retroarch/states/nova.state.auto",
+                           scan::SkipReason::kDuplicateName),
+                "and RetroArch's is the duplicate");
+  retroarch.value.sync.states = true;
+  retroarch.value.sync.map_state_slots = true;
+  const scan::ScanResult retro_states =
+      scan::ScanStates(retroarch.value, kRetroArchDefaults, index, files, kFirstTick);
+  checks.Expect(SkippedFor(retro_states, "/tico/states/nes/nova.state5",
+                           scan::SkipReason::kDuplicateName),
+                "and under play_with = retroarch, Tico's is");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2013,7 +2197,7 @@ int main(int argc, char** argv) {
   if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
       scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
       scenario == "sources" || scenario == "grown" || scenario == "retroarch" ||
-      scenario == "tico" || scenario == "isolated") {
+      scenario == "tico" || scenario == "isolated" || scenario == "contest") {
     if (scenario == "names") {
       Names(checks);
     } else if (scenario == "ambiguous") {
@@ -2034,6 +2218,8 @@ int main(int argc, char** argv) {
       Tico(checks);
     } else if (scenario == "isolated") {
       Isolated(checks);
+    } else if (scenario == "contest") {
+      Contest(checks);
     } else {
       Unusable(checks);
     }
@@ -2060,6 +2246,8 @@ int main(int argc, char** argv) {
     Library(checks, *client, base, fixture);
   } else if (scenario == "paging") {
     Paging(checks, *client, base, fixture);
+  } else if (scenario == "retried") {
+    Retried(checks, *client, base, fixture);
   } else {
     std::cerr << "unknown scenario: " << scenario << "\n";
     return 2;

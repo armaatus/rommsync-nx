@@ -1,6 +1,7 @@
 #include "rommsync/state_db.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -17,10 +19,15 @@
 #include "rommsync/hash_file.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/newer_release.hpp"
 #include "rommsync/sync.hpp"
 
 namespace rommsync::state {
 namespace {
+
+/// `testing::SetBetweenReads`'s hook. Atomic for `io::SetFileSync`'s reason:
+/// set from one place, never swapped mid-read.
+std::atomic<testing::BetweenReads> g_between_reads{nullptr};
 
 std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
@@ -397,6 +404,38 @@ constexpr std::size_t kRc1MaxStateBytes = 128 * 1024;
 /// line past this is not one any build wrote.
 constexpr std::size_t kMaxLineBytes = 4 * 1024;
 
+/// A row's key, as 64 bits: what `Parser` remembers of a row it let go, so the
+/// rows past rc1's bound cost eight bytes each rather than a key apiece. FNV-1a;
+/// a collision reads as a second row and discards the file, which costs a
+/// re-hash -- the price of every damaged `state.db` -- at odds no card meets.
+std::uint64_t Fingerprint(char kind, std::int64_t rom_id, const std::string* name) {
+  std::uint64_t hash = 0xcbf29ce484222325ULL;
+  const auto mix = [&hash](unsigned char byte) {
+    hash ^= byte;
+    hash *= 0x100000001b3ULL;
+  };
+  mix(static_cast<unsigned char>(kind));
+  for (int shift = 0; shift < 64; shift += 8) {
+    mix(static_cast<unsigned char>(static_cast<std::uint64_t>(rom_id) >> shift));
+  }
+  // Present-or-not before the bytes, so a null slot is not the empty one.
+  mix(name == nullptr ? 0 : 1);
+  if (name != nullptr) {
+    for (const char byte : *name) {
+      mix(static_cast<unsigned char>(byte));
+    }
+  }
+  return hash;
+}
+
+std::uint64_t Fingerprint(const SaveRecord& record) {
+  return Fingerprint('s', record.rom_id, record.slot.has_value() ? &*record.slot : nullptr);
+}
+
+std::uint64_t Fingerprint(const StateRecord& record) {
+  return Fingerprint('t', record.rom_id, &record.file_name);
+}
+
 /// A `state.db`, a line at a time, so a file can be read without its text held
 /// whole (`Load`).
 ///
@@ -405,6 +444,11 @@ constexpr std::size_t kMaxLineBytes = 4 * 1024;
 /// that, states and archival rows are kept first -- nothing rebuilds a state's
 /// row, and an archival row is keyed as it was -- and slotted save rows fill
 /// what is left, the rest let go: each costs its save one re-hash.
+///
+/// **Which slotted rows is a rule** (#255): the first in `(rom_id, slot)` order,
+/// the order `AdoptLegacySaves` settles a contest in, whatever order rc1 wrote
+/// them in. A row let go is remembered by its `Fingerprint`, so one repeating it
+/// is a second row like one repeating a row that was kept.
 class Parser {
  public:
   /// One line, without its `\n`.
@@ -418,6 +462,7 @@ class Parser {
                  : line == std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion)
                      ? kSourceSlotVersion
                      : 0;
+      newer_ = records::NewerVersion(line, kFormatMagic, kFormatVersion);
       return;
     }
     if (version_ == 0 || over_) {
@@ -442,8 +487,22 @@ class Parser {
 
   int version() const { return version_; }
 
+  /// A later release's version, read off the header, or zero. Its rows are not
+  /// read: they are the ones this build would misread.
+  int newer() const { return newer_; }
+
   LoadedBaseline Finish() {
     LoadedBaseline loaded;
+    if (newer_ > 0) {
+      // Not "does not begin with": nothing is wrong with the file, and that
+      // sentence reads as a card going bad. The policy is the one #205 states --
+      // a baseline is rebuilt from the card -- so this is a re-hash, said as the
+      // other records say a newer release's file.
+      loaded.diagnostics.push_back(records::NewerRelease(
+          "state.db", std::to_string(newer_), kFormatVersion,
+          "its baseline is discarded and rebuilt from the card, so every save is hashed once"));
+      return loaded;
+    }
     if (version_ == 0) {
       // Includes an empty file and a truncated first line. Naming the expected
       // header rather than quoting what was found: the found bytes may be
@@ -477,7 +536,8 @@ class Parser {
       loaded.diagnostics.push_back(
           "state.db was written by rc1, past the " + std::to_string(kMaxRecords) +
           " rows this build reads; " + std::to_string(dropped_) +
-          " row(s) were let go, slotted saves before states -- those are hashed again");
+          " row(s) were let go, slotted saves before states and the last in (rom_id, slot) "
+          "order first -- those are hashed again");
     }
     loaded.value = std::move(baseline_);
     loaded.legacy_saves = std::move(legacy_);
@@ -490,18 +550,41 @@ class Parser {
     return version_ == kSourceSlotVersion ? kRc1MaxRecords : kMaxRecords;
   }
 
-  /// Whether a row more than this build's bound would be kept: a held-apart
-  /// save row is let go for it, or, with none left, the row itself.
-  bool MakeRoom() {
+  /// Whether a row is kept, at this build's bound. A held-apart row with a
+  /// larger key than `held`'s -- or than any, when `held` is null and the row is
+  /// a state or an archival one -- is let go to make room; with none, the row
+  /// itself is, and its `fingerprint` remembered.
+  bool MakeRoom(std::uint64_t fingerprint, const SaveRecord* held) {
     if (baseline_.size() + legacy_.size() < kMaxRecords) {
       return true;
     }
     ++dropped_;
-    if (legacy_.empty()) {
+    if (legacy_.empty() || (held != nullptr && !Before(*held, legacy_.back()))) {
+      LetGo(fingerprint);
       return false;
     }
+    LetGo(Fingerprint(legacy_.back()));
     legacy_.pop_back();
     return true;
+  }
+
+  /// Key order, `Baseline::Key`'s, without building a key.
+  static bool Before(const SaveRecord& a, const SaveRecord& b) {
+    return std::tie(a.rom_id, a.slot) < std::tie(b.rom_id, b.slot);
+  }
+
+  /// Where `record` is held, or goes: `legacy_` is kept in key order, which
+  /// makes the largest held key the back and a repeat a binary search.
+  std::vector<SaveRecord>::iterator Held(const SaveRecord& record) {
+    return std::lower_bound(legacy_.begin(), legacy_.end(), record, Before);
+  }
+
+  void LetGo(std::uint64_t fingerprint) {
+    let_go_.insert(std::lower_bound(let_go_.begin(), let_go_.end(), fingerprint), fingerprint);
+  }
+
+  bool WasLetGo(std::uint64_t fingerprint) const {
+    return std::binary_search(let_go_.begin(), let_go_.end(), fingerprint);
   }
 
   void Row(std::string_view line) {
@@ -520,22 +603,25 @@ class Parser {
           return;
         }
         const bool held_apart = version_ == kSourceSlotVersion && record.slot.has_value();
-        const bool second =
-            held_apart ? std::any_of(legacy_.begin(), legacy_.end(),
-                                     [&record](const SaveRecord& held) {
-                                       return held.rom_id == record.rom_id &&
-                                              held.slot == record.slot;
-                                     })
-                       : baseline_.Find(record.rom_id, record.slot) != nullptr;
+        const std::uint64_t fingerprint = Fingerprint(record);
+        bool second = WasLetGo(fingerprint);
+        if (!second && held_apart) {
+          const auto at = Held(record);
+          second = at != legacy_.end() && !Before(record, *at);
+        } else if (!second) {
+          second = baseline_.Find(record.rom_id, record.slot) != nullptr;
+        }
         if (second) {
           Add(&complaints_, where + "a second row for the same (rom_id, slot)");
           return;
         }
-        if (!MakeRoom()) {
+        if (!MakeRoom(fingerprint, held_apart ? &record : nullptr)) {
           return;
         }
         if (held_apart) {
-          legacy_.push_back(std::move(record));
+          // Looked up again: `MakeRoom` may have let the back go.
+          const auto at = Held(record);
+          legacy_.insert(at, std::move(record));
         } else {
           baseline_.Set(std::move(record));
         }
@@ -547,11 +633,13 @@ class Parser {
           Add(&complaints_, where + why);
           return;
         }
-        if (baseline_.FindState(record.rom_id, record.file_name) != nullptr) {
+        const std::uint64_t fingerprint = Fingerprint(record);
+        if (WasLetGo(fingerprint) ||
+            baseline_.FindState(record.rom_id, record.file_name) != nullptr) {
           Add(&complaints_, where + "a second row for the same (rom_id, file_name) state");
           return;
         }
-        if (MakeRoom()) {
+        if (MakeRoom(fingerprint, nullptr)) {
           baseline_.SetState(std::move(record));
         }
         return;
@@ -567,9 +655,11 @@ class Parser {
   std::size_t rows_ = 0;
   std::size_t dropped_ = 0;
   int version_ = 0;
+  int newer_ = 0;
   bool over_ = false;
   Baseline baseline_;
-  std::vector<SaveRecord> legacy_;
+  std::vector<SaveRecord> legacy_;  ///< sorted by key
+  std::vector<std::uint64_t> let_go_;  ///< sorted
   std::vector<std::string> complaints_;
 };
 
@@ -578,53 +668,59 @@ class Parser {
 /// At most `kMaxStateBytes`, `io::ReadBounded`'s bound and reasoning, shared
 /// with `config.ini`. Past it, the file is read on only while it is rc1's
 /// version 2 within rc1's bound -- a line at a time, its text never held, so it
-/// costs the heap what a file inside this build's bound does.
+/// costs the heap what a file inside this build's bound does -- or for as long
+/// as it takes to see that it is a later release's. Both reads are one open
+/// (#255): reopening the path for the second let a rename between them read as
+/// an unreadable file.
 io::BoundedRead Load(const std::string& path, LoadedBaseline* out) {
-  {
-    std::string contents;
-    const io::BoundedRead outcome = io::ReadBounded(path, kMaxStateBytes, &contents);
-    if (outcome != io::BoundedRead::kTooLarge) {
-      if (outcome == io::BoundedRead::kOk) {
-        *out = ParseBaseline(contents);
-      }
-      return outcome;
-    }
+  std::string contents;
+  bool streamed = false;
+  const io::BoundedRead outcome = io::ReadBounded(
+      path, kMaxStateBytes, &contents, [&path, out, &streamed](std::FILE* file) {
+        streamed = true;
+        if (const testing::BetweenReads hook = g_between_reads.load(); hook != nullptr) {
+          hook(path);
+        }
+        Parser parser;
+        std::string line;
+        char buffer[1024];
+        std::size_t total = 0;
+        std::size_t got = 0;
+        bool fits = true;
+        bool newer = false;
+        while (fits && !newer && (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
+          total += got;
+          fits = total <= kRc1MaxStateBytes;
+          for (std::size_t at = 0; fits && !newer && at < got; ++at) {
+            if (buffer[at] != '\n') {
+              line.push_back(buffer[at]);
+              fits = line.size() <= kMaxLineBytes;
+              continue;
+            }
+            parser.Line(line);
+            line.clear();
+            // A later release's header is the whole answer; its rows are the
+            // ones this build would misread, so they are not read at all.
+            newer = parser.newer() > 0;
+            fits = newer || parser.version() == kSourceSlotVersion;
+          }
+        }
+        if (std::ferror(file) != 0) {
+          return io::BoundedRead::kUnreadable;
+        }
+        if (!fits) {
+          return io::BoundedRead::kTooLarge;
+        }
+        if (!newer) {
+          parser.Line(line);
+        }
+        *out = parser.Finish();
+        return io::BoundedRead::kOk;
+      });
+  if (outcome == io::BoundedRead::kOk && !streamed) {
+    *out = ParseBaseline(contents);
   }
-  std::FILE* file = std::fopen(path.c_str(), "rb");
-  if (file == nullptr) {
-    return io::BoundedRead::kUnreadable;
-  }
-  Parser parser;
-  std::string line;
-  char buffer[1024];
-  std::size_t total = 0;
-  std::size_t got = 0;
-  bool fits = true;
-  while (fits && (got = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
-    total += got;
-    fits = total <= kRc1MaxStateBytes;
-    for (std::size_t at = 0; fits && at < got; ++at) {
-      if (buffer[at] != '\n') {
-        line.push_back(buffer[at]);
-        fits = line.size() <= kMaxLineBytes;
-        continue;
-      }
-      parser.Line(line);
-      line.clear();
-      fits = parser.version() == kSourceSlotVersion;
-    }
-  }
-  const bool failed = std::ferror(file) != 0;
-  std::fclose(file);
-  if (failed) {
-    return io::BoundedRead::kUnreadable;
-  }
-  if (!fits) {
-    return io::BoundedRead::kTooLarge;
-  }
-  parser.Line(line);
-  *out = parser.Finish();
-  return io::BoundedRead::kOk;
+  return outcome;
 }
 
 }  // namespace
@@ -839,6 +935,12 @@ LoadedBaseline LoadBaseline(const std::string& path) {
   }
   return loaded;
 }
+
+namespace testing {
+
+BetweenReads SetBetweenReads(BetweenReads hook) { return g_between_reads.exchange(hook); }
+
+}  // namespace testing
 
 StoreResult SaveBaseline(const std::string& path, const Baseline& baseline) {
   StoreResult result;

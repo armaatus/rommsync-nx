@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "rommsync/config.hpp"
+#include "rommsync/file_system.hpp"
 
 namespace rommsync::retroarch {
 
@@ -60,6 +61,17 @@ inline constexpr std::size_t kMaxLineBytes = 8192;
 /// counted -- the `config::kMaxDiagnostics` reasoning for a file this client
 /// does not even own.
 inline constexpr std::size_t kMaxDiagnostics = 8;
+
+/// The four settings that lay out one of RetroArch's two folders -- saves' or
+/// states' -- picked out of `Settings` once, so a caller that handles both
+/// does not choose between each pair itself.
+struct Folder {
+  std::string directory;              ///< `savefile_directory` / `savestate_directory`
+  const char* default_directory = ""; ///< the build's, `kDefaultSavefileDirectory`...
+  bool sort_by_core = false;          ///< `sort_*_enable`
+  bool sort_by_content = false;       ///< `sort_*_by_content_enable`
+  bool in_content_dir = false;        ///< `*_in_content_dir`
+};
 
 /// The settings, each at RetroArch's default until the file says otherwise.
 struct Settings {
@@ -90,7 +102,21 @@ struct Settings {
 
   /// RetroArch is syncing its own saves and states.
   bool SyncsItself() const { return cloud_sync && cloud_sync_saves; }
+
+  Folder Saves() const;
+  Folder States() const;
 };
+
+/// The folder RetroArch writes `folder`'s files to when it keeps them in one of
+/// its own: the directory `retroarch.cfg` names, or the build's default when
+/// that is missing or not a directory -- RetroArch ignores a folder it cannot
+/// use (`path_is_directory`, configuration.c) and writes to its default instead.
+///
+/// The one place that rule is written (#258): the scan reads saves where this
+/// says and the placer writes them there, and two copies of it are a save
+/// written where the scan does not look. One listing, none when the named
+/// folder is the default.
+std::string EffectiveDirectory(const Folder& folder, fs::FileSystem& files);
 
 /// The settings and everything wrong with the file they came from.
 struct LoadResult {

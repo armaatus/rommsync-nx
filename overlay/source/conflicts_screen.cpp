@@ -47,8 +47,12 @@ const char* ActionFor(const ConflictsView& view) {
   }
   // `can_restore` rather than the mode: whether a restore is on offer is the
   // model's decision (`overlay_conflicts_view.hpp`), and re-deriving it here
-  // would be a second place for it to live.
-  return view.can_restore ? "Restore" : nullptr;
+  // would be a second place for it to live. A save conflict's is the Keep
+  // server / Keep local / Skip choice (#249), so A chooses rather than restores.
+  if (!view.can_restore) {
+    return nullptr;
+  }
+  return view.keep_choice ? "Choose" : "Restore";
 }
 
 }  // namespace
@@ -92,7 +96,8 @@ bool ConflictsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidA
   }
   if ((keys_down & HidNpadButton_A) != 0) {
     // From the list this opens an entry; from an entry it asks for the
-    // confirmation; from the confirmation it queues the restore. A press the
+    // confirmation -- a save conflict's Keep server / Keep local / Skip -- and
+    // from the confirmation it queues the restore, or does what was chosen. A press the
     // model already knows would be refused sends nothing and leaves the reason
     // on screen. Still *handled*: the press was on this screen's own control.
     model_.Activate();
@@ -221,6 +226,22 @@ void ConflictsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width
       }
     }
   } else {
+    // A save conflict's choice (#249), above the detail it is about: the three
+    // answers, the selected one marked. What it means is the hint's.
+    for (int index = 0; index < static_cast<int>(view_.choices.size()); ++index) {
+      if (clipped || row + kRowHeight > body_bottom) {
+        break;
+      }
+      if (index == view_.choice) {
+        DrawBounded(renderer, ">", x, row, kBodyFont, plain, kRowIndent);
+      }
+      DrawBounded(renderer, view_.choices[static_cast<std::size_t>(index)].label, x + kRowIndent,
+                  row, kBodyFont, index == view_.choice ? plain : muted, body_width);
+      row += kRowHeight;
+    }
+    if (!view_.choices.empty()) {
+      row += kRowHeight / 2;
+    }
     // The detail: a label column and a value column, so the two sides of the
     // comparison line up. They are what the user is here to read.
     for (const ConflictDetailLine& detail : view_.detail) {

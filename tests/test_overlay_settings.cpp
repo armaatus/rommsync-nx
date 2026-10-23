@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "checks.hpp"
@@ -553,14 +554,155 @@ void CheckMenuReachesEveryScreen(Checks& checks) {
   checks.Expect(library, "the library browser is reachable");
   checks.Expect(pairing, "the pairing screen is reachable without discarding anything");
 
-  // Nothing outside the menu is selectable: this screen is read-only, and a row
-  // that highlights is a row a user presses.
+  // Outside the menu, a row is selectable only when a press changes it (#264):
+  // a row that highlights is a row a user presses, and one that did nothing
+  // would be a control that lies.
   for (std::size_t index = 1; index < view.sections.size(); ++index) {
     for (const overlay::SettingsRow& row : view.sections[index].rows) {
-      checks.Expect(!row.selectable,
-                    "no configuration row is selectable in this build: " + row.label);
+      checks.Expect(row.selectable == row.change.has_value(),
+                    "a configuration row is selectable exactly when a press changes it: " +
+                        row.label);
+      checks.Expect(row.destination == overlay::Destination::kNone,
+                    "and opens nothing: " + row.label);
     }
   }
+}
+
+/// The value a row shows, the edit a press on it sends, and what the A prompt
+/// says over it -- or a failure naming which of the three is missing.
+void ExpectChange(Checks& checks, const overlay::SettingsView& view, const std::string& section,
+                  const std::string& label, const std::string& shows, const std::string& sends) {
+  const std::string what = section + " " + label;
+  const overlay::SettingsRow* row = RowNamed(view, section, label);
+  checks.Expect(row != nullptr, what + " is on the settings screen");
+  if (row == nullptr) {
+    return;
+  }
+  checks.ExpectEq(row->value, shows, what + " shows the value in force");
+  checks.Expect(row->selectable && row->editable, what + " can be pressed, and is a setting");
+  checks.Expect(!row->note.empty(), what + " says what the value means");
+  checks.Expect(row->change.has_value(), what + " carries the edit a press sends");
+  if (!row->change.has_value()) {
+    return;
+  }
+  const std::string bare = section.substr(1, section.size() - 2);
+  checks.ExpectEq(row->change->section, bare, what + ": the edit is to that section");
+  checks.ExpectEq(row->change->key, label, what + ": and that key");
+  checks.ExpectEq(row->change->value, sends, what + ": the next value, in config.ini's words");
+  checks.Expect(!row->change->remove, what + ": a press sets, never resets");
+  checks.Expect(Contains(row->press_label, "Set to"), what + ": the prompt says a press sets it");
+}
+
+/// #264: `[sync] on_server_delete` and `[sources]` are on the settings screen,
+/// and a press on each steps it to its next value.
+void CheckM10SettingsAreShownAndChanged(Checks& checks) {
+  const overlay::SettingsView defaults = overlay::RenderSettings(ViewFor(checks, kMinimal));
+  ExpectChange(checks, defaults, "[sync]", "on_server_delete", "Remove", "keep");
+  ExpectChange(checks, defaults, "[sources]", "retroarch", "Auto", "on");
+  ExpectChange(checks, defaults, "[sources]", "retroarch_content_dir", "Off", "true");
+  const overlay::SettingsRow* remove = RowNamed(defaults, "[sync]", "on_server_delete");
+  checks.Expect(remove != nullptr && Contains(remove->note, "backed up"),
+                "remove says the save is backed up before it goes");
+
+  const overlay::SettingsView set = overlay::RenderSettings(
+      ViewFor(checks, std::string(kMinimal) +
+                          "[sync]\non_server_delete = keep\n"
+                          "[sources]\nretroarch = on\nretroarch_content_dir = true\n"));
+  ExpectChange(checks, set, "[sync]", "on_server_delete", "Keep", "remove");
+  ExpectChange(checks, set, "[sources]", "retroarch", "On", "off");
+  ExpectChange(checks, set, "[sources]", "retroarch_content_dir", "On", "false");
+  const overlay::SettingsRow* on = RowNamed(set, "[sources]", "retroarch");
+  checks.Expect(on != nullptr && Contains(on->note, "Cloud Sync"),
+                "on names the two writers it allows");
+
+  const overlay::SettingsView off = overlay::RenderSettings(
+      ViewFor(checks, std::string(kMinimal) + "[sources]\nretroarch = off\n"));
+  ExpectChange(checks, off, "[sources]", "retroarch", "Off", "auto");
+
+  // Every edit a row sends is one the write path takes, and pressing until the
+  // value comes round again visits every value once. The row, `ApplyEdit` and
+  // `ParseConfig` are three readings of one setting, and this is where they
+  // are made to agree.
+  for (const auto& [section, label, values] :
+       {std::tuple<std::string, std::string, std::size_t>{"[sync]", "on_server_delete", 2},
+        {"[sources]", "retroarch", 3},
+        {"[sources]", "retroarch_content_dir", 2}}) {
+    std::string text = kMinimal;
+    std::vector<std::string> seen;
+    for (std::size_t press = 0; press <= values; ++press) {
+      const overlay::SettingsView view = overlay::RenderSettings(ViewFor(checks, text));
+      const overlay::SettingsRow* row = RowNamed(view, section, label);
+      if (row == nullptr || !row->change.has_value()) {
+        checks.Expect(false, section + " " + label + " has a change to press");
+        break;
+      }
+      seen.push_back(row->value);
+      config::Edit edit;
+      edit.assignments.push_back(*row->change);
+      std::string after;
+      std::vector<config::Diagnostic> diagnostics;
+      checks.Expect(config::ApplyEdit(text, edit, &after, &diagnostics),
+                    section + " " + label + " = " + row->change->value + " is an edit SetConfig takes");
+      text = after;
+    }
+    checks.ExpectEq(seen.size(), values + 1, section + " " + label + ": every press was drawn");
+    if (seen.size() == values + 1) {
+      checks.ExpectEq(seen.back(), seen.front(), section + " " + label + ": the cycle comes round");
+      for (std::size_t a = 0; a < values; ++a) {
+        for (std::size_t b = a + 1; b < values; ++b) {
+          checks.Expect(seen[a] != seen[b],
+                        section + " " + label + ": no value is visited twice in one round");
+        }
+      }
+    }
+  }
+}
+
+/// What a press on a setting row produced, said under the headline.
+void CheckEveryChangeOutcomeIsDrawn(Checks& checks) {
+  const ipc::ConfigView sent = ViewFor(checks, kMinimal);
+  checks.Expect(overlay::RenderSettings(sent).notice.empty(), "nothing pressed, nothing said");
+
+  overlay::ChangeState applied;
+  applied.sent = true;
+  applied.assignment = {"sync", "on_server_delete", "keep", false};
+  applied.result.outcome = ipc::WriteOutcome::kApplied;
+  const overlay::SettingsView saved = overlay::RenderSettings(sent, {}, applied);
+  checks.Expect(Contains(saved.notice, "on_server_delete") && Contains(saved.notice, "keep"),
+                "an applied change names the setting and its value: " + saved.notice);
+  checks.Expect(saved.notice_tone == overlay::Tone::kGood, "and reads good");
+
+  overlay::ChangeState refused = applied;
+  refused.result.outcome = ipc::WriteOutcome::kInvalid;
+  config::Diagnostic why;
+  why.severity = config::Severity::kError;
+  why.section = "sync";
+  why.key = "on_server_delete";
+  why.message = "expected remove or keep, got 'delete'";
+  refused.result.diagnostics.push_back(why);
+  const overlay::SettingsView no = overlay::RenderSettings(sent, {}, refused);
+  checks.Expect(Contains(no.notice, "expected remove or keep"),
+                "a refusal says the sysmodule's reason: " + no.notice);
+  checks.Expect(no.notice_tone == overlay::Tone::kBad, "and reads bad");
+
+  refused.result.diagnostics.clear();
+  const overlay::SettingsView bare = overlay::RenderSettings(sent, {}, refused);
+  checks.Expect(Contains(bare.notice, "nothing was changed"),
+                "a refusal with no reason still says nothing changed: " + bare.notice);
+
+  overlay::ChangeState failed = applied;
+  failed.result.outcome = ipc::WriteOutcome::kWriteFailed;
+  const overlay::SettingsView card = overlay::RenderSettings(sent, {}, failed);
+  checks.Expect(Contains(card.notice, "could not be written"),
+                "a failed write says the card did not take it: " + card.notice);
+  checks.Expect(card.notice_tone == overlay::Tone::kBad, "and reads bad");
+
+  // A pending "Re-pair" confirmation outranks it: that sentence is the warning
+  // a destructive press owes, and the screen drops one when the other happens.
+  overlay::RepairState confirming;
+  confirming.confirming = true;
+  checks.Expect(Contains(overlay::RenderSettings(sent, confirming, applied).notice, "discards"),
+                "a pending re-pair's warning is never hidden by an older change");
 }
 
 /// Every scalar the write path can edit is marked, and nothing else is.
@@ -574,6 +716,13 @@ void CheckEditableRowsAreMarked(Checks& checks) {
   }
   const overlay::SettingsRow* url = RowNamed(view, "[server]", "url");
   checks.Expect(url != nullptr && url->editable, "so is the url");
+  const overlay::SettingsRow* deleted = RowNamed(view, "[sync]", "on_server_delete");
+  checks.Expect(deleted != nullptr && deleted->editable, "so is on_server_delete (#264)");
+  for (const char* key : {"retroarch", "retroarch_content_dir"}) {
+    const overlay::SettingsRow* row = RowNamed(view, "[sources]", key);
+    checks.Expect(row != nullptr && row->editable,
+                  std::string("[sources] ") + key + " is marked as a value the write path takes");
+  }
 }
 
 /// "Re-pair" asks twice, and asks the sysmodule before it discards anything.
@@ -980,6 +1129,8 @@ int main() {
   CheckTheUrlIsNeverBesideAComplaint(checks);
   CheckMenuReachesEveryScreen(checks);
   CheckEditableRowsAreMarked(checks);
+  CheckM10SettingsAreShownAndChanged(checks);
+  CheckEveryChangeOutcomeIsDrawn(checks);
   CheckRepairConfirmsBeforeItAsks(checks);
   CheckEveryRepairOutcomeIsDrawn(checks);
   CheckTheHeadlineDoesNotCountATrimmedList(checks);

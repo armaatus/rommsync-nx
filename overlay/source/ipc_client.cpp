@@ -67,6 +67,15 @@ Result IpcClient::Open() {
   if (serviceIsActive(&service_)) {
     return 0;
   }
+  // Asked first, because `smGetService` on a name nobody registered is not
+  // refused but deferred, forever (see the header). 65100 is Atmosphere's
+  // `AtmosphereHasService`, the same tipc call `main.cpp`'s `SmWaiter` makes.
+  const SmServiceName name = smEncodeName(ipc::kServiceName);
+  bool registered = false;
+  const Result asked = tipcDispatchInOut(smGetServiceSessionTipc(), 65100, name, registered);
+  if (R_SUCCEEDED(asked) && !registered) {
+    return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+  }
   return smGetService(&service_, ipc::kServiceName);
 }
 
@@ -338,6 +347,12 @@ Result IpcClient::RestoreBackup(std::int64_t entry_id, ipc::RestoreState* state)
   // transport, so whether it was taken -- and, while another is running, which
   // one is -- is in the answer (ipc.hpp).
   return CallAndDecode(ipc::Command::kRestoreBackup, ipc::EncodeEntryId(entry_id),
+                       ipc::DecodeRestoreState, state);
+}
+
+Result IpcClient::KeepLocal(std::int64_t entry_id, ipc::RestoreState* state) {
+  // `RestoreBackup`'s reason: what became of the press is in the answer.
+  return CallAndDecode(ipc::Command::kKeepLocal, ipc::EncodeEntryId(entry_id),
                        ipc::DecodeRestoreState, state);
 }
 

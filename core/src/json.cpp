@@ -631,8 +631,9 @@ class Parser {
   }
 
   /// Scans the RFC 8259 number grammar first and converts only then, because
-  /// `from_chars` on its own would accept `inf` and `nan`, which JSON has no
-  /// syntax for.
+  /// `from_chars` on its own would accept leading zeros, which JSON has no
+  /// syntax for, and stop short of a fraction or an exponent rather than refuse
+  /// it. Only an integer is converted (json.hpp says why).
   bool ParseNumber(Value* out) {
     const std::size_t start = at_;
     if (at_ < text_.size() && text_[at_] == '-') {
@@ -683,20 +684,11 @@ class Parser {
       if (parsed.ec == std::errc() && parsed.ptr == last) {
         out->integral_ = true;
         out->integer_ = as_integer;
-        out->number_ = static_cast<double>(as_integer);
-        return true;
       }
-      // Too wide for an int64. Still a valid JSON number, but `is_integer()`
-      // stays false, so a caller that needs an exact id refuses it rather than
-      // carrying a rounded one.
+      // Otherwise too wide for an int64. Still a valid JSON number, but
+      // `is_integer()` stays false, so a caller that needs an exact id refuses
+      // it rather than carrying a rounded one.
     }
-    double as_double = 0.0;
-    const std::from_chars_result parsed = std::from_chars(first, last, as_double);
-    if (parsed.ec != std::errc() || parsed.ptr != last) {
-      at_ = start;
-      return Fail("number out of range");
-    }
-    out->number_ = as_double;
     return true;
   }
 

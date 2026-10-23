@@ -28,6 +28,10 @@
 #   SOAK_SINCE         ISO-8601 time soak.yml was added. Default: from git,
 #                      which needs history (ci.yml checks out with depth 0).
 #   SOAK_NOW           ISO-8601 time to judge at. Default: now.
+#   SOAK_GH_TIMEOUT    seconds one `gh` call may take before it is abandoned
+#                      (default 30), and SOAK_GH_RETRY_DELAY the pause between
+#                      attempts (default 10) -- so `ctest -R soak.bounded` can
+#                      show the bound biting without waiting it out.
 set -euo pipefail
 
 MAX_DAYS="${1:-3}"
@@ -50,11 +54,34 @@ print(int(moment.timestamp()))
 ' "$1" 2>/dev/null || true
 }
 
+# bounded SECONDS CMD... -- CMD, killed with everything it started once it has
+# run SECONDS; status 124 then. `gh` sets no timeout of its own, so a stalled API
+# call would otherwise hold main's run until GitHub's six-hour default (#256).
+# Python rather than coreutils' `timeout`, which macOS does not ship and
+# `ctest -R soak.bounded` runs there too.
+bounded() {
+  python3 -c '
+import os, signal, subprocess, sys
+child = subprocess.Popen(sys.argv[2:], stdin=subprocess.DEVNULL, start_new_session=True)
+try:
+    sys.exit(child.wait(timeout=float(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    # The whole group: a grandchild left alive would hold our stdout open, and
+    # the $(...) reading it would go on waiting.
+    os.killpg(child.pid, signal.SIGKILL)
+    child.wait()
+    print("%s gave no answer in %s s" % (sys.argv[2], sys.argv[1]), file=sys.stderr)
+    sys.exit(124)
+' "$@"
+}
+
 if [ -z "${SOAK_LAST_SUCCESS+set}" ]; then
   # Three tries, ten seconds apart: one API hiccup should not turn main red for
-  # a reason that has nothing to do with the soak.
+  # a reason that has nothing to do with the soak. Each is bounded, so the three
+  # together are under two minutes; ci.yml's timeout-minutes bounds the rest.
   for attempt in 1 2 3; do
-    if SOAK_LAST_SUCCESS="$(gh run list --workflow soak.yml --branch main --event schedule \
+    if SOAK_LAST_SUCCESS="$(bounded "${SOAK_GH_TIMEOUT:-30}" \
+                              gh run list --workflow soak.yml --branch main --event schedule \
                               --status success --limit 1 --json createdAt \
                               --jq '.[0].createdAt // "none"')"; then
       break
@@ -63,7 +90,7 @@ if [ -z "${SOAK_LAST_SUCCESS+set}" ]; then
       echo "::error::could not ask GitHub for the last successful soak" >&2
       exit 1
     }
-    sleep 10
+    sleep "${SOAK_GH_RETRY_DELAY:-10}"
   done
 fi
 if [ -z "${SOAK_SINCE+set}" ]; then

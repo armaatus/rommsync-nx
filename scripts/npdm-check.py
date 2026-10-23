@@ -312,10 +312,13 @@ class Elf:
         It does **not** keep out AArch64 literal pools, which the assembler
         emits inside `.text`: a constant whose word happens to match
         `0xD4xxxxx1` is indistinguishable from an `svc` here and would be
-        reported as a call this process makes. Every one of the 29 found today
+        reported as a call this process makes. Every one found today
         lands on a libnx `svc*` wrapper, so nothing is being papered over -- but
-        a failure naming a function that plainly issues no SVC is this, and the
-        answer is to look at the address, not to widen the grant.
+        a failure naming a function that plainly issues no SVC is this. Look at
+        the address before granting anything. Since the check became exact
+        (#256) there is no allowlist, so a confirmed literal can only be
+        granted: the conservative error, and the config's line should then say
+        why it is there.
         """
         calls = {}
         wanted = self.SHF_ALLOC | self.SHF_EXECINSTR
@@ -341,13 +344,24 @@ class Failure(Exception):
 
 
 def check_syscalls(npdm, elf, names):
-    """Every SVC the image issues is one the npdm grants.
+    """The npdm grants exactly the SVCs the image issues (#196, #256).
 
-    The other direction is deliberately *not* a failure: a declared SVC nothing
-    calls is a capability held for no reason, which is a narrowing to make and
-    not a build breaker. M9-11 (#210) narrowed the filesystem mask, the handle
-    table and the address space and left this set alone; it is printed so that
-    whoever narrows it has a list to start from.
+    An SVC issued and not granted kills the process. One granted and never
+    issued is a capability held for nothing, and since M9-29 (#256) that fails
+    too -- exact, as #210 made the other grants, so the set cannot widen again
+    without somebody deciding it.
+
+    The scan is the whole answer, not a floor under it. An SVC number is the
+    `svc` instruction's immediate, so issuing one means executing that
+    instruction; and this process can execute nothing but the image it is
+    loaded from, because it holds none of the code-memory SVCs
+    (`svcCreateCodeMemory`, `svcControlCodeMemory`, `svcMapProcessCodeMemory`)
+    that would let it make new code executable. Nor does anything branch on
+    the *grant*: Mesosphère reads the mask at dispatch, for
+    `svcGetInfo(IsSvcPermitted)` and while pinning a thread (both SVCs that
+    reads, 0x28 and 0x29, are issued), and libnx's one such branch is
+    `jit.c`'s, on loader hints a sysmodule does not get. sysmodule/README.md
+    says this at more length.
     """
     called = elf.svc_calls()
     granted = npdm.aci0.syscalls
@@ -360,14 +374,14 @@ def check_syscalls(npdm, elf, names):
             "kernel refuses an undeclared SVC and the process dies -- there is no soft "
             "failure and no crash report to read (#196)"
             % (number, ", ".join(sorted(called[number]))))
-    unused = sorted(granted - set(called))
-    if unused:
-        print("note: %d declared SVCs nothing in the image calls: %s"
-              % (len(unused), ", ".join(_named(n, names) for n in unused)))
+    for number in sorted(granted - set(called)):
+        problems.append(
+            "%s is declared in the npdm and nothing in the linked ELF issues it. A grant "
+            "nothing uses is one a bug can reach; delete its line from "
+            "sysmodule/sys-rommsync.json (#256)" % _named(number, names))
     if problems:
         return problems
-    print("ok: all %d SVCs the image issues are declared (%d declared in total)"
-          % (len(called), len(granted)))
+    print("ok: the npdm grants exactly the %d SVCs the image issues" % len(called))
     return []
 
 
@@ -847,6 +861,13 @@ def self_test():
     expect(elf.owner(0x1008) == "svc_82", "the symbol owning an svc was not found")
     expect(len(quietly(check_syscalls, npdm, elf, {})) == 2,
            "an undeclared SVC was not reported")
+    # The other direction (#256): a grant nothing issues is a finding too, one
+    # per SVC so the message names each line to delete from the config.
+    expect(len(quietly(check_syscalls, Npdm(_npdm({0x01, 0x21, 0x40, 0x71})),
+                       Elf(_elf([0x01, 0x21])), {})) == 2,
+           "SVCs declared and never issued passed")
+    expect(quietly(check_syscalls, Npdm(_npdm({0x01, 0x21})), Elf(_elf([0x01, 0x21])), {}) == [],
+           "a grant exactly the issued set was reported")
     expect(quietly(check_coherent, npdm) == [], "the coherent fixture was reported incoherent")
     expect(quietly(check_flags, npdm) == [], "the fixture's ACID flags were misread")
     expect(quietly(check_program_id, npdm,

@@ -54,6 +54,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -77,6 +78,17 @@
 #include "rommsync/sync_tick.hpp"
 #include "rommsync/token_store.hpp"
 #include "sized_thread.hpp"
+
+// Named by the tick's phases, which only engine.cpp defines.
+namespace rommsync::conflicts {
+struct RecordOptions;
+}
+namespace rommsync::place {
+class Placer;
+}
+namespace rommsync::sync {
+struct StateSyncReport;
+}
 
 namespace rommsync::sysmodule {
 
@@ -191,6 +203,38 @@ struct PairingBackend {
   /// boot after the first it does not matter what is in it
   /// (`device_identity.hpp`).
   auth::IdentitySeed identity_seed;
+};
+
+/// The engine's clocks, and how long its worker really blocks to see a span of
+/// them pass (#250).
+///
+/// **The console's is the default and the only one it uses**: `steady_clock`,
+/// `system_clock`, and a wait that is the span itself. What this exists for is
+/// the soak, which has to see days of the schedule -- an interval of thirty
+/// minutes, a backoff that climbs to its cap over a day offline, a token that
+/// stops working on day two -- in minutes of a test run. A clock that runs a
+/// thousand times fast has to make the *waits* a thousand times shorter too, or
+/// the worker sleeps thirty real minutes on a fast clock's say-so; so the wait
+/// is part of the interface rather than something the worker works out.
+///
+/// What it does **not** reach: the transport's own timeouts, which are real
+/// time on a real socket; the pairing poll, which `pairing.hpp` clocks itself;
+/// the boot-time network wait; and `Quiesce`'s budget, which PSC enforces in
+/// real time whatever this says. A save's `updated_at` comes from
+/// `ExecuteOptions::now`, as it always has.
+class Clock {
+ public:
+  virtual ~Clock() = default;
+  virtual std::chrono::steady_clock::time_point Steady() const {
+    return std::chrono::steady_clock::now();
+  }
+  virtual std::chrono::system_clock::time_point Wall() const {
+    return std::chrono::system_clock::now();
+  }
+  /// The real time to block for `span` of `Steady()` to pass.
+  virtual std::chrono::milliseconds RealFor(std::chrono::milliseconds span) const {
+    return span;
+  }
 };
 
 /// The engine as far as it is built.
@@ -348,12 +392,21 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// The download queue and the list pages are **not** held: a rom is not a
   /// save, and the overlay is used from inside a game, so a rom queued there
   /// that waited for the game to close would be the queue screen not working.
-  using ForegroundProbe = std::function<bool()>;
+  ///
+  /// **And which application it is, when `pm` will say** (M10-26, #261). Every
+  /// answer that names one is a sighting (`play::Sightings`), and the tick after
+  /// the game gives each play session the application seen when its save was
+  /// written -- "unknown" when none was. Only a tick that falls due, its hold
+  /// and a "Sync now" press ask, so a game played entirely between two ticks is
+  /// never seen: deliberately, because asking between ticks would be a poll on
+  /// a console with nothing owed, which #242 keeps at none.
+  using ForegroundProbe = std::function<play::Foreground()>;
   void UseForegroundProbe(ForegroundProbe probe,
                           std::chrono::milliseconds poll = kForegroundPollInterval);
 
-  /// The probe's answer, now. `ipc::ServiceCore::SyncNow` reads it to say a
-  /// press is held rather than started (`ipc::SyncOutcome::kDeferred`).
+  /// The probe's answer, now, noted as a sighting when it names an application.
+  /// `ipc::ServiceCore::SyncNow` reads it to say a press is held rather than
+  /// started (`ipc::SyncOutcome::kDeferred`).
   bool application_running() const override;
 
   /// The network the library is read over, and the token to read it with.
@@ -384,6 +437,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// It is also what a **tick** reads and writes every save through, so a
   /// console with none never gets past the scan.
   void UseCard(fs::FileSystem* filesystem);
+
+  /// The clock the schedule, the worker's waits and the drain's backoff run on
+  /// (`Clock`). **A test seam**: `main.cpp` never calls it, and null puts the
+  /// real one back. Before `StartWorker`, because the worker reads it without a
+  /// lock; it must outlive the engine.
+  void UseClock(const Clock* clock);
 
   /// The oldest RomM a tick will sync with. `server::kMinimumVersion` unless
   /// this is called, and the console never calls it (M10-2, #228).
@@ -582,6 +641,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// the cost every restore had before. `StartWorker` failing is logged
   /// (`kBoot`), so that console says why.
   ipc::RestoreState RequestRestore(std::int64_t entry_id) override;
+
+  /// #249: `RequestRestore`, taken and run the same way, through
+  /// `conflicts::KeepLocal`. Once the bytes are back, the conflict's
+  /// `(rom_id, slot)` is armed in `keep_local_` and a tick is asked for, whose
+  /// upload of that save is the one sent with `overwrite=true`.
+  ipc::RestoreState RequestKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
 
   /// Serialises `history_` -- the vector, and nothing else.
@@ -856,6 +921,17 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// a failed sync that uploaded four saves.
   void RecordFailedTickLocked();
 
+  /// How a tick ended, as far as the worker that ran it needs to know.
+  enum class TickRun {
+    /// Ran, or gave up, and recorded either way: `Finished` was called.
+    kFinished,
+    /// **Stopped for a game** (#242): one launched after the worker asked and
+    /// before the first save is planned. Nothing is recorded then -- not
+    /// `Finished`, not the play window -- and the worker hands the tick back to
+    /// the scheduler exactly as if the game had been running when it asked.
+    kHeld,
+  };
+
   /// One scheduled tick, start to finish: scan, `sync::RunTick`, record.
   ///
   /// **Not a second tick loop.** `sync::RunTick` is the loop (sync_tick.hpp) and
@@ -864,27 +940,129 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// here because `conflict_record.hpp` includes `state_sync.hpp`, so recording
   /// from inside the tick would be a cycle.
   ///
-  /// **False when it stopped for a game** (#242): one launched after the worker
-  /// asked and before the first save is planned. Nothing is recorded then --
-  /// not `Finished`, not the play window -- and the caller hands the tick back
-  /// to the scheduler exactly as if the game had been running when it asked.
-  bool RunOneTick();
+  /// It is the phases below, in order (M9-27, #254). Each that can end the tick
+  /// early -- `StartTick`, `ReadServerForTick`, `FetchLibraryForTick` -- records
+  /// the end itself, so the sequence here only has to stop.
+  TickRun RunOneTick();
+
+  /// What a tick runs against (`StartTick`, `ReadServerForTick`), what the card
+  /// held (`ScanForTick`), and what the saves half's plans did (`TallyPlan`).
+  /// Defined in engine.cpp; nothing outside a tick holds one.
+  struct TickInputs;
+  struct TickScan;
+  struct SavesTally;
+
+  /// Snapshot the credentials, the transport, the card and the configuration in
+  /// one slice, register the tick's cancel token, and give up -- recorded --
+  /// when the gate is blocked or there is nothing to sync with. False when the
+  /// tick ended here.
+  bool StartTick(TickInputs* inputs);
+
+  /// M10-2 (#228): the heartbeat when this server has not been read, and the
+  /// floor every tick. False when the tick ended here, recorded.
+  bool ReadServerForTick(TickInputs* inputs);
+
+  /// Step 0's library. A result that is not `ok()` has already been recorded as
+  /// the tick's end.
+  roms::FetchResult FetchLibraryForTick(const TickInputs& inputs);
+
+  /// The baseline, RetroArch's and Tico's layouts, the scan, what negotiate is
+  /// told of it, and M7-4's play sessions.
+  TickScan ScanForTick(const TickInputs& inputs, const roms::FetchResult& library);
+
+  /// `sync::RunTick`'s options for this tick -- and the end of the scan's own
+  /// records, which nothing past here reads (#246).
+  sync::TickOptions SavesOptionsFor(const TickInputs& inputs, const roms::FetchResult& library,
+                                    TickScan* found, place::Placer* placer);
+
+  /// The saves half: `sync::RunTick`, then what it settles -- fresh roms, play
+  /// sessions, the oversized roms' lines -- and every save it held let go before
+  /// the states half (#247). Under `save_write_mutex_`.
+  sync::TickResult RunSavesHalf(const TickInputs& inputs, const roms::FetchResult& library,
+                                sync::TickOptions* options, TickScan* found,
+                                const conflicts::RecordOptions& record, SavesTally* tally);
+
+  /// One plan's operations, counted and recorded as it ends (`TickOptions::on_plan`).
+  void TallyPlan(const sync::SyncPlan& plan, const sync::ExecutionReport& executed,
+                 const std::vector<sync::ClientSaveState>& reported,
+                 const conflicts::RecordOptions& record, SavesTally* tally);
+
+  /// The states half, when it is due and no game started under the saves half;
+  /// `*held` says which. Under `save_write_mutex_`.
+  sync::StateSyncReport RunStatesHalf(const TickInputs& inputs, const roms::FetchResult& library,
+                                      const TickScan& found, place::Placer* placer,
+                                      const conflicts::RecordOptions& record,
+                                      sync::TickOutcome saves, bool* held);
+
+  /// The tick's outcome and counts, under `mutex_`, for `Snapshot` and the
+  /// scheduler.
+  void RecordTick(const sync::TickResult& tick, const sync::StateSyncReport& states,
+                  const SavesTally& tally, bool scan_cut, bool states_held);
+
+  /// Run `write` under `mutex_` -- **unless the server changed** since
+  /// `generation` was read: `ForgetServerLocked` or a wake that asks again
+  /// (`Resume`) bumped `server_generation_`, and what the old server answered
+  /// must not overwrite the "ask again" that stands for the new one. Every
+  /// answer a tick or a drain learns from RomM and keeps goes through here.
+  template <typename Write>
+  void RecordIfCurrent(std::uint64_t generation, Write write);
+
+  /// ...with `mutex_` already held, beside other records that must land with it.
+  template <typename Write>
+  void RecordIfCurrentLocked(std::uint64_t generation, Write write);
+
+  /// The four things every `install::` exchange is sent with, bundled once so
+  /// the remote-install phases pass one argument rather than four in whichever
+  /// order each grew (#254).
+  struct InstallLink {
+    http::HttpClient& client;
+    const std::string& base_url;
+    const auth::StoredToken& token;
+    sync::CallPolicy policy;
+
+    install::Exchange Register(bool remote_install) const {
+      return install::Register(client, base_url, token, remote_install, policy);
+    }
+    install::Claimed Claim() const { return install::Claim(client, base_url, token, policy); }
+    install::Exchange Report(std::string_view request_id, const install::Verdict& verdict) const {
+      return install::Report(client, base_url, token, request_id, verdict, policy);
+    }
+  };
+
+  /// A `CallPolicy` whose retries back off on `AwaitBackoff` and stop on
+  /// `cancel`: the heartbeat's, every `install::` exchange's, and each page of
+  /// the library's (#251).
+  sync::CallPolicy PolicyFor(const http::CancelToken* cancel);
+
+  /// A link sent with `PolicyFor(cancel)`.
+  InstallLink InstallLinkFor(http::HttpClient& client, const std::string& base_url,
+                             const auth::StoredToken& token, const http::CancelToken* cancel);
 
   /// #245, on a tick: say whether this console takes remote installs, then
   /// claim what the web UI queued for it into the download queue. Outside
   /// `mutex_`. **Never fails the tick** -- every exchange that does not work is
   /// a `download.remote` warning and the next tick asks again.
-  void ServeInstalls(http::HttpClient& client, const auth::StoredToken& token,
-                     const config::Config& config, const server::ServerCapabilities& caps,
-                     const http::CancelToken* cancel);
+  void ServeInstalls(const InstallLink& link, const config::Config& config,
+                     const server::ServerCapabilities& caps);
+
+  /// Downloads went off: settle what finished, then hand every request still
+  /// taken back as failed. True once every one went, which is when the switch
+  /// may be recorded as told.
+  bool WithdrawInstalls(const InstallLink& link, std::uint64_t generation);
+
+  /// Downloads on: settle, then claim what the web UI queued into the queue.
+  void ClaimInstalls(const InstallLink& link, std::uint64_t generation);
 
   /// Report every claimed request whose queue row has finished, and forget the
   /// ones RomM has settled. Called after each drain and before each claim, on
   /// the worker, outside `mutex_`.
-  void SettleInstalls(http::HttpClient& client, const auth::StoredToken& token,
-                      const std::string& base_url, const http::CancelToken* cancel);
+  void SettleInstalls(const InstallLink& link);
 
-  /// The restore `RequestRestore` took, start to finish, and its outcome
+  /// `RequestRestore` and `RequestKeepLocal`: take the one restore, hand it
+  /// to the worker or run it here (#209). `keep_local` is which of the two.
+  ipc::RestoreState TakeRestore(std::int64_t entry_id, bool keep_local);
+
+  /// The restore `TakeRestore` took, start to finish, and its outcome
   /// recorded in `restore_` (#209). Called on the worker, or on the caller when
   /// there is no worker; `mutex_` not held, because a restore is card I/O.
   void RunRestore(std::int64_t entry_id);
@@ -900,6 +1078,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `play::kMaxWindowSeconds` then refuses outright -- so not stamping costs the
   /// play time as well as the exaggeration.
   void StampPlayWindow();
+
+  /// The sightings since the window last moved, forgotten here as they are
+  /// handed over: the window is about to move (#261). Takes `mutex_`.
+  play::Sightings TakeSightings();
 
   /// Say so when the play-session buffer could not be written (M7-4, #39).
   ///
@@ -1098,7 +1280,14 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// When a tick may run at all, and how long to wait after one that did not
   /// work (M7-2, #37). Driven only by the worker thread and by the commands that
   /// wake it, both under `mutex_`.
-  sync::Scheduler scheduler_;
+  sync::Scheduler scheduler_{sync::SchedulerConfig{}, [this] { return clock_->Steady(); },
+                             [this] { return clock_->Wall(); }};
+
+  /// What `scheduler_`, the worker's waits and `download_due_` read the time
+  /// from (`UseClock`). Never null. Read only at call time, so its place among
+  /// the members does not matter to `scheduler_` above.
+  const Clock* clock_ = &kRealClock;
+  static const Clock kRealClock;
 
   /// The tick in flight, or null. Passed to every stage of one, so a shutdown or
   /// a sleep ends it at an operation boundary rather than mid-write
@@ -1166,11 +1355,30 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// has no use for "queued" as distinct from "copying", and the worker does.
   bool restore_pending_ = false;
 
+  /// The restore `restore_` names is a Keep local (#249). Guarded by `mutex_`.
+  bool restore_keeps_local_ = false;
+
+  /// The saves whose next upload goes over the server's copy: the player's
+  /// Keep local, armed when its restore lands and spent by the plan that
+  /// answers it (`sync::ArmKeepLocal`, `sync::SpendKeepLocal`). Guarded by
+  /// `mutex_`; at most `sync::kMaxKeepLocal`.
+  ///
+  /// **In memory only.** A reboot before the next tick forgets the choice; the
+  /// restored bytes then meet the slot guard like any other upload, and a 409
+  /// ends in a conflict with them backed up and archived -- the player is asked
+  /// again rather than anything being lost.
+  std::vector<state::Baseline::Key> keep_local_;
+
   /// Roms downloaded since the last tick that negotiated, whose saves that tick
   /// asks for with `restore_unlisted` (#241). Guarded by `mutex_`; at most
   /// `sync::kMaxNegotiateRomIds`, past which a rom is an ordinary rom on the
   /// card -- its save still comes, unless this device synced it before.
   std::vector<std::int64_t> fresh_roms_;
+
+  /// The saves this console will not take that the log has already named
+  /// (#257), so each is said once a boot rather than once a tick. Touched only
+  /// inside the saves half of a tick, on the worker, so it needs no lock.
+  sync::Declines declines_;
 
   /// Install requests from RomM's web UI this console has taken and not yet
   /// reported (#245). Guarded by `mutex_`; at most `install::kMaxClaims`, and in
@@ -1252,6 +1460,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `mutex_`, and the probe is copied out and called outside it.
   ForegroundProbe foreground_probe_;
   std::chrono::milliseconds foreground_poll_ = kForegroundPollInterval;
+
+  /// What the probe named since the play window last moved (#261). Guarded by
+  /// `mutex_`; `mutable` because `application_running` is the one place that
+  /// asks, and it is const for the IPC surface. Replaced, slack and all, by
+  /// `UseForegroundProbe`, and cleared wherever `play_` stamps the window.
+  mutable play::Sightings sightings_{play::SlackFor(kForegroundPollInterval)};
 
   /// A tick is being held for a running game. Only the worker touches it; it
   /// is what makes `sync.held` one line per game rather than one per re-check.

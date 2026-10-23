@@ -47,6 +47,7 @@
 #include "http/http_wire.hpp"
 #include "http/ssl_http_client.hpp"
 #include "ipc/server.hpp"
+#include "last_words.hpp"
 #include "power.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/conflict_log.hpp"
@@ -102,8 +103,11 @@ namespace {
 //   | the claimed remote installs (M10-19)     | `kHeapInstallClaims`    | 0x2000  |   8 KiB |
 //   | the download queue's rows (M9-21)        | `kHeapDownloadQueue`    | 0x5400  |  21 KiB |
 //   | the conflict history's entries (M9-22)   | `kHeapConflictHistory`  | 0x8C00  |  35 KiB |
+//   | the declines already said (M10-21)       | `kHeapDeclines`         | 0x400   |   1 KiB |
+//   | the foreground's sightings (M10-26)      | `kHeapTitleSightings`   | 0x400   |   1 KiB |
+//   | the Keep local choices (M10-20)          | `kHeapKeepLocal`        | 0x800   |   2 KiB |
 //   | newlib arena overhead and fragmentation  | `kHeapNewlibOverhead`   | 0x8000  |  32 KiB |
-//   | **peak**                                 | `kHeapPeak`             | 0x17E000 | 1528 KiB |
+//   | **peak**                                 | `kHeapPeak`             | 0x17F000 | 1532 KiB |
 //
 // The table is written this way so that something other than a reader adds it
 // up. `tests/test_heap_budget.py` totals these rows and compares each against
@@ -777,6 +781,24 @@ constexpr size_t kHeapDownloadQueue = RoundUpToKiB(
 constexpr size_t kHeapConflictHistory = RoundUpToKiB(
     (rommsync::conflicts::kMaxEntries + 1) * sizeof(rommsync::conflicts::Entry) +
     rommsync::conflicts::kMaxEntries * kHistoryEntryTextBytes + kHistoryWriteBytes);
+// Resident for the boot, beside everything: the declines the log has already
+// named (`SdEngine::declines_`, #257), in the array `sync::Declines` reserves
+// once, to its bound.
+constexpr size_t kHeapDeclines =
+    RoundUpToKiB(rommsync::sync::kMaxDeclines * sizeof(rommsync::sync::Declines::Entry));
+// Resident for the boot, beside everything: the stretches the foreground probe
+// named since the play window last moved (`SdEngine::sightings_`, #261), at
+// their bound, and the copy `TakeSightings` hands the tick that attributes them.
+constexpr size_t kHeapTitleSightings =
+    RoundUpToKiB(2 * rommsync::play::kMaxTitleSpans * sizeof(rommsync::play::TitleSpan));
+// Resident for the boot, beside everything: the Keep local choices waiting for
+// their upload (`SdEngine::keep_local_`, #249), at their bound -- and, while a
+// plan runs, the three copies a tick holds of them: the tick's options, and
+// `RunTick`'s per-plan options and its resolution's. A key's slot is budgeted
+// at a name's chunk; `autosave` itself fits the string and allocates nothing.
+constexpr size_t kHeapKeepLocal = RoundUpToKiB(
+    4 * rommsync::sync::kMaxKeepLocal *
+    (sizeof(rommsync::state::Baseline::Key) + kHeapNameBytes));
 constexpr size_t kHeapNewlibOverhead = 0x8000;
 
 constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTransferBuffer +
@@ -784,6 +806,7 @@ constexpr size_t kHeapPeak = kHeapSocketMemory + kHeapStateBaseline + kHeapTrans
                              kHeapListPages + kHeapThreadStacks + kHeapWatcherStack +
                              kHeapLogTail + kHeapPlaySessions + kHeapOpenDirectories +
                              kHeapInstallClaims + kHeapDownloadQueue + kHeapConflictHistory +
+                             kHeapDeclines + kHeapTitleSightings + kHeapKeepLocal +
                              kHeapNewlibOverhead;
 
 // The arithmetic above, checked by the compiler rather than by a reader. It is
@@ -914,6 +937,16 @@ static_assert(sizeof(rommsync::conflicts::Entry) == 408,
               "conflicts::Entry changed size; re-measure kHistoryEntryTextBytes");
 static_assert(kHeapConflictHistory == 0x8C00,
               "conflicts::kMaxEntries moved; retotal the table");
+static_assert(sizeof(rommsync::sync::Declines::Entry) == 32,
+              "sync::Declines::Entry changed size; retotal the table");
+static_assert(kHeapDeclines == 0x400, "sync::kMaxDeclines moved; retotal the table");
+static_assert(sizeof(rommsync::play::TitleSpan) == 24,
+              "play::TitleSpan changed size; retotal the table");
+static_assert(kHeapTitleSightings == 0x400,
+              "play::kMaxTitleSpans moved; retotal the table");
+static_assert(sizeof(rommsync::state::Baseline::Key) == 48,
+              "state::Baseline::Key changed size; retotal the table");
+static_assert(kHeapKeepLocal == 0x800, "sync::kMaxKeepLocal moved; retotal the table");
 // The history read at boot, before the worker starts, under the response row --
 // one more thing held one at a time, as `queue.json` is. `Load` holds the file's
 // text, the entries it parses and the history's own array as they move across:
@@ -932,14 +965,25 @@ static_assert(rommsync::download::kMaxQueueBytes <= kHeapListResponse,
 // to its row rather than a second reader of a bound. Changing the term is a red
 // build here, which is the point: it is the term a reader is likeliest to nudge.
 static_assert(kHeapNewlibOverhead == 0x8000, "the newlib arena term moved; retotal the table");
-static_assert(kHeapPeak == 0x17E000, "the table above no longer sums to its peak row");
+static_assert(kHeapPeak == 0x17F000, "the table above no longer sums to its peak row");
 
-// 0x180000 leaves 0x2000 -- 8 KiB -- over that peak, which is the margin a
+// 0x180000 leaves 0x1000 -- 4 KiB -- over that peak, which is the margin a
 // process nobody can attach a debugger to needs. It is the only margin stated
 // here on purpose: #207's prose quoted two, and the arithmetic gave neither.
-// M9-4 (#208) took 40 KiB of it for the PSC watcher's thread, which is the row
-// above, M10-19 (#245) 8 KiB for the claimed installs, and M9-21 (#247) 21 KiB
-// for the download queue, which was always resident and never counted.
+// What has been taken from it, and for what:
+//   - M9-4 (#208), 40 KiB: the PSC watcher's thread, the row above.
+//   - M10-19 (#245), 8 KiB: the claimed installs.
+//   - M9-21 (#247), 21 KiB: the download queue, always resident and never
+//     counted.
+//   - M10-21 (#257), 1 KiB: the declines a tick has already said -- the price
+//     of a refused save costing one log line a boot rather than one a tick.
+//   - M10-26 (#261), 1 KiB: the foreground's sightings, which a play session's
+//     title is read from.
+//   - M10-20 (#249), 2 KiB: the Keep local choices -- which is why
+//     `sync::kMaxKeepLocal` is 4: a choice asks for its tick at once, so more
+//     than one waits only while sync is off or held.
+// The next row held for the boot would come out of the 4 KiB left, so it needs
+// a decision on kInnerHeapSize first.
 //
 // **M9-22 (#248) took 15 KiB more**, and every byte of it is cost that was
 // always there: the conflict history, resident and never counted (35 KiB), and
@@ -1036,7 +1080,7 @@ constexpr size_t kInnerHeapSize = 0x180000;
 constexpr size_t kHeapMargin = kInnerHeapSize - kHeapPeak;
 
 static_assert(kHeapPeak < kInnerHeapSize, "the heap no longer covers the peak in the table above");
-static_assert(kHeapMargin == 0x2000,
+static_assert(kHeapMargin == 0x1000,
               "the margin in the sentence above is no longer the one left");
 
 alignas(16) u8 g_inner_heap[kInnerHeapSize];
@@ -1258,9 +1302,23 @@ bool g_pm_up = false;
 /// A poll and not a hook, deliberately: `pmdmntHookToCreateApplicationProcess`
 /// is the one hook `dmnt:cht` holds, and pm does not start a hooked application
 /// until the hooker says so (`boot.foreground` refuses a hook here).
-bool ApplicationRunning() {
+///
+/// **And which application** (M10-26, #261): `pmdmntGetProgramId`, on the same
+/// `pm:dmnt` session, so no new service, grant or handle. libnx sends it as
+/// command 7 under Atmosphere on any firmware, and on stock from 14.0.0. A
+/// failure leaves the id out -- the play session says "unknown" -- and never
+/// turns a running game into none: the hold is the half that protects saves.
+/// The id is the *application's*: a Tico module's, or for RetroArch launched
+/// over a title, that borrowed title's.
+rommsync::play::Foreground ApplicationRunning() {
+  rommsync::play::Foreground seen;
   u64 pid = 0;
-  return R_SUCCEEDED(pmdmntGetApplicationProcessId(&pid));
+  seen.running = R_SUCCEEDED(pmdmntGetApplicationProcessId(&pid));
+  u64 program_id = 0;
+  if (seen.running && R_SUCCEEDED(pmdmntGetProgramId(&program_id, pid)) && program_id != 0) {
+    seen.program_id = program_id;
+  }
+  return seen;
 }
 
 /// Whether the "this sm will not answer 65100" note has already been taken. One
@@ -1677,6 +1735,11 @@ int main(int, char**) {
   g_log = std::make_unique<rommsync::log::FileSink>(
       std::string(rommsync::sysmodule::kConfigDir) + rommsync::log::kLogFileName);
   rommsync::log::SetSink(g_log.get());
+  // From here a `std::terminate` -- a `bad_alloc` above all, under
+  // `-fno-exceptions` -- writes `process.terminated` to that file before it
+  // aborts, rather than leaving a sysmodule that is simply gone (#250,
+  // last_words.hpp). Not earlier: before the sink there is nowhere to write.
+  rommsync::sysmodule::InstallLastWords();
 
   // What `__appInit` could not say at the time, now that there is somewhere to
   // say it (M9-1, #195). It is first, before even the version line, because a

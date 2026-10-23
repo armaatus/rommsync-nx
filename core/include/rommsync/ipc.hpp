@@ -142,7 +142,16 @@ inline constexpr const char* kServiceName = "rommsync";
 ///
 /// **7** since M10-7 (#233), which added `conflicts::Event::kDeleted`: a v6
 /// overlay reading `"deleted"` fails to decode the whole `ConflictPage`.
-inline constexpr std::uint32_t kVersion = 7;
+///
+/// **8** since M10-23 (#264), which added `on_server_delete` to `ConfigView`'s
+/// `sync` and a `sources` object beside it -- required fields, so a v8 overlay
+/// reading a v7 sysmodule's `GetConfig` fails to decode it.
+///
+/// **9** since M10-20 (#249), which added `KeepLocal` and with it
+/// `conflicts::RestoreOutcome::kNotAConflict`. The command alone would not bump
+/// it -- an older sysmodule answers `kUnknownCommand` -- but the outcome is a
+/// value a v8 overlay refuses to decode in a `RestoreState`.
+inline constexpr std::uint32_t kVersion = 9;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -202,6 +211,7 @@ enum class Command : std::uint32_t {
   kRestoreBackup = 15,
   kGetLog = 16,
   kGetRestoreState = 17,
+  kKeepLocal = 18,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -214,6 +224,7 @@ inline constexpr std::array kAllCommands = {
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
     Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
     Command::kRestoreBackup,       Command::kGetLog,       Command::kGetRestoreState,
+    Command::kKeepLocal,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -1040,7 +1051,7 @@ Decoded<ConflictQuery> DecodeConflictQuery(std::string_view text);
 std::string EncodeConflictPage(const ConflictPage& page);
 Decoded<ConflictPage> DecodeConflictPage(std::string_view text);
 
-/// `{"entry_id":<int>}` -- `RestoreBackup`'s request.
+/// `{"entry_id":<int>}` -- `RestoreBackup`'s request, and `KeepLocal`'s.
 ///
 /// Spelled apart from `EncodeRomId` even though both are one integer: they name
 /// different things, and a screen that sent a `rom_id` where an entry id was
@@ -1215,6 +1226,17 @@ class Engine {
   /// same thing.
   virtual RestoreState RequestRestore(std::int64_t entry_id) = 0;
 
+  /// The player's Keep local for a save conflict (#249): `RequestRestore`'s
+  /// shape, answered the same way and polled through the same
+  /// `restore_state()`, with two differences an implementation owes the wire.
+  /// It is refused with `conflicts::RestoreOutcome::kNotAConflict`, before
+  /// anything is written, for an entry that is not a save conflict; and once
+  /// the bytes are back on the card, the conflict's `(rom_id, slot)` goes into
+  /// the next tick's `sync::ExecuteOptions::keep_local` -- the one upload sent
+  /// with `overwrite=true` -- and a tick is asked for, so the choice goes up
+  /// while the player is still looking at it (`conflicts::KeepLocal`).
+  virtual RestoreState RequestKeepLocal(std::int64_t entry_id) = 0;
+
   /// Where the last restore stands. Safe at any rate, from the IPC thread,
   /// while one runs.
   virtual RestoreState restore_state() const = 0;
@@ -1294,6 +1316,11 @@ class ServiceCore {
 
   /// Command 17. Where the restore stands. Never fails.
   RestoreState GetRestoreState() const;
+
+  /// Command 18 (#249). Keep local for a save conflict: `RestoreBackup`'s
+  /// answer and its poll, and the next upload of that save goes over the
+  /// server's copy. Never fails; a refusal is the report's outcome.
+  RestoreState KeepLocal(std::int64_t entry_id);
 
   /// Command 16. The last `lines` lines of this process's log, clamped to
   /// `[0, kMaxLogLines]`. Never fails: a console that has logged nothing has an

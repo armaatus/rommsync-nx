@@ -876,8 +876,6 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     // work that went wrong rather than work that was not attempted.
     report.failed = failed.outcome == StateOutcome::kFailed ? 1 : 0;
     report.canceled = failed.outcome == StateOutcome::kCanceled;
-    report.unauthorized =
-        error == StateError::kUnauthorized || error == StateError::kForbidden;
     report.operations.push_back(std::move(failed));
     report.warnings.push_back(message);
     return report;
@@ -908,7 +906,6 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     }
     const bool refused_the_token =
         result.error == StateError::kUnauthorized || result.error == StateError::kForbidden;
-    report.unauthorized = report.unauthorized || refused_the_token;
     const bool stop = result.outcome == StateOutcome::kCanceled || refused_the_token;
     report.operations.push_back(std::move(result));
     return !stop;
@@ -1041,9 +1038,11 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
     }
     ++unclaimed_operations;
     // The emulator's folder for the system may not exist yet: a state the
-    // console has never held is often for a system it has never run.
+    // console has never held is often for a system it has never run. Taken
+    // back if the state then does not land (#258).
+    fs::MadeFolders folders(files);
     if (const std::size_t parent = sd_path.rfind('/'); parent != std::string::npos && parent > 0) {
-      const fs::MakeDirResult made = files.CreateDirectory(sd_path.substr(0, parent));
+      const fs::MakeDirResult made = folders.Make(sd_path.substr(0, parent));
       if (!made.ok()) {
         if (!record(Fail(server.rom_id, server.file_name, StateAction::kPlace,
                          StateError::kUnreadableCard,
@@ -1057,6 +1056,7 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
         Fetch(client, files, token, server, sd_path, StateAction::kPlace, options,
               &report.warnings);
     if (result.outcome == StateOutcome::kDownloaded) {
+      folders.Keep();
       AdvanceWritten(files, nullptr, server, sd_path, baseline, &report.warnings);
     }
     if (!record(std::move(result))) {

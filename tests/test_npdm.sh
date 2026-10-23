@@ -3,8 +3,8 @@
 #
 #   test_npdm.sh svcs   cross-compiles sysmodule/ in devkitpro/devkita64 and
 #                       runs scripts/npdm-check.py over the .nsp and the linked
-#                       ELF: every `svc` instruction the image contains is a
-#                       capability the NPDM grants, ACI0 and ACID agree, the
+#                       ELF: the SVCs the NPDM grants are exactly the `svc`
+#                       instructions the image contains (#256), ACI0 and ACID agree, the
 #                       ACID carries AcidFlag_Production and pool partition 2,
 #                       no @PLACEHOLDER@ reached the artifact, and the
 #                       filesystem mask, handle table and address space are the
@@ -74,7 +74,7 @@ phase_svcs() {
       --nsp "$nsp" --elf "$elf" --json "$SCRATCH/sysmodule/sys-rommsync.json" ||
     fail "the built NPDM does not cover what the image does"
 
-  echo "ok: the NPDM grants every SVC the linked sysmodule issues"
+  echo "ok: the NPDM grants exactly the SVCs the linked sysmodule issues"
 }
 
 case "${1:-}" in

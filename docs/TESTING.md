@@ -483,7 +483,11 @@ ctest --test-dir build --output-on-failure
   byte, so a format cannot move without its version. Each is then bumped one
   version past this build and must be refused or discarded by its policy
   ([ARCHITECTURE.md](ARCHITECTURE.md#formats-across-releases)), never misread,
-  and the refused ones never rewritten. `engine.newer` is the same downgrade
+  and the refused ones never rewritten. `config.ini`, `token.dat`,
+  `conflicts.db`, `state.db` and `play.db` must each say so in the one sentence
+  `records::NewerRelease` builds — file, version, a newer release wrote it,
+  what to install (#255) — spelled out in the test rather than built with it,
+  so a record that phrases it its own way fails. `engine.newer` is the same downgrade
   through a booted engine: a later release's `config.ini` and `token.dat` are
   two errors on the status screen, and an edit from the overlay leaves both on
   the card as they were.
@@ -507,8 +511,16 @@ ctest --test-dir build --output-on-failure
   three, because a prefix is individually well-formed and collectively a lie.
   It also covers the commit-window recovery from `.old` — including the case
   that used to be silent, where `state.db` is missing *and* the `.old` beside it
-  is unusable, which must not report as the brand-new card it looks like. On the
-  writer side it separates the two kinds of bad: an individual unusable row is
+  is unusable, which must not report as the brand-new card it looks like, and
+  the case that used to cost a re-hash: a rename landing between the bounded
+  and the streamed read of a file past `kMaxStateBytes`
+  (`state::testing::SetBetweenReads`), which must still yield the baseline
+  through the one open both reads share (#255). An rc1 file past this build's
+  row bound keeps the same slotted rows whichever order they are written in,
+  and a row repeating one it let go discards the file as any second row does.
+  A later release's file past the byte bound is still said as a later
+  release's. On the writer side it separates the two kinds of bad: an
+  individual unusable row is
   **skipped** and the rest are written (a console with an unset RTC stamps a
   save with the epoch, and refusing the whole file over it would freeze the
   baseline and re-hash the library on every tick from then on), while a file
@@ -761,7 +773,8 @@ ctest --test-dir build --output-on-failure
   to at least twice the deepest response shape a pinned RomM OpenAPI snapshot
   describes; `stack.walk` is the call-graph arithmetic on hand-built graphs.
   Those three read the tree and never skip. `stack.measured` cross-compiles the
-  sysmodule with `-fcallgraph-info=su`, walks the deepest chain from `main`, and
+  sysmodule with `-fcallgraph-info=su`, walks the deepest chain from `main` in
+  the graph the LTO link writes (named by the toolchain's `c++filt`, #253), and
   fails when a frame outgrows the header's ceilings; it needs the devkitPro
   image, so it skips where `npdm.svcs` does and runs in the `switch-build` job
   beside it, under the same `toolchain` label.
@@ -912,9 +925,26 @@ ctest --test-dir build --output-on-failure
   reordered within one directory, and `fseek`/`ftruncate` (no save path reaches
   them). A durability call made *beside* the seam is invisible to it, which is
   how the host backend's descriptor `fsync` was found -- so a backend that makes
-  something durable does it through `io::Sync`. A kernel-level injector
-  ([lazyfs](https://github.com/dsrhaslab/lazyfs), Linux and FUSE) is the check
-  on the model's assumptions and is not part of this suite.
+  something durable does it through `io::Sync`.
+
+  The check on the model is [lazyfs](https://github.com/dsrhaslab/lazyfs), a
+  FUSE filesystem that holds writes in its own page cache until an `fsync` and
+  can be told to drop what is unsynced, or to persist half of one write or one
+  of a run of them and die (#250). `lazyfs.overwrite` (`tests/test_lazyfs.sh`)
+  runs two overwrites on a lazyfs mount -- `BackUpFirst` then `WriteAtomically`,
+  and a download's order, its body staged in pieces then `CommitStaged` -- cuts
+  the power in front of every call each makes to `io::Disk` and after the last,
+  tears the writes of every file the save's bytes pass through, and holds what
+  reaches lazyfs's root to the same `crash::OldOrNew` after the same sweep. A
+  download renamed into place unsynced has to be caught, and is: a zero-byte
+  save, as the model predicts. It needs Linux and FUSE, so it skips here and
+  everywhere else; `.github/workflows/lazyfs.yml` runs it nightly on a GitHub
+  runner against lazyfs built at a pinned commit, where a skip is a failure,
+  and `lazyfs.workflow` holds that job to existing. What lazyfs does not model
+  is the model's directory half: it passes create, rename and unlink straight
+  through, so a name is durable the moment it is made, and the per-directory
+  loss of unsynced names is checked by nothing but the model. Flying writes and
+  a sync that lies are beyond both.
 - **What the sysmodule holds, measured** (M9-15, #204). The heap's table in
   `sysmodule/source/main.cpp` is a bound added up from constants, and two things
   measure what it describes. `scripts/image-budget.sh` reads the linked image --
@@ -944,9 +974,57 @@ ctest --test-dir build --output-on-failure
   These are host numbers: the host's standard library, C++ allocations only
   (libcurl's are the host transport's), and a fixture library of a few roms.
   What carries to the console is the shape -- flat or growing -- and the order
-  of magnitude of a tick. Not done here: curl-style OOM injection (fail
-  allocation *N* on run *N*), and `libfaketime` to run the scheduler's own
-  clock fast -- the soak asks for each tick instead of waiting for one.
+  of magnitude of a tick.
+- **The heap running out, at every allocation** (M9-23, #250). `test_oom` is
+  curl's OOM injection: `count_new::FailAt(n)` fails the *n*th allocation from
+  now, once, and a run counts what one tick -- or one rom download -- allocates
+  and then fails each of them in turn, one child process per allocation.
+  The child dies the way the console would: a throwing `new` that fails is a
+  `bad_alloc` nothing catches, which under the sysmodule's `-fno-exceptions` is
+  `std::terminate`, with no destructor run and no file closed. The sysmodule's
+  terminate handler (`sysmodule/source/last_words.cpp`) is installed in the child
+  as `main.cpp` installs it, and writes `process.terminated` with the exception's
+  type to the log without allocating (`log::WriteLast`) before it aborts. The
+  parent reads what the death left: the log's last line has to say why, and,
+  after the next boot's sweep, `oom.tick`'s save is its old bytes or the
+  server's -- the server's only beside a backup of the old (`crash::OldOrNew`)
+  -- and `oom.download`'s rom is whole or absent, `queue.json` still reads and
+  the save beside the rom is untouched. `oom.last_words` holds the line and the
+  handler on their own. The server's answers are recorded once from the rig
+  and replayed in every child, because a tick that completed would change the
+  next one's plan and allocation *N* has to be the same allocation every run.
+  A tick is a few hundred allocations, so every one is failed on every push.
+- **The schedule on its own clock, run fast** (M9-23, #250). The soak asks for
+  each tick; `soak.schedule` asks for none. `SdEngine::UseClock` gives the
+  engine a `sysmodule::Clock` -- the scheduler's steady and wall clocks, and how
+  long the worker really blocks for a span of them -- and the test's
+  `FastClock` runs both 4000 times fast with the wall clock movable on its own,
+  which is libfaketime's `FAKETIME_DONT_FAKE_MONOTONIC` without a preload: a
+  thirty-minute interval is 450 ms. The engine is configured as a console is,
+  a thirty-minute interval and a boot tick, and run for stretches of that
+  clock: online, where it ticks about twice an hour and every tick completes;
+  offline, with the proxy resetting every connection, where the backoff climbs
+  to its cap and the schedule neither gives up nor storms, then completes
+  within a capped backoff of the network coming back; the wall clock a year
+  ahead and then two years back, where it neither catches up a year of ticks
+  nor stalls waiting for the wall clock -- monotonic drives; and a token the
+  server answers 401 to, where the gate blocks within its three rejections and
+  from then on no request reaches the server while `auth.rejected` is still
+  said once an interval. The server's own clock is real, so a token's expiry is
+  the server refusing it, which is all a client ever sees of one. The
+  transport's timeouts are real time too, so a tick costs minutes of the fast
+  clock -- which is why the online bound is "about twice an hour, and never
+  more", not exactly twice. `ctest` runs six hours a stretch (~30 s); the
+  nightly soak runs two days a stretch.
+- **The numbers, over time** (#250). The nightly soak writes what it held
+  between rounds, a round's peak over that and its allocations
+  (`ROMMSYNC_BENCH_JSON`), measures the linked image in the pinned devkitPro
+  image (`IMAGE_BUDGET_JSON` to `scripts/image-budget.sh`), and hands both to
+  benchmark-action, which keeps them on the `benchmarks` branch -- made by the
+  workflow on its first night if it is not there. Tracked, not gated: each
+  number has its gate already, and an alert (10% on the soak, 2% on the image)
+  goes to the run's summary. `soak.tracked` holds the workflow to that, and
+  `soak.bench` holds the file `soak.smoke` writes to benchmark-action's shape.
 - The `package.*` group covers `scripts/package.sh`, which turns those two build
   outputs into the zip a user unpacks onto their SD card. `package.layout`,
   `package.refuses`, `package.deterministic` and `package.upgrade` stub the two
@@ -1084,10 +1162,10 @@ any workflow job that pairs a fixed name with one.
 `contract.captures` re-runs `probe_contract.py --auth --negotiate
 --sync-scenarios` against the fixture and compares the result with the committed
 captures for the fixture's RomM — `server/contract/captures/5.4.0/` for 5.4.0,
-and `server/contract/captures/` for 5.2.0, kept as history — the responses [API_CONTRACT.md](API_CONTRACT.md),
-[AUTH.md](AUTH.md) and [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md) quote and that M1/M2
-are coded against. It compares field names, nesting and JSON types, plus the
-`action`/`reason` pairs each scenario is named for; ids, timestamps and the
+the responses [API_CONTRACT.md](API_CONTRACT.md) quotes and the client is coded
+against, and `server/contract/captures/` for 5.2.0, kept as the record of a
+version the client refuses. It compares field names, nesting and JSON types,
+plus the `action`/`reason` pairs each scenario is named for; ids, timestamps and the
 per-run slot names differ every run and are ignored.
 
 The scenarios upload throwaway saves — an empty-save negotiate returns an empty
@@ -1229,7 +1307,7 @@ two cannot drift.
 | `auth` | Auth (M1) full device-code flow + 401/refresh proven on host + docker RomM. | `auth.*`, `pair.*`, `device.*`, `core.token_store`, `core.device_identity`, `harness.expired`, and M1-6's `engine.pairs`, `engine.repairs`, `engine.nonblocking`, `engine.unauthenticated` |
 | `ipc` | Config + IPC (M5) proven on host harness. | `core.config`, `config.*`, `ipc.*`, `lists.*`, `overlay.*`, `engine.config`, `engine.commands`. What these prove is the protocol, and since M9-7 (#198) they prove it through the overlay's own `ipc_client.cpp` as well as through `ipc::Dispatch` -- `overlay.wire`, `overlay.roundtrip`, `overlay.errors`. What no test reaches is the libnx `cmif`/`hipc` glue: `sysmodule/source/ipc/server.cpp` and the message unpacking in `service.cpp`, verified with the rest of the Horizon glue at M8-2. |
 | `ssl` | HttpClient ssl-service backend proven in a Ryujinx NRO (M0-1), or on an isolated NRO on a backup SD. | **Nothing yet.** `switch.builds` and `switch.tlsprobe` prove it compiles and links for aarch64; no handshake has been executed anywhere. See *what the first console decides*. |
-| `backup` | Every save-overwrite path shown to back up first, durably (SYNC_PROTOCOL hard rule) -- verified by tests, a power cut replayed at every call. | `harness.backup`, `execute.*`, `states.overwrite`, `states.keeps_both`, `states.crash`, `conflicts.crash`, `tick.newer_download`, `tick.newer_conflict`, `tick.migrated`, `tick.backupdir`, `tick.durable` — **a crash-prefix replay** of each of the three paths that land on a save (`execute.crash`, `states.crash`, `conflicts.crash`; `tests/crash_disk.hpp`), and of the tick that resolves a 409 from RomM's slot guard by taking the server's head (`tick.newer_download`, `tick.newer_conflict`, #232), and of the first tick after an upgrade from rc1, whose migrated save takes the shared slot's newer head (`tick.migrated`, #236), which makes "first" an order of *persistence* rather than of calls: every point of the recorded overwrite is cut, every card a non-journalling FAT may keep is swept by the boot sweep, and each must hold the old bytes or the new, never the new without the old under `.backup/` — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
+| `backup` | Every save-overwrite path shown to back up first, durably (SYNC_PROTOCOL hard rule) -- verified by tests, a power cut replayed at every call. | `harness.backup`, `oom.tick`, `execute.*`, `states.overwrite`, `states.keeps_both`, `states.crash`, `conflicts.crash`, `tick.newer_download`, `tick.newer_conflict`, `tick.migrated`, `tick.backupdir`, `tick.durable` — **a crash-prefix replay** of each of the three paths that land on a save (`execute.crash`, `states.crash`, `conflicts.crash`; `tests/crash_disk.hpp`), and of the tick that resolves a 409 from RomM's slot guard by taking the server's head (`tick.newer_download`, `tick.newer_conflict`, #232), and of the first tick after an upgrade from rc1, whose migrated save takes the shared slot's newer head (`tick.migrated`, #236), which makes "first" an order of *persistence* rather than of calls: every point of the recorded overwrite is cut, every card a non-journalling FAT may keep is swept by the boot sweep, and each must hold the old bytes or the new, never the new without the old under `.backup/` — **the same judgement after a death by running out of heap** at every allocation a tick makes (`oom.tick`, #250) — **and a census** of every `io::CommitStaged`/`CopyAtomically`/`WriteAtomically` call site in `core/src`, `sysmodule/source` and `overlay/source`, so a *new* overwrite path fails the gate until somebody classifies it. The two Horizon targets are in scope because `sysmodule/source/engine.cpp` already writes a file, and a census that only read `core/` would answer a narrower question than the row asks. Each row that lands on a save names the call that does it, and the census insists a call to `sync::BackUpFirst` comes before it — which is how M7-1's restore, whose overwrite is a `CopyAtomically` rather than a `CommitStaged`, is held to the same rule as the two paths M2-5 wrote. That census is the word "every"; the tests are the rest. |
 | `release` | A tagged, released v1 build exists (M6). | A `v1` tag reachable from `main` that agrees with `VERSION`, and a published, non-draft release carrying the zip and `SHA256SUMS`. **Failing today: this repository has no tags and no releases.** |
 | `media` | A known-good NAND/SD backup exists; testing will be on a spare/backup SD or emuMMC, not the daily driver. | **Nothing in a repository can attest to this**, and a checkbox that says otherwise is worse than none. See *what the first console decides*. |
 

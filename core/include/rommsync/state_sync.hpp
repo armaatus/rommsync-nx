@@ -311,8 +311,9 @@ struct StateSyncReport {
   /// attempted.
   bool canceled = false;
 
-  /// The server stopped accepting the token part way through.
-  bool unauthorized = false;
+  // A 401 or a 403 stops the run where it stands, and what it said about the
+  // token is read off the operation that met it, by `AnswerOf(const
+  // StateSyncReport&)` (#206) -- so there is no flag here to drift from that.
 
   /// State rows dropped from the baseline to keep it inside
   /// `state::kMaxRecords`. States are trimmed before saves ever are; see

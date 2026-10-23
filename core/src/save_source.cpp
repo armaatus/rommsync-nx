@@ -35,6 +35,12 @@ std::vector<std::string_view> Segments(std::string_view sd_path) {
 // DuckStation's `.mcd` is not a Beetle `.srm` until somebody proves it is, and
 // the rest are standalone emulators whose files nobody has compared yet. An
 // adapter that rewrites one into the other comes after #44 captures real files.
+//
+// An isolated module's save format is its row's too (#258): Mupen64Plus's four
+// files, each a save of its own; DuckStation's one card per game; PPSSPP's
+// folders. Flycast, DraStic and YabaSanshiro have none yet -- nobody has read
+// their names off a console [#44] -- so a save of theirs keeps the extension
+// the same module uploaded it under.
 constexpr TicoModule kTicoModules[] = {
     {"nes", "FCEUmm", "fceumm"},
     {"snes", "Snes9x", "snes9x"},
@@ -46,13 +52,15 @@ constexpr TicoModule kTicoModules[] = {
     {"master-system", "Genesis Plus GX", "genesis_plus_gx"},
     {"game-gear", "Genesis Plus GX", "genesis_plus_gx"},
     {"sega-cd", "Genesis Plus GX", "genesis_plus_gx"},
-    {"n64", "Mupen64Plus", "tico-mupen64plus"},
-    {"psx", "DuckStation", "tico-duckstation"},
+    {"n64", "Mupen64Plus", "tico-mupen64plus", {.also = {".eep", ".sra", ".fla", ".mpk"}}},
+    {"psx", "DuckStation", "tico-duckstation", {.primary = ".mcd", .memory_cards = true}},
     {"dc", "Flycast", "tico-flycast"},
     {"nds", "DraStic", "tico-drastic"},
     {"saturn", "YabaSanshiro", "tico-yabasanshiro"},
-    {"psp", "PPSSPP", "tico-ppsspp"},
+    {"psp", "PPSSPP", "tico-ppsspp", {.folders = true}},
 };
+
+constexpr SaveFormat kLibretroFormat = {.primary = ".srm", .also = {".rtc"}};
 
 /// The RetroArch core a flat `saves/` is filed under, for the systems where
 /// Tico's module is *not* a libretro core. Everywhere else it is Tico's core:
@@ -194,6 +202,65 @@ std::vector<std::string> RetroArchAliases(std::string_view id) {
     }
   }
   return std::vector<std::string>(aliases.begin(), aliases.end());
+}
+
+bool IsRetroArchCore(std::string_view id) {
+  for (const RetroArchCore& core : RetroArchCores()) {
+    if (id == core.id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SameCore(std::string_view written_by, std::string_view loaded_by) {
+  if (written_by.empty() || loaded_by.empty()) {
+    return false;
+  }
+  if (written_by == loaded_by) {
+    return true;
+  }
+  if (!IsRetroArchCore(loaded_by)) {
+    return false;
+  }
+  const std::vector<std::string> aliases = RetroArchAliases(loaded_by);
+  for (const std::string& alias : aliases) {
+    if (alias == written_by) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SaveFormat::Writes(std::string_view extension) const {
+  if (extension.empty()) {
+    return false;
+  }
+  if (extension == primary) {
+    return true;
+  }
+  for (const char* other : also) {
+    if (other != nullptr && extension == other) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const SaveFormat& LibretroFormat() { return kLibretroFormat; }
+
+SaveFormat SaveFormatOf(std::string_view emulator_id) {
+  if (IsRetroArchCore(emulator_id)) {
+    return kLibretroFormat;
+  }
+  if (IsIsolated(emulator_id)) {
+    for (const TicoModule& module : kTicoModules) {
+      if (emulator_id == module.emulator_id) {
+        return module.format;
+      }
+    }
+  }
+  return {};
 }
 
 const TicoModule* TicoModuleFor(std::string_view tico_slug) {

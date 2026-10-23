@@ -48,10 +48,14 @@ set -euo pipefail
 # M10's code took most of the rest: 2,355,200 bytes at the whole-branch review
 # (2026-10-22), 4 KiB under. Dropping the six `snprintf` calls that linked
 # newlib's formatter (`switch.builds` now refuses it) gave back 40 KiB of
-# .text: 2,310,144 bytes, 48 KiB under. Growth past it is a decision, made here
-# with its reason beside it, and not something a PR does by accident. Atmosphere leaves third-
-# party sysmodules a shared pool (7 MB on HOS 21.0.0+, docs/DEVELOPMENT.md#what-the-image-costs),
-# and this process is one tenant of it.
+# .text: 2,310,144 bytes, 48 KiB under, and 2,314,240 after the merges that
+# followed. #253's LTO and integer-only JSON numbers (no fast_float) took it to
+# 2,215,936: 140 KiB under.
+# Growth past it is a decision, made here with its reason beside it, and not
+# something a PR does by accident. Atmosphere adds 7 MB to the system pool on
+# HOS 21.x and 22.x, shared by every custom sysmodule and its own
+# (docs/DEVELOPMENT.md#what-the-image-costs reconciles the two figures once
+# quoted), and this process is one tenant of it.
 IMAGE_BUDGET=$(( 2304 * 1024 ))
 # What `.bss` may hold besides the heap: every other file-scope object.
 # ~17 KiB today (libnx's and newlib's state, the log ring's bookkeeping).
@@ -183,6 +187,21 @@ report() {
   echo "| overlay \`.ovl\` (file) | $ovl_bytes | $OVL_BUDGET |"
 }
 report
+# The same numbers as benchmark-action's `customSmallerIsBetter` JSON, for the
+# nightly soak to track over time (#250): growth that stays under every ceiling
+# above is still growth, and it is visible there before it trips one. An
+# environment variable rather than a flag, because the `switch-build` job may
+# pass this script none (`switch.ci_requires_artifacts`).
+if [ -n "${IMAGE_BUDGET_JSON:-}" ]; then
+  {
+    echo "["
+    echo "  {\"name\": \"sysmodule mapped image\", \"unit\": \"bytes\", \"value\": $mapped, \"extra\": \"budget $IMAGE_BUDGET\"},"
+    echo "  {\"name\": \"sysmodule .bss\", \"unit\": \"bytes\", \"value\": $bss, \"extra\": \"heap $heap\"},"
+    echo "  {\"name\": \"sysmodule .text\", \"unit\": \"bytes\", \"value\": $text, \"extra\": \"ceiling $TEXT_CEILING\"},"
+    echo "  {\"name\": \"overlay .ovl\", \"unit\": \"bytes\", \"value\": $ovl_bytes, \"extra\": \"budget $OVL_BUDGET\"}"
+    echo "]"
+  } >"$IMAGE_BUDGET_JSON"
+fi
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   { echo "### sys-rommsync image budget"; echo; report; } >>"$GITHUB_STEP_SUMMARY"
 fi

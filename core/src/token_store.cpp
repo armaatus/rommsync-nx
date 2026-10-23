@@ -8,6 +8,7 @@
 
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/json.hpp"
+#include "rommsync/newer_release.hpp"
 
 namespace rommsync::auth {
 namespace {
@@ -227,16 +228,16 @@ LoadedToken ReadRecord(const std::string& path, io::ReadError* how) {
     parsed.error = std::move(document.error);
   }
   if (!parsed.ok()) {
-    if (document.ok() && RecordVersion(document.value) > kTokenFormatVersion) {
+    const std::int64_t version = document.ok() ? RecordVersion(document.value) : 0;
+    if (version > kTokenFormatVersion) {
       // Its own error rather than `kMalformed`: nothing is wrong with the file,
       // and the remedy is a release, not a re-pair -- though a re-pair is also
-      // the way to replace it, for a user staying on this one.
+      // the way to replace it, for a user staying on this one. The path stands
+      // where the other records put their name (`records::NewerRelease`).
       loaded.error = StoreError::kNewerFormat;
-      loaded.message = Describe(
-          path, "was written by a newer release than this sys-rommsync, which reads token "
-                "format " + std::to_string(kTokenFormatVersion) +
-                    "; it is left as it is -- install sys-rommsync and the overlay from the "
-                    "release that wrote it, or pair again to replace it");
+      loaded.message = records::NewerRelease(
+          path, std::to_string(version), static_cast<int>(kTokenFormatVersion),
+          "it is left as it is, and pairing again is what replaces it");
       return loaded;
     }
     loaded.error = StoreError::kMalformed;

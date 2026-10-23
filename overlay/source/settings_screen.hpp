@@ -9,10 +9,13 @@
 // reach it (`ctest -R overlay.settings`). The same split the other four screens
 // have, for the same reason.
 //
-// **This screen does not edit `config.ini`.** The sysmodule owns writes
-// (docs/ARCHITECTURE.md); live edits are M5-3 (#30) and the row is marked, not
-// offered. `overlay.settings`, `overlay.library` and `overlay.sync_actions` all
-// grep this directory for the write path rather than leaving it reviewed.
+// **This screen does not write `config.ini`.** The sysmodule owns writes
+// (docs/ARCHITECTURE.md): a row the view model gives a `change` -- `[sync]
+// on_server_delete` and `[sources]`, since M10-23 (#264) -- sends that one
+// assignment over `SetConfig` (M5-3, #30) and draws the answer, and every other
+// row is marked, not offered. `overlay.settings`, `overlay.library` and
+// `overlay.sync_actions` all grep this directory for the write path rather than
+// leaving it reviewed.
 //
 // **It is also the overlay's root menu.** Until this screen there was no
 // navigation at all: `main.cpp` opened on the status screen and nothing pushed
@@ -32,6 +35,7 @@
 
 #include "ipc_client.hpp"
 #include "lifecycle.hpp"
+#include "rommsync/config.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_settings_view.hpp"
 #include "screen_frame.hpp"
@@ -57,12 +61,12 @@ class SettingsScreen : public tsl::Gui {
   /// this screen does that could have changed it.
   void update() override;
 
-  /// Up/Down scroll the list, A opens the screen under the cursor, and X starts
-  /// -- and then confirms -- a re-pair.
+  /// Up/Down scroll the list, A opens the screen under the cursor or steps the
+  /// setting under it to its next value, and X starts -- and then confirms -- a
+  /// re-pair.
   ///
-  /// Only a menu row answers A. Everything else on this screen is read-only in
-  /// this build, and a row that highlighted but did nothing would be a control
-  /// that lies (#24's rule).
+  /// Only a menu row or a row with a `change` answers A. A row that highlighted
+  /// but did nothing would be a control that lies (#24's rule).
   bool handleInput(u64 keys_down, u64 keys_held, const HidTouchState& touch,
                    HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
 
@@ -110,6 +114,13 @@ class SettingsScreen : public tsl::Gui {
   /// `overlay_settings_view.hpp` carries the rest of the reasoning.
   void PressRepair();
 
+  /// A: send `assignment` to `SetConfig`, then poll for what is now in force.
+  ///
+  /// One press, no confirmation: every setting offered this way is a choice
+  /// between words that are all safe to land on, and pressing again undoes it
+  /// (`SettingsRow::change`).
+  void PressChange(config::Assignment assignment);
+
   /// The row the cursor is on, or nullptr when there is none.
   const SettingsRow* CursorRow() const;
 
@@ -133,6 +144,10 @@ class SettingsScreen : public tsl::Gui {
   /// Where the button is between presses. Not in the view, for the reason
   /// `LastCommand` is not (`overlay_sync_actions.hpp`).
   RepairState repair_;
+
+  /// What the last setting press produced. Dropped with `repair_`, and by a
+  /// press on the other button.
+  ChangeState change_;
 
   /// What the last render produced. Starts as "not running" rather than as an
   /// empty screen: the first frame is drawn before the first poll returns, and

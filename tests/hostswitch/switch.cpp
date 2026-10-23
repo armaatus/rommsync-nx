@@ -41,6 +41,11 @@ std::atomic<int>& Open() {
   return open;
 }
 
+std::atomic<int>& Deferred() {
+  static std::atomic<int> deferred{0};
+  return deferred;
+}
+
 }  // namespace
 
 namespace hostswitch {
@@ -62,6 +67,23 @@ void Unregister(const char* name, Server* server) {
 const Dispatched& LastDispatched() { return LastDispatchedMutable(); }
 
 int OpenSessions() { return Open().load(); }
+
+int DeferredRequests() { return Deferred().load(); }
+
+Result TipcDispatchInOut(TipcService* service, u32 request_id, const void* in, std::size_t in_size,
+                         void* out, std::size_t out_size) {
+  if (service == nullptr || request_id != 65100 || in_size != sizeof(SmServiceName) ||
+      out_size != sizeof(bool)) {
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  }
+  SmServiceName asked{};
+  std::memcpy(&asked, in, sizeof(asked));
+  const SmServiceName held = smEncodeName(RegisteredName().c_str());
+  const bool registered = RegisteredServer() != nullptr &&
+                          std::memcmp(asked.name, held.name, sizeof(asked.name)) == 0;
+  std::memcpy(out, &registered, sizeof(registered));
+  return 0;
+}
 
 Result DispatchOut(Service* service, u32 command_id, void* out, std::size_t out_size,
                    const SfDispatchParams& params) {
@@ -118,14 +140,21 @@ Result DispatchOut(Service* service, u32 command_id, void* out, std::size_t out_
 
 Result smGetService(Service* out, const char* name) {
   if (RegisteredServer() == nullptr || RegisteredName() != name) {
-    // What a console with no `sys-rommsync` answers, and the state the status
-    // screen has a sentence for.
+    // **Not what a console answers**: Atmosphere's sm defers this request and
+    // never returns it (`hostswitch::DeferredRequests`). Answered so the test
+    // survives, and counted so it can say the overlay asked.
+    ++Deferred();
     return MAKERESULT(Module_Libnx, LibnxError_NotFound);
   }
   out->server = RegisteredServer();
   out->generation = Generation();
   ++Open();
   return 0;
+}
+
+TipcService* smGetServiceSessionTipc() {
+  static TipcService sm;
+  return &sm;
 }
 
 void serviceClose(Service* s) {

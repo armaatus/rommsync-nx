@@ -17,8 +17,8 @@
 // The response shapes (`SyncNegotiateResponse`, `SyncOperationSchema`) are
 // pinned here too, against the same tables, because they are the same kind of
 // drift: a field the snapshot grows is a decision the server started making that
-// this client cannot see. What the *values* in those fields mean -- the four
-// actions and the thirteen reasons -- is `sync.plan`'s, which reads the
+// this client cannot see. What the *values* in those fields mean -- the five
+// actions and the fifteen reasons -- is `sync.plan`'s, which reads the
 // committed captures rather than the schema.
 //
 // What no offline test can pin is whether a *misnamed* optional field would be

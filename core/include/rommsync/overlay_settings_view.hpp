@@ -1,5 +1,5 @@
 // The overlay's settings screen -- the whole effective configuration, every
-// complaint the parser had about it, and the one action the screen owns --
+// complaint the parser had about it, and the presses the screen owns --
 // decided here and drawn over there.
 //
 // M4-4 (#26), and the place a bad `config.ini` stops being invisible. A console
@@ -14,11 +14,13 @@
 // elements; everything that could be wrong about the screen is
 // `ctest -R overlay.settings`.
 //
-// **This screen does not edit `config.ini`, and nothing under `overlay/` writes
-// it** (docs/ARCHITECTURE.md). The write path exists -- `SetConfig` and
-// `config::ApplyEdit`, M5-3 (#30) -- and using it from here is #30's, not this
-// issue's. Rows carry `editable` to mark where a value *will* become editable;
-// they carry no way to change one.
+// **Nothing under `overlay/` writes `config.ini`** (docs/ARCHITECTURE.md). The
+// write path is the sysmodule's -- `SetConfig` and `config::ApplyEdit`, M5-3
+// (#30) -- and a row this screen changes in place carries the one assignment a
+// press sends there (`SettingsRow::change`). Since M10-23 (#264) that is the
+// settings that are a choice between a few words: `[sync] on_server_delete` and
+// `[sources]`. Every other row carries `editable` to mark where a value the
+// write path takes *could* become editable, and no way to change it.
 //
 // **A `Diagnostic` about `server.url` never quotes the URL** (`config.hpp`), and
 // this file may not helpfully re-add it: a URL is the one configured field that
@@ -33,6 +35,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,11 +82,11 @@ const char* ToString(Destination destination);
 
 /// What a row is, which is what a press on it does.
 enum class SettingsRowKind {
-  /// A menu row. The only selectable kind: everything else on this screen is
-  /// read-only in this build.
+  /// A menu row: a press opens `destination`.
   kNavigate,
 
-  /// A scalar setting: `[sync] interval_min`, `[server] url`.
+  /// A scalar setting: `[sync] interval_min`, `[server] url`. Selectable only
+  /// when it carries a `change`.
   kValue,
 
   /// One line of the folder map -- one `roms`/`saves`/`states` path, or the
@@ -114,25 +117,38 @@ struct SettingsRow {
 
   Tone tone = Tone::kNeutral;
 
-  /// A press on this row does something. `kNavigate` only, in this build.
+  /// A press on this row does something: a menu row, or a row with a `change`.
   bool selectable = false;
 
   /// Where a press goes. `kNone` for everything that is not a menu row.
   Destination destination = Destination::kNone;
 
-  /// M5-3 (#30) can write this key. Marked rather than offered: this screen is
-  /// read-only, and the moment `overlay/` opens `config.ini` the invariant that
-  /// the sysmodule owns writes is gone (docs/ARCHITECTURE.md).
+  /// What a press on this row sends to `SetConfig`: the setting's **next**
+  /// value, in `config.ini`'s own words, so a few presses walk every value and
+  /// come round again (#264). Empty on every row a press does not change.
   ///
-  /// **The renderer deliberately draws nothing for it today**, and that is not
-  /// an omission: every row that is not a `kNavigate` is editable, so a marker
+  /// The next value rather than a picker because the overlay has no dialog,
+  /// and because every setting offered this way is a choice between two or
+  /// three words that are all safe to land on: a press that overshoots is
+  /// undone by pressing again, and the sysmodule backs up before any save is
+  /// removed whichever `on_server_delete` is in force.
+  std::optional<config::Assignment> change;
+
+  /// What the A prompt says over this row -- "Open", "Set to Keep" -- or empty
+  /// on a row a press does nothing on.
+  std::string press_label;
+
+  /// M5-3 (#30) can write this key. Marked, and offered only where `change`
+  /// is set: the moment `overlay/` opens `config.ini` the invariant that the
+  /// sysmodule owns writes is gone (docs/ARCHITECTURE.md).
+  ///
+  /// **The renderer deliberately draws nothing for it**, and that is not an
+  /// omission: every row that is not a `kNavigate` is editable, so a marker
   /// would be on every configuration row on the screen and would separate
-  /// nothing. It becomes worth drawing when the overlay grows an editor -- #30
-  /// built the `SetConfig` behind one, and no screen sends it -- and the set
-  /// stops being uniform: a key it refuses, or a folder row that can only be
-  /// changed as a whole `roms` list rather than one path at a time. Until then
-  /// the flag is the model saying which keys `config::ApplyEdit` accepts, held
-  /// by `overlay.settings` rather than by a screenshot.
+  /// nothing. What separates the rows a press changes is the A prompt drawn
+  /// over them (`press_label`). The flag is the model saying which keys
+  /// `config::ApplyEdit` accepts, held by `overlay.settings` rather than by a
+  /// screenshot.
   bool editable = false;
 };
 
@@ -218,6 +234,22 @@ struct RepairState {
   RepairOutcome outcome = RepairOutcome::kNone;
 };
 
+/// What the last press on a setting row produced (#264).
+///
+/// Carried in rather than latched inside the view, for `RepairState`'s reason:
+/// the view is a pure function of what the sysmodule reports, and the answer
+/// to one `SetConfig` is not part of the next `GetConfig`.
+struct ChangeState {
+  /// A change has been sent since the screen opened. Nothing is said until one.
+  bool sent = false;
+
+  /// What was sent: the row's `change` at the moment of the press.
+  config::Assignment assignment;
+
+  /// What `SetConfig` answered.
+  ipc::ConfigResult result;
+};
+
 /// Everything the settings screen draws, and nothing about how.
 struct SettingsView {
   Link link = Link::kOk;
@@ -259,8 +291,9 @@ struct SettingsView {
   /// here to find (#26).
   Button repair;
 
-  /// What the last press produced, or what the next one will do while a
-  /// confirmation is pending. Empty when there is nothing to say.
+  /// What the last press produced -- on "Re-pair" or on a setting row -- or what
+  /// the next "Re-pair" will do while a confirmation is pending. Empty when
+  /// there is nothing to say.
   std::string notice;
   Tone notice_tone = Tone::kNeutral;
 };
@@ -271,7 +304,8 @@ struct SettingsView {
 /// the one this screen most needs to draw (`ipc::ConfigView`) -- so there is no
 /// arm here for "could not be read". A sysmodule that could not be *asked* is
 /// `RenderSettingsUnreachable`.
-SettingsView RenderSettings(const ipc::ConfigView& config, const RepairState& repair = {});
+SettingsView RenderSettings(const ipc::ConfigView& config, const RepairState& repair = {},
+                            const ChangeState& change = {});
 
 /// The screen for a sysmodule that could not be asked, or could not be
 /// understood. `link` must not be `kOk`; the wording is the status screen's,

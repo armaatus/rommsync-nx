@@ -152,6 +152,10 @@ struct ResolveReport {
 
 /// Fold `run`, one plan's resolution, into `*tick`'s, for a tick that ran a plan
 /// per chunk (#246): `TickResult::resolved` is every plan's.
+///
+/// Every field of `ResolveReport` is folded here, by hand, so a field added
+/// there is one to fold here too: `tick.newer_bounds` pins how many there are
+/// and checks each, and goes red until both are told (#259).
 void Accumulate(ResolveReport* tick, ResolveReport run);
 
 /// Resolve every operation in `*executed` that failed with `kNewerOnServer`,

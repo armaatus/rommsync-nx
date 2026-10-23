@@ -19,6 +19,9 @@
 //                   consulted anywhere in the recording path
 //   restore      -- the old bytes exactly, **and a new backup written first**,
 //                   which the sandbox audit checks rather than this file
+//   keep_local   -- #249: a save conflict's Keep local restores the local bytes
+//                   and arms its (rom_id, slot); anything else is refused, and a
+//                   plan that answered the key spends it
 //   interrupted  -- a restore killed mid-write leaves the old bytes, never a
 //                   splice, and no `.tmp` after the sweep
 //   service      -- both commands through `ipc::Dispatch` over a real `SdEngine`
@@ -80,6 +83,7 @@ namespace io = rommsync::io;
 namespace ipc = rommsync::ipc;
 namespace overlay = rommsync::overlay;
 namespace scan = rommsync::scan;
+namespace state = rommsync::state;
 namespace sync = rommsync::sync;
 namespace sysmodule = rommsync::sysmodule;
 
@@ -766,6 +770,187 @@ void Restore(checks::Checks& c) {
   }
 }
 
+// --- keep_local ---------------------------------------------------------------
+//
+// #249: the player's Keep local on a save conflict. The local bytes go back on
+// the card through the restore -- backed up first, as any overwrite -- and the
+// conflict's `(rom_id, slot)` is what the next upload of them goes over the
+// server's copy with. Anything that is not a save conflict is refused before a
+// byte is written, and the armed keys are spent by the plan that answered them.
+
+/// One operation's result, for `SpendKeepLocal`.
+sync::OperationResult Ran(std::int64_t rom_id, std::string slot, sync::Action action,
+                          sync::OperationOutcome outcome,
+                          sync::OperationError error = sync::OperationError::kNone) {
+  sync::OperationResult result;
+  result.rom_id = rom_id;
+  result.slot = std::move(slot);
+  result.action = action;
+  result.outcome = outcome;
+  result.error = error;
+  return result;
+}
+
+void KeepLocal(checks::Checks& c) {
+  const std::string previous = "the bytes this console had, and chose to keep\n";
+  const std::string server = "the server's copy, which the conflict put here\n";
+  conflicts::RestoreOptions options;
+  options.backup_dir = harness::kBackupDir;
+  options.now = []() { return Moment(kWhen + 500); };
+
+  // A save conflict: the local bytes go back, the server's copy is backed up
+  // first, and the key the next upload goes over the server's copy with is
+  // handed back.
+  {
+    Sandbox sandbox(c, "conflicts-keep-local");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    const std::string backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+    c.Expect(sandbox.Write(backup, previous), "the conflict's backup is on the card");
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+    conflicts::Entry entry = SaveEntry(4, "game.srm");
+    entry.backup_sd_path = backup;
+    const std::int64_t id = history.Append(entry).id;
+
+    state::Baseline::Key key{0, std::nullopt};
+    const conflicts::RestoreReport kept = conflicts::KeepLocal(*files, history, id, &key, options);
+    c.Expect(kept.ok(), std::string("Keep local restored the local bytes: ") +
+                            conflicts::ToString(kept.outcome) + " -- " + kept.message);
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), previous, "the local bytes are back, exactly");
+    c.Expect(!kept.backup_sd_path.empty() && sandbox.Read(kept.backup_sd_path) == server,
+             "and the server's copy it replaced was backed up first: " + kept.message);
+    c.Expect(key == state::Baseline::Key{4, std::string("retroarch-srm")},
+             "the key is the conflict's (rom_id, slot)");
+    c.Expect(kept.message.find("over the server's copy") != std::string::npos,
+             "and the sentence says the next sync puts them over the server's copy: " +
+                 kept.message);
+  }
+
+  // Not a save conflict: refused, nothing written, no key.
+  {
+    Sandbox sandbox(c, "conflicts-keep-local-refused");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), server);
+    const std::string backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+    c.Expect(sandbox.Write(backup, previous), "a backup is on the card");
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+
+    conflicts::Entry replaced = SaveEntry(4, "game.srm");
+    replaced.event = conflicts::Event::kReplaced;
+    replaced.backup_sd_path = backup;
+    conflicts::Entry state_entry = SaveEntry(4, "game.state");
+    state_entry.kind = conflicts::EntryKind::kState;
+    state_entry.event = conflicts::Event::kReplaced;
+    state_entry.slot.reset();
+    state_entry.backup_sd_path = backup;
+    conflicts::Entry slotless = SaveEntry(4, "game.srm");
+    slotless.slot.reset();
+    slotless.backup_sd_path = backup;
+    for (const auto& [what, entry] :
+         {std::pair<std::string, conflicts::Entry>{"a download that replaced a save", replaced},
+          {"a save state", state_entry},
+          {"a conflict with no slot", slotless}}) {
+      state::Baseline::Key key{0, std::nullopt};
+      const conflicts::RestoreReport refused =
+          conflicts::KeepLocal(*files, history, history.Append(entry).id, &key, options);
+      c.Expect(refused.outcome == conflicts::RestoreOutcome::kNotAConflict,
+               what + " is not a conflict Keep local applies to: " +
+                   conflicts::ToString(refused.outcome));
+      c.Expect(key.first == 0, what + ": and no key is armed");
+    }
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and nothing was written");
+
+    // A conflict whose backup is gone is the restore's own refusal.
+    conflicts::Entry orphan = SaveEntry(4, "game.srm");
+    orphan.backup_sd_path = std::string(harness::kBackupDir) + "/4-retroarch-srm-9.srm";
+    state::Baseline::Key key{0, std::nullopt};
+    const conflicts::RestoreReport missing =
+        conflicts::KeepLocal(*files, history, history.Append(orphan).id, &key, options);
+    c.Expect(missing.outcome == conflicts::RestoreOutcome::kBackupMissing,
+             std::string("a conflict whose backup is gone is named: ") +
+                 conflicts::ToString(missing.outcome));
+    c.Expect(key.first == 0, "and arms nothing");
+  }
+
+  // Armed once per save, and bounded: the oldest falls off.
+  {
+    std::vector<state::Baseline::Key> keep;
+    sync::ArmKeepLocal(&keep, {4, std::string("autosave")});
+    sync::ArmKeepLocal(&keep, {4, std::string("autosave")});
+    c.ExpectEq(keep.size(), std::size_t{1}, "a second Keep local of one save arms it once");
+    for (std::int64_t rom = 100; rom < 100 + static_cast<std::int64_t>(sync::kMaxKeepLocal);
+         ++rom) {
+      sync::ArmKeepLocal(&keep, {rom, std::string("autosave")});
+    }
+    c.ExpectEq(keep.size(), sync::kMaxKeepLocal, "at most kMaxKeepLocal are held");
+    c.Expect(sync::FindByKey(keep, state::Baseline::Key{4, std::string("autosave")}) == nullptr,
+             "and the oldest is the one let go");
+  }
+
+  // Spent by the plan that answered it -- an upload that went or was refused,
+  // or any other action, which means the server asked for no upload -- and
+  // kept by one that never reached the server or never named it.
+  {
+    const auto key = [](std::int64_t rom) {
+      return state::Baseline::Key{rom, std::string("autosave")};
+    };
+    std::vector<state::Baseline::Key> keep = {key(1), key(2), key(3), key(4), key(5), key(6),
+                                              key(7)};
+    // Key 7 was armed after the plan went out: the plan carried no override
+    // for it, so its upload did not spend it.
+    const std::vector<state::Baseline::Key> sent = {key(1), key(2), key(3), key(4), key(5),
+                                                    key(6)};
+    sync::ExecutionReport executed;
+    executed.operations = {
+        Ran(1, "autosave", sync::Action::kUpload, sync::OperationOutcome::kUploaded),
+        Ran(2, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kTransferFailed),
+        Ran(3, "autosave", sync::Action::kDownload, sync::OperationOutcome::kDownloaded),
+        Ran(5, "autosave", sync::Action::kUpload, sync::OperationOutcome::kCanceled,
+            sync::OperationError::kCanceled),
+        Ran(6, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kRefused),
+        Ran(7, "autosave", sync::Action::kUpload, sync::OperationOutcome::kUploaded),
+    };
+    sync::SpendKeepLocal(&keep, sent, executed);
+    c.Expect(keep == std::vector<state::Baseline::Key>{key(2), key(4), key(5), key(7)},
+             "the upload that went, the refused one and the download spend theirs; the "
+             "transfer that failed, the cancelled one, the save the plan never named and the "
+             "choice armed after it went out keep theirs (" + std::to_string(keep.size()) +
+                 " left)");
+  }
+
+  // An upload that failed before its request was made -- the card could not
+  // be read or hashed, or the save was not there -- never carried its
+  // override to the server, so it keeps it as a failed transfer does. Spending
+  // it would send the next upload with overwrite=false into the slot guard's
+  // 409, and the player's choice would resolve as Keep server.
+  {
+    const auto key = [](std::int64_t rom) {
+      return state::Baseline::Key{rom, std::string("autosave")};
+    };
+    std::vector<state::Baseline::Key> keep = {key(1), key(2)};
+    const std::vector<state::Baseline::Key> sent = keep;
+    sync::ExecutionReport executed;
+    executed.operations = {
+        Ran(1, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kUnreadableCard),
+        Ran(2, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kNoLocalSave),
+    };
+    sync::SpendKeepLocal(&keep, sent, executed);
+    c.Expect(keep == sent,
+             "an upload the card could not read, or had no save for, keeps its Keep local (" +
+                 std::to_string(keep.size()) + " left)");
+  }
+}
+
 // --- interrupted --------------------------------------------------------------
 //
 // A restore killed mid-write. The guarantee is that whatever is at the save path
@@ -1089,6 +1274,16 @@ ipc::ConflictRow Row(conflicts::Entry entry, bool backup_present) {
   return row;
 }
 
+/// A save a download replaced, which is what a plain restore is for. A save
+/// *conflict*'s confirmation is the Keep server / Keep local / Skip choice
+/// instead (#249), so the restore's own scenarios use one of these.
+conflicts::Entry ReplacedEntry(std::int64_t rom_id, std::string file_name) {
+  conflicts::Entry entry = SaveEntry(rom_id, std::move(file_name));
+  entry.event = conflicts::Event::kReplaced;
+  entry.reason.clear();
+  return entry;
+}
+
 /// A model with one restorable entry loaded, opened, confirmed and pressed --
 /// so its next `Next()` is the restore.
 overlay::ConflictsModel OneRestorable(std::int64_t entry_id) {
@@ -1097,7 +1292,7 @@ overlay::ConflictsModel OneRestorable(std::int64_t entry_id) {
   ipc::ConflictPage page;
   page.offset = 0;
   page.total = 1;
-  conflicts::Entry entry = SaveEntry(4, "polled.srm");
+  conflicts::Entry entry = ReplacedEntry(4, "polled.srm");
   entry.id = entry_id;
   page.entries = {Row(entry, true)};
   model.OnPage(page);
@@ -1135,7 +1330,7 @@ void Overlay(checks::Checks& c) {
     ipc::ConflictPage page;
     page.offset = 0;
     page.total = 3;
-    conflicts::Entry ready = SaveEntry(4, "game.srm");
+    conflicts::Entry ready = ReplacedEntry(4, "game.srm");
     ready.id = 3;
     conflicts::Entry gone = SaveEntry(5, "gone.srm");
     gone.id = 2;
@@ -1308,6 +1503,157 @@ void Overlay(checks::Checks& c) {
              "and nothing needs re-reading, because a restore changed no entry");
   }
 
+  // #249: a save conflict's confirmation is a choice -- Keep server, which
+  // is what the sync already did and the default; Keep local, which is the one
+  // command here that ends in `overwrite=true`; and Skip, which decides nothing.
+  {
+    const auto conflict_model = [](std::int64_t entry_id) {
+      overlay::ConflictsModel model;
+      model.Next();
+      ipc::ConflictPage page;
+      page.offset = 0;
+      page.total = 1;
+      conflicts::Entry entry = SaveEntry(4, "chosen.srm");
+      entry.id = entry_id;
+      page.entries = {Row(entry, true)};
+      model.OnPage(page);
+      return model;
+    };
+
+    overlay::ConflictsModel model = conflict_model(61);
+    model.Activate();
+    overlay::ConflictsView view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail && view.keep_choice,
+             "a save conflict's detail offers the choice rather than a plain restore");
+    c.Expect(view.can_restore, "while its backup is there to keep");
+    model.Activate();
+    view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kConfirm, "A opens the choice");
+    std::vector<overlay::ConflictChoice> offered;
+    for (const overlay::ConflictChoiceRow& row : view.choices) {
+      offered.push_back(row.choice);
+      c.Expect(!row.label.empty() && !row.meaning.empty(), "every choice has a label and a meaning");
+    }
+    c.Expect(offered == std::vector<overlay::ConflictChoice>{overlay::ConflictChoice::kKeepServer,
+                                                             overlay::ConflictChoice::kKeepLocal,
+                                                             overlay::ConflictChoice::kSkip},
+             "the three choices, in that order");
+    c.ExpectEq(view.choice, 0, "with Keep server -- what the sync already did -- selected");
+    c.Expect(view.hint.find(overlay::ChoiceMeaning(overlay::ConflictChoice::kKeepServer)) !=
+                 std::string::npos,
+             "and the hint says what the selected one means: " + view.hint);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "nothing is sent for opening it");
+
+    // Keep server needs no action: nothing is sent, and the screen says so.
+    model.Activate();
+    view = model.Render();
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+             "Keep server sends nothing -- the server's copy is already on the card");
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail &&
+                 view.headline.find("server's copy") != std::string::npos,
+             "and says the server's copy stays: " + view.headline);
+
+    // Keep local is the one that is sent.
+    model.Activate();
+    model.MoveSelection(1);
+    view = model.Render();
+    c.ExpectEq(view.choice, 1, "Down moves to Keep local");
+    c.Expect(view.hint.find(overlay::ChoiceMeaning(overlay::ConflictChoice::kKeepLocal)) !=
+                 std::string::npos,
+             "whose meaning is on the screen before the press: " + view.hint);
+    c.Expect(std::string(overlay::ChoiceMeaning(overlay::ConflictChoice::kKeepLocal))
+                     .find("over the server's copy") != std::string::npos,
+             "and says it goes over the server's copy -- the override, named");
+    model.MoveSelection(5);
+    c.ExpectEq(model.Render().choice, 2, "the choice is clamped at the last");
+    model.MoveSelection(-1);
+    model.Activate();
+    const overlay::ConflictsModel::Command keep = model.Next();
+    c.Expect(keep.kind == overlay::ConflictsModel::Command::Kind::kKeepLocal,
+             "Keep local sends KeepLocal, not a plain restore");
+    c.ExpectEq(keep.entry_id, std::int64_t{61}, "for the entry that was open");
+    model.OnRestoreState(Running(61));
+    view = model.Render();
+    c.Expect(view.headline.find("Keeping") != std::string::npos,
+             "a taken Keep local reads as one in progress: " + view.headline);
+    c.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+             "and is polled like a restore");
+    conflicts::RestoreReport report;
+    report.outcome = conflicts::RestoreOutcome::kRestored;
+    model.OnRestoreState(Done(61, report));
+    view = model.Render();
+    c.Expect(view.mode == overlay::ConflictsMode::kDetail &&
+                 view.headline.find("next sync") != std::string::npos,
+             "the outcome says the next sync puts it on the server: " + view.headline);
+    c.Expect(view.tone == overlay::Tone::kGood, "as a success");
+
+    // A refusal names itself.
+    {
+      overlay::ConflictsModel refused = conflict_model(62);
+      refused.Activate();
+      refused.Activate();
+      refused.MoveSelection(1);
+      refused.Activate();
+      refused.Next();
+      conflicts::RestoreReport not_one;
+      not_one.outcome = conflicts::RestoreOutcome::kNotAConflict;
+      refused.OnRestoreState(Done(62, not_one));
+      const overlay::ConflictsView drawn = refused.Render();
+      c.Expect(drawn.tone == overlay::Tone::kBad &&
+                   drawn.headline.find("only for a save conflict") != std::string::npos,
+               "a Keep local the sysmodule refused says why: " + drawn.headline);
+    }
+
+    // Slow is not gone, for Keep local as for a restore: asked about, never
+    // sent twice.
+    {
+      overlay::ConflictsModel slow = conflict_model(63);
+      slow.Activate();
+      slow.Activate();
+      slow.MoveSelection(1);
+      slow.Activate();
+      c.Expect(slow.Next().kind == overlay::ConflictsModel::Command::Kind::kKeepLocal,
+               "the Keep local goes out");
+      slow.OnUnreachable(overlay::Link::kNotResponding);
+      slow.OnLinkRestored();
+      c.Expect(slow.Next().kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+               "and one that ran out of budget is asked about, not pressed again");
+    }
+
+    // Skip decides nothing: back to the list, nothing sent.
+    {
+      overlay::ConflictsModel skip = conflict_model(64);
+      skip.Activate();
+      skip.Activate();
+      skip.MoveSelection(2);
+      skip.Activate();
+      c.Expect(skip.Render().mode == overlay::ConflictsMode::kList,
+               "Skip goes back to the list");
+      c.Expect(skip.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+               "and sends nothing");
+    }
+
+    // B on the choice is a cancel, and sends nothing either.
+    {
+      overlay::ConflictsModel back = conflict_model(65);
+      back.Activate();
+      back.Activate();
+      back.MoveSelection(1);
+      c.Expect(back.Back(), "B leaves the choice");
+      c.Expect(back.Render().mode == overlay::ConflictsMode::kDetail, "for the detail");
+      c.Expect(back.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
+               "without sending the choice it was on");
+    }
+
+    // A replaced save is not a conflict: its confirmation is the plain restore.
+    {
+      overlay::ConflictsModel plain = OneRestorable(66);
+      c.Expect(plain.Render().choices.empty() && !plain.Render().keep_choice,
+               "a save a download replaced offers a restore, not the choice");
+    }
+  }
+
   // A refused page is a page that failed, and says so with a way out.
   {
     overlay::ConflictsModel model;
@@ -1394,7 +1740,7 @@ void Overlay(checks::Checks& c) {
     first.total = 12;
     first.has_more = true;
     for (int index = 0; index < ipc::kMaxConflictPage; ++index) {
-      conflicts::Entry entry = SaveEntry(4, "first-" + std::to_string(index) + ".srm");
+      conflicts::Entry entry = ReplacedEntry(4, "first-" + std::to_string(index) + ".srm");
       entry.id = 200 + index;
       first.entries.push_back(Row(entry, true));
     }
@@ -1410,7 +1756,7 @@ void Overlay(checks::Checks& c) {
     second.offset = ipc::kMaxConflictPage;
     second.total = 12;
     for (int index = 0; index < 4; ++index) {
-      conflicts::Entry entry = SaveEntry(5, "second-" + std::to_string(index) + ".srm");
+      conflicts::Entry entry = ReplacedEntry(5, "second-" + std::to_string(index) + ".srm");
       entry.id = 300 + index;
       second.entries.push_back(Row(entry, true));
     }
@@ -1447,7 +1793,7 @@ void Overlay(checks::Checks& c) {
     ipc::ConflictPage page;
     page.offset = 0;
     page.total = 1;
-    conflicts::Entry entry = SaveEntry(4, "vanished.srm");
+    conflicts::Entry entry = ReplacedEntry(4, "vanished.srm");
     entry.id = 44;
     page.entries = {Row(entry, true)};
     model.OnPage(page);
@@ -1886,7 +2232,7 @@ int main(int argc, char** argv) {
 
   if (scenario == "store" || scenario == "record" || scenario == "restore" ||
       scenario == "interrupted" || scenario == "service" || scenario == "overlay" ||
-      scenario == "crash") {
+      scenario == "crash" || scenario == "keep_local") {
     checks::Checks checks;
     if (scenario == "store") {
       Store(checks);
@@ -1898,6 +2244,8 @@ int main(int argc, char** argv) {
       Interrupted(checks);
     } else if (scenario == "crash") {
       Crash(checks);
+    } else if (scenario == "keep_local") {
+      KeepLocal(checks);
     } else if (scenario == "service") {
       Service(checks);
     } else {

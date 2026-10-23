@@ -7,10 +7,20 @@
 // it accepts RFC 8259 and almost nothing else, so a truncated or hostile body
 // is a named error rather than a plausible-looking value.
 //
-// The one deliberate narrowing: a number whose magnitude no `double` can hold
-// (`1e400`, `1e-400`) is refused rather than saturated to infinity or to zero.
-// Both are well-formed JSON. Neither is a value RomM has any way to mean, and
-// a silent +inf in a size or a timestamp is worse than a rejected body.
+// Numbers are read as integers or not at all (#253). One written without a
+// fraction or exponent that fits an `int64_t` is an integer; any other
+// well-formed number -- `1.5`, `2e3`, `1e400` -- is a number and nothing more:
+// valid JSON, `is_number()`, never `is_integer()`, with no value to read off
+// it. Every number the client reads is an id, a size, a count or a timestamp,
+// and nothing in core/, sysmodule/ or overlay/ ever asked for a `double`; the
+// double this parser used to make for each one cost each image libstdc++'s
+// floating-point `from_chars` -- fast_float, ~23 KiB of code and tables -- to
+// answer a question nobody put. So there is no `number()`, and the narrowing
+// that came with it -- refusing a magnitude no double holds, rather than
+// saturating it to an infinity a size could be read as -- has nothing left to
+// guard: `1e400` in a size field is refused by `Reader`, by name, as every
+// fraction there is. A field that genuinely needs a fraction is a decision to
+// bring the double back, together with that refusal.
 //
 // Strict on purpose, because every relaxation here is a way for a broken
 // response to look fine:
@@ -78,12 +88,9 @@ class Value {
   /// False for anything that is not a bool.
   bool boolean() const { return type_ == Type::kBool && bool_; }
 
-  /// Zero for anything that is not a number.
-  double number() const { return type_ == Type::kNumber ? number_ : 0.0; }
-
   /// True when this is a number written without a fraction or exponent and it
-  /// fits an `int64_t`. Ids and durations must go through this rather than
-  /// through `number()`, which cannot hold every 64-bit integer exactly.
+  /// fits an `int64_t`. The only number that has a value: see the top of this
+  /// file for why there is no `double` accessor.
   bool is_integer() const { return type_ == Type::kNumber && integral_; }
   std::int64_t integer() const { return integral_ ? integer_ : 0; }
 
@@ -109,7 +116,6 @@ class Value {
   Type type_ = Type::kNull;
   bool bool_ = false;
   bool integral_ = false;
-  double number_ = 0.0;
   std::int64_t integer_ = 0;
   std::string string_;
   std::vector<Value> elements_;

@@ -2,11 +2,13 @@
 // client half of the IPC wire compiles and runs on a host (M9-7, #198).
 //
 // **This is not a libnx emulator and must not grow into one.** Everything below
-// is here because `ipc_client.cpp` or `screen_frame.cpp` names it, with two
+// is here because `ipc_client.cpp` or `screen_frame.cpp` names it, with three
 // exceptions that are the seam's own and are marked as such: `Module_Kernel` /
 // `KernelError_SessionClosed`, which is how a sysmodule exiting under a live
-// session is modelled, and `hostswitch::OpenSessions`, which is how
-// `overlay.cycles` balances what an open/close cycle took (M9-6, #209).
+// session is modelled, `hostswitch::OpenSessions`, which is how
+// `overlay.cycles` balances what an open/close cycle took (M9-6, #209), and
+// `hostswitch::DeferredRequests`, which is how a request sm would park forever
+// is counted rather than hung (M9-27, #254).
 // Anything else that wants adding is either a file that does not belong on
 // this seam or a sign the seam has moved -- say so in
 // `overlay/AGENTS.md` rather than growing this header. `tesla.hpp` in particular
@@ -133,6 +135,19 @@ const Dispatched& LastDispatched();
 /// the life of the console, because nx-ovlloader's process never exits.
 int OpenSessions();
 
+/// How many `smGetService` calls named a service nobody had registered.
+///
+/// **On a console each of these never returns.** Atmosphere's sm *defers* a
+/// request for a name that is not registered, and a deferred request is
+/// answered only when the name appears (`sm_service_manager.cpp`,
+/// sysmodule/source/boot_wait.hpp). nx-ovlloader's SAC lets the overlay ask for
+/// any name, so `smGetService("rommsync")` with the sysmodule not running
+/// parks the draw thread -- and the panel and the user's input with it --
+/// forever. The shim cannot park a test, so it answers `LibnxError_NotFound`
+/// and counts the request here; `overlay.version` asserts the count stays
+/// zero (#254).
+int DeferredRequests();
+
 }  // namespace hostswitch
 
 /// A session, as far as this client uses one. `serviceIsActive` is the whole of
@@ -150,6 +165,39 @@ inline bool serviceIsActive(Service* s) { return s != nullptr && s->server != nu
 void serviceClose(Service* s);
 
 Result smGetService(Service* out, const char* name);
+
+/// libnx's spelling of a service name on the wire: eight bytes, unterminated
+/// when it fills them.
+struct SmServiceName {
+  char name[8];
+};
+
+inline SmServiceName smEncodeName(const char* name) {
+  SmServiceName out{};
+  for (std::size_t i = 0; i < sizeof(out.name) && name[i] != '\0'; ++i) {
+    out.name[i] = name[i];
+  }
+  return out;
+}
+
+/// sm's own session, as `IpcClient::Open` uses it: the target of one tipc
+/// command, Atmosphere's `AtmosphereHasService` (65100).
+struct TipcService {};
+TipcService* smGetServiceSessionTipc();
+
+namespace hostswitch {
+
+/// One tipc command to sm. Only 65100 is answered -- whether a name is
+/// registered, which sm answers rather than defers -- because it is the only
+/// one this client sends; anything else is libnx's "bad input".
+Result TipcDispatchInOut(TipcService* service, u32 request_id, const void* in, std::size_t in_size,
+                         void* out, std::size_t out_size);
+
+}  // namespace hostswitch
+
+/// libnx's macro, in the one form `IpcClient::Open` uses.
+#define tipcDispatchInOut(_s, _rid, _in, _out) \
+  ::hostswitch::TipcDispatchInOut((_s), (_rid), &(_in), sizeof(_in), &(_out), sizeof(_out))
 
 /// libnx's `SfBufferAttr`/`SfBuffer` pair, in the shape
 /// `serviceDispatchOut`'s designated-initialiser call site builds.

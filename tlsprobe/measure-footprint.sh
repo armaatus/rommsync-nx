@@ -19,19 +19,56 @@
 # that needs anything off this machine).
 #
 #   ./tlsprobe/measure-footprint.sh
+#   ./tlsprobe/measure-footprint.sh --flags    the compile and link flags it
+#                                              would use, read from switch.mk;
+#                                              no network, no build
 #
-# It builds nothing in the worktree and leaves nothing behind.
+# Both need scripts/toolchain.sh's pinned image already pulled; it says which
+# `docker pull` when it is not. It builds nothing in the worktree and leaves
+# nothing behind.
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The pinned image (#199), so the numbers are for the toolchain the builds use.
 # shellcheck source=../scripts/toolchain.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/toolchain.sh"
+. "$REPO_ROOT/scripts/toolchain.sh"
 IMAGE="$DEVKITPRO_IMAGE"
 
-command -v docker >/dev/null 2>&1 || { echo "no docker" >&2; exit 1; }
-docker info >/dev/null 2>&1 || { echo "docker daemon not running" >&2; exit 1; }
+# switch.mk's flags, as make computes them, so these numbers are comparable to
+# the ones a real target produces. This used to be a copy kept by hand and
+# called verbatim, and it was not: it said -Wall where switch.mk says
+# ROMMSYNC_WARNINGS (#256). Asked of switch.mk alone, with no target's Makefile
+# in front of it, so no target's additions come with them; `ctest -R
+# switch.footprint_flags` refuses a copy coming back, and `switch.tlsprobe`
+# holds what this prints to switch.mk's text.
+#
+# The rule is handed to make with --eval, which defines it before switch.mk is
+# read; its recipe is expanded after, once every variable has its value --
+# INCLUDE among them, which CFLAGS took while it was still empty. The include
+# path switch.mk builds for this directory names nothing that exists, so only
+# the toolchain's headers come of it. The link map switch.mk asks for is named
+# after the target ($*), so it is dropped rather than written as `.map` into
+# whatever directory make ran in.
+FLAGS_RULE='rommsync-flags: ; @: $(info CXXFLAGS=$(CXXFLAGS) $(INCLUDE))$(info LDFLAGS=$(filter-out -Wl%.map,$(LDFLAGS)) $(LIBPATHS))'
 
-docker run --rm "$IMAGE" bash -leuo pipefail -c '
+missing="$(toolchain_missing)" && { echo "$missing" >&2; exit 1; }
+FLAGS="$(toolchain_run "$REPO_ROOT" \
+  'make -s --no-print-directory -f "$PWD/switch.mk" TOPDIR="$PWD/tlsprobe" --eval "$1" rommsync-flags' \
+  "$FLAGS_RULE")"
+CXXFLAGS="$(sed -n 's/^CXXFLAGS=//p' <<<"$FLAGS")"
+LDFLAGS="$(sed -n 's/^LDFLAGS=//p' <<<"$FLAGS")"
+[ -n "$CXXFLAGS" ] && [ -n "$LDFLAGS" ] || {
+  echo "could not read the compile and link flags out of switch.mk: $FLAGS" >&2
+  exit 1
+}
+
+if [ "${1:-}" = --flags ]; then
+  printf 'CXXFLAGS=%s\nLDFLAGS=%s\n' "$CXXFLAGS" "$LDFLAGS"
+  exit 0
+fi
+
+# Root, unlike toolchain_run: installing the portlib below writes to /opt.
+docker run --rm -e CXXFLAGS="$CXXFLAGS" -e LDFLAGS="$LDFLAGS" "$IMAGE" bash -leuo pipefail -c '
 mkdir -p /tmp/fp && cd /tmp/fp
 
 # Only the mbedtls image needs a portlib. Installed here rather than baked into
@@ -148,16 +185,7 @@ int main(int, char**) {
 }
 EOF
 
-# switch.mk`s flags, verbatim, so these numbers are comparable to the ones a
-# real target produces.
-ARCH="-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE"
-CXXFLAGS="-g -Wall -Os -ffunction-sections -fdata-sections \
-  -fno-unwind-tables -fno-asynchronous-unwind-tables $ARCH -D__SWITCH__ \
-  -std=c++20 -fno-rtti -fno-exceptions \
-  -isystem /opt/devkitpro/libnx/include -isystem /opt/devkitpro/portlibs/switch/include"
-LDFLAGS="-specs=/opt/devkitpro/libnx/switch.specs -g $ARCH -Wl,--gc-sections \
-  -L/opt/devkitpro/libnx/lib -L/opt/devkitpro/portlibs/switch/lib"
-
+# CXXFLAGS and LDFLAGS come in from switch.mk, read above.
 CXX=/opt/devkitpro/devkitA64/bin/aarch64-none-elf-g++
 SIZE=/opt/devkitpro/devkitA64/bin/aarch64-none-elf-size
 

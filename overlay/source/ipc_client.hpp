@@ -36,7 +36,8 @@
 // `tests/hostswitch/switch.h` and drives every method below against the real
 // `ipc::Dispatch` and the real `sysmodule::ToResult` -- `ctest -R overlay.wire`,
 // `overlay.roundtrip`, `overlay.errors`. What is still hardware-only is the
-// Horizon transport underneath: `smGetService` finding a real port, and the
+// Horizon transport underneath: sm answering 65100 for `rommsync` (`Open`),
+// `smGetService` finding a real port, and the
 // `cmif` message `sysmodule/source/ipc/service.cpp` unpacks. Those are verified
 // after the M8-1 gate (overlay/AGENTS.md).
 #pragma once
@@ -136,8 +137,32 @@ class IpcClient {
   /// able to say something about: it is what a user who forgot to enable it
   /// sees.
   ///
-  /// Not bounded: it is a call to `sm`, which is not the process that can be
-  /// stuck, and it is made before the worker has anything to carry.
+  /// **Why this is the one call #209's budget does not bound, decided in M9-27
+  /// (#254).** It goes to `sm`, not to the sysmodule, and the two ways it could
+  /// hang are not the same problem:
+  ///
+  ///   * **A stuck `sm`** is not bounded, deliberately. Every process on the
+  ///     console acquires its services through it, so a console whose `sm` has
+  ///     stopped answering has stopped -- there is no panel left to keep
+  ///     responsive, and a budget would only add a worker that `Shutdown` then
+  ///     waits on forever (`cmif` and `tipc` cannot cancel a request).
+  ///   * **A deferred request** is the one that happens, and it is prevented
+  ///     rather than timed. Atmosphere's sm does not refuse a name that is not
+  ///     registered -- it parks the request until the name appears
+  ///     (`sysmodule/source/boot_wait.hpp`, #195) -- and nx-ovlloader may ask
+  ///     for any name, so with `sys-rommsync` switched off a bare
+  ///     `smGetService` holds the draw thread, the panel and the user's input
+  ///     forever. So sm is asked first whether `rommsync` is registered
+  ///     (`AtmosphereHasService`, command 65100, which answers rather than
+  ///     defers), and an unregistered name answers `LibnxError_NotFound`
+  ///     without the request that would park. `overlay.version` holds this.
+  ///
+  /// What it leaves, stated: a sysmodule that unregisters between the two calls
+  /// -- one exiting at that instant -- still parks the second; and an `sm` that
+  /// does not answer 65100 is not Atmosphere's, so the acquisition goes ahead
+  /// unasked exactly as before, the conservative direction `main.cpp`'s
+  /// `MayProceedWith` takes for the same reason. Neither has been seen on a
+  /// console: nothing here has run on one before the M8-1 gate.
   Result Open();
 
   /// Drop the session. **A no-op while a call is still out**, because the
@@ -213,6 +238,11 @@ class IpcClient {
   /// waited for (M9-6, #209). `GetRestoreState` is the poll that follows.
   Result RestoreBackup(std::int64_t entry_id, ipc::RestoreState* state);
   Result GetRestoreState(ipc::RestoreState* state);
+
+  /// Keep local for a save conflict (#249): `RestoreBackup`'s shape, polled
+  /// with `GetRestoreState`, and the next upload of that save goes over the
+  /// server's copy.
+  Result KeepLocal(std::int64_t entry_id, ipc::RestoreState* state);
 
   /// The last `lines` lines of the sysmodule's log, from memory (M7-3, #38).
   /// The log screen's, since #209 wired it: until then it was the one command
