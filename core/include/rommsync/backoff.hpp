@@ -8,7 +8,9 @@
 // second one that drifts. Every retry inside one call -- a `sync::CallPolicy`,
 // a download drain's, a page of the rom index -- walks it too, through
 // `sync::WaitToRetry`; five of them once doubled a delay of their own, with no
-// jitter, until #251.
+// jitter, until #251. `sync::BackoffFor` hands this a floor already clamped to
+// the cap, because there the cap is the caller's promise rather than the
+// courtesy `Configure` reads it as.
 //
 // **Jitter is the thing the lifted version adds.** Several consoles on one LAN
 // come back from a router reboot at the same instant, fail at the same instant,

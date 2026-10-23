@@ -356,9 +356,11 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
                                       !http::AnsweredTooLarge(sent);
     if (!lost) {
       backoff.Succeed();
-    } else if (backoff.failures() + 1 < attempts) {
+    } else if (canceled() || backoff.failures() + 1 < attempts) {
       // The same page again, after the wait -- unless the caller gave up, which
-      // the top of the loop says without spending the wait first.
+      // the top of the loop says without spending the wait first. Even on the
+      // last attempt: a link that failed as the token fired is a cancelled
+      // fetch, not a server that is down.
       if (!canceled()) {
         sync::WaitToRetry(policy, &backoff);
       }

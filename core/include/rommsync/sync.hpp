@@ -613,16 +613,19 @@ auth::Answer AnswerOf(NegotiateError error);
 
 /// How hard one call tries.
 ///
-/// Shared by the two calls in this header rather than written twice: negotiate
-/// and complete want exactly these five knobs, for exactly the same reasons,
-/// and two copies of them would be two places for a default to drift.
+/// Shared by every call that retries -- negotiate and complete here, the play
+/// session ingest, the remote-install exchanges, the heartbeat, each page of the
+/// rom index -- rather than written once each: they want exactly these knobs,
+/// for exactly the same reasons, and copies of them would be places for a
+/// default to drift.
 struct CallPolicy {
   /// Ceiling on a single request. A tick that hangs is a tick that never ends,
   /// and nothing may block boot (CLAUDE.md).
   std::chrono::milliseconds timeout = http::kDefaultTimeout;
 
-  /// Requests one negotiation may spend, including the first. Only a
-  /// `ShouldRetry` failure spends another.
+  /// Requests one call -- one page, for a paged one -- may spend, including the
+  /// first. Only a failure worth retrying (`ShouldRetry`, `http::TransientStatus`)
+  /// spends another.
   int max_attempts = 3;
 
   /// The first delay before a retry, doubled per consecutive retryable failure

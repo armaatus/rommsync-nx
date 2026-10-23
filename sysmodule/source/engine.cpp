@@ -2259,8 +2259,8 @@ roms::FetchResult SdEngine::FetchLibraryForTick(const TickInputs& inputs) {
   roms::FetchResult library = roms::FetchRomIndex(*inputs.client, fetch);
   ObserveAnswer(roms::AnswerOf(library));
   if (!library.ok()) {
-    // The common one: a console with no wifi fails this every tick.
     StampPlayWindow();
+    // The common one: a console with no wifi fails this every tick.
     sync::TickOutcome outcome = sync::TickOutcome::kOffline;
     if (library.transport == http::Error::kCanceled) {
       // A sleep or a shutdown, not the server: neither a failed tick nor a
