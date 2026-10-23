@@ -561,8 +561,8 @@ Eight things are worth knowing before you do it:
   satisfy it.** `.github/scripts/merge_gate.py` is a required check on `main`,
   and it exempts neither a release nor whoever opened it: the body has to carry
   a `Closes #N` line (file a release issue if there is none), an approving
-  review of the current head has to exist — the dispatcher's, once the PR is
-  open, or a person's — and no review thread may be left open
+  review of the current head has to exist — a person's, now that the
+  dispatcher that posted one is gone (#277) — and no review thread may be left open
   (`required_conversation_resolution` is on). `gh pr create --fill` writes the
   body from the commit message, so a `Release 0.2.0` commit produces a body with
   no closing line. `enforce_admins` is off, so an admin *can* merge it with the

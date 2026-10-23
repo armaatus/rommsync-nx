@@ -92,7 +92,7 @@ away.** There is no second reviewer behind this one to take the argument to.
 **Important** — a real defect or a breach of a hard rule: wrong behaviour on a
 path that matters, a missing test that would have caught the bug, a broken build
 on either target, or the tracker left saying something untrue. Fixed, or
-disputed in the commit message with a reason the re-review accepts.
+disputed in the commit message with a reason the reviewer accepts.
 
 **Suggestion** — naming, comment wording, ordering, a clearer formulation of
 something already correct. **A Suggestion blocks nothing** and nobody has to

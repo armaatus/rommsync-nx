@@ -56,16 +56,7 @@ fi
 leaked=false
 for project in $projects; do
   echo "==> removing stack $project and its volumes"
-  # `-p` names the stack outright rather than letting .env decide: both passes
-  # must address the project they were given even when .env disagrees.
-  #
-  # `--profile tls` because `down` only touches services whose profile is
-  # ACTIVE: the TLS terminator tls-fixture.sh starts would otherwise survive,
-  # come back on every docker start under `restart: unless-stopped`, hold this
-  # worktree's TLS_PORT, and block the network removal behind it (#122).
-  # `orca.teardown_profiles` fails the day a profile is added and not named here.
-  if ! docker compose -p "$project" -f server/testing/docker-compose.yml \
-        --profile tls down -v --remove-orphans; then
+  if ! orca_stack_down "$project"; then
     echo "!! compose down failed for $project"
   fi
 

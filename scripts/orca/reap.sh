@@ -9,7 +9,7 @@
 # volumes, with no directory left to find it from. This is the sweep that
 # catches those.
 #
-#   ./scripts/orca/reap.sh          # list what is stale, change nothing
+#   ./scripts/orca/reap.sh          # list what is stale, change nothing (also --dry-run)
 #   ./scripts/orca/reap.sh --yes    # tear those stacks down, volumes included
 #
 # This deletes databases, so every uncertainty resolves towards keeping a stack:
@@ -26,7 +26,7 @@ for arg in "$@"; do
   case "$arg" in
     --yes|-y)  APPLY=true ;;
     --dry-run) ;;
-    *) echo "usage: $0 [--yes]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--yes|--dry-run]" >&2; exit 2 ;;
   esac
 done
 
@@ -101,7 +101,7 @@ found="$(
     docker ps -a      --format '{{.Label "com.docker.compose.project"}}'
     docker volume ls  --format '{{.Label "com.docker.compose.project"}}'
     docker network ls --format '{{.Label "com.docker.compose.project"}}'
-  } 2>/dev/null | grep '^rmx-' | sort -u || true
+  } 2>/dev/null | grep "^${ORCA_PROJECT_PREFIX}-" | sort -u || true
 )"
 
 stale=""
@@ -111,7 +111,7 @@ for project in $found; do
 done
 
 if [ -z "${stale// /}" ]; then
-  echo "nothing to reap; every rmx-* stack belongs to a live worktree"
+  echo "nothing to reap; every ${ORCA_PROJECT_PREFIX}-* stack belongs to a live worktree"
   exit 0
 fi
 
@@ -123,12 +123,8 @@ for project in $stale; do
 
   # This repo's compose file describes every one of its stacks -- only the
   # project name differs -- so it can tear down a stack whose own worktree is
-  # long gone. `--profile tls` for the same reason as archive.sh: a service
-  # whose profile is not active is invisible to `down`, and comes back under
-  # `restart: unless-stopped`.
-  docker compose -p "$project" -f server/testing/docker-compose.yml \
-    --profile tls down -v --remove-orphans \
-    || echo "!! down failed for $project"
+  # long gone.
+  orca_stack_down "$project" || echo "!! down failed for $project"
 
   # `down` only removes what it recognises as its own: a stack that was
   # half-dismantled by hand keeps its network, and sometimes a stray container,

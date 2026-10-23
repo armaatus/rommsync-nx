@@ -20,6 +20,9 @@
 # Returns non-zero rather than exiting if no SHA-1 tool is available: under
 # `set -e` an aborting derivation would guarantee the very leak it exists to
 # prevent, so callers get to fall back on .env instead.
+# Every stack this repo starts is named under it; reap.sh sweeps by it.
+ORCA_PROJECT_PREFIX=rmx
+
 orca_derive_env() {
   local root="$1" hex=""
 
@@ -53,7 +56,7 @@ print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:4])
   # directory names collide (a checkout and a worktree both called
   # "rommsync-nx") would otherwise share a compose project, and the second
   # `up -d` would adopt and recreate the first's containers and database.
-  orca_project="rmx-${orca_slug}-${orca_offset}"
+  orca_project="${ORCA_PROJECT_PREFIX}-${orca_slug}-${orca_offset}"
 }
 
 # Whether the daemon is actually answering.
@@ -63,6 +66,20 @@ print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:4])
 # stack that survived because the daemon was down is exactly the one that needs
 # reporting, and calling it removed is worse than not checking at all.
 orca_docker_ready() { docker info >/dev/null 2>&1; }
+
+# Take one stack down by name, volumes included, whatever .env says.
+#
+# `-p` names the project outright, so teardown hits the stack it was given even
+# when .env disagrees. `--profile tls` because `down` only touches services
+# whose profile is ACTIVE: the TLS terminator tls-fixture.sh starts would
+# otherwise survive, come back on every docker start under `restart:
+# unless-stopped`, hold the worktree's TLS_PORT, and block the network removal
+# behind it (#122). `orca.teardown_profiles` fails the day a profile is added
+# and not named here.
+orca_stack_down() {
+  docker compose -p "$1" -f server/testing/docker-compose.yml \
+    --profile tls down -v --remove-orphans
+}
 
 # Everything docker holds for one compose project, as `kind<TAB>name` lines.
 # Only meaningful once orca_docker_ready succeeds.

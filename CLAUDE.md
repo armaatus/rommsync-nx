@@ -96,7 +96,7 @@ avoid. *Alone* runs both ways (#215).
 
 `/implement` opens with no planning phase: the issue's **Goal / Scope / Design
 notes / Acceptance** are the plan, and they are meant to be sufficient. Where the
-implementation ends up departing from them, the PR body says so under `## Plan`.
+implementation ends up departing from them, the commit message says so under `## Plan`.
 Departing is normal; departing silently is not.
 
 ## Code
@@ -125,7 +125,7 @@ Never hand-edit the `blocked`/`ready` labels — `.github/workflows/unblock.yml`
 derives them from the `Blocked by #N` lines below the `<!-- blockers -->` marker.
 Those lines *are* editable, and a genuinely missing dependency should be added,
 but changing one changes what other agents may start: do it deliberately, alone,
-and say so in the PR body. Never edit them as a side effect of rewording a body.
+and say so in your commit message. Never edit them as a side effect of rewording a body.
 
 ## Finishing
 

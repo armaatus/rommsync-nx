@@ -1236,8 +1236,9 @@ the fault proxy. And the profile is named rather than wildcarded — `--profile
 '*'` would cover a profile added later without a second edit, but it needs
 Compose 2.24 and an older one reads `*` as a literal profile name, activating
 nothing and restoring the leak in silence. A profile added to the compose file
-has to be named in `compose.sh`, `archive.sh` and `reap.sh` by hand, and
-`orca.teardown_profiles` fails until all three do.
+has to be named in `compose.sh` and in `orca_stack_down` (`lib.sh`, which
+`archive.sh` and `reap.sh` share) by hand, and `orca.teardown_profiles` fails
+until both do.
 
 Removing a worktree runs `scripts/orca/archive.sh` (Orca runs it through
 `orca.yaml`; run it yourself before a plain `git worktree remove`), which takes

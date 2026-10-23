@@ -304,14 +304,14 @@ print(f"ROMM_BASE_URL=http://127.0.0.1:{21000 + offset}")
 PY
 )"
     while IFS= read -r line; do
-      grep -qx "$line" "$FIXTURE/.env" \
+      grep -Fqx "$line" "$FIXTURE/.env" \
         || fail ".env does not carry $line: $(cat "$FIXTURE/.env")"
     done <<<"$want"
     # Teardown re-derives rather than reading .env back, so the two derivations
     # have to agree or archive.sh and reap.sh aim at a stack nobody started.
     . "$FIXTURE/scripts/orca/lib.sh"
     orca_derive_env "$root" || fail "orca_derive_env found no sha1 tool"
-    grep -qx "COMPOSE_PROJECT_NAME=$orca_project" "$FIXTURE/.env" \
+    grep -Fqx "COMPOSE_PROJECT_NAME=$orca_project" "$FIXTURE/.env" \
       || fail "teardown would derive $orca_project, which is not the stack env.sh named"
     echo "PASS: .env names the stack and ports the way every existing worktree's stack was named"
     ;;
@@ -320,19 +320,24 @@ PY
     # `down` only touches services whose profile is active, so a profile any
     # teardown path does not name survives it, comes back on every docker start
     # under `restart: unless-stopped`, and holds the worktree's port (#122).
-    # Three paths take a stack down: compose.sh (by hand), archive.sh (on
-    # worktree removal) and reap.sh (orphans). Read the profiles out of the
-    # compose file, so adding one fails here until all three name it.
+    # Two places take a stack down: compose.sh (by hand), and orca_stack_down
+    # in lib.sh, which archive.sh (on worktree removal) and reap.sh (orphans)
+    # share. Read the profiles out of the compose file, so adding one fails
+    # here until both name it.
     compose="$REPO_ROOT/server/testing/docker-compose.yml"
     profiles="$(sed -n 's/.*profiles:[[:space:]]*\[\(.*\)\].*/\1/p' "$compose" \
                 | tr ',' '\n' | tr -d ' "'"'" | sort -u)"
     [ -n "$profiles" ] || fail "found no profiles in $compose; this phase would assert nothing"
-    for script in compose.sh archive.sh reap.sh; do
+    for script in compose.sh lib.sh; do
       [ -f "$REPO_ROOT/scripts/orca/$script" ] || fail "scripts/orca/$script is missing"
       for profile in $profiles; do
         grep -q -- "--profile $profile" "$REPO_ROOT/scripts/orca/$script" \
           || fail "scripts/orca/$script never activates profile '$profile', so its down leaves that service running"
       done
+    done
+    for script in archive.sh reap.sh; do
+      grep -q 'orca_stack_down' "$REPO_ROOT/scripts/orca/$script" \
+        || fail "scripts/orca/$script takes stacks down without orca_stack_down, so this phase cannot see its profiles"
     done
     echo "PASS: every teardown path activates every profile: $(echo $profiles)"
     ;;

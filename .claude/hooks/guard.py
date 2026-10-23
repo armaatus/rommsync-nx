@@ -30,8 +30,9 @@ the person who merges.
 
 Writing a file is judged through the editing tools (Edit, Write, NotebookEdit),
 which is how an agent actually applies a diff. The shell half used to enumerate
-seven write verbs and still missed `patch -p1` and `git apply`; a partial model of writing is a guard that reports
-success on the spellings it does not know, so it is gone rather than extended.
+seven write verbs and still missed `patch -p1` and `git apply`; a partial
+model of writing is a guard that reports success on the spellings it does not
+know, so it is gone rather than extended.
 
     ./.claude/hooks/guard.py --selftest
 """
@@ -140,6 +141,9 @@ def _in_agent_worktree(cwd=None):
     from their own checkout is the ordinary case, and a guard that argues about
     it is a guard people route around. A linked worktree's git dir is
     `<common>/worktrees/<name>`, so the two paths differ there and only there.
+
+    A question git cannot answer counts as an agent's worktree: the rule must
+    not fail open on the day the probe breaks.
     """
     if AGENT_WORKTREE is not None:
         return AGENT_WORKTREE
@@ -149,10 +153,10 @@ def _in_agent_worktree(cwd=None):
             capture_output=True, text=True, timeout=5, cwd=cwd,
         )
     except Exception:
-        return False
+        return True
     lines = out.stdout.split("\n")
     if out.returncode != 0 or len(lines) < 2 or not lines[1]:
-        return False
+        return True
     git_dir = lines[0]
     common = os.path.join(cwd or os.getcwd(), lines[1])
     return os.path.realpath(git_dir) != os.path.realpath(common)
@@ -320,8 +324,8 @@ def _check_merge(words):
     sub = _gh_rest(words)
     if sub[:2] == ["pr", "merge"]:
         # `--auto` included. It asks GitHub to merge once the required checks
-        # pass, and with no merge gate among them (#277) nothing in those checks
-        # stands for the maintainer's review: arming it is merging on green.
+        # pass, and with merge-gate retired (#277) none of them stands for the
+        # maintainer's review: arming it is merging on green.
         deny(MERGE_REFUSAL)
     if sub[:1] == ["api"] and any(
         re.search(r"/pulls/\d+/merge", w) or "mergePullRequest" in w for w in rest
@@ -715,14 +719,22 @@ def _plumbing_checks():
     # worktree: the main checkout is a person's, a linked worktree an agent's.
     with tempfile.TemporaryDirectory() as tmp:
         main_dir, linked = os.path.join(tmp, "main"), os.path.join(tmp, "linked")
+        plain = os.path.join(tmp, "plain")
+        os.mkdir(plain)
         quiet = {"capture_output": True, "check": True}
+        # This machine's git config must not decide the fixture: a global
+        # commit.gpgsign or hooks path would fail or stall the empty commit.
+        isolated = ["-c", "user.name=t", "-c", "user.email=t@t",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
         subprocess.run(["git", "init", "-q", main_dir], **quiet)
-        subprocess.run(["git", "-C", main_dir, "-c", "user.name=t", "-c", "user.email=t@t",
+        subprocess.run(["git", "-C", main_dir, *isolated,
                         "commit", "-q", "--allow-empty", "-m", "x"], **quiet)
-        subprocess.run(["git", "-C", main_dir, "worktree", "add", "-q", linked], **quiet)
+        subprocess.run(["git", "-C", main_dir, *isolated,
+                        "worktree", "add", "-q", linked], **quiet)
         for where, want, what in (
             (main_dir, False, "the main checkout is not an agent's worktree"),
             (linked, True, "...and a linked worktree is"),
+            (plain, True, "...and neither is a directory git cannot answer for waved through"),
         ):
             got = _in_agent_worktree(where)
             if got != want:
@@ -733,7 +745,7 @@ def _plumbing_checks():
     return failures
 
 
-PLUMBING_ASSERTIONS = 9
+PLUMBING_ASSERTIONS = 10
 
 
 def _stateful_checks():
