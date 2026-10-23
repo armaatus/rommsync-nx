@@ -7,8 +7,8 @@
 // and hands it to `threadCreate` with a null `stack_mem` -- so libnx calls
 // `__libnx_aligned_alloc(0x1000, stack_sz + tls_sz + reent_sz)` and the stack
 // comes out of `g_inner_heap` (nx/source/kernel/thread.c). Two of those cost
-// this process ~257 KiB, against a table in `main.cpp` that budgeted 64 KiB for
-// both and a margin smaller than the difference. With `-fno-exceptions` an
+// this process far more than a table in `main.cpp` budgeted for them, with a
+// margin smaller than the difference. With `-fno-exceptions` an
 // allocation that does not fit is `std::terminate` on a console with no crash
 // report.
 //
@@ -36,31 +36,28 @@ namespace rommsync::sysmodule {
 
 /// The stack each of this process's own threads gets.
 ///
-/// **128 KiB, which is what they already had** -- this constant does not shrink
+/// **The size devkitA64 already gave them** -- this constant does not shrink
 /// anything, it makes the number visible so that shrinking it later is one edit
-/// and one table row rather than an archaeology exercise. What it is measured
-/// against, from `-fstack-usage` over the whole linked sysmodule plus the direct
-/// call graph of `sys-rommsync.elf` (#207):
+/// and one table row rather than an archaeology exercise.
 ///
-///   * the deepest single frame the build compiles is 4,288 bytes
-///     (`io::CopyAtomically`), and `SdEngine::RunOneTick` alone was 3,136
-///     before #254 split it into phases;
-///   * `json::Parser` is the one recursion in the tree, bounded by
-///     `json::kMaxDepth`, which was 64 at ~496 bytes a level -- so ~31 KiB of
-///     that worst case was JSON nesting the *server* chooses. M9-18 (#216)
-///     lowered the limit to 16 for the main thread's sake. The two figures
-///     below are #207's, taken at 64; 48 fewer levels at #216's measured 432
-///     bytes put each ~20 KiB lower (~39 and ~19 KiB), not re-walked, and the
-///     constant was not shrunk with them;
-///   * the deepest chain reachable from `RunWorker` totals ~59 KiB, and from
-///     `DrivePairing` ~39 KiB.
+/// **What holds it is `stack.measured` (M9-31, #268), not a figure here.** The
+/// numbers this comment used to quote were walked by hand, once, and went
+/// stale twice -- when #254 split the tick into phases and when #253 turned on
+/// LTO. Now `scripts/stack-budget.py` walks the linked image's call graph from
+/// each thread's `SizedThread::Enter`, with the main thread's accounting:
+/// `json::kMaxDepth + 1` trips round the parser's heaviest level, the
+/// red-black-tree and `std::sort` recursions at the depth their sizes bound,
+/// and **any other recursion a failure**, since nothing would bound it. Each
+/// thread that parses has a ceiling on the rest of its chain beside the levels
+/// -- `stack::kWorkerRestBytes` and `stack::kPairingRestBytes`, in
+/// `stack_budget.hpp` -- and its deepest chain, parsing or not, must fit in
+/// **half** this stack; `stack.measured` prints what it found. `stack.fit`
+/// holds the ceilings inside that half on every push, without the toolchain.
 ///
-/// That bound is an over-approximation of our own code and an *under*-count of
-/// everything else: 244 indirect call sites (`http::HttpClient` and
-/// `fs::FileSystem` are interfaces) are edges no static walk follows. 64 KiB
-/// would leave the worker under 10% headroom over a figure that is already
-/// known to be incomplete, and overflowing a Horizon thread stack is a data
-/// abort, not a diagnosable failure.
+/// Half, because the walk is a floor on the truth: `http::HttpClient` and
+/// `fs::FileSystem` are interfaces, an indirect call is an edge no static walk
+/// follows, and newlib's and libnx's frames count as zero. Overflowing a
+/// Horizon thread stack is a data abort, not a diagnosable failure.
 ///
 /// Must be a multiple of the page size, which is what the `static_assert` below
 /// checks: `__syscall_thread_create` refuses a `stack_size` with any of the low
@@ -85,19 +82,21 @@ inline constexpr std::size_t kThreadHeapOverheadBytes = 0x2000;
 /// The PSC watcher's stack (M9-4, #208), and the reason it is not the number
 /// above.
 ///
-/// That one is measured against `RunWorker` and `DrivePairing`, whose deepest
-/// chains reach ~59 KiB and ~39 KiB. This thread's whole call graph is
+/// That one is held against `RunWorker` and `DrivePairing`, which parse
+/// whatever RomM answers. This thread's whole call graph is
 /// `power::Watcher::Run` -> `SdEngine::Quiesce`/`Resume` -> a lock, two
 /// condition-variable waits, a `timed_mutex`, and -- only when the quiesce ran
-/// out of budget -- one `log::Warn`, which is where the deepest frame under it
-/// lives (`log::Redact`, and newlib's `fopen`/`fwrite` under `FileSink`). None
-/// of it recurses and none of it parses JSON, which is what makes the worker's
-/// number what it is.
+/// out of budget -- one `log::Warn` (`log::Redact`, and newlib's
+/// `fopen`/`fwrite` under `FileSink`). None of it recurses and none of it
+/// parses JSON, which is what makes the worker's number what it is.
 ///
-/// 32 KiB is ~8x the deepest single frame the whole build compiles -- 4,288
-/// bytes, in `io::CopyAtomically`, which this thread does not reach -- and it is
-/// 96 KiB the inner heap does not have to find for a thread that spends its life
-/// blocked on an event.
+/// `stack.measured` holds all of that: it walks this thread from its `Enter`,
+/// resolving `power::Watcher`'s calls through `power::Sink&` and
+/// `power::Module&` to `SdEngine` and `PscModule` -- the only implementations --
+/// since otherwise the walk would see nothing past `Enter`; it fails if the
+/// thread ever reaches the JSON reader, and its deepest chain must fit in half
+/// of this. Every byte below `kThreadStackBytes` is heap the inner heap does
+/// not have to find for a thread that spends its life blocked on an event.
 inline constexpr std::size_t kWatcherStackBytes = 0x8000;
 
 static_assert(kThreadStackBytes % 0x1000 == 0,

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The main thread's stack against a real cross-compile's frames (M9-18, #216).
+# Every thread's stack against a real cross-compile's frames (M9-18, #216;
+# the threads past `main`, M9-31, #268).
 #
 #   test_stack_budget.sh measured   cross-compiles sysmodule/ in the pinned
 #                                   devkitpro/devkita64 (or in place, under
@@ -7,9 +8,12 @@
 #                                   -fstack-usage -fcallgraph-info=su and runs
 #                                   `scripts/stack-budget.py measured` over the
 #                                   .ci files it leaves: the deepest chain from
-#                                   `main`, with the JSON recursion counted
-#                                   kMaxDepth + 1 times, stays under the ceilings
-#                                   sysmodule/source/stack_budget.hpp records.
+#                                   `main` and from each `SizedThread::Enter`,
+#                                   with the JSON recursion counted kMaxDepth + 1
+#                                   times, stays under the ceilings
+#                                   sysmodule/source/stack_budget.hpp records and
+#                                   inside half of each thread's stack -- and,
+#                                   with the worker's stack shrunk, does not.
 #
 # The other three phases of the same script read the tree only, and are run
 # straight from tests/CMakeLists.txt. This one cannot: frame sizes exist only
@@ -68,7 +72,27 @@ phase_measured() {
     fail "the cross-compile left no .ci files; -fcallgraph-info=su did not reach the compiler"
 
   toolchain_run "$SCRATCH" 'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' ||
-    fail "the main thread's measured stack is outside its budget"
+    fail "a thread's measured stack is outside its budget"
+
+  # And the check bites on the real graph (#268): the same walk against a
+  # worker stack shrunk to 0x2000 -- half of it under the worker's measured
+  # chain -- must fail, and fail on the worker. The script reads the constant
+  # out of the header text, so no rebuild; the frames are the ones just measured.
+  local header="$SCRATCH/sysmodule/source/sized_thread.hpp" out
+  sed 's/kThreadStackBytes = 0x[0-9A-Fa-f]*;/kThreadStackBytes = 0x2000;/' "$header" >"$header.new" &&
+    mv "$header.new" "$header"
+  grep -q 'kThreadStackBytes = 0x2000;' "$header" ||
+    fail "could not shrink kThreadStackBytes in the scratch copy of sized_thread.hpp"
+  if out="$(toolchain_run "$SCRATCH" \
+              'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' 2>&1)"; then
+    echo "$out" >&2
+    fail "the walk passed with the worker's stack shrunk to 0x2000; it is not holding the worker to its stack"
+  fi
+  grep -q "the worker thread's deepest" <<<"$out" || {
+    echo "$out" >&2
+    fail "the walk failed with the worker's stack shrunk, but not on the worker"
+  }
+  echo "ok: with kThreadStackBytes shrunk to 0x2000 the walk fails on the worker thread"
 }
 
 case "${1:-}" in
