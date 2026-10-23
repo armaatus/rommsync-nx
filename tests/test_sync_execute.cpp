@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -1275,6 +1276,99 @@ void CrashDelete(rig::Checks& checks) {
   }
 }
 
+// --- late_write -----------------------------------------------------------------
+//
+// #263: a game writing its save while the sync acts on it. Hard rule 2's backup
+// is a copy of the bytes the save held *at the copy*; a write that lands after it
+// and before the save is replaced or removed is in no copy anywhere, so the
+// replacement or removal has to see it and stand down. `LateWrite` is that
+// game, timed to the one call that separates the two.
+
+/// A `Disk` that writes the save the moment a backup's name is published under
+/// `.backup/` -- after the copy is complete, before anything replaces or removes
+/// the save. `write` is the game; it runs once.
+class LateWrite final : public io::Disk {
+ public:
+  explicit LateWrite(std::function<void()> write) : write_(std::move(write)) {
+    previous_ = io::SetDisk(this);
+  }
+  ~LateWrite() override { io::SetDisk(previous_); }
+
+  LateWrite(const LateWrite&) = delete;
+  LateWrite& operator=(const LateWrite&) = delete;
+
+  std::FILE* Open(const std::string& path, const char* mode) override {
+    return Inner().Open(path, mode);
+  }
+  std::size_t Write(std::FILE* file, const void* data, std::size_t size) override {
+    return Inner().Write(file, data, size);
+  }
+  int Rename(const std::string& from, const std::string& to) override {
+    const int renamed = Inner().Rename(from, to);
+    // The backup's own commit: its staged copy onto its name, in `.backup/`.
+    if (renamed == 0 && !fired_ && to.find("/.backup/") != std::string::npos &&
+        from == io::TempPathFor(to)) {
+      fired_ = true;
+      write_();
+    }
+    return renamed;
+  }
+  int Remove(const std::string& path) override { return Inner().Remove(path); }
+  bool Sync(const std::string& path) override { return Inner().Sync(path); }
+
+  /// Whether the write happened, so a scenario cannot pass on one that never ran.
+  bool fired() const { return fired_; }
+
+ private:
+  io::Disk& Inner() const { return previous_ != nullptr ? *previous_ : io::StdioDisk(); }
+
+  std::function<void()> write_;
+  io::Disk* previous_ = nullptr;
+  bool fired_ = false;
+};
+
+void LateWriteDelete(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-late-delete");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  NeverCalled client(checks);
+  auth::StoredToken token;
+  token.server_url = "http://127.0.0.1:1";
+  token.access_token = "not-used";
+  token.device_id = "not-used";
+
+  const std::string name = "late-delete.srm";
+  const std::string bytes = "the copy RomM deleted\n";
+  const std::string late = "progress the game wrote after the backup\n";
+  sandbox.SeedSave(SavePath(name), bytes);
+  const std::vector<sync::ClientSaveState> reported = {ReportedAs(41, "late", name, bytes)};
+  sync::ExecuteOptions options = DeleteOptionsAt(1'757'000'700);
+  options.reported = &reported;
+
+  sync::ExecutionReport report;
+  {
+    // `Reseed` rather than `Write`: from here on the late bytes are the save,
+    // and the teardown audit holds the executor to *them*.
+    LateWrite game([&] { sandbox.Reseed(SavePath(name), late); });
+    report = sync::ExecutePlan(client, *files, token, DeletePlan(41, "late"),
+                               {{41, "late", SavePath(name), name}}, options);
+    checks.Expect(game.fired(), "the game wrote between the backup and the removal");
+  }
+
+  checks.ExpectEq(sandbox.Read(SavePath(name)), late,
+                  "the write that landed after the backup is still on the card");
+  checks.ExpectEq(report.failed, 1, "the removal is a failed operation, not a done one");
+  if (report.operations.size() == 1) {
+    const sync::OperationResult& done = report.operations[0];
+    checks.Expect(done.error == sync::OperationError::kUnverified,
+                  std::string("named as bytes the ruling was not about: ") +
+                      sync::ToString(done.error) + " -- " + done.message);
+    checks.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == bytes,
+                  "and the backup is left beside it, holding the bytes RomM ruled on: " +
+                      done.backup_sd_path);
+  }
+}
+
 // --- upload -------------------------------------------------------------------
 //
 // An upload that respects RomM's slot guard: `overwrite=false`, `session_id`
@@ -1470,6 +1564,141 @@ void Download(rig::Checks& checks, http::HttpClient& client, const std::string& 
                   "and the save is left exactly as it was: no backup, no overwrite");
 
   harness::DeleteSave(client, base, fixture, server.id);
+}
+
+// --- late_fetch ---------------------------------------------------------------
+//
+// #263, for the two actions that write over a save: a `download` and a
+// `conflict`, each with the game writing the save between its backup and the
+// commit. The conflict's window is the wider of the two -- its archival upload
+// (#240) sits inside it -- and the write is put at its start.
+
+/// One late write against one plan: the server's copy must not land, and the
+/// write must still be the save. Returns the operation's result, if there was one.
+std::optional<sync::OperationResult> ExecuteUnderLateWrite(
+    rig::Checks& checks, Sandbox& sandbox, fs::FileSystem& files, http::HttpClient& client,
+    const std::string& base, const Fixture& fixture, const sync::SyncPlan& plan, const std::vector<sync::SaveTarget>& targets,
+    const sync::ExecuteOptions& options, const std::string& late, const std::string& what) {
+  const std::string save = targets[0].sd_path;
+  sync::ExecutionReport report;
+  {
+    LateWrite game([&] { sandbox.Reseed(save, late); });
+    report = sync::ExecutePlan(client, files, TokenFor(base, fixture), plan,
+                               targets, options);
+    checks.Expect(game.fired(), what + ": the game wrote between the backup and the commit");
+  }
+  checks.ExpectEq(sandbox.Read(save), late,
+                  what + ": the write that landed after the backup is still the save");
+  checks.ExpectEq(report.failed, 1, what + ": counted failed, not done");
+  checks.Expect(!sandbox.Exists(io::TempPathFor(save)),
+                what + ": and the server's copy is not left staged beside it");
+  if (report.operations.size() != 1) {
+    return std::nullopt;
+  }
+  const sync::OperationResult& done = report.operations[0];
+  checks.Expect(done.error == sync::OperationError::kUnverified,
+                what + ": named as a save that moved since its backup: " +
+                    sync::ToString(done.error) + " -- " + done.message);
+  return done;
+}
+
+void LateWriteFetch(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                    const Fixture& fixture, const harness::Rom& rom) {
+  const std::string late = "progress the game wrote after the backup\n";
+
+  // 1. download.
+  {
+    Sandbox sandbox(checks, "execute-late-download");
+    const std::string slot = harness::UniqueSlot("m9-26-download");
+    const std::string name = "late-download.srm";
+    const std::string previous = "the local copy, one tick old\n";
+    sandbox.SeedSave(SavePath(name), previous);
+
+    const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "the server's newer copy, which would replace it\n");
+    harness::Save server;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m9-26", staged, name,
+                             /*with_device=*/false, &server)) {
+      checks.Expect(false, "the server copy was stored");
+      return;
+    }
+    sync::SyncNegotiatePayload payload;
+    payload.device_id = fixture.device_id;
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, name, slot, "m9-26", crypto::Md5Hex(previous),
+        std::chrono::system_clock::now() - std::chrono::hours{1},
+        static_cast<std::int64_t>(previous.size())));
+    sync::SyncPlan plan;
+    if (PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+      checks.Expect(plan.operations[0].action == sync::Action::kDownload,
+                    std::string("the plan is a download: ") +
+                        sync::ToString(plan.operations[0].action));
+      const auto done = ExecuteUnderLateWrite(
+          checks, sandbox, *rommsync::host::MakeNativeFileSystem(sandbox.root().string()), client, base, fixture, plan, {{rom.id, slot, SavePath(name), name}},
+          OptionsAt(1'757'000'710), late, "download");
+      if (done.has_value()) {
+        checks.Expect(!done->backup_sd_path.empty() &&
+                          sandbox.Read(done->backup_sd_path) == previous,
+                      "download: the backup is left, holding the bytes it was taken of");
+      }
+      checks.Expect(!DeviceIsSynced(client, base, fixture, server.id),
+                    "download: and the server is not told this device holds its copy");
+    }
+    harness::DeleteSave(client, base, fixture, server.id);
+  }
+
+  // 2. conflict, keep both.
+  {
+    Sandbox sandbox(checks, "execute-late-conflict");
+    const std::string slot = harness::UniqueSlot("m9-26-conflict");
+    const std::string name = "late-conflict.srm";
+    const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "server v1\n");
+    harness::Save server;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m9-26", staged, name,
+                             /*with_device=*/true, &server)) {
+      checks.Expect(false, "the first server copy was stored");
+      return;
+    }
+    PassASecond();
+    rig::WriteFile(staged, "server v2, longer\n");
+    harness::Save moved;
+    if (!harness::ReplaceSave(client, base, fixture, server.id, staged, name, &moved)) {
+      checks.Expect(false, "the server copy moved forward in place");
+      harness::DeleteSave(client, base, fixture, server.id);
+      return;
+    }
+    const std::string previous = "device v2\n";
+    sandbox.SeedSave(SavePath(name), previous);
+
+    sync::SyncNegotiatePayload payload;
+    payload.device_id = fixture.device_id;
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, name, slot, "m9-26", crypto::Md5Hex(previous),
+        std::chrono::system_clock::now() + std::chrono::seconds{300},
+        static_cast<std::int64_t>(previous.size())));
+    sync::SyncPlan plan;
+    if (PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+      checks.Expect(plan.operations[0].action == sync::Action::kConflict,
+                    std::string("the plan is a conflict: ") +
+                        sync::ToString(plan.operations[0].action));
+      sync::ExecuteOptions options = OptionsAt(1'757'000'711);
+      options.reported = &payload.saves;
+      const auto done =
+          ExecuteUnderLateWrite(checks, sandbox,
+                                *rommsync::host::MakeNativeFileSystem(sandbox.root().string()),
+                                client, base, fixture, plan,
+                                {{rom.id, slot, SavePath(name), name}}, options, late, "conflict");
+      if (done.has_value()) {
+        checks.Expect(!done->backup_sd_path.empty() &&
+                          sandbox.Read(done->backup_sd_path) == previous,
+                      "conflict: the backup is left, holding the bytes it was taken of");
+      }
+    }
+    // The archival copy the conflict made before the write was noticed goes with
+    // `main`'s `DeleteArchivalCopies`.
+    harness::DeleteSave(client, base, fixture, server.id);
+  }
 }
 
 // --- crash --------------------------------------------------------------------
@@ -2601,7 +2830,8 @@ int main(int argc, char** argv) {
   // The two that need no server, so they stay checked with docker stopped.
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
       scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
-      scenario == "delete" || scenario == "crash_delete" || scenario == "isolated") {
+      scenario == "delete" || scenario == "crash_delete" || scenario == "isolated" ||
+      scenario == "late_delete") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -2618,6 +2848,8 @@ int main(int argc, char** argv) {
       CrashDelete(checks);
     } else if (scenario == "isolated") {
       Isolated(checks);
+    } else if (scenario == "late_delete") {
+      LateWriteDelete(checks);
     } else {
       Counting(checks);
     }
@@ -2674,6 +2906,8 @@ int main(int argc, char** argv) {
     Dropped(checks, *client, base, fixture, rom);
   } else if (scenario == "collision") {
     Collision(checks, *client, base, fixture, rom);
+  } else if (scenario == "late_fetch") {
+    LateWriteFetch(checks, *client, base, fixture, rom);
   } else if (scenario == "revoked") {
     Revoked(checks, *client, base, fixture, rom);
   } else {
