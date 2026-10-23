@@ -243,6 +243,12 @@ struct TicoConfig {
 /// spells it, which is also what an edit stores (#271).
 std::string AccountText(const TicoConfig& tico);
 
+/// `[tico] account`'s value read back: `AccountText`'s inverse, trimmed and
+/// case-folded, with a named account's id lowercased -- it becomes a folder name
+/// under `users/`, and Tico writes its folders lowercase. Nullopt for anything
+/// else. The one reading of the key, for the parser, an edit and the IPC alike.
+std::optional<TicoConfig> ParseTicoAccount(std::string_view text);
+
 /// `[platform.<slug>] play_with`: the emulator a platform is played in on this
 /// console, which decides where a save or a state the card has never held is
 /// written (#237, `place::Placer`). A file already on the card stays where it
@@ -254,6 +260,15 @@ enum class PlayWith {
 
 /// `tico` or `retroarch`. Never null.
 const char* ToString(PlayWith play_with);
+
+/// `ToString`'s inverse, trimmed and case-folded; nullopt for anything else --
+/// an empty value too, which each caller reads as "the default" in its own way.
+std::optional<PlayWith> ParsePlayWith(std::string_view text);
+
+/// The emulator `slug` is played in with no `play_with` line: Tico for every
+/// system Tico runs (#226 D5) -- the ones `scan::TicoModuleFor` knows and the
+/// off-by-default `OptionalPlatforms` -- else none.
+std::optional<PlayWith> DefaultPlayWith(std::string_view slug);
 
 /// True when `text` is a Tico account folder's name: 32 hex digits, either case
 /// (FAT32 does not keep case apart; Tico writes lowercase).
@@ -366,10 +381,9 @@ struct Config {
   /// The `emulator` override for `slug`, or empty when there is none.
   std::string_view EmulatorOverride(std::string_view slug) const;
 
-  /// The emulator `slug` is played in: its `play_with` line, else Tico for
-  /// every system Tico runs (#226 D5) -- the ones `scan::TicoModuleFor` knows
-  /// and the off-by-default `OptionalPlatforms` -- else none, which places
-  /// nothing rather than guessing.
+  /// The emulator `slug` is played in: its `play_with` line, else
+  /// `DefaultPlayWith` -- which may be none, and places nothing rather than
+  /// guessing.
   std::optional<PlayWith> PlayWithFor(std::string_view slug) const;
 
   /// Where a download for `slug` is written: the first `roms` entry, or empty

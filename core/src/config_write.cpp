@@ -595,7 +595,7 @@ bool NormalizeValue(const Resolved& target, std::string_view raw, std::string* o
       // The parser's three spellings, lowercased: the id becomes a folder name
       // under `users/`, and Tico writes its folders lowercase.
       const std::string word = LowerAscii(Trim(raw));
-      if (word != "auto" && word != "legacy" && !IsTicoUid(word)) {
+      if (!ParseTicoAccount(word).has_value()) {
         Complain(diagnostics, Severity::kError, target.section, target.key,
                  "expected auto, legacy or an account's 32-digit id, got '" +
                      Redact(Trim(raw)) + "'");
@@ -607,8 +607,7 @@ bool NormalizeValue(const Resolved& target, std::string_view raw, std::string* o
     case ValueKind::kPlayWith: {
       // Empty is a value here, the way `emulator =` is: it puts the default back.
       const std::string word = LowerAscii(Trim(raw));
-      if (!word.empty() && word != config::ToString(PlayWith::kTico) &&
-          word != config::ToString(PlayWith::kRetroArch)) {
+      if (!word.empty() && !ParsePlayWith(word).has_value()) {
         Complain(diagnostics, Severity::kError, target.section, target.key,
                  "expected tico or retroarch, got '" + Redact(Trim(raw)) + "'");
         return false;

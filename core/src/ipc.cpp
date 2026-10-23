@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -453,10 +454,8 @@ bool ReadPlatformMap(const json::Value& object, config::Config* config, json::Er
     if (!ReadText(member.value, "play_with", &play_with, error)) {
       return false;
     }
-    if (play_with == config::ToString(config::PlayWith::kTico)) {
-      config->play_with[member.key] = config::PlayWith::kTico;
-    } else if (play_with == config::ToString(config::PlayWith::kRetroArch)) {
-      config->play_with[member.key] = config::PlayWith::kRetroArch;
+    if (const std::optional<config::PlayWith> parsed = config::ParsePlayWith(play_with)) {
+      config->play_with[member.key] = *parsed;
     } else if (!play_with.empty()) {
       return Fail(error, "play_with", "is not tico, retroarch or empty: " + play_with);
     }
@@ -948,15 +947,12 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
         if (tico_section == nullptr || !ReadText(*tico_section, "account", &account, error)) {
           return;
         }
-        if (account == "legacy") {
-          out->config.tico.account = config::TicoAccount::kLegacy;
-        } else if (config::IsTicoUid(account)) {
-          out->config.tico.account = config::TicoAccount::kNamed;
-          out->config.tico.uid = account;
-        } else if (account != "auto") {
+        std::optional<config::TicoConfig> tico = config::ParseTicoAccount(account);
+        if (!tico.has_value()) {
           Fail(error, "account", "is not auto, legacy or an account's id");
           return;
         }
+        out->config.tico = std::move(*tico);
         // Each one becomes the value of a press, so each has to be one
         // `[tico] account` takes.
         const json::Value* accounts =

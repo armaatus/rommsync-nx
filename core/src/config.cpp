@@ -11,6 +11,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -419,21 +420,16 @@ void ApplyTico(const ParseState& state, int line, std::string_view key, std::str
     diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
     return;
   }
-  const std::string lowered = LowerAscii(Trim(value));
-  TicoConfig tico;
-  if (lowered == "legacy") {
-    tico.account = TicoAccount::kLegacy;
-  } else if (IsTicoUid(lowered)) {
-    tico.account = TicoAccount::kNamed;
-    tico.uid = lowered;
-  } else if (lowered != "auto") {
+  std::optional<TicoConfig> tico = ParseTicoAccount(value);
+  if (!tico.has_value()) {
     // Checked here because the value becomes a folder name under `users/`, and
     // anything but 32 hex digits is either a typo or a path.
     diags->Add(Severity::kWarning, line, state.section, key,
                "expected auto, legacy or an account's 32-digit id, got '" + Redact(value) +
                    "'; keeping auto");
+    tico.emplace();
   }
-  config->tico = std::move(tico);
+  config->tico = std::move(*tico);
 }
 
 /// `rejected` collects slugs whose section had a line the parser could not use,
@@ -447,13 +443,10 @@ void ApplyPlatform(const ParseState& state, int line, std::string_view key,
     return;
   }
   if (key == "play_with") {
-    const std::string lowered = LowerAscii(Trim(value));
-    if (lowered.empty()) {
+    if (Trim(value).empty()) {
       config->play_with.erase(state.slug);  // `play_with =` is the default again
-    } else if (lowered == "tico") {
-      config->play_with[state.slug] = PlayWith::kTico;
-    } else if (lowered == "retroarch") {
-      config->play_with[state.slug] = PlayWith::kRetroArch;
+    } else if (const std::optional<PlayWith> parsed = ParsePlayWith(value)) {
+      config->play_with[state.slug] = *parsed;
     } else {
       // Not guessed at: which emulator's folder a first restore lands in is the
       // whole meaning of the line, and a typo that picked one would write saves
@@ -854,6 +847,30 @@ const char* ToString(PlayWith play_with) {
   return "tico";
 }
 
+std::optional<PlayWith> ParsePlayWith(std::string_view text) {
+  const std::string word = LowerAscii(Trim(text));
+  for (const PlayWith play_with : {PlayWith::kTico, PlayWith::kRetroArch}) {
+    if (word == ToString(play_with)) {
+      return play_with;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<TicoConfig> ParseTicoAccount(std::string_view text) {
+  const std::string word = LowerAscii(Trim(text));
+  TicoConfig tico;
+  if (word == "legacy") {
+    tico.account = TicoAccount::kLegacy;
+  } else if (IsTicoUid(word)) {
+    tico.account = TicoAccount::kNamed;
+    tico.uid = word;
+  } else if (word != "auto") {
+    return std::nullopt;
+  }
+  return tico;
+}
+
 std::string AccountText(const TicoConfig& tico) {
   switch (tico.account) {
     case TicoAccount::kAuto:
@@ -893,6 +910,10 @@ std::optional<PlayWith> Config::PlayWithFor(std::string_view slug) const {
   if (found != play_with.end()) {
     return found->second;
   }
+  return DefaultPlayWith(slug);
+}
+
+std::optional<PlayWith> DefaultPlayWith(std::string_view slug) {
   if (scan::TicoModuleFor(scan::TicoSlugFor(slug)) != nullptr ||
       OptionalPlatforms().find(slug) != OptionalPlatforms().end()) {
     return PlayWith::kTico;
