@@ -35,6 +35,27 @@ SCRATCH=""
 cleanup() { [ -n "$SCRATCH" ] && rm -rf "$SCRATCH"; return 0; }
 trap cleanup EXIT
 
+# The walk with one constant shrunk in the scratch copy, put back before it
+# returns. The edit, the walk and the restore run in ONE toolchain container:
+# a file the host renames over inside a Docker Desktop bind mount can read as
+# missing to the next container on macOS, which made the walk after a restore
+# fail on a header it said defined nothing. Exits 3 if the edit did not take.
+walk_shrunk() {
+  toolchain_run "$SCRATCH" '
+    file="$1" name="$2" value="$3"
+    cp "$file" "$file.orig"
+    sed -i "s/$name = 0x[0-9A-Fa-f]*;/$name = $value;/" "$file"
+    if ! grep -q "$name = $value;" "$file"; then
+      mv "$file.orig" "$file"
+      echo "could not shrink $name in the scratch copy of $file"
+      exit 3
+    fi
+    rc=0
+    python3 scripts/stack-budget.py measured --repo . --ci sysmodule 2>&1 || rc=$?
+    mv "$file.orig" "$file"
+    exit "$rc"' "$@"
+}
+
 phase_measured() {
   local missing
   missing="$(toolchain_missing)" && skip "$missing"
@@ -78,14 +99,8 @@ phase_measured() {
   # worker stack shrunk to 0x2000 -- half of it under the worker's measured
   # chain -- must fail, and fail on the worker. The script reads the constant
   # out of the header text, so no rebuild; the frames are the ones just measured.
-  local header="$SCRATCH/sysmodule/source/sized_thread.hpp" out
-  cp "$header" "$header.orig"
-  sed 's/kThreadStackBytes = 0x[0-9A-Fa-f]*;/kThreadStackBytes = 0x2000;/' "$header" >"$header.new" &&
-    mv "$header.new" "$header"
-  grep -q 'kThreadStackBytes = 0x2000;' "$header" ||
-    fail "could not shrink kThreadStackBytes in the scratch copy of sized_thread.hpp"
-  if out="$(toolchain_run "$SCRATCH" \
-              'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' 2>&1)"; then
+  local out
+  if out="$(walk_shrunk sysmodule/source/sized_thread.hpp kThreadStackBytes 0x2000)"; then
     echo "$out" >&2
     fail "the walk passed with the worker's stack shrunk to 0x2000; it is not holding the worker to its stack"
   fi
@@ -94,18 +109,11 @@ phase_measured() {
     fail "the walk failed with the worker's stack shrunk, but not on the worker"
   }
   echo "ok: with kThreadStackBytes shrunk to 0x2000 the walk fails on the worker thread"
-  mv "$header.orig" "$header"
 
   # And on the ceiling sized_thread.hpp points a reader to rather than quoting a
   # figure: `kWorkerRestBytes` shrunk under the worker's measured chain, with
   # its stack as it is, must fail on that ceiling.
-  local budget="$SCRATCH/sysmodule/source/stack_budget.hpp"
-  sed 's/kWorkerRestBytes = 0x[0-9A-Fa-f]*;/kWorkerRestBytes = 0x100;/' "$budget" >"$budget.new" &&
-    mv "$budget.new" "$budget"
-  grep -q 'kWorkerRestBytes = 0x100;' "$budget" ||
-    fail "could not shrink kWorkerRestBytes in the scratch copy of stack_budget.hpp"
-  if out="$(toolchain_run "$SCRATCH" \
-              'python3 scripts/stack-budget.py measured --repo . --ci sysmodule' 2>&1)"; then
+  if out="$(walk_shrunk sysmodule/source/stack_budget.hpp kWorkerRestBytes 0x100)"; then
     echo "$out" >&2
     fail "the walk passed with kWorkerRestBytes shrunk to 0x100; it is not holding the worker to its ceiling"
   fi
