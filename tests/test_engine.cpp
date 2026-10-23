@@ -3629,6 +3629,91 @@ void RommForgotten(checks::Checks& c) {
   c.ExpectEq(server.negotiations(), negotiated, "so the second tick negotiated nothing");
 }
 
+/// A server whose heartbeat answers and whose library is never there: every
+/// `GET /api/roms` is a connection that failed. Counts them, and says when the
+/// first has been answered.
+class NoLibrary final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      result.response.status = 200;
+      result.response.body = R"({"SYSTEM":{"VERSION":"5.4.0"}})";
+      return result;
+    }
+    if (request.url.find("/api/roms") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++pages_;
+      arrived_.notify_all();
+    }
+    result.error = http::Error::kConnectFailed;
+    result.message = "nothing behind this test server";
+    return result;
+  }
+
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    return Send({});
+  }
+
+  bool AwaitPage() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return arrived_.wait_for(lock, std::chrono::seconds{10}, [this] { return pages_ > 0; });
+  }
+
+  int pages() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return pages_;
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable arrived_;
+  int pages_ = 0;
+};
+
+/// #251: the library fetch backs off between attempts now, and a console put to
+/// sleep in that backoff cancels the tick. That has to end the tick as
+/// cancelled -- one request, no retry after it, and nothing recorded -- rather
+/// than as a server that is down: `kOffline` would be a failed tick on the
+/// status screen and a `net.offline` line about a link nobody was using.
+void IndexCanceled(checks::Checks& c) {
+  rommsync::log::Reset();
+  // Before the console, so it outlives the worker: a fetch that ignores the
+  // cancel is still asking it for pages when the scenario ends.
+  NoLibrary server;
+  Console console(c, "engine-index-canceled");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n\n[sync]\n"
+                                 "enabled = true\ninterval_min = 0\non_boot = false\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-index-canceled";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one");
+  console.engine.UseMinimumServerVersion(rommsync::server::kMinimumVersion);
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  c.Expect(server.AwaitPage(), "and its first page of the library failed");
+  // The tick is in its backoff now, or about to be: either way the sleep ends it.
+  console.engine.Quiesce();
+
+  const ipc::Status status = console.Status();
+  c.ExpectEq(server.pages(), 1, "the sleep stopped the fetch before its retry");
+  c.Expect(status.last_sync_result == ipc::SyncResult::kNever,
+           "and the tick is not recorded as failed: it was cancelled");
+  const ipc::LogTail tail = console.Log();
+  c.Expect(!Logged(tail, "net.offline"),
+           "nor logged as a server that is down:" + Rendered(tail));
+}
+
 /// #231: a card where Tico 0.8 keeps saves for two accounts and `config.ini`
 /// names neither. The scan syncs no Tico save there (`scan.tico`); what this adds
 /// is that the settings screen -- `GetConfig`, which is where a user goes to pick
@@ -5543,6 +5628,8 @@ int main(int argc, char** argv) {
     LogsMisconfiguration(checks);
   } else if (scenario == "romm_forgotten") {
     RommForgotten(checks);
+  } else if (scenario == "index_canceled") {
+    IndexCanceled(checks);
   } else if (const RigScenario* rig_scenario = FindRigScenario(scenario)) {
     // The scenarios that need the fixture RomM. `server` pins that a *live*
     // credential stops being on the card, and the M1-6 three drive a real
