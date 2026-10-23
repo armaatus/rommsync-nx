@@ -829,6 +829,11 @@ void CheckTicoAccountIsPicked(Checks& checks) {
   }
 }
 
+/// A platform Tico does not run by default, mapped to a folder Tico keeps
+/// saves in.
+constexpr const char* kPico8InTico =
+    "[platform.pico8]\nroms = /roms/pico8\nsaves = /tico/saves/pico8\n";
+
 /// #271: a platform's `play_with` is shown beside its folders and steps like
 /// #264's rows.
 void CheckPlayWithIsChanged(Checks& checks) {
@@ -851,6 +856,27 @@ void CheckPlayWithIsChanged(Checks& checks) {
   const overlay::SettingsRow* unset = RowNamed(none, "[platform.pico8]", "play_with");
   checks.Expect(unset != nullptr && Contains(unset->note, "not placed"),
                 "with no emulator named, a save new to the card is not placed");
+
+  // Tico places nothing for a platform whose map lists no Tico folder
+  // (`place::Placer`), so it is not a value the press offers there...
+  checks.Expect(unset != nullptr && unset->change.has_value() &&
+                    unset->change->value == "retroarch",
+                "Not set steps to RetroArch");
+  const overlay::SettingsView retro = overlay::RenderSettings(
+      ViewFor(checks, own + "play_with = retroarch\n"));
+  ExpectChange(checks, retro, "[platform.pico8]", "play_with", "RetroArch", "");
+  // ...and one written by hand is shown as the nothing it places.
+  const overlay::SettingsView hand = overlay::RenderSettings(
+      ViewFor(checks, own + "play_with = tico\n"));
+  const overlay::SettingsRow* tico = RowNamed(hand, "[platform.pico8]", "play_with");
+  checks.Expect(tico != nullptr && tico->value == "Tico" && Contains(tico->note, "no Tico folder"),
+                "a hand-written tico with no Tico folder says it places nothing: " +
+                    (tico == nullptr ? std::string("no row") : tico->note));
+  // Where the map does list one, Tico is the third value.
+  const overlay::SettingsView mapped =
+      overlay::RenderSettings(ViewFor(checks, std::string(kMinimal) + kPico8InTico +
+                                                  "play_with = retroarch\n"));
+  ExpectChange(checks, mapped, "[platform.pico8]", "play_with", "RetroArch", "tico");
 }
 
 /// #271's rows walk every value and come round, through the write path.
@@ -860,7 +886,8 @@ void CheckM10RestCycles(Checks& checks) {
             kMinimal, "[sync]", "map_state_slots", 2},
         {kMinimal, "[platform.snes]", "play_with", 2},
         {std::string(kMinimal) + "[platform.pico8]\nroms = /roms/pico8\n", "[platform.pico8]",
-         "play_with", 3}}) {
+         "play_with", 2},
+        {std::string(kMinimal) + kPico8InTico, "[platform.pico8]", "play_with", 3}}) {
     std::string text = base;
     std::vector<std::string> seen;
     for (std::size_t press = 0; press <= values; ++press) {
