@@ -3296,16 +3296,15 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
   // **Never under a running game** (#273). The game holds its save in memory
   // and writes it when it closes, over the bytes Keep local puts back -- and
   // the tick #242 holds for it would then upload *that* write with
-  // `overwrite=true`, bytes the player never chose. Asked here, at the write,
-  // and of any application: `pm` names a title, not the save it holds, and
-  // RetroArch runs every rom under one, so "the save's own game" cannot be told
-  // from another. A plain restore is not asked: it overrules nothing, and the
-  // next sync arbitrates whatever the card holds.
-  if (keep_local && application_running()) {
-    report.outcome = conflicts::RestoreOutcome::kGameRunning;
-    report.message = "a game is running, and would save over the kept bytes when it closes -- "
-                     "nothing was written; close it and choose Keep local again";
-  } else {
+  // `overwrite=true`, bytes the player never chose. Asked of any application:
+  // `pm` names a title, not the save it holds, and RetroArch runs every rom
+  // under one, so "the save's own game" cannot be told from another. Asked
+  // before the locks below, since on a console it is a service call; `KeepLocal`
+  // refuses on it after the entry's own refusals. A plain restore is not asked:
+  // it overrules nothing, and the next sync arbitrates whatever the card holds.
+  conflicts::RestoreOptions restore_options;
+  restore_options.game_running = keep_local && application_running();
+  {
     // **Held for the whole check-and-act**, which on the worker is the same
     // thread as every tick and so cannot contend with one; it is taken anyway
     // because `Quiesce` reads it to know that no save write is in flight, and
@@ -3327,7 +3326,7 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
       report.outcome = conflicts::RestoreOutcome::kBackupFailed;
       report.message = "this build cannot open the SD card, so nothing was written";
     } else if (keep_local) {
-      report = conflicts::KeepLocal(*card_, history_, entry_id, armed, &kept);
+      report = conflicts::KeepLocal(*card_, history_, entry_id, armed, &kept, restore_options);
     } else {
       report = conflicts::Restore(*card_, history_, entry_id);
     }

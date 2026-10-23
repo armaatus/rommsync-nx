@@ -1067,11 +1067,30 @@ void KeepLocal(checks::Checks& c) {
     c.Expect(key.first == 0, "and arms nothing");
     c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and writes nothing");
 
-    // The newest conflict of a save is still Keep local's to take.
+    // Under a game, a superseded entry is still refused as superseded: that
+    // holds whatever the player does, where the game is theirs to close.
+    conflicts::RestoreOptions under_game = options;
+    under_game.game_running = true;
+    const conflicts::RestoreReport stale =
+        conflicts::KeepLocal(*files, history, newest, {}, &key, under_game);
+    c.Expect(stale.outcome == conflicts::RestoreOutcome::kSuperseded,
+             std::string("superseded comes before a running game: ") +
+                 conflicts::ToString(stale.outcome));
+
+    // The newest conflict of a save is still Keep local's to take -- but not
+    // under a game, which would save over the kept bytes when it closes.
     conflicts::Entry third = SaveEntry(4, "game.srm");
     third.backup_sd_path = newer_backup;
+    const std::int64_t third_id = history.Append(third).id;
+    const conflicts::RestoreReport running =
+        conflicts::KeepLocal(*files, history, third_id, {}, &key, under_game);
+    c.Expect(running.outcome == conflicts::RestoreOutcome::kGameRunning,
+             std::string("the newest conflict under a game is refused: ") +
+                 conflicts::ToString(running.outcome) + " -- " + running.message);
+    c.Expect(key.first == 0, "and arms nothing");
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), server, "and writes nothing");
     const conflicts::RestoreReport kept =
-        conflicts::KeepLocal(*files, history, history.Append(third).id, {}, &key, options);
+        conflicts::KeepLocal(*files, history, third_id, {}, &key, options);
     c.Expect(kept.ok(), std::string("the save's newest conflict is kept: ") +
                             conflicts::ToString(kept.outcome) + " -- " + kept.message);
     c.ExpectEq(sandbox.Read(SavePath("game.srm")), newer, "with its own bytes");

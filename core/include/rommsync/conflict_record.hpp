@@ -95,6 +95,12 @@ struct RestoreOptions {
   /// The clock the new backup's name is stamped from. Null means
   /// `std::chrono::system_clock::now`.
   std::function<sync::Timestamp()> now;
+
+  /// `KeepLocal` only: a game is in the foreground, as the caller found it --
+  /// `core/` has no foreground to look at. Refused after the entry's own
+  /// refusals, so a choice that could never be taken says why rather than
+  /// "close the game" first (#273).
+  bool game_running = false;
 };
 
 /// Put the bytes `entry_id` names back on the card.
@@ -148,13 +154,12 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 ///       - with `kKeepLocalFull` when `armed` -- the choices already waiting --
 ///         holds `sync::kMaxKeepLocal` keys and not this one (#273), so that
 ///         `sync::ArmKeepLocal` never has to refuse bytes already restored;
+///       - with `kGameRunning` when `options.game_running` says so (#273): the
+///         game would save over the kept bytes when it closes;
 ///   - on `kRestored` only, `*key` is the conflict's `(rom_id, slot)`, which the
 ///     caller arms (`sync::ArmKeepLocal`) for the next tick. That upload is then
 ///     the one sent with `overwrite=true` (`sync::ExecuteOptions::keep_local`);
 ///     every other upload still meets RomM's slot guard.
-///
-/// Whether a game is running is the caller's to ask (`kGameRunning`): `core/`
-/// has no foreground to look at.
 ///
 /// **Hard rule 3 holds**: the server stays the source of truth because the
 /// override is the player's, named, once -- never inferred. And it is still

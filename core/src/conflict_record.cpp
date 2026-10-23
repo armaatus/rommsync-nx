@@ -324,6 +324,11 @@ RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int6
                         " Keep local choices are already waiting for a sync to send them, and "
                         "this would be one more");
     }
+    if (options.game_running) {
+      return refuse(RestoreOutcome::kGameRunning,
+                    "a game is running, and would save over the kept bytes when it closes; "
+                    "close it and choose Keep local again");
+    }
   }
   // A missing entry falls through: `Restore` names that refusal itself.
   RestoreReport report = Restore(files, history, entry_id, options);
