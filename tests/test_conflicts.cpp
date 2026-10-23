@@ -925,6 +925,30 @@ void KeepLocal(checks::Checks& c) {
              "choice armed after it went out keep theirs (" + std::to_string(keep.size()) +
                  " left)");
   }
+
+  // An upload that failed before its request was made -- the card could not
+  // be read or hashed, or the save was not there -- never carried its
+  // override to the server, so it keeps it as a failed transfer does. Spending
+  // it would send the next upload with overwrite=false into the slot guard's
+  // 409, and the player's choice would resolve as Keep server.
+  {
+    const auto key = [](std::int64_t rom) {
+      return state::Baseline::Key{rom, std::string("autosave")};
+    };
+    std::vector<state::Baseline::Key> keep = {key(1), key(2)};
+    const std::vector<state::Baseline::Key> sent = keep;
+    sync::ExecutionReport executed;
+    executed.operations = {
+        Ran(1, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kUnreadableCard),
+        Ran(2, "autosave", sync::Action::kUpload, sync::OperationOutcome::kFailed,
+            sync::OperationError::kNoLocalSave),
+    };
+    sync::SpendKeepLocal(&keep, sent, executed);
+    c.Expect(keep == sent,
+             "an upload the card could not read, or had no save for, keeps its Keep local (" +
+                 std::to_string(keep.size()) + " left)");
+  }
 }
 
 // --- interrupted --------------------------------------------------------------
