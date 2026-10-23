@@ -142,7 +142,11 @@ inline constexpr const char* kServiceName = "rommsync";
 ///
 /// **7** since M10-7 (#233), which added `conflicts::Event::kDeleted`: a v6
 /// overlay reading `"deleted"` fails to decode the whole `ConflictPage`.
-inline constexpr std::uint32_t kVersion = 7;
+///
+/// **8** since M10-23 (#264), which added `on_server_delete` to `ConfigView`'s
+/// `sync` and a `sources` object beside it -- required fields, so a v8 overlay
+/// reading a v7 sysmodule's `GetConfig` fails to decode it.
+inline constexpr std::uint32_t kVersion = 8;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

@@ -115,6 +115,11 @@ ipc::ConfigView LoadedConfigView() {
   view.config.sync.states = true;
   view.config.sync.interval_min = 45;
   view.config.downloads.resume = false;
+  // Every M10 setting away from its default, so a round trip that dropped one
+  // would read back the default and be seen to (#264).
+  view.config.sync.on_server_delete = config::OnServerDelete::kKeep;
+  view.config.sources.retroarch = config::SourceMode::kOff;
+  view.config.sources.retroarch_content_dir = true;
   config::Diagnostic note;
   note.severity = config::Severity::kWarning;
   note.line = 9;
@@ -194,10 +199,12 @@ int Version() {
   // decoder refuses. 5 since M10-2 (#228): `Status` gained the server's version
   // and whether this build syncs with it. 6 since M10-16 (#242): `SyncOutcome`
   // gained `kDeferred`, which a v5 decoder refuses. 7 since M10-7 (#233): a
-  // conflict entry's `event` gained `deleted`, which a v6 decoder refuses. What
-  // is frozen is command 0's *encoding*, asserted above
-  // -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{7},
+  // conflict entry's `event` gained `deleted`, which a v6 decoder refuses. 8
+  // since M10-23 (#264): `ConfigView` gained `on_server_delete` and `sources`,
+  // required fields a v7 decoder never reads and a v8 one will not do without.
+  // What is frozen is command 0's *encoding*, asserted above -- not the number
+  // in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{8},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -415,6 +422,12 @@ int RoundTrip() {
     checks.ExpectEq(back.value.config.sync.states, sent.config.sync.states, "states survives");
     checks.ExpectEq(back.value.config.downloads.resume, sent.config.downloads.resume,
                     "resume survives");
+    checks.Expect(back.value.config.sync.on_server_delete == config::OnServerDelete::kKeep,
+                  "on_server_delete survives");
+    checks.Expect(back.value.config.sources.retroarch == config::SourceMode::kOff,
+                  "[sources] retroarch survives");
+    checks.ExpectEq(back.value.config.sources.retroarch_content_dir, true,
+                    "[sources] retroarch_content_dir survives");
     checks.Expect(SamePlatforms(sent.config, back.value.config), "the whole folder map survives");
     checks.Expect(SameDiagnostics(sent.diagnostics, back.value.diagnostics),
                   "and every diagnostic with it");
