@@ -352,6 +352,8 @@ const char* ToString(Event event) {
       return "save.deleted";
     case Event::kRemoteInstall:
       return "download.remote";
+    case Event::kPlayRecorded:
+      return "play.recorded";
   }
   return "unknown";
 }

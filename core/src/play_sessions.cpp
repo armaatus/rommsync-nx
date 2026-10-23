@@ -339,6 +339,10 @@ void Sightings::Note(const Foreground& seen, sync::Timestamp at) {
   spans_.push_back(TitleSpan{*seen.program_id, at, at});
 }
 
+std::chrono::seconds SlackFor(std::chrono::milliseconds poll) {
+  return std::chrono::ceil<std::chrono::seconds>(poll * 2);
+}
+
 void AttributeTitles(std::vector<sync::PlaySession>* sessions, const Sightings& sightings) {
   for (sync::PlaySession& session : *sessions) {
     std::optional<std::uint64_t> found;
@@ -369,6 +373,19 @@ std::string TitleOf(const sync::PlaySession& session) {
     out[at] = kHex[id & 0xF];
     id >>= 4;
   }
+  return out;
+}
+
+std::string Describe(const sync::PlaySession& session) {
+  std::string out = "rom " + (session.rom_id.has_value() ? std::to_string(*session.rom_id)
+                                                         : std::string("unknown"));
+  if (session.save_slot.has_value()) {
+    out += " slot " + *session.save_slot;
+  }
+  const std::int64_t seconds = session.duration_ms / 1000;
+  out += ": played up to ";
+  out += seconds < 60 ? std::to_string(seconds) + " s" : std::to_string(seconds / 60) + " min";
+  out += ", title " + TitleOf(session);
   return out;
 }
 

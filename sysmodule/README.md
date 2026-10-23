@@ -269,6 +269,9 @@ guess, and is still wrong to make now.
   application-launch hook `pm:dmnt` also offers is the single one
   `dmnt:cht` holds, and pm does not start a hooked application until its hooker
   says so, so taking it would make every game launch wait on this process.
+  M10-26 (#261) asks the same session which application it is
+  (`pmdmntGetProgramId`), so a play session names the title seen writing its
+  save, at no new grant or handle.
 
 ## Where the work is
 

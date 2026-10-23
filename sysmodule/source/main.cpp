@@ -1269,9 +1269,23 @@ bool g_pm_up = false;
 /// A poll and not a hook, deliberately: `pmdmntHookToCreateApplicationProcess`
 /// is the one hook `dmnt:cht` holds, and pm does not start a hooked application
 /// until the hooker says so (`boot.foreground` refuses a hook here).
-bool ApplicationRunning() {
+///
+/// **And which application** (M10-26, #261): `pmdmntGetProgramId`, on the same
+/// `pm:dmnt` session, so no new service, grant or handle. libnx sends it as
+/// command 7 under Atmosphere on any firmware, and on stock from 14.0.0. A
+/// failure leaves the id out -- the play session says "unknown" -- and never
+/// turns a running game into none: the hold is the half that protects saves.
+/// The id is the *application's*: a Tico module's, or for RetroArch launched
+/// over a title, that borrowed title's.
+rommsync::play::Foreground ApplicationRunning() {
+  rommsync::play::Foreground seen;
   u64 pid = 0;
-  return R_SUCCEEDED(pmdmntGetApplicationProcessId(&pid));
+  seen.running = R_SUCCEEDED(pmdmntGetApplicationProcessId(&pid));
+  u64 program_id = 0;
+  if (seen.running && R_SUCCEEDED(pmdmntGetProgramId(&program_id, pid)) && program_id != 0) {
+    seen.program_id = program_id;
+  }
+  return seen;
 }
 
 /// Whether the "this sm will not answer 65100" note has already been taken. One

@@ -196,6 +196,12 @@ enum class Event {
   /// tick**: the feature is optional, and a server that will not answer it
   /// still syncs.
   kRemoteInstall,
+
+  /// A play session this console recorded (M10-26, #261): the rom, the slot,
+  /// the upper bound and the application seen writing the save, or "unknown".
+  /// The one place a title is seen, because the completion that carries the
+  /// session usually releases it from `play.db` in the same tick.
+  kPlayRecorded,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -209,6 +215,7 @@ inline constexpr std::array kAllEvents = {
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
     Event::kSyncHeld,    Event::kSaveDeleted, Event::kRemoteInstall,
+    Event::kPlayRecorded,
 };
 
 /// Stable tag -- `net.offline`. Never null.

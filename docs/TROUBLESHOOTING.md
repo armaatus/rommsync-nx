@@ -110,6 +110,7 @@ and a log is not worth it. A save is never in that position; see
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
+| `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -699,6 +700,22 @@ and the status screen says *partial* — for the sync that runs once the game
 closes. Downloads from
 the queue are not held — a rom is not a save — so a rom queued from the overlay
 mid-game still comes down.
+
+**The play time it records.** The sync after the game names what you played,
+one line per save that changed, with the application the console saw in the
+foreground when the save was written — its title id:
+
+```
+22 info play.recorded rom 12 slot autosave: played up to 31 min, title 0100000000ABC000
+```
+
+"Up to", because the console knows when it last looked and when the save was
+written, not when you started. `title unknown` is not a fault: the console only
+looks while a sync is waiting for a game, so a game played entirely between two
+syncs is never seen, and neither is a save written just as a second application
+came up. The title is the *application's* — a Tico module, or for RetroArch
+launched over a game, that game's — and the rom is the one the save belongs to.
+RomM has nowhere to keep the title, so the log is the only place it appears.
 
 **When to report it.** If a `sync.held` line is never followed by a `sync.tick`
 after you have closed the game and gone back to the HOME Menu, attach the log

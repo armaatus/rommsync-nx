@@ -151,6 +151,7 @@ void SdEngine::UseForegroundProbe(ForegroundProbe probe, std::chrono::millisecon
   std::lock_guard<std::mutex> lock(mutex_);
   foreground_probe_ = std::move(probe);
   foreground_poll_ = poll;
+  sightings_ = play::Sightings(play::SlackFor(poll));
 }
 
 bool SdEngine::application_running() const {
@@ -159,9 +160,25 @@ bool SdEngine::application_running() const {
     std::lock_guard<std::mutex> lock(mutex_);
     probe = foreground_probe_;
   }
+  if (!probe) {
+    return false;
+  }
   // Outside the lock: on a console this is a service call to `pm`, and
   // `mutex_` guards what the frame-polled commands read.
-  return probe && probe();
+  const play::Foreground seen = probe();
+  if (seen.program_id.has_value()) {
+    const sync::Timestamp at = std::chrono::system_clock::now();
+    std::lock_guard<std::mutex> lock(mutex_);
+    sightings_.Note(seen, at);
+  }
+  return seen.running;
+}
+
+play::Sightings SdEngine::TakeSightings() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  play::Sightings taken = sightings_;
+  sightings_.Clear();
+  return taken;
 }
 
 void SdEngine::Wake() {
@@ -1565,6 +1582,10 @@ void SdEngine::StampPlayWindow() {
   // Moving it can only ever *lose* a session -- a save written before this
   // stamp and noticed after it is skipped -- and that is the safe direction:
   // play time nobody played is the failure nobody can correct.
+  //
+  // What the foreground was seen doing goes with it: nothing seen before the
+  // window opens can have written a save the next window finds (#261).
+  static_cast<void>(TakeSightings());
   LogPlayStore(play_.Record({}, std::chrono::system_clock::now()));
 }
 
@@ -2351,9 +2372,16 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   // would be an optional extra taking hard rule 2's machinery down with it.
   const sync::Timestamp play_now = std::chrono::system_clock::now();
   if (config.sync.enabled) {
-    const play::Derivation played =
+    play::Derivation played =
         play::DeriveSessions(ObservationsOf(found.loaded.value), ObservationsOf(found.scanned.saves),
                              play_.last_seen(), play_now);
+    // Which application wrote each save, where a held tick saw one (#261), and
+    // a line per session: the completion below usually releases them from
+    // `play.db` in this same tick, so the log is where a title is seen at all.
+    play::AttributeTitles(&played.sessions, TakeSightings());
+    for (const sync::PlaySession& session : played.sessions) {
+      log::Info(log::Event::kPlayRecorded, play::Describe(session));
+    }
     LogPlayStore(play_.Record(played.sessions, play_now));
     found.play_sent = play_.Pending(play::kMaxSessions);
   } else {

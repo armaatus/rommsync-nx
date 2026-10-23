@@ -326,6 +326,11 @@ class Sightings {
   std::vector<TitleSpan> spans_;
 };
 
+/// The `slack` for a probe asked every `poll`: twice it -- a poll the worker
+/// ran late, behind a list page, is not a game that closed -- in whole seconds,
+/// because an mtime is.
+std::chrono::seconds SlackFor(std::chrono::milliseconds poll);
+
 /// The granularity of the mtime a session ends at: FAT keeps two seconds. A
 /// save stamped up to this much before an application's first sighting can
 /// still be its write.
@@ -343,6 +348,13 @@ void AttributeTitles(std::vector<sync::PlaySession>* sessions, const Sightings& 
 /// `session.title_id` as sixteen upper-case hex digits -- how Atmosphere names
 /// a title's folder -- or `kUnknownTitle`.
 std::string TitleOf(const sync::PlaySession& session);
+
+/// One recorded session as a log line: `rom 12 slot tico-srm: played up to 31
+/// min, title 0100000000ABC000`. "Up to" because `duration_ms` is the window,
+/// an upper bound (see the header note). The log is where the title is seen at
+/// all: a session the completion carries is released from `play.db` in the
+/// tick that derived it.
+std::string Describe(const sync::PlaySession& session);
 
 // --- the buffer on the card ---------------------------------------------------
 

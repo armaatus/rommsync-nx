@@ -1241,7 +1241,10 @@ bounds.
   again every few seconds (`pmdmntGetApplicationProcessId`); one tick runs once
   the game has closed, however many fell due. "Sync now" during a game is that
   same tick (`SyncOutcome::kDeferred`). The download queue is not held — a rom is
-  not a save. `engine.foreground` holds this against the real RomM.
+  not a save. `engine.foreground` holds this against the real RomM. What the
+  hold sees running is also the title a play session names (#261,
+  `play.recorded`): the application seen when the save was written, or
+  `unknown` — never used to find the rom, which is the save's.
 - Partial plan failure → complete with the accurate `operations_failed`; leave
   unsynced files for next tick. Never leave a half-written save (write to temp,
   fsync, rename). An `action` this build does not recognise is counted with

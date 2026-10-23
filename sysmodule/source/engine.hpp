@@ -360,12 +360,21 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// The download queue and the list pages are **not** held: a rom is not a
   /// save, and the overlay is used from inside a game, so a rom queued there
   /// that waited for the game to close would be the queue screen not working.
-  using ForegroundProbe = std::function<bool()>;
+  ///
+  /// **And which application it is, when `pm` will say** (M10-26, #261). Every
+  /// answer that names one is a sighting (`play::Sightings`), and the tick after
+  /// the game gives each play session the application seen when its save was
+  /// written -- "unknown" when none was. Only the hold asks, so a game played
+  /// entirely between two ticks is never seen: deliberately, because asking
+  /// between ticks would be a poll on a console with nothing owed, which #242
+  /// keeps at none.
+  using ForegroundProbe = std::function<play::Foreground()>;
   void UseForegroundProbe(ForegroundProbe probe,
                           std::chrono::milliseconds poll = kForegroundPollInterval);
 
-  /// The probe's answer, now. `ipc::ServiceCore::SyncNow` reads it to say a
-  /// press is held rather than started (`ipc::SyncOutcome::kDeferred`).
+  /// The probe's answer, now, noted as a sighting when it names an application.
+  /// `ipc::ServiceCore::SyncNow` reads it to say a press is held rather than
+  /// started (`ipc::SyncOutcome::kDeferred`).
   bool application_running() const override;
 
   /// The network the library is read over, and the token to read it with.
@@ -1022,6 +1031,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// play time as well as the exaggeration.
   void StampPlayWindow();
 
+  /// The sightings since the window last moved, forgotten here as they are
+  /// handed over: the window is about to move (#261). Takes `mutex_`.
+  play::Sightings TakeSightings();
+
   /// Say so when the play-session buffer could not be written (M7-4, #39).
   ///
   /// Every `play::StoreResult` in this class goes through here, because the
@@ -1378,6 +1391,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `mutex_`, and the probe is copied out and called outside it.
   ForegroundProbe foreground_probe_;
   std::chrono::milliseconds foreground_poll_ = kForegroundPollInterval;
+
+  /// What the probe named since the play window last moved (#261). Guarded by
+  /// `mutex_`; `mutable` because `application_running` is the one place that
+  /// asks, and it is const for the IPC surface. Replaced, slack and all, by
+  /// `UseForegroundProbe`, and cleared wherever `play_` stamps the window.
+  mutable play::Sightings sightings_{play::SlackFor(kForegroundPollInterval)};
 
   /// A tick is being held for a running game. Only the worker touches it; it
   /// is what makes `sync.held` one line per game rather than one per re-check.

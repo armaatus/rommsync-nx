@@ -7,11 +7,12 @@
 // grow a file forever, it does not re-send what the server already has, and it
 // never fails a sync tick.
 //
-// Five scenarios need no server and must stay checked with docker stopped:
+// Six scenarios need no server and must stay checked with docker stopped:
 // `encode` is the wire body both endpoints carry, `derive` is the mtime
 // arithmetic with an injected clock (the acceptance criterion that says nothing
 // here is verified on hardware -- hard rule 1), `store` is the bounded file that
-// survives a reboot, `reconcile` is what an answer releases, and `tick` is the
+// survives a reboot, `titled` is which application wrote a save (#261, against
+// a fake foreground), `reconcile` is what an answer releases, and `tick` is the
 // promise that a session the encoder refuses costs the play time and not the
 // completion.
 //
@@ -736,6 +737,11 @@ void Titled(rig::Checks& checks) {
   checks.ExpectEq(play::TitleOf(unseen), std::string("0100000000ABC000"),
                   "upper case");
 
+  checks.ExpectEq(play::SlackFor(std::chrono::milliseconds{5000}).count(),
+                  std::chrono::seconds::rep{10}, "the console's five-second poll gives ten");
+  checks.ExpectEq(play::SlackFor(std::chrono::milliseconds{50}).count(),
+                  std::chrono::seconds::rep{1}, "and a test's fifty milliseconds a whole second");
+
   // A Tico game played under a held tick, quit back to the library at
   // kNoon - 300, the library left open for a while.
   play::Sightings sightings(std::chrono::seconds{10});
@@ -798,6 +804,21 @@ void Titled(rig::Checks& checks) {
                     "and the newest are the ones kept");
     busy.Clear();
     checks.Expect(busy.spans().empty(), "and a stamped window forgets them");
+  }
+
+  // The log line a recorded session is, which is where a user meets the title:
+  // a session sent with the tick that derived it never waits in play.db.
+  {
+    sync::PlaySession played = SessionOf(12, "tico-srm", kNoon - 1860, kNoon);
+    played.title_id = kModule;
+    checks.ExpectEq(play::Describe(played),
+                    std::string("rom 12 slot tico-srm: played up to 31 min, title 0100000000ABC000"),
+                    "a recorded session names its rom, its slot, its bound and its title");
+    sync::PlaySession archival = SessionOf(12, "", kNoon - 45, kNoon);
+    archival.save_slot.reset();
+    checks.ExpectEq(play::Describe(archival),
+                    std::string("rom 12: played up to 45 s, title unknown"),
+                    "and one nothing attributed says unknown");
   }
 
   // The title is the client's record, never the server's: neither ingest entry

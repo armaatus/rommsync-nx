@@ -125,6 +125,7 @@ namespace ipc = rommsync::ipc;
 // redeclares it (clang accepts it, which is how this reached CI once).
 namespace crypto = rommsync::crypto;
 namespace rlog = rommsync::log;
+namespace play = rommsync::play;
 namespace power = rommsync::sysmodule::power;
 namespace sysmodule = rommsync::sysmodule;
 
@@ -4001,12 +4002,23 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   c.Expect(console.sandbox.Write(save, played), "a save on the card the server does not have");
 
   std::atomic<bool> running{true};
+  // Which application `pm` names, for the third game (#261). Zero is one it
+  // would not name, which is what the first two games are.
+  std::atomic<std::uint64_t> title{0};
   LaunchesMidTick counted(client, running);
   const std::unique_ptr<fs::FileSystem> card =
       rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
   console.Boot();
-  console.engine.UseForegroundProbe([&running] { return running.load(); },
-                                    std::chrono::milliseconds{50});
+  console.engine.UseForegroundProbe(
+      [&running, &title] {
+        play::Foreground foreground;
+        foreground.running = running.load();
+        if (foreground.running && title.load() != 0) {
+          foreground.program_id = title.load();
+        }
+        return foreground;
+      },
+      std::chrono::milliseconds{50});
   console.engine.UseServer(&counted, token.access_token);
   console.engine.UseCard(card.get());
   console.engine.StartWorker();
@@ -4120,6 +4132,42 @@ int Foreground(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(heartbeats, std::size_t{1},
              "one heartbeat in the whole run: the tick that ran after the first game read "
              "it, the held ticks never did, and the second tick reused the answer (#228)");
+
+  // **Which title was played** (M10-26, #261). A third game, one `pm` names,
+  // writes nova's save while a press is held for it -- the module's exit write
+  // -- and closes. The tick after it derives the session from the save and
+  // names the application seen writing it. Past a whole second first, so the
+  // save's mtime lands after the window the second tick stamped.
+  std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+  title = 0x0100'0000'00AB'C000ULL;
+  running = true;
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kDeferred, "a third game holds a press");
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  c.Expect(console.sandbox.Write(save, "what the third game wrote as it closed\n"),
+           "the game writes its save");
+  std::this_thread::sleep_for(std::chrono::milliseconds{200});
+  running = false;
+  const std::chrono::steady_clock::time_point third_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 3 && std::chrono::steady_clock::now() < third_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  const ipc::LogTail titled_log = console.Log();
+  c.ExpectEq(ticks.ticks(), 3, "the tick after the third game runs" + Rendered(titled_log));
+  bool named = false;
+  for (const std::string& line : titled_log.lines) {
+    named = named || (line.find(" play.recorded rom " + std::to_string(rom.id) + " slot ") !=
+                          std::string::npos &&
+                      line.find(", title 0100000000ABC000") != std::string::npos);
+  }
+  c.Expect(named, "and records nova's session under the title seen writing it" +
+                      Rendered(titled_log));
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+    if (std::find(before.begin(), before.end(), id) == before.end() &&
+        std::find(uploaded.begin(), uploaded.end(), id) == uploaded.end()) {
+      uploaded.push_back(id);
+    }
+  }
 
   for (const std::int64_t id : uploaded) {
     harness::DeleteSave(client, base, fixture, id);
@@ -5255,8 +5303,13 @@ int StatesGuarded(http::HttpClient& client, const std::string& base) {
       return std::nullopt;
     });
     console.Boot();
-    console.engine.UseForegroundProbe([&running] { return running.load(); },
-                                      std::chrono::milliseconds{50});
+    console.engine.UseForegroundProbe(
+        [&running] {
+          play::Foreground foreground;
+          foreground.running = running.load();
+          return foreground;
+        },
+        std::chrono::milliseconds{50});
     console.engine.UseServer(&wire, std::string());
     console.engine.UseCard(card.get());
     console.engine.StartWorker();
