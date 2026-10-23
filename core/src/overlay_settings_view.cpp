@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -12,6 +13,8 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "rommsync/overlay_sync_actions.hpp"
+#include "rommsync/save_source.hpp"
+#include "rommsync/tico.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -189,6 +192,23 @@ SettingsSection TicoSection(const config::TicoConfig& tico,
   return section;
 }
 
+/// Whether `slug`'s map lists a folder Tico keeps its saves or states in --
+/// what `place::Placer` needs before it can place anything in Tico.
+bool MapsTicoFolder(const config::Config& config, const std::string& slug) {
+  const config::PlatformFolders* folders = config.Platform(slug);
+  if (folders == nullptr) {
+    return false;
+  }
+  for (const std::vector<std::string>* list : {&folders->saves, &folders->states}) {
+    for (const std::string& folder : *list) {
+      if (scan::SourceOf(folder).source == scan::Source::kTico && !tico::RootOf(folder).empty()) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /// `[platform.<slug>] play_with` (#237, #258, #271): where a save new to the
 /// card is placed, and whose copy syncs when Tico and RetroArch both hold one.
 /// Offered: neither placement writes over a file, and a copy that starts
@@ -201,12 +221,7 @@ SettingsRow PlayWithRow(const config::Config& config, const std::string& slug) {
   // A platform Tico runs has Tico as its default, so the cycle is the two
   // emulators. Any other has none, and "not set" -- an empty value, which puts
   // the default back -- is one of the values a press visits.
-  bool has_default = false;
-  {
-    config::Config bare;
-    has_default = bare.PlayWithFor(slug).has_value();
-  }
-  if (has_default) {
+  if (config::DefaultPlayWith(slug).has_value()) {
     static constexpr Choice kValues[] = {
         {"Tico", "tico", "a save new to the card goes to Tico; its copy syncs if both have one"},
         {"RetroArch", "retroarch",
@@ -214,13 +229,30 @@ SettingsRow PlayWithRow(const config::Config& config, const std::string& slug) {
     };
     return Changeable(section, "play_with", kValues, word);
   }
+  if (MapsTicoFolder(config, slug)) {
+    static constexpr Choice kValues[] = {
+        {"Not set", "", "no emulator named: a save new to the card is not placed"},
+        {"RetroArch", "retroarch",
+         "a save new to the card goes to RetroArch; its copy syncs if both have one"},
+        {"Tico", "tico", "a save new to the card goes to Tico; its copy syncs if both have one"},
+    };
+    return Changeable(section, "play_with", kValues, word);
+  }
+  // With no Tico folder in the map, Tico is a value `place::Placer` refuses
+  // every placement under, so it is not offered. A `tico` already written in
+  // config.ini is shown for what it does, and a press leaves it.
   static constexpr Choice kValues[] = {
       {"Not set", "", "no emulator named: a save new to the card is not placed"},
       {"RetroArch", "retroarch",
        "a save new to the card goes to RetroArch; its copy syncs if both have one"},
-      {"Tico", "tico", "a save new to the card goes to Tico; its copy syncs if both have one"},
   };
-  return Changeable(section, "play_with", kValues, word);
+  if (in_force != config::PlayWith::kTico) {
+    return Changeable(section, "play_with", kValues, word);
+  }
+  SettingsRow row = Changeable(section, "play_with", kValues, "");
+  row.value = "Tico";
+  row.note = "the folder map lists no Tico folder for it: a save new to the card is not placed";
+  return row;
 }
 
 /// `[sources]` (#230, #264).
