@@ -84,13 +84,6 @@ const char* EventText(conflicts::Event event, conflicts::EntryKind kind) {
   return "overwritten";
 }
 
-/// A save conflict with a slot: the one entry Keep local can apply to (#249),
-/// the same test `conflicts::KeepLocal` makes before it writes anything.
-bool IsSaveConflict(const conflicts::Entry& entry) {
-  return entry.kind == conflicts::EntryKind::kSave && entry.event == conflicts::Event::kConflict &&
-         entry.slot.has_value();
-}
-
 constexpr ConflictChoice kChoices[] = {ConflictChoice::kKeepServer, ConflictChoice::kKeepLocal,
                                        ConflictChoice::kSkip};
 constexpr int kLastChoice = static_cast<int>(std::size(kChoices)) - 1;
@@ -170,7 +163,8 @@ std::string_view ChoiceMeaning(ConflictChoice choice) {
       return "The server's copy stays on the card, as the sync left it. Nothing is sent.";
     case ConflictChoice::kKeepLocal:
       return "This console's bytes go back on the card, and the next sync uploads them over "
-             "the server's copy. The server keeps that copy as an older version.";
+             "the server's copy. RomM deletes nothing: that copy stays on the server behind "
+             "this one.";
     case ConflictChoice::kSkip:
       return "Decide later. Nothing changes, and this choice stays here.";
   }
@@ -531,7 +525,7 @@ void ConflictsModel::OnLinkRestored() {
 void ConflictsModel::MoveSelection(int delta) {
   if (mode_ == ConflictsMode::kConfirm) {
     const ipc::ConflictRow* row = Current();
-    if (row != nullptr && IsSaveConflict(row->entry)) {
+    if (row != nullptr && row->entry.save_conflict()) {
       choice_ = std::clamp(choice_ + delta, 0, kLastChoice);
     }
     return;
@@ -611,7 +605,7 @@ void ConflictsModel::Activate() {
         return;
       }
       bool keep_local = false;
-      if (IsSaveConflict(row->entry)) {
+      if (row->entry.save_conflict()) {
         switch (kChoices[choice_]) {
           case ConflictChoice::kKeepServer:
             // Already done: the sync put the server's copy on the card. The
@@ -816,7 +810,7 @@ ConflictsView ConflictsModel::Render() const {
   }
 
   view.can_restore = restorable == Restorability::kReady && !restored_ && restoring_ == 0;
-  view.keep_choice = IsSaveConflict(entry);
+  view.keep_choice = entry.save_conflict();
 
   if (mode_ == ConflictsMode::kConfirm && view.keep_choice) {
     for (const ConflictChoice choice : kChoices) {

@@ -900,7 +900,12 @@ void KeepLocal(checks::Checks& c) {
     const auto key = [](std::int64_t rom) {
       return state::Baseline::Key{rom, std::string("autosave")};
     };
-    std::vector<state::Baseline::Key> keep = {key(1), key(2), key(3), key(4), key(5), key(6)};
+    std::vector<state::Baseline::Key> keep = {key(1), key(2), key(3), key(4), key(5), key(6),
+                                              key(7)};
+    // Key 7 was armed after the plan went out: the plan carried no override
+    // for it, so its upload did not spend it.
+    const std::vector<state::Baseline::Key> sent = {key(1), key(2), key(3), key(4), key(5),
+                                                    key(6)};
     sync::ExecutionReport executed;
     executed.operations = {
         Ran(1, "autosave", sync::Action::kUpload, sync::OperationOutcome::kUploaded),
@@ -913,11 +918,12 @@ void KeepLocal(checks::Checks& c) {
             sync::OperationError::kRefused),
         Ran(7, "autosave", sync::Action::kUpload, sync::OperationOutcome::kUploaded),
     };
-    sync::SpendKeepLocal(&keep, executed);
-    c.Expect(keep == std::vector<state::Baseline::Key>{key(2), key(4), key(5)},
+    sync::SpendKeepLocal(&keep, sent, executed);
+    c.Expect(keep == std::vector<state::Baseline::Key>{key(2), key(4), key(5), key(7)},
              "the upload that went, the refused one and the download spend theirs; the "
-             "transfer that failed, the cancelled one and the save the plan never named keep "
-             "theirs (" + std::to_string(keep.size()) + " left)");
+             "transfer that failed, the cancelled one, the save the plan never named and the "
+             "choice armed after it went out keep theirs (" + std::to_string(keep.size()) +
+                 " left)");
   }
 }
 

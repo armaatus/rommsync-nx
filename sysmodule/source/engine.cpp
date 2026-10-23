@@ -2438,8 +2438,8 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
   // `keep` says leave it.
   options.execute.on_server_delete = config.sync.on_server_delete;
   // The player's Keep local, and nothing else, sends `overwrite=true` (#249).
-  // A copy: the plans spend what they answer (`TallyPlan`), and a restore taken
-  // while this tick runs arms a choice the next tick sends.
+  // A copy: the plans spend what they answer of it (`RunSavesHalf`), and a
+  // restore taken while this tick runs arms a choice the next tick sends.
   {
     std::lock_guard<std::mutex> lock(mutex_);
     options.execute.keep_local = keep_local_;
@@ -2487,8 +2487,16 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
   // **Every operation is read here, plan by plan**, and not off the result:
   // a tick runs each chunk's plan on its own and frees it before the next
   // (#246), so `tick.executed` is the last plan's alone (`TickOptions::on_plan`).
-  options->on_plan = [this, found, &record, tally](const sync::SyncPlan& plan,
-                                                  const sync::ExecutionReport& executed) {
+  const std::vector<state::Baseline::Key>* sent = &options->execute.keep_local;
+  options->on_plan = [this, found, &record, tally, sent](const sync::SyncPlan& plan,
+                                                        const sync::ExecutionReport& executed) {
+    // A Keep local this plan answered has had its one upload (#249). Only one
+    // this tick *sent*: a restore that lands while the tick runs arms a choice
+    // this plan never carried.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      sync::SpendKeepLocal(&keep_local_, *sent, executed);
+    }
     TallyPlan(plan, executed, found->reported, record, tally);
   };
 
@@ -2568,12 +2576,6 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
 void SdEngine::TallyPlan(const sync::SyncPlan& plan, const sync::ExecutionReport& executed,
                          const std::vector<sync::ClientSaveState>& reported,
                          const conflicts::RecordOptions& record, SavesTally* tally) {
-  // A Keep local this plan answered has had its one upload (#249).
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    sync::SpendKeepLocal(&keep_local_, executed);
-  }
-
   // A rom whose restore was cut off -- the link, the server, the card -- keeps
   // its place in `fresh_roms_`, or the next tick would read its save as one the
   // user deleted and never bring it. A refusal that asking again cannot change

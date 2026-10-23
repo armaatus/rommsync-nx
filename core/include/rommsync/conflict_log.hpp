@@ -255,6 +255,13 @@ struct Entry {
 
   /// True when this entry could be restored if the backup is still there.
   bool restorable() const { return Overwrote(event) && !backup_sd_path.empty(); }
+
+  /// True for a save conflict with a slot: the one entry Keep local applies to
+  /// (#249). The screen offers the choice by it and `conflicts::KeepLocal`
+  /// refuses by it, so the two cannot disagree.
+  bool save_conflict() const {
+    return kind == EntryKind::kSave && event == Event::kConflict && slot.has_value();
+  }
 };
 
 /// One entry as a JSON object -- **the row in `conflicts.db` and the item in an

@@ -265,8 +265,7 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
                         state::Baseline::Key* key, const RestoreOptions& options) {
   const Entry* entry = history.Find(entry_id);
-  if (entry != nullptr && (entry->kind != EntryKind::kSave || entry->event != Event::kConflict ||
-                           !entry->slot.has_value())) {
+  if (entry != nullptr && !entry->save_conflict()) {
     RestoreReport refused;
     refused.outcome = RestoreOutcome::kNotAConflict;
     refused.message = entry->file_name +
@@ -285,8 +284,8 @@ RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int6
       (report.backup_sd_path.empty()
            ? std::string(", and there was nothing there to keep")
            : ", and the server's copy that was there is under " + report.backup_sd_path) +
-      ". The next sync uploads them over the server's copy, which stays on the server as an "
-      "older version.";
+      ". The next sync uploads them over the server's copy; RomM deletes nothing, so that copy "
+      "stays on the server behind this one.";
   return report;
 }
 

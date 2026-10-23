@@ -445,8 +445,9 @@ and it is the only thing that ever sends `overwrite=true`:
    answers the key **spends** it (`sync::SpendKeepLocal`): an upload that went or
    was refused, or any other action -- the server asking for no upload. Only an
    upload that never reached the server, or a plan that did not name the save,
-   keeps it for the next. So the choice is one upload's: a later upload of the
-   save meets the guard as every upload does.
+   keeps it for the next, as does a choice armed after the plan went out. So
+   the choice is one upload's: a later upload of the save meets the guard as
+   every upload does.
 
 The choice is held in memory. A reboot before its tick forgets it, and the
 restored bytes then meet the guard like any upload: a 409 is resolved as a

@@ -520,8 +520,12 @@ void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local,
 }
 
 void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                    const std::vector<state::Baseline::Key>& sent,
                     const ExecutionReport& executed) {
-  const auto answered = [&executed](const state::Baseline::Key& key) {
+  const auto answered = [&executed, &sent](const state::Baseline::Key& key) {
+    if (FindByKey(sent, key) == nullptr) {
+      return false;  // armed after this plan went out: it carried no override
+    }
     const OperationResult* result = FindByKey(executed.operations, key);
     if (result == nullptr) {
       return false;  // not in this plan: a later one may name it

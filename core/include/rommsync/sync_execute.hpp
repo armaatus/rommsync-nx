@@ -786,8 +786,12 @@ void ArmKeepLocal(std::vector<state::Baseline::Key>* keep_local, const state::Ba
 /// armed past that would let some later upload, days on, supersede a save
 /// nobody chose to replace. An upload that never reached the server -- a
 /// transfer that failed, a cancellation -- keeps its key for the next plan, as
-/// does a key no operation of `executed` names.
+/// does a key no operation of `executed` names. A key that is not in `sent` --
+/// the list the plan was executed with -- is kept whatever the plan did: it was
+/// armed after the plan went out, so the plan's upload of it carried no
+/// override.
 void SpendKeepLocal(std::vector<state::Baseline::Key>* keep_local,
+                    const std::vector<state::Baseline::Key>& sent,
                     const ExecutionReport& executed);
 
 /// Execute `plan`, one operation at a time, in the order the server sent them.
