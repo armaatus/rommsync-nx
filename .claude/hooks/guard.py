@@ -20,7 +20,11 @@ Commands are shell-tokenised with shlex rather than matched as raw strings, so
 `git -C /some/path push --force origin main` is caught and
 `git commit -m "note about --force pushes"` is not. Compound commands are split
 on `;`, `&&`, `||`, `|` and `&` -- outside quotes only -- and each segment is
-judged on its own, and `bash -c` is recursed into.
+judged on its own. A segment is judged by the command it runs, past shell
+keywords (`then`, `{`), assignments and wrappers (`env`, `sudo`, `timeout 5`);
+a command carried in an argument -- `bash -c`, `eval`, `ssh host` -- and the
+commands inside `$(...)` and backticks are judged as commands too. A heredoc
+body and a single-quoted string are data.
 
 What this is NOT: a sandbox. It reads a command and decides; it does not confine
 one. A session that means to get past it can. The line it holds is the ROUTINE
@@ -483,7 +487,17 @@ _WRAPPERS = {
     "nohup": (),
     "time": ("-f", "-o"),
     "exec": ("-a",),
+    "timeout": ("-s", "-k", "--signal", "--kill-after"),
+    "nice": ("-n",),
+    "xargs": ("-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a"),
 }
+
+# The wrappers that take positional operands of their own before the command:
+# `timeout 5 cp ...` runs `cp`, not `5`.
+_WRAPPER_OPERANDS = {"timeout": 1}
+
+# The shell's own words that put a command after them: `then cp ...` is `cp`.
+_KEYWORDS = {"{", "!", "if", "then", "elif", "else", "do", "while", "until"}
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
@@ -508,18 +522,19 @@ def _in_place(words, verb):
 
 
 def _unwrapped(words):
-    """`words` with leading assignments and wrapper commands peeled off."""
+    """`words` with leading keywords, assignments and wrapper commands peeled off."""
     while words:
-        if _ASSIGNMENT.match(words[0]):
+        if _ASSIGNMENT.match(words[0]) or words[0] in _KEYWORDS:
             words = words[1:]
             continue
-        takes_value = _WRAPPERS.get(_verb(words))
+        verb = _verb(words)
+        takes_value = _WRAPPERS.get(verb)
         if takes_value is None:
             return words
         i = 1
         while i < len(words) and (words[i].startswith("-") or _ASSIGNMENT.match(words[i])):
             i += 2 if words[i] in takes_value else 1
-        words = words[i:]
+        words = words[i + _WRAPPER_OPERANDS.get(verb, 0):]
     return words
 
 
@@ -688,21 +703,21 @@ def _written_paths(segment):
     return verb, [w for w in writes if w[0]], c_dir
 
 
-def _joined(prefix, path):
+def _prefixed(prefix, path):
     """`path` under `prefix`, uncollapsed. A falsy prefix leaves it alone."""
     if path.startswith("/") or not prefix:
         return path
     return prefix.rstrip("/") + "/" + path
 
 
-def _join(prefix, path):
+def _resolve(prefix, path):
     """`path` as seen from `prefix`, collapsed; the raw path when unknowable.
 
     A `prefix` of None is "somewhere this cannot work out" and "" is "a
     relative root it does not know": either way the path is judged on its own
     tail, which is what the path rules match.
     """
-    collapsed = _collapse(_joined(prefix, path))
+    collapsed = _collapse(_prefixed(prefix, path))
     return collapsed if collapsed else path
 
 
@@ -721,7 +736,7 @@ def _after_cd(prefix, words):
         return None
     if not target.startswith("/") and prefix is None:
         return None
-    return _collapse(_joined(prefix, target))
+    return _collapse(_prefixed(prefix, target))
 
 
 def _collapse(path):
@@ -777,9 +792,9 @@ def _check_writes(segment, prefix):
     """Rule 3 from the shell: the paths a command writes, judged as an Edit is."""
     verb, writes, c_dir = _written_paths(segment)
     if c_dir is not None:
-        prefix = _join(prefix, c_dir) if prefix is not None or c_dir.startswith("/") else None
+        prefix = _resolve(prefix, c_dir) if prefix is not None or c_dir.startswith("/") else None
     for path, sources, reaches_all in writes:
-        full = _join(prefix, path)
+        full = _resolve(prefix, path)
         # Absolute -- because the shell's cwd is known, or the path was -- means
         # the protected paths are matched where they actually are, not on a tail
         # that any scratch `/tmp/.../captures/` also ends in.
@@ -801,49 +816,111 @@ def check_bash(command, cwd=None):
     """
     branch_cache = [None]
     prefix = cwd if isinstance(cwd, str) else ""
+    # The shell runs a substitution to build the line's words, wherever it
+    # stands. Where that is after a `cd` this does not track, so its paths are
+    # judged on their own tails rather than resolved against a guess.
+    for inner in _substitutions(command):
+        check_bash(inner)
     for segment in _segments(command):
         words = _words(segment)
         if not words:
             continue
         # `(cd x && ...)`: the subshell's parenthesis is not part of the verb.
         words[0] = words[0].lstrip("(")
-        if _verb(words) in ("cd", "pushd"):
+        words = _unwrapped(words)
+        verb = _verb(words)
+        if verb in ("cd", "pushd"):
             # Before the prefix moves: a redirect on the `cd` line is written
             # where the shell already stands.
             _check_writes(segment, prefix)
             prefix = _after_cd(prefix, words)
             continue
-        if _verb(words) == "popd":
+        if verb == "popd":
             prefix = None
             continue
-        # `bash -c "..."` is a command in an argument. Judge what it will run --
-        # and, first, where its own output is redirected.
-        if _verb(words) in ("bash", "sh", "zsh", "dash") and "-c" in words:
+        # `bash -c "..."` and `eval "..."` are a command in an argument. Judge
+        # what they will run -- and, first, where their own output is
+        # redirected.
+        script = _carried_script(words)
+        if script is not None:
             _check_writes(segment, prefix)
-            idx = words.index("-c")
-            if idx + 1 < len(words):
-                check_bash(words[idx + 1], prefix)
+            check_bash(script, prefix)
             continue
         # `ssh host "..."` runs its argument on the far side, as bash -c does
-        # here. Quote-blind splitting caught that by accident; the quote-aware
-        # split needs it said. Only the merge, review and force-push rules
-        # cross: the far side's paths are not this tree's.
-        if _verb(words) == "ssh":
-            remote = _ssh_remote(words)
-            if remote:
-                for far in _segments(remote):
-                    far_words = _words(far)
-                    if far_words:
-                        _check_merge(far_words)
-                        _check_review(far_words)
-                        _check_force_push(far_words, branch_cache)
+        # here. Only the merge, review and force-push rules cross: the far
+        # side's paths are not this tree's.
+        if verb == "ssh":
+            for far in _segments(_ssh_remote(words)):
+                _check_acts(_unwrapped(_words(far)), branch_cache)
             _check_writes(segment, prefix)
             continue
-        _check_merge(words)
-        _check_review(words)
-        _check_force_push(words, branch_cache)
+        _check_acts(words, branch_cache)
         _check_writes(segment, prefix)
     return 0
+
+
+def _check_acts(words, branch_cache):
+    """Rules 1, 2 and 4: the acts that are the same act on any machine."""
+    _check_merge(words)
+    _check_review(words)
+    _check_force_push(words, branch_cache)
+
+
+_SHELLS = ("bash", "sh", "zsh", "dash")
+_C_FLAG = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
+
+
+def _carried_script(words):
+    """The command line `bash -c` (`-lc`, `-ec` ...) or `eval` runs, or None."""
+    verb = _verb(words)
+    if verb == "eval":
+        return " ".join(words[1:])
+    if verb not in _SHELLS:
+        return None
+    for i, w in enumerate(words[1:], 1):
+        if _C_FLAG.match(w):
+            return words[i + 1] if i + 1 < len(words) else ""
+    return None
+
+
+def _substitutions(command):
+    """The commands inside the line's `$(...)` and backticks.
+
+    Double quotes do not stop the shell running them, so a commit message with
+    `$(...)` in it runs it; single quotes and a heredoc body do (see
+    `_strip_heredocs`). Arithmetic `$((...))` runs nothing.
+    """
+    text = _strip_heredocs(command)
+    quote, i = None, 0
+    while i < len(text):
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                quote = None
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'" and quote is None:
+            quote = c
+        elif c == '"':
+            quote = None if quote else c
+        elif c == "`":
+            end = text.find("`", i + 1)
+            end = len(text) if end < 0 else end
+            yield text[i + 1:end]
+            i = end + 1
+            continue
+        elif text.startswith("$(", i) and not text.startswith("$((", i):
+            depth, j = 1, i + 2
+            while j < len(text) and depth:
+                depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+            yield text[i + 2:j - 1 if depth == 0 else j]
+            i = j
+            continue
+        i += 1
 
 
 # ssh(1)'s options that take a value: the word after one is not the host.

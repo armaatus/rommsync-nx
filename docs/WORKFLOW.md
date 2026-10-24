@@ -257,9 +257,11 @@ Three properties are deliberate:
 - **It does not fail open.** An unreadable payload or an unparseable command
   blocks, and so does a `guard.json` that does not parse.
 - **It tokenises with `shlex`**, splits compound commands on `;`, `&&`, `||`,
-  `|` and `&` outside quotes, recurses into `bash -c`, and skips heredoc
-  *bodies* — so `true && gh pr merge 3` is caught while a document or a commit
-  message quoting that line is not.
+  `|` and `&` outside quotes, judges each segment past shell keywords and
+  wrappers (`then`, `{`, `env`, `timeout 5`), recurses into `bash -c`, `eval`,
+  `$(...)` and backticks, and skips heredoc *bodies* and single-quoted strings —
+  so `true && gh pr merge 3` is caught while a document or a commit message
+  quoting that line is not.
 - **`--selftest` counts what it ran.** It is the record of what has been checked
   — **not** a proof that nothing else gets through.
 
