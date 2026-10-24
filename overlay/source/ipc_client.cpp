@@ -356,6 +356,11 @@ Result IpcClient::KeepLocal(std::int64_t entry_id, ipc::RestoreState* state) {
                        ipc::DecodeRestoreState, state);
 }
 
+Result IpcClient::CancelKeepLocal(std::int64_t entry_id, ipc::CancelKeepLocalResult* result) {
+  return CallAndDecode(ipc::Command::kCancelKeepLocal, ipc::EncodeEntryId(entry_id),
+                       ipc::DecodeCancelKeepLocalResult, result);
+}
+
 Result IpcClient::GetRestoreState(ipc::RestoreState* state) {
   return CallAndDecode(ipc::Command::kGetRestoreState, ipc::EncodeEmpty(),
                        ipc::DecodeRestoreState, state);

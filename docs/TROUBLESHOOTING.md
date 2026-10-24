@@ -716,6 +716,13 @@ them over the server's copy. This happens even with sync switched off; only the
 upload waits for sync then. A held choice that cannot land is a `save.failed`
 warning, nothing is written, and the conflict is offered again.
 
+Changed your mind before closing the game? Open the conflict and press
+**Cancel Keep local** (#279): nothing was written, so nothing is undone, the
+conflict is offered again, and the log says
+`sync.held rom 12 slot autosave: the Keep local held for the game is cancelled`.
+If the game had already closed, the choice has landed and stands — the screen
+says *already landed*, and the next sync uploads it.
+
 **The play time it records.** The sync after the game names what you played,
 one line per save that changed, with the application the console saw in the
 foreground when the save was written — its title id:

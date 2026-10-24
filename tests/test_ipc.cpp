@@ -216,9 +216,10 @@ int Version() {
   // M10-33 (#273): a restore's outcome gained Keep local's `superseded`,
   // `game_running` and `keep_local_full`. 13 since M10-34 (#275): `held`
   // replaced `game_running`, and a conflict row gained a required
-  // `keep_local`. What is frozen is command 0's *encoding*, asserted above --
-  // not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{13},
+  // `keep_local`. 14 since M10-35 (#279): `CancelKeepLocal`, whose answer an
+  // older overlay has no decoder for. What is frozen is command 0's
+  // *encoding*, asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{14},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -762,6 +763,56 @@ int RoundTrip() {
                   "and a rom id where an entry id belongs is refused, not acted on");
   }
 
+  // #279: a held Keep local is withdrawn by its entry id, and the answer says
+  // what became of it -- cancelled, already past cancelling, or nothing held --
+  // with the row's state after it, so the screen draws the row as it now is.
+  {
+    for (const ipc::CancelOutcome outcome :
+         {ipc::CancelOutcome::kCancelled, ipc::CancelOutcome::kLanded,
+          ipc::CancelOutcome::kNotHeld}) {
+      for (const ipc::KeepLocalState state :
+           {ipc::KeepLocalState::kOpen, ipc::KeepLocalState::kHeld,
+            ipc::KeepLocalState::kWaiting}) {
+        const ipc::CancelKeepLocalResult sent{outcome, state};
+        const ipc::Decoded<ipc::CancelKeepLocalResult> back =
+            ipc::DecodeCancelKeepLocalResult(ipc::EncodeCancelKeepLocalResult(sent));
+        checks.Expect(back.ok() && back.value.outcome == outcome && back.value.keep_local == state,
+                      std::string("a cancel's answer reads back as itself: ") +
+                          ipc::ToString(outcome) + "/" + ipc::ToString(state) + " " +
+                          back.error.Describe());
+      }
+    }
+    checks.ExpectEq(ipc::EncodeCancelKeepLocalResult(
+                        {ipc::CancelOutcome::kLanded, ipc::KeepLocalState::kWaiting}),
+                    std::string("{\"outcome\":\"landed\",\"keep_local\":\"waiting\"}"),
+                    "spelled by name on the wire");
+    checks.Expect(!ipc::DecodeCancelKeepLocalResult("{\"outcome\":\"undone\",\"keep_local\":"
+                                                    "\"open\"}")
+                       .ok(),
+                  "an outcome this build has no name for is refused, not guessed at");
+    checks.Expect(!ipc::DecodeCancelKeepLocalResult("{\"outcome\":\"cancelled\"}").ok(),
+                  "and so is an answer without the row's state");
+
+    FakeEngine engine;
+    engine.cancel_result = {ipc::CancelOutcome::kCancelled, ipc::KeepLocalState::kOpen};
+    ipc::ServiceCore core(engine);
+    std::string response;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kCancelKeepLocal),
+                                ipc::EncodeEntryId(12), &response) == ipc::Error::kOk,
+                  "CancelKeepLocal never fails at the transport");
+    checks.ExpectEq(engine.last_cancel_id, std::int64_t{12}, "it asks the engine for that entry");
+    checks.ExpectEq(engine.keep_local_requests, 0, "and asks for no Keep local");
+    checks.ExpectEq(engine.restore_requests, 0, "nor a restore");
+    const ipc::Decoded<ipc::CancelKeepLocalResult> answered =
+        ipc::DecodeCancelKeepLocalResult(response);
+    checks.Expect(answered.ok() && answered.value.outcome == ipc::CancelOutcome::kCancelled,
+                  "answering the engine's outcome: " + answered.error.Describe());
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kCancelKeepLocal),
+                                ipc::EncodeRomId(12), &response) ==
+                      ipc::Error::kMalformedRequest,
+                  "and a rom id where an entry id belongs is refused, not acted on");
+  }
+
   // Every string field is user data and may hold anything a filesystem allows.
   // `json::Quote` is what carries it rather than interpreting it, and this is
   // the check that nothing here builds a payload by concatenation instead.
@@ -1072,6 +1123,7 @@ int Secrets() {
       {ipc::Command::kGetLog, ipc::EncodeLogRequest(ipc::kMaxLogLines)},
       {ipc::Command::kGetRestoreState, ipc::EncodeEmpty()},
       {ipc::Command::kKeepLocal, ipc::EncodeEntryId(3)},
+      {ipc::Command::kCancelKeepLocal, ipc::EncodeEntryId(3)},
   };
 
   // The log is the newest way a credential could reach this wire: a call site
@@ -1961,6 +2013,7 @@ class HarnessEngine : public ipc::Engine {
   }
   ipc::RestoreState RequestRestore(std::int64_t) override { return {}; }
   ipc::RestoreState RequestKeepLocal(std::int64_t) override { return {}; }
+  ipc::CancelKeepLocalResult CancelKeepLocal(std::int64_t) override { return {}; }
   ipc::RestoreState restore_state() const override { return {}; }
 
   auth::StoredToken token() const {

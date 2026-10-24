@@ -402,6 +402,11 @@ constexpr ClientCall kClientCalls[] = {
        ipc::RestoreState out;
        return c.KeepLocal(3, &out);
      }},
+    {ipc::Command::kCancelKeepLocal, "CancelKeepLocal",
+     [](overlay::IpcClient& c) {
+       ipc::CancelKeepLocalResult out;
+       return c.CancelKeepLocal(3, &out);
+     }},
 };
 
 int RunWire(Checks& checks) {

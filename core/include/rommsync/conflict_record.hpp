@@ -139,6 +139,12 @@ RestoreReport Restore(fs::FileSystem& files, const History& history, std::int64_
 /// how the conflicts page tells which row a waiting choice belongs to.
 const Entry* NewestSaveEntry(const History& history, const state::Baseline::Key& key);
 
+/// Whether `entry` -- one of `history`'s own, compared by address -- carries
+/// its save's Keep local choice: a save conflict, and that save's newest
+/// entry. The row a choice is drawn on (#275) and the one a cancel reaches
+/// (#279).
+bool CarriesChoice(const History& history, const Entry& entry);
+
 /// The player's **Keep local** for a save conflict (#249): the local bytes back
 /// on the card, and the key whose next upload goes over the server's copy.
 ///

@@ -348,6 +348,7 @@ bool TakesRequest(Command command) {
     case Command::kRestoreBackup:
     case Command::kGetLog:
     case Command::kKeepLocal:
+    case Command::kCancelKeepLocal:
       return true;
     case Command::kGetInterfaceVersion:
     case Command::kGetStatus:
@@ -410,6 +411,10 @@ RestoreState ServiceCore::RestoreBackup(std::int64_t entry_id) {
 RestoreState ServiceCore::KeepLocal(std::int64_t entry_id) {
   // `RestoreBackup`'s shape and its reason: taken, answered at once, polled.
   return Bounded(engine_.RequestKeepLocal(entry_id));
+}
+
+CancelKeepLocalResult ServiceCore::CancelKeepLocal(std::int64_t entry_id) {
+  return engine_.CancelKeepLocal(entry_id);
 }
 
 RestoreState ServiceCore::GetRestoreState() const { return Bounded(engine_.restore_state()); }
@@ -618,6 +623,17 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
       }
       // `kRestoreBackup`'s reason: a refusal is an outcome in the answer.
       payload = EncodeRestoreState(core.KeepLocal(entry_id.value));
+      break;
+    }
+
+    case Command::kCancelKeepLocal: {
+      const Decoded<std::int64_t> entry_id = DecodeEntryId(request);
+      if (!entry_id.ok()) {
+        return Error::kMalformedRequest;
+      }
+      // `kRestoreBackup`'s reason: "it already landed" is an answer, not a
+      // failure, and a failing `Result` would take it with it.
+      payload = EncodeCancelKeepLocalResult(core.CancelKeepLocal(entry_id.value));
       break;
     }
 

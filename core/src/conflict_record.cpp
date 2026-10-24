@@ -305,6 +305,10 @@ const Entry* NewestSaveEntry(const History& history, const state::Baseline::Key&
   return newest;
 }
 
+bool CarriesChoice(const History& history, const Entry& entry) {
+  return entry.save_conflict() && NewestSaveEntry(history, {entry.rom_id, entry.slot}) == &entry;
+}
+
 RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int64_t entry_id,
                         const std::vector<state::Baseline::Key>& armed,
                         state::Baseline::Key* key, const RestoreOptions& options) {

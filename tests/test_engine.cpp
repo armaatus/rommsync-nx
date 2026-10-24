@@ -75,6 +75,10 @@
 //   keep_local_guards -- #273/#275: held under a game and landed over the game's
 //                write once it closes; refused past four waiting, with nothing
 //                written and nothing armed (no server)
+//   keep_local_cancel -- #279: a held Keep local cancelled before the game closes
+//                writes nothing and lands nothing; one that landed first stands
+//   keep_local_cancel_race -- #279: a cancel during the kept bytes' copy, by the
+//                worker's landing or by a second press, answers landed
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -282,6 +286,15 @@ class Console {
       state = RestoreState();
     }
     return state;
+  }
+
+  /// Command 19, read off the wire: a held Keep local withdrawn (#279).
+  /// Decoded rather than its value, so a caller asserting `not_held` -- the
+  /// default -- cannot pass on an answer that did not decode.
+  ipc::Decoded<ipc::CancelKeepLocalResult> CancelKeepLocal(std::int64_t entry_id) {
+    std::string response;
+    Call(ipc::Command::kCancelKeepLocal, ipc::EncodeEntryId(entry_id), &response);
+    return ipc::DecodeCancelKeepLocalResult(response);
   }
 
   /// The queue as the *card* holds it, which is the only copy that survives a
@@ -1866,9 +1879,11 @@ class SlowCard final : public fs::FileSystem {
     return real_->Resolve(sd_path);
   }
 
+  /// Hold the next call. `AwaitHeld` then waits for that one, not an earlier.
   void Arm() {
     std::lock_guard<std::mutex> lock(mutex_);
     armed_ = true;
+    held_ = false;
   }
 
   void Release() {
@@ -2098,6 +2113,313 @@ void KeepLocalGuards(checks::Checks& c) {
   c.Expect(again.report.ok(), std::string("a waiting choice may be made again: ") +
                                   conflicts::ToString(again.report.outcome) + " -- " +
                                   again.report.message);
+}
+
+/// #279, through the engine and over the wire: a Keep local held under a
+/// running game is withdrawn before the game closes. Nothing was written while
+/// it was held, so nothing is written by the cancel, and once the hold
+/// releases nothing lands. A choice the landing reached first is past
+/// cancelling: the cancel says it landed, and the kept bytes stay.
+///
+/// Sync is switched off, so no tick spends a landed choice -- what is on the
+/// card is the hold's and the cancel's doing alone. The upload half of a
+/// landing that beat the cancel is `keep_local_overtaken`'s, against RomM.
+/// What #279's offline scenarios lay out for save `n` (from 1): its file, the
+/// console's bytes under `.backup/`, and the server's copy on the card.
+std::string CancelFile(int n) { return "game" + std::to_string(n) + ".srm"; }
+std::string CancelKept(int n) { return "the bytes kept for save " + std::to_string(n); }
+std::string CancelServer(int n) { return "the server's copy of " + std::to_string(n); }
+
+/// `count` save conflicts, save `n` as rom `n`, with sync switched off so no
+/// tick spends a landed choice. Answers the entry ids, oldest first.
+std::vector<std::int64_t> SeedSaveConflicts(checks::Checks& c, Console& console, int count) {
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini", "[sync]\nenabled = false\n"),
+           "a card with sync switched off");
+  std::vector<std::int64_t> ids;
+  conflicts::History history(console.directory + conflicts::kHistoryFileName);
+  history.Load();
+  for (int n = 1; n <= count; ++n) {
+    const std::string backup = std::string(harness::kBackupDir) + "/" + std::to_string(n) +
+                               "-retroarch-srm-1757000000.srm";
+    c.Expect(console.sandbox.SeedSave(harness::SavePath(CancelFile(n)), CancelServer(n)) &&
+                 console.sandbox.Write(backup, CancelKept(n)),
+             "a save conflict's two sides are on the card");
+    conflicts::Entry entry;
+    entry.kind = conflicts::EntryKind::kSave;
+    entry.event = conflicts::Event::kConflict;
+    entry.rom_id = n;
+    entry.rom_name = "Game";
+    entry.file_name = CancelFile(n);
+    entry.slot = "retroarch-srm";
+    entry.when = 1'757'000'000;
+    entry.sd_path = harness::SavePath(CancelFile(n));
+    entry.backup_sd_path = backup;
+    ids.push_back(history.Append(entry).id);
+  }
+  return ids;
+}
+
+void KeepLocalCancel(checks::Checks& c) {
+  rlog::Reset();
+  Console console(c, "engine-keep-local-cancel");
+  const auto file = CancelFile;
+  const auto kept = CancelKept;
+  const auto server = CancelServer;
+  const std::vector<std::int64_t> ids = SeedSaveConflicts(c, console, 3);
+
+  std::atomic<bool> running{true};
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  console.engine.UseForegroundProbe(
+      [&running] {
+        play::Foreground foreground;
+        foreground.running = running.load();
+        return foreground;
+      },
+      std::chrono::milliseconds{50});
+  console.engine.StartWorker();
+
+  const auto keep_local = [&console](std::int64_t id) {
+    std::string response;
+    console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(id), &response);
+    return console.AwaitRestore(id);
+  };
+  const auto expect_cancel = [&](std::int64_t id, ipc::CancelOutcome outcome,
+                                 ipc::KeepLocalState state, const std::string& what) {
+    const ipc::Decoded<ipc::CancelKeepLocalResult> answer = console.CancelKeepLocal(id);
+    c.Expect(answer.ok() && answer.value.outcome == outcome && answer.value.keep_local == state,
+             what + ": " + ipc::ToString(answer.value.outcome) + "/" +
+                 ipc::ToString(answer.value.keep_local) + " " + answer.error.Describe());
+  };
+  const auto await_card = [&](int n, const std::string& bytes) {
+    const std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (console.sandbox.Read(harness::SavePath(file(n))) != bytes &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    }
+  };
+
+  // Held under the game, then withdrawn: the row is open again, and nothing
+  // was written by either.
+  const ipc::RestoreState held = keep_local(ids[0]);
+  c.Expect(held.report.outcome == conflicts::RestoreOutcome::kHeld,
+           std::string("Keep local under a running game is held: ") +
+               conflicts::ToString(held.report.outcome) + " -- " + held.report.message);
+  expect_cancel(ids[0], ipc::CancelOutcome::kCancelled, ipc::KeepLocalState::kOpen,
+                "a held choice is cancelled, and the row it answers with is open");
+  c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kOpen,
+           std::string("the conflicts page reads the row as open: ") +
+               ipc::ToString(console.KeepLocalOf(ids[0])));
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), server(1),
+             "nothing was written to the card");
+  bool said = false;
+  for (const std::string& line : console.Log().lines) {
+    said = said || (line.find("sync.held") != std::string::npos &&
+                    line.find("rom 1") != std::string::npos &&
+                    line.find("retroarch-srm") != std::string::npos &&
+                    line.find("cancel") != std::string::npos);
+  }
+  c.Expect(said, "a sync.held line names the rom and slot whose Keep local was cancelled");
+  expect_cancel(ids[0], ipc::CancelOutcome::kNotHeld, ipc::KeepLocalState::kOpen,
+                "a second cancel finds nothing held");
+
+  // The game closes: the hold has nothing to land, however often it asks.
+  running = false;
+  std::this_thread::sleep_for(std::chrono::milliseconds{400});
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), server(1),
+             "after the hold releases, nothing lands");
+  c.Expect(!console.sandbox.HasBackupOf(server(1)),
+           "and nothing was backed up for a landing either");
+  c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kOpen, "the row stays open");
+
+  // Chosen again, it lands as any Keep local does: the cancel lost nothing.
+  const ipc::RestoreState again = keep_local(ids[0]);
+  c.Expect(again.report.ok(), std::string("Keep local chosen again lands with no game: ") +
+                                  conflicts::ToString(again.report.outcome) + " -- " +
+                                  again.report.message);
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), kept(1), "with its bytes on the card");
+  expect_cancel(ids[0], ipc::CancelOutcome::kLanded, ipc::KeepLocalState::kWaiting,
+                "a waiting choice is past cancelling, and the row it answers with waits");
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), kept(1),
+             "and the kept bytes stay on the card");
+
+  // Held, and the game closes before the cancel arrives: the landing went first.
+  running = true;
+  const ipc::RestoreState second = keep_local(ids[1]);
+  c.Expect(second.report.outcome == conflicts::RestoreOutcome::kHeld,
+           std::string("a second save's Keep local is held: ") +
+               conflicts::ToString(second.report.outcome));
+  running = false;
+  await_card(2, kept(2));
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(2))), kept(2),
+             "the hold released and the choice landed");
+  expect_cancel(ids[1], ipc::CancelOutcome::kLanded, ipc::KeepLocalState::kWaiting,
+                "a cancel after the landing says it already landed, not cancelled");
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(2))), kept(2),
+             "and the kept bytes stay on the card");
+  c.Expect(console.KeepLocalOf(ids[1]) == ipc::KeepLocalState::kWaiting,
+           std::string("the row waits for its upload: ") +
+               ipc::ToString(console.KeepLocalOf(ids[1])));
+
+  // Never chosen: nothing to withdraw, and nothing touched.
+  expect_cancel(ids[2], ipc::CancelOutcome::kNotHeld, ipc::KeepLocalState::kOpen,
+                "a row nobody chose has nothing held");
+  expect_cancel(9999, ipc::CancelOutcome::kNotHeld, ipc::KeepLocalState::kOpen,
+                "and neither has an entry the history does not hold");
+  c.ExpectEq(console.sandbox.Read(harness::SavePath(file(3))), server(3), "its card is untouched");
+}
+
+/// #279's race: a cancel that arrives once the kept bytes are on their way to
+/// the card answers `landed`, never `cancelled` -- whichever path is writing
+/// them -- and the bytes it says landed are the ones on the card.
+///
+///   1. The worker's own landing, held open mid-copy on a slow card: a cancel
+///      sent then says it landed. A fifth Keep local pressed then, with four
+///      held or landing, is refused -- the one being landed still holds its
+///      place under `kMaxKeepLocal`.
+///   2. A second `KeepLocal` for the held row, sent with no game (an older
+///      overlay, or any client but this one's screen), which lands the choice
+///      itself: a cancel after it was taken says so too.
+void KeepLocalCancelRace(checks::Checks& c) {
+  const auto expect_landed = [&c](Console& console, std::int64_t id, const std::string& what) {
+    const ipc::Decoded<ipc::CancelKeepLocalResult> answer = console.CancelKeepLocal(id);
+    c.Expect(answer.ok() && answer.value.outcome == ipc::CancelOutcome::kLanded &&
+                 answer.value.keep_local == ipc::KeepLocalState::kWaiting,
+             what + ": " + ipc::ToString(answer.value.outcome) + "/" +
+                 ipc::ToString(answer.value.keep_local) + " " + answer.error.Describe());
+  };
+  const auto keep_local = [](Console& console, std::int64_t id) {
+    std::string response;
+    console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(id), &response);
+    return console.AwaitRestore(id);
+  };
+
+  // 1.
+  {
+    Console console(c, "engine-keep-local-cancel-landing");
+    const int saves = static_cast<int>(rommsync::sync::kMaxKeepLocal) + 1;
+    const std::vector<std::int64_t> ids = SeedSaveConflicts(c, console, saves);
+    std::atomic<bool> running{true};
+    SlowCard card(rommsync::host::MakeNativeFileSystem(console.sandbox.root().string()));
+    console.Boot();
+    console.engine.UseCard(&card);
+    console.engine.UseForegroundProbe(
+        [&running] {
+          play::Foreground foreground;
+          foreground.running = running.load();
+          return foreground;
+        },
+        std::chrono::milliseconds{50});
+    console.engine.StartWorker();
+    for (int n = 0; n < saves - 1; ++n) {
+      const ipc::RestoreState held = keep_local(console, ids[static_cast<std::size_t>(n)]);
+      c.Expect(held.report.outcome == conflicts::RestoreOutcome::kHeld,
+               "Keep local " + std::to_string(n + 1) + " under a running game is held: " +
+                   conflicts::ToString(held.report.outcome));
+    }
+
+    card.Arm();
+    running = false;
+    c.Expect(card.AwaitHeld(), "the game closed, and the worker is landing a held choice");
+    // Both wait for the history the copy holds, as `ListConflicts` does, so
+    // each is sent from a thread of its own and the copy is then let go.
+    std::optional<ipc::Decoded<ipc::CancelKeepLocalResult>> late;
+    std::thread cancel([&] { late = console.CancelKeepLocal(ids[0]); });
+    std::thread press([&] {
+      std::string response;
+      console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(ids.back()), &response);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    card.Release();
+    cancel.join();
+    press.join();
+    c.Expect(late.has_value() && late->ok() &&
+                 late->value.outcome == ipc::CancelOutcome::kLanded &&
+                 late->value.keep_local == ipc::KeepLocalState::kWaiting,
+             "a cancel during the worker's landing says it landed: " +
+                 (late.has_value() ? std::string(ipc::ToString(late->value.outcome)) + "/" +
+                                         ipc::ToString(late->value.keep_local)
+                                   : std::string("no answer")));
+    const ipc::RestoreState fifth = console.AwaitRestore(ids.back());
+    c.Expect(fifth.report.outcome == conflicts::RestoreOutcome::kKeepLocalFull,
+             std::string("a fifth Keep local pressed mid-landing is refused: ") +
+                 conflicts::ToString(fifth.report.outcome) + " -- " + fifth.report.message);
+    c.ExpectEq(console.sandbox.Read(harness::SavePath(CancelFile(saves))), CancelServer(saves),
+               "and wrote nothing");
+    for (int n = 1; n < saves; ++n) {
+      c.ExpectEq(console.sandbox.Read(harness::SavePath(CancelFile(n))), CancelKept(n),
+                 "held choice " + std::to_string(n) + " landed, the one cancelled late included");
+    }
+    c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kWaiting,
+             std::string("and its row waits for the upload, as the cancel said: ") +
+                 ipc::ToString(console.KeepLocalOf(ids[0])));
+  }
+
+  // 2. A foreground poll no test outlives, so only the second press lands it.
+  // The press is held where it asks whether a game runs -- after it was
+  // taken, before anything is written -- and the cancel arrives there.
+  {
+    std::atomic<bool> running{true};
+    std::mutex gate_mutex;
+    std::condition_variable gate;
+    bool gate_armed = false;
+    bool in_probe = false;
+    Console console(c, "engine-keep-local-cancel-repress");
+    const std::vector<std::int64_t> ids = SeedSaveConflicts(c, console, 1);
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    console.engine.UseCard(card.get());
+    console.engine.UseForegroundProbe(
+        [&] {
+          std::unique_lock<std::mutex> lock(gate_mutex);
+          if (gate_armed) {
+            in_probe = true;
+            gate.notify_all();
+            gate.wait(lock, [&] { return !gate_armed; });
+          }
+          play::Foreground foreground;
+          foreground.running = running.load();
+          return foreground;
+        },
+        std::chrono::hours{1});
+    console.engine.StartWorker();
+    const ipc::RestoreState held = keep_local(console, ids[0]);
+    c.Expect(held.report.outcome == conflicts::RestoreOutcome::kHeld,
+             std::string("Keep local under a running game is held: ") +
+                 conflicts::ToString(held.report.outcome));
+
+    running = false;
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      gate_armed = true;
+    }
+    std::string response;
+    console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(ids[0]), &response);
+    {
+      std::unique_lock<std::mutex> lock(gate_mutex);
+      c.Expect(gate.wait_for(lock, std::chrono::seconds{10}, [&] { return in_probe; }),
+               "Keep local sent again with no game is taken, and on its way to the card");
+    }
+    expect_landed(console, ids[0], "a cancel then says it landed, not cancelled");
+    {
+      std::lock_guard<std::mutex> lock(gate_mutex);
+      gate_armed = false;
+    }
+    gate.notify_all();
+    const ipc::RestoreState done = console.AwaitRestore(ids[0]);
+    c.Expect(done.report.ok(), std::string("the second press landed the choice: ") +
+                                   conflicts::ToString(done.report.outcome) + " -- " +
+                                   done.report.message);
+    c.ExpectEq(console.sandbox.Read(harness::SavePath(CancelFile(1))), CancelKept(1),
+               "with the kept bytes on the card");
+    c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kWaiting,
+             std::string("and the row waits for its upload, as the cancel said: ") +
+                 ipc::ToString(console.KeepLocalOf(ids[0])));
+  }
 }
 
 /// M9-6 (#209): a restore that takes as long as the card does holds no IPC
@@ -6107,6 +6429,9 @@ int KeepLocalChoice(http::HttpClient& client, const std::string& base) {
 ///   6. a third conflict, held under a game that closes WITHOUT writing the
 ///      save: the kept bytes land over the card's as they were, and go up with
 ///      `overwrite=true` (#275's first acceptance, on its own).
+///   7. a fourth, held and cancelled in time: nothing goes up; then held again,
+///      and its landing beats the cancel: the cancel says it
+///      landed, and the upload still goes with `overwrite=true` (#279).
 int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   rig::Checks c;
   harness::Fixture fixture;
@@ -6345,6 +6670,64 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   c.Expect(console.KeepLocalOf(third_conflict) == ipc::KeepLocalState::kOpen,
            "the choice is spent: the row is open again");
 
+  // 7. Held, and the game closes before the player's Cancel arrives (#279):
+  // the landing went first, so the cancel says so and undoes nothing. Sync is
+  // off for the landing, so the upload is still owed when the cancel comes.
+  const std::string theirs_fourth = "the other device, at the fourth conflict " + stamp + "\n";
+  const std::string mine_fourth = "the switch's progress, at the fourth conflict " + stamp + "\n";
+  conflict(theirs_fourth, mine_fourth, "the fourth conflict");
+  const std::int64_t fourth_conflict = newest_conflict();
+  c.Expect(fourth_conflict > third_conflict, "the fourth conflict is the save's newest entry");
+  // First withdrawn in time, with sync on: nothing reaches the card or the
+  // server, before the game closes or after.
+  running = true;
+  const ipc::RestoreState withdrawn = keep_local(fourth_conflict);
+  c.Expect(withdrawn.report.outcome == conflicts::RestoreOutcome::kHeld,
+           std::string("Keep local under a running game is held: ") +
+               conflicts::ToString(withdrawn.report.outcome));
+  const ipc::Decoded<ipc::CancelKeepLocalResult> in_time = console.CancelKeepLocal(fourth_conflict);
+  c.Expect(in_time.ok() && in_time.value.outcome == ipc::CancelOutcome::kCancelled,
+           std::string("cancelled before the game closes: ") +
+               ipc::ToString(in_time.value.outcome) + " " + in_time.error.Describe());
+  running = false;
+  TickOnce(console, ticks, c, "the tick after a cancelled Keep local");
+  c.ExpectEq(console.sandbox.Read(save), theirs_fourth,
+             "the card keeps the server's copy" + Rendered(console.Log()));
+  c.ExpectEq(overrides().size(), std::size_t{2}, "and nothing went up with overwrite=true");
+  c.Expect(console.KeepLocalOf(fourth_conflict) == ipc::KeepLocalState::kOpen,
+           "the row is open, to be chosen again");
+
+  // Chosen again, and this time the landing beats the cancel.
+  c.Expect(console.SetEnabled(false).enabled == false, "sync is switched off for the landing");
+  running = true;
+  const ipc::RestoreState held_late = keep_local(fourth_conflict);
+  c.Expect(held_late.report.outcome == conflicts::RestoreOutcome::kHeld,
+           std::string("Keep local under a running game is held: ") +
+               conflicts::ToString(held_late.report.outcome));
+  running = false;
+  const std::chrono::steady_clock::time_point landed_by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (console.sandbox.Read(save) != mine_fourth && std::chrono::steady_clock::now() < landed_by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(console.sandbox.Read(save), mine_fourth, "the game closed and the choice landed");
+  const ipc::Decoded<ipc::CancelKeepLocalResult> late = console.CancelKeepLocal(fourth_conflict);
+  c.Expect(late.ok() && late.value.outcome == ipc::CancelOutcome::kLanded &&
+               late.value.keep_local == ipc::KeepLocalState::kWaiting,
+           std::string("a cancel after the landing says it already landed: ") +
+               ipc::ToString(late.value.outcome) + "/" + ipc::ToString(late.value.keep_local) +
+               " " + late.error.Describe());
+  c.ExpectEq(console.sandbox.Read(save), mine_fourth, "and the kept bytes stay on the card");
+  c.Expect(console.SetEnabled(true).enabled, "sync is switched back on");
+  TickOnce(console, ticks, c, "the tick the landed choice waited for");
+  c.ExpectEq(overrides().size(), std::size_t{3},
+             "and the upload still went with overwrite=true" + Rendered(console.Log()));
+  bool fourth_on_server = false;
+  for (const ServerRow& row : RowsFor(client, base, fixture, rom.id, "autosave")) {
+    fourth_on_server = fourth_on_server || row.content_hash == crypto::Md5Hex(mine_fourth);
+  }
+  c.Expect(fourth_on_server, "the kept bytes are on the server");
+
   ClearSlots(client, base, fixture, rom.id);
   harness::DeleteArchivalCopies(client, base, fixture, rom.id);
   harness::DeleteDevice(client, base, fixture, device_id);
@@ -6440,6 +6823,10 @@ int main(int argc, char** argv) {
     RestoreDuringBootWait(checks);
   } else if (scenario == "keep_local_guards") {
     KeepLocalGuards(checks);
+  } else if (scenario == "keep_local_cancel") {
+    KeepLocalCancel(checks);
+  } else if (scenario == "keep_local_cancel_race") {
+    KeepLocalCancelRace(checks);
   } else if (scenario == "syncnow") {
     SyncNowStarts(checks);
   } else if (scenario == "unreachable") {

@@ -81,6 +81,7 @@ class KnobEngine : public ipc::Engine {
   }
   ipc::RestoreState RequestRestore(std::int64_t) override { return {}; }
   ipc::RestoreState RequestKeepLocal(std::int64_t) override { return {}; }
+  ipc::CancelKeepLocalResult CancelKeepLocal(std::int64_t) override { return {}; }
   ipc::RestoreState restore_state() const override { return {}; }
 
  private:

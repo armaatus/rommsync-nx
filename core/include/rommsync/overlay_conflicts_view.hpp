@@ -72,6 +72,13 @@
 // card waiting for its upload (`ipc::ConflictRow::keep_local`) -- is drawn as
 // chosen rather than open, and A on it offers no second choice.
 //
+// A **held** choice can be taken back before the game closes (#279): A on its
+// detail sends `CancelKeepLocal`, nothing was written for it, and the row is
+// open again. One whose game closed first has landed, and the answer says so
+// with the row's real state -- waiting for its upload -- which the screen
+// draws instead of open. A waiting row offers no cancel: its bytes are on the
+// card.
+//
 // Hard rule 4 applies as it does to the rest of `core/`: no libnx header, no
 // libultrahand type. What crosses is strings and enums, so the renderer picks
 // the colour for a `Tone` and this file names none.
@@ -253,6 +260,11 @@ struct ConflictsView {
   /// `kConfirm`.
   bool keep_choice = false;
 
+  /// A on this view withdraws a held Keep local (#279): `kDetail` of a row
+  /// whose `keep_local` is `held`, with nothing already out. Never with
+  /// `can_restore`: a held row's choice is made.
+  bool can_cancel = false;
+
   /// `kConfirm` on a save conflict: the three choices, in order. Empty
   /// otherwise, which is a plain restore's confirmation.
   std::vector<ConflictChoiceRow> choices;
@@ -287,15 +299,23 @@ class ConflictsModel {
   /// The one command the screen should send this frame.
   struct Command {
     /// `kKeepLocal` is #249's: a restore, asked for as Keep local, and polled
-    /// with `kRestoreState` like one.
-    enum class Kind { kNone, kListConflicts, kRestore, kRestoreState, kKeepLocal };
+    /// with `kRestoreState` like one. `kCancelKeepLocal` is #279's, answered
+    /// at once through `OnCancelKeepLocal`.
+    enum class Kind {
+      kNone,
+      kListConflicts,
+      kRestore,
+      kRestoreState,
+      kKeepLocal,
+      kCancelKeepLocal
+    };
 
     Kind kind = Kind::kNone;
 
     /// `kListConflicts`.
     ipc::ConflictQuery query;
 
-    /// `kRestore` and `kKeepLocal`.
+    /// `kRestore`, `kKeepLocal` and `kCancelKeepLocal`.
     std::int64_t entry_id = 0;
   };
 
@@ -333,6 +353,11 @@ class ConflictsModel {
   /// definition.
   void OnRestoreState(const ipc::RestoreState& state);
 
+  /// `CancelKeepLocal` answered (#279). The row takes the state the answer
+  /// carries -- open once cancelled, waiting if the landing went first -- so
+  /// the screen never draws a choice as open that is on the card.
+  void OnCancelKeepLocal(const ipc::CancelKeepLocalResult& result);
+
   /// The sysmodule refused the command `Next()` handed out.
   void OnRefused(ipc::Error error);
 
@@ -358,7 +383,8 @@ class ConflictsModel {
   /// On a save conflict's choice it moves between the three choices instead.
   void MoveSelection(int delta);
 
-  /// A. Open the selected entry, or -- from the confirmation -- send the
+  /// A. Open the selected entry, or -- from a held Keep local's detail --
+  /// cancel it (#279), or -- from the confirmation -- send the
   /// restore. From a save conflict's choice, do what the selected one says:
   /// nothing for Keep server, `KeepLocal` for Keep local, and back to the list
   /// for Skip.
@@ -384,6 +410,9 @@ class ConflictsModel {
  private:
   /// The row the detail and the confirmation are about, or nullptr.
   const ipc::ConflictRow* Current() const;
+
+  /// A on `row`'s detail would send `CancelKeepLocal` (#279).
+  bool CanCancel(const ipc::ConflictRow& row) const;
 
   /// Everything loaded, dropped. The next `Next()` asks for the first page.
   void Reset();
@@ -455,6 +484,18 @@ class ConflictsModel {
   /// The entry Keep server was last chosen for, so its detail says so. Zero
   /// when none.
   std::int64_t kept_server_ = 0;
+
+  /// #279. A cancel waiting to be sent, and the one that is out; zero when
+  /// there is none.
+  std::int64_t cancel_wanted_ = 0;
+  std::int64_t cancelling_ = 0;
+
+  /// The entry the last cancel was answered for, and what it said -- or,
+  /// when `cancel_error_` is not `kOk`, that the sysmodule refused it. Zero
+  /// when none.
+  std::int64_t cancel_answered_ = 0;
+  ipc::CancelOutcome last_cancel_ = ipc::CancelOutcome::kNotHeld;
+  ipc::Error cancel_error_ = ipc::Error::kOk;
 
   /// What `Next()` last handed out, so `OnRefused` knows what was refused.
   Command::Kind issued_ = Command::Kind::kNone;

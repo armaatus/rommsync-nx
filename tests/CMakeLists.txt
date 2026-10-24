@@ -2357,6 +2357,8 @@ set(ENGINE_SCENARIOS
   restore_polled  # M9-6: a restore on a slow card holds no IPC call while it copies
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
   keep_local_guards  # #273/#275: Keep local held under a game, refused past four waiting
+  keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
+  keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
@@ -2420,7 +2422,7 @@ set(ENGINE_RIG_SCENARIOS
   install_wake       # review: a refused remote-install claim is asked again after a wake
   declined           # #257: a save the placer will not place costs one line, never a failed save
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
-  keep_local_overtaken  # #273/#275: held under a game then landed; superseded and overtaken unsent
+  keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
