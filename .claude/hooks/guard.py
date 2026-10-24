@@ -28,11 +28,14 @@ one -- the shapes an agent reaches for when it is solving the problem in front o
 it rather than working around a rule. Past that, the backstops are the diff and
 the person who merges.
 
-Writing a file is judged through the editing tools (Edit, Write, NotebookEdit),
-which is how an agent actually applies a diff. The shell half used to enumerate
-seven write verbs and still missed `patch -p1` and `git apply`; a partial
-model of writing is a guard that reports success on the spellings it does not
-know, so it is gone rather than extended.
+Rule 3 judges a write whichever way it arrives: through the editing tools
+(Edit, Write, NotebookEdit), and through the shell spellings an agent routinely
+reaches for -- a redirect, `cp`/`mv`/`install`/`ln`/`rsync`/`tee`/`rm`, `sed -i`
+and `perl -i`, and the git verbs that rewrite a tracked file. That is a list,
+and it misses what it does not name (`patch`, `git apply`, `dd`, an interpreter
+opening a file); the selftest is the record of which spellings it knows. It
+came back because leaving it out was worse: #267's capture reached the pinned
+contract by a plain `cp`, while the docs said the shell was covered.
 
     ./.claude/hooks/guard.py --selftest
 """
@@ -55,7 +58,8 @@ import sys
 #     "protected_paths": [
 #       {"path": "server/contract/captures/",
 #        "tail": "captures/",
-#        "reason": "the pinned API contract; a test diffs a live probe against it"}
+#        "reason": "the pinned API contract; a test diffs a live probe against it",
+#        "regenerate": "Regenerate it with the probe's --capture."}
 #     ],
 #     "secret_suffixes": ["/config.ini"],
 #     "secret_contains": ["/token.dat"],
@@ -98,6 +102,9 @@ def _derive(project):
             entry["path"],
             entry.get("tail", entry["path"].rstrip("/").rsplit("/", 1)[-1] + "/"),
             entry.get("reason", "protected by .claude/hooks/guard.json"),
+            # How the project DOES rewrite it, when it does: the refusal names
+            # the sanctioned writer instead of leaving the agent to find one.
+            entry.get("regenerate", ""),
         )
         for entry in project.get("protected_paths", [])
     )
@@ -108,7 +115,7 @@ def _derive(project):
     # The same files matched by a distinctive tail, so a relative path after a
     # `cd` is still recognised.
     tails = tuple(project.get("secret_tails", []))
-    return paths, suffixes, contains, tails, tuple(t for _, t, _ in paths) + tails
+    return paths, suffixes, contains, tails, tuple(p[1] for p in paths) + tails
 
 
 (PROTECTED_PATHS, SECRET_SUFFIXES, SECRET_CONTAINS,
@@ -425,21 +432,254 @@ def _check_force_push(words, branch_cache):
         )
 
 
-def check_bash(command):
+def _shell_tokens(segment):
+    """The segment's tokens with every redirection operator its own token.
+
+    `_words` reads `echo x>a` as two words, the second one `x>a`, so the
+    redirect is invisible to it. `punctuation_chars` splits `>`, `>>`, `&>` and
+    `2>&1` out while still keeping a quoted `"a > b"` as one word -- which is
+    what keeps a commit message that mentions a redirect from being one.
+    """
+    lexer = shlex.shlex(segment, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return segment.split()
+
+
+_OPERATOR_CHARS = set("<>&|();")
+
+# Words that run the next word as the command. `FOO=1 cp ...` and `sudo cp ...`
+# are still `cp`.
+_WRAPPERS = ("sudo", "env", "command", "nohup", "time", "exec")
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _in_place(words, verb):
+    """`sed -i`/`perl -i`, however the flag is clustered or suffixed."""
+    for w in words[1:]:
+        if w == "--in-place" or w.startswith("--in-place="):
+            return verb == "sed"
+        if len(w) > 1 and w[0] == "-" and w[1] != "-" and "i" in w[1:]:
+            # perl's `-I dir` is an include path, and capital, so it cannot
+            # land here; sed's `-i.bak` and perl's `-pi` both do.
+            return True
+    return False
+
+
+def _git_args(words):
+    """(`git`'s verb, the words after it, the `-C` dir), or (None, [], None)."""
+    if _verb(words) != "git":
+        return None, [], None
+    i, where = 1, None
+    while i < len(words):
+        w = words[i]
+        if w in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            if w == "-C" and i + 1 < len(words):
+                where = words[i + 1]
+            i += 2
+            continue
+        if w.startswith("-"):
+            i += 1
+            continue
+        return w, words[i + 1:], where
+    return None, [], None
+
+
+def _git_written(words):
+    """The paths a `git` command rewrites in the working tree."""
+    verb, args, where = _git_args(words)
+    positional = [w for w in args if not w.startswith("-")]
+    written = []
+    if verb == "rm":
+        written = positional
+    elif verb == "checkout":
+        # Only checking a path out of ANOTHER revision rewrites it. `git
+        # checkout -- <path>` puts back the bytes the index holds -- the pinned
+        # ones -- which is how a probe run gone wrong is undone, and refusing it
+        # would refuse the repair.
+        if "--" in args:
+            cut = args.index("--")
+            rev = [w for w in args[:cut] if not w.startswith("-")]
+            written = args[cut + 1:] if rev else []
+        elif len(positional) >= 2:
+            # `git checkout <rev> <path>`. A lone word is a branch, not a path.
+            written = positional[1:]
+    elif verb == "restore":
+        # The same line: `git restore <path>` restores the pin, `--source`
+        # brings in somebody else's bytes.
+        if any(w in ("-s", "--source") or w.startswith("--source=")
+               or (w.startswith("-s") and not w.startswith("--")) for w in args):
+            written = positional
+    return written, where
+
+
+def _written_paths(segment):
+    """Every path this one command creates, replaces, moves or deletes.
+
+    The routine spellings, not all of them: the redirect, the copy, the move,
+    `tee`, the in-place edit, and the git verbs that rewrite a tracked file.
+    `patch`, `git apply`, `dd` and an interpreter opening a file are not here,
+    and nothing claims they are -- the module docstring says what this is not.
+
+    Returns (verb, paths, base) -- `base` the `git -C` dir the paths are
+    relative to, if any.
+    """
+    tokens = _shell_tokens(segment)
+    written, words, i = [], [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t and set(t) <= _OPERATOR_CHARS:
+            if "<" in t or ">" in t:
+                target = tokens[i + 1] if i + 1 < len(tokens) else None
+                # `2>err`: the 2 is the descriptor, not an argument of the verb.
+                if words and words[-1].isdigit():
+                    words.pop()
+                # `2>&1` duplicates a descriptor; `&> f` and `>& f` write f.
+                duplicates = t.endswith("&") and target is not None and (
+                    target.isdigit() or target == "-")
+                if ">" in t and target is not None and not duplicates:
+                    written.append(target)
+                i += 2
+            else:
+                i += 1
+            continue
+        words.append(t)
+        i += 1
+
+    while words and (_ASSIGNMENT.match(words[0]) or _verb(words) in _WRAPPERS):
+        words = words[1:]
+    verb = _verb(words)
+    positional = [w for w in words[1:] if not w.startswith("-")]
+    # `cp -t DIR src...` names its destination with a flag.
+    targets = [words[k + 1] for k, w in enumerate(words[:-1])
+               if w in ("-t", "--target-directory")]
+    targets += [w.split("=", 1)[1] for w in words if w.startswith("--target-directory=")]
+    base = None
+
+    if verb in ("cp", "install", "ln", "rsync"):
+        written += targets or positional[-1:]
+    elif verb == "mv":
+        # Both ends: a move REMOVES its source, so moving a capture out of the
+        # tree unpins it as surely as copying a new one in.
+        written += positional + targets
+    elif verb in ("tee", "rm"):
+        written += positional
+    elif verb in ("sed", "perl") and _in_place(words, verb):
+        written += positional
+    elif verb == "git":
+        paths, base = _git_written(words)
+        written += paths
+    return verb, [w for w in written if w], base
+
+
+def _join(prefix, path):
+    """`path` as seen from `prefix`, collapsed; the raw path when unknowable.
+
+    A `prefix` of None is "somewhere this cannot work out" and "" is "a
+    relative root it does not know": either way the path is judged on its own
+    tail, which is what every rule here matches.
+    """
+    if path.startswith("/"):
+        joined = path
+    elif not prefix:
+        joined = path
+    else:
+        joined = prefix.rstrip("/") + "/" + path
+    collapsed = _collapse(joined)
+    return collapsed if collapsed else path
+
+
+def _after_cd(prefix, words):
+    """Where `cd <dir>` leaves the shell, or None when this cannot know.
+
+    Unknown has to stay unknown -- a variable, a bare `cd`, a `cd -`, a walk
+    above a relative root. A guessed prefix would resolve a later path to a file
+    the command never touches.
+    """
+    targets = [w for w in words[1:] if not w.startswith("-")]
+    if len(targets) != 1:
+        return None
+    target = targets[0]
+    if "$" in target or "`" in target or target.startswith("~"):
+        return None
+    if not target.startswith("/") and prefix is None:
+        return None
+    joined = target if target.startswith("/") else (
+        prefix.rstrip("/") + "/" + target if prefix else target)
+    collapsed = _collapse(joined)
+    if collapsed is None:
+        return None
+    return collapsed
+
+
+def _collapse(path):
+    """`a/./b`, `a//b` and `a/c/../b` as the one path they name.
+
+    None for a walk that climbs past the top. The protected markers are matched
+    literally, so an unnormalised `./` or `..` in a path is enough to stop one
+    matching.
+    """
+    rooted = path.startswith("/")
+    out = []
+    for part in path.split("/"):
+        if not part or part == ".":
+            continue
+        if part == "..":
+            if not out:
+                return None
+            out.pop()
+        else:
+            out.append(part)
+    joined = "/".join(out)
+    return ("/" + joined) if rooted else joined
+
+
+def _check_writes(segment, prefix):
+    """Rule 3 from the shell: the paths a command writes, judged as an Edit is."""
+    verb, paths, base = _written_paths(segment)
+    if base is not None:
+        prefix = _join(prefix, base) if prefix is not None or base.startswith("/") else None
+    for path in paths:
+        full = _join(prefix, path)
+        # A destination directory without its slash -- `cp x .../captures` --
+        # writes INTO it, so it is judged as a directory too.
+        message = _refusal(full) or _refusal(full.rstrip("/") + "/")
+        if message:
+            deny(f"{message}\n(`{verb}` writes {path} -- the shell spelling of the "
+                 "same write.)")
+
+
+def check_bash(command, cwd=None):
+    """Every rule that reads a command line.
+
+    `cwd` is where the shell stands -- the hook payload's own `cwd` -- so that a
+    relative path after a `cd` still reaches the path rules as the file it is.
+    """
     branch_cache = [None]
+    prefix = cwd if isinstance(cwd, str) and cwd.startswith("/") else ""
     for segment in _segments(command):
         words = _words(segment)
         if not words:
+            continue
+        if _verb(words) in ("cd", "pushd"):
+            # Before the prefix moves: a redirect on the `cd` line is written
+            # where the shell already stands.
+            _check_writes(segment, prefix)
+            prefix = _after_cd(prefix, words)
             continue
         # `bash -c "..."` is a command in an argument. Judge what it will run.
         if _verb(words) in ("bash", "sh", "zsh", "dash") and "-c" in words:
             idx = words.index("-c")
             if idx + 1 < len(words):
-                check_bash(words[idx + 1])
+                check_bash(words[idx + 1], prefix)
             continue
         _check_merge(words)
         _check_review(words)
         _check_force_push(words, branch_cache)
+        _check_writes(segment, prefix)
     return 0
 
 
@@ -459,31 +699,41 @@ def _protected_tail(path):
     return None
 
 
-def check_path(path):
-    """Rule 3: secrets, and the paths this project pinned."""
+def _refusal(path):
+    """Why rule 3 refuses a write to `path`, or None. Edit and shell alike."""
     normalised = path if path.startswith("/") else "/" + path
     tail = _protected_tail(path)
 
     if (normalised.endswith(SECRET_SUFFIXES)
             or any(m in normalised for m in SECRET_CONTAINS)
             or (tail and tail in SECRET_TAILS)):
-        deny(
+        return (
             f"Blocked: {path} holds per-worktree secrets, and none of them belong in\n"
             "the tree. .env is generated -- regenerate it with "
             "./scripts/orca/env.sh rather than editing it."
         )
 
-    for where, protected_tail, reason in PROTECTED_PATHS:
+    for where, protected_tail, reason, regenerate in PROTECTED_PATHS:
         if where in normalised or (protected_tail and tail == protected_tail):
             # The reason is the whole value of the rule: "blocked" with no why
-            # sends the agent looking for a way around it.
-            deny(
+            # sends the agent looking for a way around it -- and so is a rule
+            # that refuses the write without naming the writer that may.
+            return (
                 f"Blocked: {where} is {reason}.\n"
                 "Editing it to match a failing run silences whatever it exists to "
                 "catch.\n"
-                "Say in the PR body what changed and why, or ask for it to be "
-                "regenerated the way this project regenerates it."
+                + (regenerate if regenerate else
+                   "Say in the PR body what changed and why, or ask for it to be "
+                   "regenerated the way this project regenerates it.")
             )
+    return None
+
+
+def check_path(path):
+    """Rule 3: secrets, and the paths this project pinned."""
+    message = _refusal(path)
+    if message:
+        deny(message)
     return 0
 
 
@@ -500,7 +750,7 @@ def main(payload):
                 "cannot tell whether it is allowed. Refusing rather than allowing an "
                 "unexamined command."
             )
-        return check_bash(command)
+        return check_bash(command, payload.get("cwd"))
 
     # NotebookEdit names its target notebook_path, not file_path. Reading only
     # file_path is how a matcher ends up promising coverage it does not have.
@@ -575,6 +825,56 @@ SELFTEST = [
     # refused it as a Write never saw it.
     ("Bash", {"command": "cp x server/contract/captures/5.4.0/y.json"}, 2,
      "a capture is not copied into place from the shell"),
+    ("Bash", {"command": "echo x>server/contract/captures/a.json"}, 2,
+     "...nor redirected into, with the operator against the word before it"),
+    ("Bash", {"command": "probe &> captures/a.json"}, 2, "...nor by `&>`"),
+    ("Bash", {"command": "cat > server/contract/captures/a.json <<'EOF'\n{}\nEOF"}, 2,
+     "...and a heredoc's opening line is a real write even though its body is data"),
+    ("Bash", {"command": "install -m 0644 /tmp/x server/contract/captures/a.json"}, 2,
+     "...nor installed"),
+    ("Bash", {"command": "rsync -a /tmp/out/ server/contract/captures/5.4.0/"}, 2,
+     "...nor rsynced"),
+    ("Bash", {"command": "perl -pi -e 's/a/b/' server/contract/captures/a.json"}, 2,
+     "...nor edited in place by perl"),
+    ("Bash", {"command": "cp -t server/contract/captures/5.4.0 /tmp/a.json /tmp/b.json"}, 2,
+     "...nor copied with the destination given by -t"),
+    ("Bash", {"command": "cp /tmp/a.json server/contract/captures"}, 2,
+     "...nor into the directory named without its slash"),
+    ("Bash", {"command": "cd server/contract/captures && cp /tmp/a.json 5.4.0/a.json"}, 2,
+     "...nor after a cd that consumed the marker"),
+    ("Bash", {"command": "cd server/contract/captures/5.4.0 && cp /tmp/a.json ."}, 2,
+     "...nor to `.` once the cd has arrived"),
+    ("Bash", {"command": "FOO=1 cp /tmp/x .env"}, 2, "...nor behind an assignment"),
+    ("Bash", {"command": "bash -c 'cp /tmp/x token.dat'"}, 2, "...nor inside bash -c"),
+    ("Bash", {"command": "rm server/contract/captures/a.json"}, 2,
+     "a capture is not deleted -- a removed pin is as unpinned as an edited one"),
+    ("Bash", {"command": "git rm -q server/contract/captures/a.json"}, 2, "...nor by git rm"),
+    ("Bash", {"command": "mv server/contract/captures/a.json /tmp/"}, 2,
+     "...nor moved out, which removes it"),
+    ("Bash", {"command": "git checkout main -- server/contract/captures/"}, 2,
+     "a capture is not checked out of another revision"),
+    ("Bash", {"command": "git restore --source=HEAD~3 server/contract/captures/a.json"}, 2,
+     "...nor restored from one"),
+    ("Bash", {"command": "git -C server/contract/captures checkout main -- a.json"}, 2,
+     "...however git is pointed at it"),
+    ("Bash", {"command": "git checkout -- server/contract/captures/"}, 0,
+     "putting back the pinned bytes is the repair, not a write around the pin"),
+    ("Bash", {"command": "git restore server/contract/captures/a.json"}, 0, "...by restore too"),
+    ("Bash", {"command": "git checkout fix/captures/sweep"}, 0, "a branch is not a path"),
+    ("Bash", {"command": "cp server/contract/captures/a.json /tmp/a.json"}, 0,
+     "copying a capture OUT is reading it"),
+    ("Bash", {"command": "cd /tmp && cp server/contract/captures/a.json ."}, 0,
+     "...wherever the cd left the copy"),
+    ("Bash", {"command": "./.venv/bin/python server/probe_contract.py --auth --negotiate "
+                         "--sync-scenarios --capture server/contract/captures/5.4.0"}, 0,
+     "the probe writing its captures in place is the sanctioned writer"),
+    ("Bash", {"command": "ctest --test-dir build 2>&1 | tee build/logs/ctest.log"}, 0,
+     "`2>&1` is a descriptor, and tee into a log is ordinary"),
+    ("Bash", {"command": "probe 2>build/logs/err.txt"}, 0, "...and so is a stderr redirect"),
+    ("Bash", {"command": "git commit -m 'never cp x > server/contract/captures/a.json'"}, 0,
+     "a quoted redirect in a commit message is not one"),
+    ("Bash", {"command": "sed -i '' s/a/b/ src/app.c"}, 0, "an in-place edit of source is fine"),
+    ("Bash", {"command": "echo hi > /tmp/note.txt"}, 0, "an ordinary redirect is fine"),
     ("Edit", {"file_path": "/w/demo/.claude/hooks/guard.py"}, 0,
      "the guards themselves are editable -- the diff and the maintainer's merge are their control"),
     ("Edit", {"file_path": "/w/demo/src/app.c"}, 0, "ordinary source files are editable"),
@@ -589,6 +889,31 @@ SELFTEST = [
     # --- payloads -----------------------------------------------------------
     ("Bash", {}, 2, "a Bash call with no command is refused, not allowed"),
     ("Edit", {}, 0, "a matched tool that names no path has nothing here to answer to"),
+]
+
+# #267's acceptance, as the matrix it is: each routine write shape into the
+# pinned contract and into each secret is refused, and reading the same path
+# by the routine read shapes is not.
+_WRITE_TARGETS = ("server/contract/captures/5.4.0/y.json", ".env",
+                  "token.dat", "device.dat", "config.ini")
+_WRITE_SHAPES = (("cp /tmp/x {}", "cp"), ("mv /tmp/x {}", "mv"),
+                 ("echo x | tee {}", "tee"), ("probe > {}", "a > redirect"),
+                 ("probe >> {}", "a >> redirect"), ("sed -i '' s/a/b/ {}", "sed -i"))
+_READ_SHAPES = (("cat {}", "cat"), ("diff {} /tmp/x", "diff"),
+                ("git show HEAD:{}", "git show"))
+SELFTEST += [("Bash", {"command": shape.format(t)}, 2, f"{name} into {t} is refused")
+             for t in _WRITE_TARGETS for shape, name in _WRITE_SHAPES]
+SELFTEST += [("Bash", {"command": shape.format(t)}, 0, f"{name} of {t} is allowed")
+             for t in _WRITE_TARGETS for shape, name in _READ_SHAPES]
+
+# A relative path means wherever the shell already stands, which the hook
+# payload's `cwd` says. (cwd, command, want, what)
+CWD_CASES = [
+    ("/w/demo/server/contract/captures/5.4.0", "cp /tmp/a.json b.json", 2,
+     "a relative write is judged where the shell stands"),
+    ("/w/demo/server/contract/captures", "cd .. && cp /tmp/a.json b.json", 0,
+     "...and a cd out of there is followed"),
+    ("/w/demo", "cp /tmp/a.json b.json", 0, "...which is an ordinary directory usually"),
 ]
 
 # Rule 4, which holds only in a linked worktree -- where agents work. Same
@@ -629,6 +954,7 @@ SELFTEST_PROJECT = {
             "path": "server/contract/captures/",
             "tail": "captures/",
             "reason": "the pinned API contract a test diffs a live probe against",
+            "regenerate": "Regenerate it with the probe, which may write there.",
         }
     ],
     "secret_suffixes": ["/config.ini"],
@@ -637,19 +963,56 @@ SELFTEST_PROJECT = {
 }
 
 
-def _run(tool, tool_input):
-    """One case, with the refusal text swallowed.
+def _run(tool, tool_input, cwd=None, said=None):
+    """One case, with the refusal text swallowed -- or kept in `said`.
 
     Every blocking row prints its reason to stderr, and forty of them buries the
     one line that matters -- which assertion failed. The failures below print
     their own message, so nothing is lost.
     """
+    payload = {"tool_name": tool, "tool_input": tool_input}
+    if cwd is not None:
+        payload["cwd"] = cwd
     try:
-        with contextlib.redirect_stderr(io.StringIO()):
-            main({"tool_name": tool, "tool_input": tool_input})
+        with contextlib.redirect_stderr(said if said is not None else io.StringIO()):
+            main(payload)
         return 0
     except SystemExit as exc:
         return exc.code
+
+
+def _cwd_and_message_checks():
+    """CWD_CASES, and that a refusal names the writer that MAY write there.
+
+    A refusal with no way forward sends the agent looking for a way round, and
+    #267's own `cp` was exactly that: the probe's output, copied in by hand.
+    """
+    failures = 0
+    for cwd, command, want, what in CWD_CASES:
+        got = _run("Bash", {"command": command}, cwd=cwd)
+        if got != want:
+            print(f"FAIL: {what} (expected exit {want}, got {got})", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"  ok: {what}")
+    hint = SELFTEST_PROJECT["protected_paths"][0]["regenerate"]
+    for tool, tool_input, what in (
+        ("Bash", {"command": "cp /tmp/x server/contract/captures/a.json"},
+         "the shell refusal names the sanctioned writer"),
+        ("Write", {"file_path": "/w/demo/server/contract/captures/a.json"},
+         "...and so does the Edit/Write one"),
+    ):
+        said = io.StringIO()
+        got = _run(tool, tool_input, said=said)
+        if got != 2 or hint not in said.getvalue():
+            print(f"FAIL: {what} (exit {got}, said {said.getvalue()!r})", file=sys.stderr)
+            failures += 1
+        else:
+            print(f"  ok: {what}")
+    return failures
+
+
+MESSAGE_ASSERTIONS = 2
 
 
 def _bash_cases(cases):
@@ -796,12 +1159,14 @@ def selftest():
     finally:
         AGENT_WORKTREE = saved
     failures += _stateful_checks()
+    failures += _cwd_and_message_checks()
     failures += _plumbing_checks()
     if failures:
         print(f"{failures} guard assertion(s) failed", file=sys.stderr)
         return 1
-    print(f"{len(SELFTEST) + len(AGENT_CASES) + PLUMBING_ASSERTIONS} "
-          "guard assertions hold")
+    held = (len(SELFTEST) + len(AGENT_CASES) + len(CWD_CASES)
+            + MESSAGE_ASSERTIONS + PLUMBING_ASSERTIONS)
+    print(f"{held} guard assertions hold")
     return 0
 
 

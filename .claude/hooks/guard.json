@@ -3,7 +3,8 @@
   "protected_paths": [
     {"path": "server/contract/captures/",
      "tail": "captures/",
-     "reason": "the pinned RomM contract (5.2.0, and 5.4.0 under captures/5.4.0/); a test diffs a live probe against it"}
+     "reason": "the pinned RomM contract (5.2.0, and 5.4.0 under captures/5.4.0/); a test diffs a live probe against it",
+     "regenerate": "Regenerate it by running server/probe_contract.py --capture <that dir> against this worktree's own fixture (server/contract/captures/README.md, Re-capturing). The probe writing there is the sanctioned writer and this hook does not stop it; copying its output in afterwards, redirecting into a capture or editing one in place is what it stops."}
   ],
   "secret_suffixes": ["/config.ini", "/token.dat", "/device.dat", "/server/testing/fixture-auth.env"],
   "secret_contains": ["/token.dat", "/device.dat", "fixture-auth.env"],

@@ -238,7 +238,7 @@ deterministic. Four rules, each with a `--selftest` row:
 |---|---|
 | `gh pr merge` — `--auto` included — and its REST (`gh api …/pulls/N/merge`) and GraphQL (`mergePullRequest`) spellings | the maintainer merges; the agent that wrote it does not |
 | force-pushing the default branch | the commit chain is the audit trail. The branch name comes from `.claude/hooks/guard.json` |
-| editing `.env` and whatever `.claude/hooks/guard.json` names as a secret or a pinned path | hard rule 5, and the pinned RomM contract under `server/contract/captures/` |
+| writing `.env` and whatever `.claude/hooks/guard.json` names as a secret or a pinned path — by an edit, or by the routine shell spellings: a redirect, `cp`/`mv`/`install`/`ln`/`rsync`/`tee`/`rm`, `sed -i`/`perl -i`, and `git checkout`/`git restore` from another revision (#267). Reading one stays open, and so does `server/probe_contract.py --capture`, the captures' sanctioned writer | hard rule 5, and the pinned RomM contract under `server/contract/captures/` |
 | `gh pr review`, its REST (`gh api …/pulls/N/reviews`) and GraphQL (`addPullRequestReview`, `submitPullRequestReview`) spellings, and a `gh api` body read from a file, **in a linked worktree** | every pull request here goes up from the maintainer's account, so an agent's review is a review of its own work |
 
 The review rule holds **only in a linked worktree** — where agents work — and

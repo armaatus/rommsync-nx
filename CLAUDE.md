@@ -155,8 +155,10 @@ Your job ends at a commit on your worktree's branch.
   anything that finds an issue to be wrong. They are advisory.
 - **Hooks** ([`.claude/hooks/guard.py`](.claude/hooks/guard.py)) are not. They
   block, with an explanation: merging or reviewing your own PR, force-pushing
-  `main`, writing to `server/contract/captures/`, editing secrets — from a shell
-  command as well as from an edit. The paths and names it protects are
+  `main`, writing to `server/contract/captures/` or a secret — by an edit, or by
+  a redirect, `cp`, `mv`, `tee`, `sed -i` and the other shell spellings its
+  selftest lists; the probe's `--capture` is the captures' one sanctioned
+  writer. The paths and names it protects are
   [`.claude/hooks/guard.json`](.claude/hooks/guard.json). A block is a rule you
   were about to break, not a bug. It is not a sandbox: `guard.py --selftest` is the
   record of what has been checked, not a proof that nothing gets through.
