@@ -2358,6 +2358,7 @@ set(ENGINE_SCENARIOS
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
   keep_local_guards  # #273/#275: Keep local held under a game, refused past four waiting
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
+  keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
