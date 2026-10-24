@@ -570,6 +570,11 @@ SELFTEST = [
     ("Edit", {"file_path": "/w/demo/server/contract/captures/login.json"}, 2,
      "a pinned capture is not hand-edited"),
     ("Write", {"file_path": "captures/login.json"}, 2, "...by a relative path, matched on its tail"),
+    # The same rule for a shell command (#267): the 5.4.0 capture reached
+    # captures/ by a `cp` from the probe's scratch output, and the guard that
+    # refused it as a Write never saw it.
+    ("Bash", {"command": "cp x server/contract/captures/5.4.0/y.json"}, 2,
+     "a capture is not copied into place from the shell"),
     ("Edit", {"file_path": "/w/demo/.claude/hooks/guard.py"}, 0,
      "the guards themselves are editable -- the diff and the maintainer's merge are their control"),
     ("Edit", {"file_path": "/w/demo/src/app.c"}, 0, "ordinary source files are editable"),
