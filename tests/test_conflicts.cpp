@@ -1040,6 +1040,9 @@ void KeepLocal(checks::Checks& c) {
     conflicts::Entry second = SaveEntry(4, "game.srm");
     second.backup_sd_path = newer_backup;
     const std::int64_t newest = history.Append(second).id;
+    c.Expect(!conflicts::CarriesChoice(history, *history.Find(older)) &&
+                 conflicts::CarriesChoice(history, *history.Find(newest)),
+             "the choice is the newest conflict's, not the one it replaced");
 
     const conflicts::RestoreReport refused =
         conflicts::KeepLocal(*files, history, older, {}, &key, options);
@@ -1058,7 +1061,10 @@ void KeepLocal(checks::Checks& c) {
     conflicts::Entry downloaded = SaveEntry(4, "game.srm");
     downloaded.event = conflicts::Event::kReplaced;
     downloaded.backup_sd_path = newer_backup;
-    history.Append(downloaded);
+    const std::int64_t downloaded_id = history.Append(downloaded).id;
+    c.Expect(!conflicts::CarriesChoice(history, *history.Find(newest)) &&
+                 !conflicts::CarriesChoice(history, *history.Find(downloaded_id)),
+             "and after a download no entry of the save carries one");
     const conflicts::RestoreReport overtaken =
         conflicts::KeepLocal(*files, history, newest, {}, &key, options);
     c.Expect(overtaken.outcome == conflicts::RestoreOutcome::kSuperseded,

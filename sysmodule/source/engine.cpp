@@ -3280,7 +3280,10 @@ ipc::KeepLocalState SdEngine::KeepLocalOfLocked(const state::Baseline::Key& key)
   // past cancelling (#279) -- its bytes are about to be on the card, game
   // or none -- so it reads as the waiting choice it is about to be, the same
   // answer a cancel gets. Ahead of the held list, which a press for a held
-  // row leaves the key in until its outcome.
+  // row leaves the key in until its outcome -- and a press that does not land
+  // (a game running, a backup it could not write) leaves it there for good,
+  // so the cancel said `landed` of bytes that never moved. Harmless: nothing
+  // was written, and the next page offers Cancel again.
   const bool pressed = restore_.phase == ipc::RestorePhase::kRunning && restore_keeps_local_ &&
                        restore_kept_ == key;
   if (pressed || landing_ == key) {
@@ -3298,8 +3301,7 @@ ipc::KeepLocalState SdEngine::KeepLocalOfLocked(const state::Baseline::Key& key)
 std::optional<state::Baseline::Key> SdEngine::ChoiceKeyOf(std::int64_t entry_id) const {
   std::lock_guard<std::mutex> history(history_mutex_);
   const conflicts::Entry* entry = history_.Find(entry_id);
-  if (entry == nullptr || !entry->save_conflict() ||
-      conflicts::NewestSaveEntry(history_, {entry->rom_id, entry->slot}) != entry) {
+  if (entry == nullptr || !conflicts::CarriesChoice(history_, *entry)) {
     return std::nullopt;
   }
   return state::Baseline::Key{entry->rom_id, entry->slot};
@@ -3358,9 +3360,7 @@ void SdEngine::BuildConflictPage(const ipc::ConflictQuery& query, ipc::ConflictP
     // A choice is its save's, and drawn on the entry it was made on: the
     // save's newest, which is the only one Keep local takes. A candidate for
     // now; `ListConflicts` says whether it is chosen.
-    if (entries[at].save_conflict() &&
-        conflicts::NewestSaveEntry(history_, {entries[at].rom_id, entries[at].slot}) ==
-            &entries[at]) {
+    if (conflicts::CarriesChoice(history_, entries[at])) {
       row.keep_local = ipc::KeepLocalState::kWaiting;
     }
     if (!ipc::AppendIfItFits(page, std::move(row))) {

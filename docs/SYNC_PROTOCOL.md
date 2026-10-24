@@ -513,8 +513,11 @@ and it is the only thing that ever sends `overwrite=true`:
    finds the key still held and nothing is on its way to the card, or it
    finds it claimed, pressed or armed and answers `landed`, the row
    `waiting`, and undoes nothing -- the kept bytes stay and the upload still
-   goes with `overwrite=true`. (A press that then finds a game running holds
-   the choice again; the row reads `held` once more.) A
+   goes with `overwrite=true`. (A press that then does not land -- it finds
+   a game running, or its backup cannot be written -- leaves the choice
+   held, so a cancel during it said `landed` of bytes that never moved; the
+   row reads `held` once more and offers Cancel again. Nothing was written
+   either way.) A
    `waiting` row offers no cancel: its bytes are on the card. Cancel never
    switches straight to Keep server (that would be a restore under a running
    game); the player cancels, then chooses. `not_held` answers anything else
