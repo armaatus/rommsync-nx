@@ -824,11 +824,43 @@ def check_bash(command, cwd=None):
             if idx + 1 < len(words):
                 check_bash(words[idx + 1], prefix)
             continue
+        # `ssh host "..."` runs its argument on the far side, as bash -c does
+        # here. Quote-blind splitting caught that by accident; the quote-aware
+        # split needs it said. Only the merge, review and force-push rules
+        # cross: the far side's paths are not this tree's.
+        if _verb(words) == "ssh":
+            remote = _ssh_remote(words)
+            if remote:
+                for far in _segments(remote):
+                    far_words = _words(far)
+                    if far_words:
+                        _check_merge(far_words)
+                        _check_review(far_words)
+                        _check_force_push(far_words, branch_cache)
+            _check_writes(segment, prefix)
+            continue
         _check_merge(words)
         _check_review(words)
         _check_force_push(words, branch_cache)
         _check_writes(segment, prefix)
     return 0
+
+
+# ssh(1)'s options that take a value: the word after one is not the host.
+_SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def _ssh_remote(words):
+    """The command line `ssh [options] host command...` runs remotely, if any."""
+    i = 1
+    while i < len(words) and words[i].startswith("-") and words[i] != "--":
+        opt = words[i]
+        i += 1
+        if len(opt) == 2 and opt[1] in _SSH_VALUE_OPTS:
+            i += 1
+    if i < len(words) and words[i] == "--":
+        i += 1
+    return " ".join(words[i + 1:])
 
 
 def _protected_tail(path):
@@ -937,6 +969,11 @@ SELFTEST = [
      "...and by its GraphQL name"),
     ("Bash", {"command": "true && gh pr merge 3"}, 2, "a second segment is judged too"),
     ("Bash", {"command": 'bash -c "gh pr merge 3"'}, 2, "...and so is bash -c"),
+    ("Bash", {"command": 'ssh host "x; gh pr merge 3"'}, 2,
+     "...and so is what ssh runs on the far side"),
+    ("Bash", {"command": "ssh -p 2222 -i key host gh pr merge 3"}, 2,
+     "...past ssh's own options and the host"),
+    ("Bash", {"command": 'ssh host "ls; uptime"'}, 0, "an ssh that merges nothing is allowed"),
     ("Bash", {"command": "gh pr create --title x --body y"}, 0, "opening a PR is allowed"),
     ("Bash", {"command": "gh api repos/o/r/pulls/12"}, 0, "reading a PR over the API is allowed"),
     ("Bash", {"command": 'git commit -m "note: do not gh pr merge yourself"'}, 0,
