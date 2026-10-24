@@ -169,7 +169,12 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **13** since M10-34 (#275), which replaced `kGameRunning` with
 /// `conflicts::RestoreOutcome::kHeld` -- Keep local under a game is held, not
 /// refused -- and added `ConflictRow::keep_local`, a required field.
-inline constexpr std::uint32_t kVersion = 13;
+///
+/// **14** since M10-35 (#279), which added `CancelKeepLocal`. An older
+/// sysmodule answers it `kUnknownCommand`, but an overlay that offers Cancel on
+/// a held row has to be talking to one that can withdraw it, so the two say
+/// "update" to each other rather than drawing a button that is refused.
+inline constexpr std::uint32_t kVersion = 14;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -230,6 +235,7 @@ enum class Command : std::uint32_t {
   kGetLog = 16,
   kGetRestoreState = 17,
   kKeepLocal = 18,
+  kCancelKeepLocal = 19,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -242,7 +248,7 @@ inline constexpr std::array kAllCommands = {
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
     Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
     Command::kRestoreBackup,       Command::kGetLog,       Command::kGetRestoreState,
-    Command::kKeepLocal,
+    Command::kKeepLocal,           Command::kCancelKeepLocal,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -903,6 +909,32 @@ enum class KeepLocalState {
 };
 const char* ToString(KeepLocalState state);
 
+/// What became of a `CancelKeepLocal` (#279).
+enum class CancelOutcome {
+  /// The choice was held and is withdrawn. Nothing had been written, so
+  /// nothing is undone: the row is open, and the hold lands nothing.
+  kCancelled,
+
+  /// **Past cancelling.** The game closed and the choice landed, or is landing
+  /// now: the kept bytes are on the card -- or going there -- and their upload
+  /// with `overwrite=true` is still owed. Withdrawing it then would not be free,
+  /// so it is not done; the row reads `waiting`.
+  kLanded,
+
+  /// Nothing is held for that entry: it is not the newest entry of a save
+  /// conflict, it was never chosen, or the choice was already spent or dropped.
+  kNotHeld,
+};
+const char* ToString(CancelOutcome outcome);
+
+/// `CancelKeepLocal`'s answer: the outcome, and the row's `keep_local` once it
+/// was decided -- so a screen draws the row as it now is, `waiting` after a
+/// landing that beat the cancel, rather than guessing `open`.
+struct CancelKeepLocalResult {
+  CancelOutcome outcome = CancelOutcome::kNotHeld;
+  KeepLocalState keep_local = KeepLocalState::kOpen;
+};
+
 /// One entry, plus the facts about it that are not in the file.
 struct ConflictRow {
   conflicts::Entry entry;
@@ -1108,6 +1140,11 @@ Decoded<ConflictPage> DecodeConflictPage(std::string_view text);
 std::string EncodeEntryId(std::int64_t entry_id);
 Decoded<std::int64_t> DecodeEntryId(std::string_view text);
 
+/// `{"outcome":"cancelled|landed|not_held","keep_local":"open|held|waiting"}`
+/// -- `CancelKeepLocal`'s answer (#279). Its request is `EncodeEntryId`.
+std::string EncodeCancelKeepLocalResult(const CancelKeepLocalResult& result);
+Decoded<CancelKeepLocalResult> DecodeCancelKeepLocalResult(std::string_view text);
+
 std::string EncodeRestoreReport(const conflicts::RestoreReport& report);
 Decoded<conflicts::RestoreReport> DecodeRestoreReport(std::string_view text);
 
@@ -1296,6 +1333,14 @@ class Engine {
   /// while the player is still looking at it (`conflicts::KeepLocal`).
   virtual RestoreState RequestKeepLocal(std::int64_t entry_id) = 0;
 
+  /// Withdraw a Keep local that is **held** (#279), before the game closes.
+  /// Nothing was written while it was held, so dropping it costs nothing --
+  /// it is what a reboot already does. A choice that has landed, or is
+  /// landing, is past this (`kLanded`): its bytes are on the card. Decided
+  /// under the lock the landing claims its key under, so a cancel and a
+  /// landing cannot both happen. Answered at once; never fails.
+  virtual CancelKeepLocalResult CancelKeepLocal(std::int64_t entry_id) = 0;
+
   /// Where the last restore stands. Safe at any rate, from the IPC thread,
   /// while one runs.
   virtual RestoreState restore_state() const = 0;
@@ -1380,6 +1425,10 @@ class ServiceCore {
   /// answer and its poll, and the next upload of that save goes over the
   /// server's copy. Never fails; a refusal is the report's outcome.
   RestoreState KeepLocal(std::int64_t entry_id);
+
+  /// Command 19 (#279). Withdraw a held Keep local; never fails, and what
+  /// became of it is the answer's outcome.
+  CancelKeepLocalResult CancelKeepLocal(std::int64_t entry_id);
 
   /// Command 16. The last `lines` lines of this process's log, clamped to
   /// `[0, kMaxLogLines]`. Never fails: a console that has logged nothing has an

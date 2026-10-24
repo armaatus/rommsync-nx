@@ -49,6 +49,11 @@ const char* ActionFor(const ConflictsView& view) {
   // model's decision (`overlay_conflicts_view.hpp`), and re-deriving it here
   // would be a second place for it to live. A save conflict's is the Keep
   // server / Keep local / Skip choice (#249), so A chooses rather than restores.
+  if (view.can_cancel) {
+    // A held Keep local (#279). Named in full: "Cancel" beside "Back" would
+    // read as the same thing.
+    return "Cancel Keep local";
+  }
   if (!view.can_restore) {
     return nullptr;
   }

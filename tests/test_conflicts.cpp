@@ -1922,9 +1922,80 @@ void Overlay(checks::Checks& c) {
       c.Expect(drawn.headline.find("Keep local") != std::string::npos && !drawn.can_restore,
                "and its detail says so rather than offering the choice again: " +
                    drawn.headline);
+      c.Expect(drawn.can_cancel, "but offers to cancel it, while it is held (#279)");
       held.Activate();
       c.Expect(held.Render().mode == overlay::ConflictsMode::kDetail,
-               "A on a chosen entry opens no choice");
+               "A on a held entry opens no choice");
+      const overlay::ConflictsModel::Command cancel = held.Next();
+      c.Expect(cancel.kind == overlay::ConflictsModel::Command::Kind::kCancelKeepLocal &&
+                   cancel.entry_id == 64,
+               "it sends CancelKeepLocal for that entry");
+      c.Expect(!held.Render().can_cancel, "and offers no second cancel while that one is out");
+      held.OnCancelKeepLocal({ipc::CancelOutcome::kCancelled, ipc::KeepLocalState::kOpen});
+      drawn = held.Render();
+      c.Expect(drawn.headline.find("cancelled") != std::string::npos &&
+                   drawn.headline.find("Nothing was written") != std::string::npos,
+               "the detail says it is cancelled and nothing was written: " + drawn.headline);
+      c.Expect(!drawn.can_cancel && drawn.can_restore,
+               "and the choice is on offer again, not the cancel");
+      held.Activate();
+      c.Expect(held.Render().mode == overlay::ConflictsMode::kConfirm,
+               "A opens the Keep server / Keep local / Skip choice again");
+      held.Activate();
+      drawn = held.Render();
+      c.Expect(drawn.headline.find("Kept the server's copy") != std::string::npos,
+               "and what is chosen next is what the detail says, not the cancel: " +
+                   drawn.headline);
+      held.Back();
+      drawn = held.Render();
+      c.Expect(!drawn.rows.empty() && drawn.rows[0].note.find("Keep local is chosen") ==
+                                          std::string::npos,
+               "and the row is drawn open on the list: " +
+                   (drawn.rows.empty() ? std::string() : drawn.rows[0].note));
+    }
+
+    // #279: the cancel lost the race to the landing. The row is drawn as the
+    // sysmodule says it now is -- waiting for its upload -- never as open,
+    // and offers no cancel.
+    {
+      overlay::ConflictsModel late;
+      late.Next();
+      ipc::ConflictPage page;
+      page.total = 1;
+      conflicts::Entry entry = SaveEntry(4, "game.srm");
+      entry.id = 66;
+      ipc::ConflictRow row = Row(entry, true);
+      row.keep_local = ipc::KeepLocalState::kHeld;
+      page.entries = {row};
+      late.OnPage(page);
+      late.Activate();
+      late.Activate();
+      c.Expect(late.Next().kind == overlay::ConflictsModel::Command::Kind::kCancelKeepLocal,
+               "the cancel goes out");
+      late.OnCancelKeepLocal({ipc::CancelOutcome::kLanded, ipc::KeepLocalState::kWaiting});
+      overlay::ConflictsView drawn = late.Render();
+      c.Expect(drawn.headline.find("already landed") != std::string::npos,
+               "the detail says the choice already landed: " + drawn.headline);
+      c.Expect(!drawn.can_cancel && !drawn.can_restore, "and offers neither cancel nor choice");
+      late.Back();
+      drawn = late.Render();
+      c.Expect(!drawn.rows.empty() && drawn.rows[0].note.find("next sync") != std::string::npos,
+               "the row waits for its upload: " +
+                   (drawn.rows.empty() ? std::string() : drawn.rows[0].note));
+
+      // A cancel the sysmodule refused is said, and the row is left as it was.
+      overlay::ConflictsModel refused;
+      refused.Next();
+      refused.OnPage(page);
+      refused.Activate();
+      refused.Activate();
+      refused.Next();
+      refused.OnRefused(ipc::Error::kInternal);
+      drawn = refused.Render();
+      c.Expect(drawn.tone == overlay::Tone::kBad &&
+                   drawn.headline.find("not cancelled") != std::string::npos,
+               "a refused cancel says it did not happen: " + drawn.headline);
+      c.Expect(drawn.can_cancel, "and the held row still offers it");
     }
 
     // A page from the sysmodule says which rows are chosen, held or waiting,
@@ -1951,6 +2022,17 @@ void Overlay(checks::Checks& c) {
       const overlay::ConflictsView detail = model.Render();
       c.Expect(!detail.can_restore && detail.headline.find(says) != std::string::npos,
                std::string("and its detail says what is left to happen: ") + detail.headline);
+      // #279: only a held choice is withdrawn. A waiting one's bytes are on
+      // the card already, and stays final.
+      const bool offered = state == ipc::KeepLocalState::kHeld;
+      c.Expect(detail.can_cancel == offered,
+               std::string("a ") + ipc::ToString(state) + " row " +
+                   (offered ? "offers" : "does not offer") + " Cancel");
+      model.Activate();
+      c.Expect((model.Next().kind == overlay::ConflictsModel::Command::Kind::kCancelKeepLocal) ==
+                   offered,
+               std::string("and A on a ") + ipc::ToString(state) + " row " +
+                   (offered ? "sends" : "sends no") + " cancel");
     }
 
     // #273's refusals, each in its own words and none a success.

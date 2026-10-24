@@ -15,6 +15,7 @@ void Send(ScreenFrame& frame, IpcClient& client, ConflictsModel& model, Link& li
   Result rc = 0;
   ipc::ConflictPage page;
   ipc::RestoreState restore;
+  ipc::CancelKeepLocalResult cancel;
 
   switch (command.kind) {
     case ConflictsModel::Command::Kind::kListConflicts:
@@ -31,6 +32,10 @@ void Send(ScreenFrame& frame, IpcClient& client, ConflictsModel& model, Link& li
       break;
     case ConflictsModel::Command::Kind::kRestoreState:
       rc = client.GetRestoreState(&restore);
+      break;
+    case ConflictsModel::Command::Kind::kCancelKeepLocal:
+      // A held Keep local withdrawn (#279), answered at once.
+      rc = client.CancelKeepLocal(command.entry_id, &cancel);
       break;
     case ConflictsModel::Command::Kind::kNone:
       return;
@@ -60,6 +65,9 @@ void Send(ScreenFrame& frame, IpcClient& client, ConflictsModel& model, Link& li
     case ConflictsModel::Command::Kind::kRestoreState:
     case ConflictsModel::Command::Kind::kKeepLocal:
       model.OnRestoreState(restore);
+      return;
+    case ConflictsModel::Command::Kind::kCancelKeepLocal:
+      model.OnCancelKeepLocal(cancel);
       return;
     case ConflictsModel::Command::Kind::kNone:
       return;

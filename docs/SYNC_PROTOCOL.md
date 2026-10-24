@@ -497,6 +497,23 @@ and it is the only thing that ever sends `overwrite=true`:
    is dropped with a `save.failed` warning, the row is open again, and nothing
    was written. A reboot before it lands forgets it, as it forgets an armed
    one -- with nothing written to undo.
+
+   **A held choice can be cancelled before the game closes** (#279), for the
+   player who mis-pressed or changed their mind. The conflicts screen offers
+   *Cancel Keep local* on a `held` row; `CancelKeepLocal` (IPC command 19)
+   drops the key from `keep_local_held_`, writes nothing -- there is nothing
+   to undo, which is what a reboot already does -- and answers `cancelled`
+   with the row `open`, both choices on offer again, plus a `sync.held` line
+   naming the rom and slot. The cancel **races the landing**, and is decided
+   against it under `mutex_`: `LandHeldKeepLocal` claims a key there
+   (`SdEngine::landing_`) before the card is touched, so either the cancel
+   finds it still held and nothing has been written, or it finds it claimed
+   or armed and answers `landed`, the row `waiting`, and undoes nothing --
+   the kept bytes stay and the upload still goes with `overwrite=true`. A
+   `waiting` row offers no cancel: its bytes are on the card. Cancel never
+   switches straight to Keep server (that would be a restore under a running
+   game); the player cancels, then chooses. `not_held` answers anything else
+   -- a row never chosen, or a choice spent or dropped -- with its state.
 2. Once the bytes are on the card -- never before -- the sysmodule arms the
    conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
    `sync::kMaxKeepLocal`) and asks for a tick.

@@ -244,6 +244,10 @@ class IpcClient {
   /// server's copy.
   Result KeepLocal(std::int64_t entry_id, ipc::RestoreState* state);
 
+  /// Withdraw a held Keep local (#279). Answered at once: cancelled, or past
+  /// cancelling, with the row's state as it now is.
+  Result CancelKeepLocal(std::int64_t entry_id, ipc::CancelKeepLocalResult* result);
+
   /// The last `lines` lines of the sysmodule's log, from memory (M7-3, #38).
   /// The log screen's, since #209 wired it: until then it was the one command
   /// the sysmodule dispatched with nothing here to send it.

@@ -169,6 +169,13 @@ class FakeEngine : public ipc::Engine {
     return TakeLocked(entry_id);
   }
 
+  /// #279: answered with `cancel_result`, and the entry it was asked of kept.
+  ipc::CancelKeepLocalResult CancelKeepLocal(std::int64_t entry_id) override {
+    std::lock_guard<std::mutex> lock(restore_mutex_);
+    last_cancel_id = entry_id;
+    return cancel_result;
+  }
+
   ipc::RestoreState TakeLocked(std::int64_t entry_id) {
     if (restore_.phase == ipc::RestorePhase::kRunning) {
       return restore_;
@@ -206,6 +213,8 @@ class FakeEngine : public ipc::Engine {
   int restore_requests = 0;
   std::int64_t last_keep_local_id = 0;
   int keep_local_requests = 0;
+  std::int64_t last_cancel_id = 0;
+  ipc::CancelKeepLocalResult cancel_result;
   conflicts::RestoreReport restore_report;
   bool restore_runs_inline = true;
 

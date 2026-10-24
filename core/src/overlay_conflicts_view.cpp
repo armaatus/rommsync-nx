@@ -309,8 +309,19 @@ void ConflictsModel::Reset() {
   last_kept_local_ = false;
   choice_ = 0;
   kept_server_ = 0;
+  cancel_wanted_ = 0;
+  cancelling_ = 0;
+  cancel_answered_ = 0;
+  last_cancel_ = ipc::CancelOutcome::kNotHeld;
+  cancel_error_ = ipc::Error::kOk;
   issued_ = Command::Kind::kNone;
   stale_ = false;
+}
+
+bool ConflictsModel::CanCancel(const ipc::ConflictRow& row) const {
+  // Held, and nothing out that this press would race: a restore, or a cancel.
+  return row.keep_local == ipc::KeepLocalState::kHeld && restoring_ == 0 &&
+         cancel_wanted_ == 0 && cancelling_ == 0;
 }
 
 const ipc::ConflictRow* ConflictsModel::Current() const {
@@ -336,6 +347,15 @@ ConflictsModel::Command ConflictsModel::Next() {
     command.entry_id = restore_wanted_;
     restoring_ = restore_wanted_;
     keeping_local_ = keep_local_wanted_;
+    issued_ = command.kind;
+    return command;
+  }
+  // A cancel (#279), for the same reason: it answers at once, and the player
+  // is looking at the row it is about.
+  if (cancel_wanted_ != 0) {
+    command.kind = Command::Kind::kCancelKeepLocal;
+    command.entry_id = cancel_wanted_;
+    cancelling_ = cancel_wanted_;
     issued_ = command.kind;
     return command;
   }
@@ -496,9 +516,40 @@ void ConflictsModel::FinishRestore(const conflicts::RestoreReport& report) {
   }
 }
 
+void ConflictsModel::OnCancelKeepLocal(const ipc::CancelKeepLocalResult& result) {
+  if (issued_ != Command::Kind::kCancelKeepLocal) {
+    return;
+  }
+  issued_ = Command::Kind::kNone;
+  const std::int64_t cancelled = cancelling_;
+  cancel_wanted_ = 0;
+  cancelling_ = 0;
+  cancel_answered_ = cancelled;
+  last_cancel_ = result.outcome;
+  cancel_error_ = ipc::Error::kOk;
+  // The one row whose fact changed, as `FinishRestore` updates its own, and
+  // to the state the sysmodule answered rather than the one the press hoped
+  // for: a landing that went first leaves the row waiting, not open.
+  for (ipc::ConflictRow& row : rows_) {
+    if (row.entry.id == cancelled) {
+      row.keep_local = result.keep_local;
+      break;
+    }
+  }
+}
+
 void ConflictsModel::OnRefused(ipc::Error error) {
   const Command::Kind refused = issued_;
   issued_ = Command::Kind::kNone;
+  if (refused == Command::Kind::kCancelKeepLocal) {
+    // Not documented to fail either. The row is left as drawn -- held -- and
+    // the press can be made again.
+    cancel_answered_ = cancelling_;
+    cancel_error_ = error == ipc::Error::kOk ? ipc::Error::kInternal : error;
+    cancel_wanted_ = 0;
+    cancelling_ = 0;
+    return;
+  }
   if (refused == Command::Kind::kRestore || refused == Command::Kind::kRestoreState ||
       refused == Command::Kind::kKeepLocal) {
     // None of them is documented to fail at the transport (ipc.hpp), so a
@@ -541,6 +592,13 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
         keep_local_wanted_ = false;
         awaiting_ = true;
         break;
+      case Command::Kind::kCancelKeepLocal:
+        // Not sent again on its own: the row stays drawn as held, and a
+        // second press is harmless -- a cancel that was taken answers
+        // `not_held` with the row open.
+        cancel_wanted_ = 0;
+        cancelling_ = 0;
+        break;
       case Command::Kind::kRestoreState:
       case Command::Kind::kNone:
         break;
@@ -555,6 +613,8 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
   restoring_ = 0;
   keeping_local_ = false;
   awaiting_ = false;
+  cancel_wanted_ = 0;
+  cancelling_ = 0;
   stale_ = true;
 }
 
@@ -618,6 +678,7 @@ void ConflictsModel::Activate() {
       }
       opened_ = rows_[static_cast<std::size_t>(selected_)].entry.id;
       restored_ = false;
+      cancel_answered_ = 0;
       if (lost_ != opened_) {
         lost_ = 0;
       }
@@ -626,6 +687,18 @@ void ConflictsModel::Activate() {
     }
     case ConflictsMode::kDetail: {
       const ipc::ConflictRow* row = Current();
+      if (row != nullptr && row->keep_local == ipc::KeepLocalState::kHeld) {
+        // A held Keep local is taken back with one press (#279), not behind
+        // a confirmation: nothing has been written for it, so the cancel
+        // costs nothing, and choosing again is the same A it was.
+        if (CanCancel(*row)) {
+          cancel_wanted_ = row->entry.id;
+          restored_ = false;
+          lost_ = 0;
+          cancel_answered_ = 0;
+        }
+        return;
+      }
       if (row == nullptr || RestorabilityOf(*row) != Restorability::kReady ||
           row->keep_local != ipc::KeepLocalState::kOpen) {
         // Nothing to confirm. The row already says why, and asking a user to
@@ -642,6 +715,8 @@ void ConflictsModel::Activate() {
       restored_ = false;
       lost_ = 0;
       kept_server_ = 0;
+      // A cancel's answer is about the choice before this one.
+      cancel_answered_ = 0;
       // Keep server first: it is what the sync already did, so an A pressed
       // through without reading changes nothing.
       choice_ = 0;
@@ -691,6 +766,7 @@ bool ConflictsModel::Back() {
       opened_ = 0;
       restored_ = false;
       kept_server_ = 0;
+      cancel_answered_ = 0;
       return true;
     case ConflictsMode::kList:
       return false;
@@ -869,6 +945,8 @@ ConflictsView ConflictsModel::Render() const {
   view.can_restore =
       restorable == Restorability::kReady && !restored_ && restoring_ == 0 && !chosen;
   view.keep_choice = entry.save_conflict();
+  const bool cancel_out = cancel_wanted_ == entry.id || cancelling_ == entry.id;
+  view.can_cancel = CanCancel(*row);
 
   if (mode_ == ConflictsMode::kConfirm && view.keep_choice) {
     for (const ConflictChoice choice : kChoices) {
@@ -902,6 +980,44 @@ ConflictsView ConflictsModel::Render() const {
     view.tone = Tone::kWarn;
     return view;
   }
+  if (cancel_out) {
+    view.headline = "Cancelling Keep local...";
+    view.hint = "B goes back to the list";
+    return view;
+  }
+  if (cancel_answered_ != 0 && cancel_answered_ == entry.id) {
+    view.hint = "B goes back to the list";
+    if (cancel_error_ != ipc::Error::kOk) {
+      view.headline = std::string("Keep local was not cancelled (") +
+                      ipc::ToString(cancel_error_) + "); it is still held";
+      view.tone = Tone::kBad;
+      view.hint = "A tries again; B goes back to the list";
+      return view;
+    }
+    switch (last_cancel_) {
+      case ipc::CancelOutcome::kCancelled:
+        view.headline = "Keep local is cancelled. Nothing was written, and the choice is open "
+                        "again.";
+        view.tone = Tone::kGood;
+        view.hint = "A chooses again; B goes back to the list";
+        return view;
+      case ipc::CancelOutcome::kLanded:
+        // The race #279 names: the game closed and the choice landed before
+        // the press arrived. It stands, and the row says what is left.
+        view.headline = "Keep local already landed, so it was not cancelled";
+        view.tone = Tone::kWarn;
+        if (chosen) {
+          view.hint = ChosenText(row->keep_local);
+        }
+        return view;
+      case ipc::CancelOutcome::kNotHeld:
+        view.headline = "Nothing was held to cancel";
+        if (!chosen && view.can_restore) {
+          view.hint = "A chooses which to keep; B goes back to the list";
+        }
+        return view;
+    }
+  }
   if (restored_ && last_kept_local_ && last_restore_.ok()) {
     view.headline = "Kept this console's copy. The next sync uploads it over the server's.";
     view.tone = Tone::kGood;
@@ -919,7 +1035,8 @@ ConflictsView ConflictsModel::Render() const {
   if (chosen) {
     view.headline = ChosenText(row->keep_local);
     view.tone = Tone::kGood;
-    view.hint = "B goes back to the list";
+    view.hint = view.can_cancel ? "A cancels it; B goes back to the list"
+                                : "B goes back to the list";
     return view;
   }
   if (restorable == Restorability::kReady && view.keep_choice) {

@@ -260,6 +260,12 @@ constexpr KeepLocalState kAllKeepLocalStates[] = {
     KeepLocalState::kWaiting,
 };
 
+constexpr CancelOutcome kAllCancelOutcomes[] = {
+    CancelOutcome::kCancelled,
+    CancelOutcome::kLanded,
+    CancelOutcome::kNotHeld,
+};
+
 constexpr RestorePhase kAllRestorePhases[] = {
     RestorePhase::kIdle,
     RestorePhase::kRunning,
@@ -556,6 +562,8 @@ const char* ToString(Command command) {
       return "GetRestoreState";
     case Command::kKeepLocal:
       return "KeepLocal";
+    case Command::kCancelKeepLocal:
+      return "CancelKeepLocal";
   }
   return "Unknown";
 }
@@ -694,6 +702,18 @@ const char* ToString(KeepLocalState state) {
       return "waiting";
   }
   return "open";
+}
+
+const char* ToString(CancelOutcome outcome) {
+  switch (outcome) {
+    case CancelOutcome::kCancelled:
+      return "cancelled";
+    case CancelOutcome::kLanded:
+      return "landed";
+    case CancelOutcome::kNotHeld:
+      return "not_held";
+  }
+  return "not_held";
 }
 
 const char* ToString(RestorePhase phase) {
@@ -1477,6 +1497,28 @@ Decoded<std::int64_t> DecodeEntryId(std::string_view text) {
         // Positive: `0` is never an entry id (conflict_log.hpp), so a
         // default-constructed request cannot address one.
         ReadInteger(object, "entry_id", out, 1, kMaxId, error);
+      });
+}
+
+std::string EncodeCancelKeepLocalResult(const CancelKeepLocalResult& result) {
+  std::string out("{");
+  AppendText(&out, "outcome", ToString(result.outcome), /*first=*/true);
+  AppendText(&out, "keep_local", ToString(result.keep_local));
+  out += '}';
+  return out;
+}
+
+Decoded<CancelKeepLocalResult> DecodeCancelKeepLocalResult(std::string_view text) {
+  return DecodeObject<CancelKeepLocalResult>(
+      text, "cancel result",
+      [](const json::Value& object, CancelKeepLocalResult* out, json::Error* error) {
+        // Both required: the row's state is what the screen draws, and a
+        // missing one read as `open` would offer a choice that is not open.
+        if (ReadEnum(object, "outcome", kAllCancelOutcomes, ToString, "a cancel outcome",
+                     &out->outcome, error)) {
+          ReadEnum(object, "keep_local", kAllKeepLocalStates, ToString, "a Keep local state",
+                   &out->keep_local, error);
+        }
       });
 }
 
