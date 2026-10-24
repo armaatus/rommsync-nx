@@ -19,8 +19,8 @@ something upstream changes shape is worse than no guard at all.
 Commands are shell-tokenised with shlex rather than matched as raw strings, so
 `git -C /some/path push --force origin main` is caught and
 `git commit -m "note about --force pushes"` is not. Compound commands are split
-on `;`, `&&`, `||` and `|` and each segment is judged on its own, and `bash -c`
-is recursed into.
+on `;`, `&&`, `||`, `|` and `&` -- outside quotes only -- and each segment is
+judged on its own, and `bash -c` is recursed into.
 
 What this is NOT: a sandbox. It reads a command and decides; it does not confine
 one. A session that means to get past it can. The line it holds is the ROUTINE
@@ -188,21 +188,7 @@ def _words(command):
 
 def _is_git(words, verb):
     """`git <verb>`, allowing git's own global options in between."""
-    if not words:
-        return False
-    if words[0].rsplit("/", 1)[-1] != "git":
-        return False
-    i = 1
-    while i < len(words):
-        w = words[i]
-        if w in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
-            i += 2
-            continue
-        if w.startswith("-"):
-            i += 1
-            continue
-        return w == verb
-    return False
+    return _git_args(words)[0] == verb
 
 
 def _gh_rest(words):
@@ -258,11 +244,6 @@ def _current_branch(cwd=None):
         return ""
 
 
-# `;` `&&` `||` `|` and newlines separate commands; only the first word of each
-# is the verb. Judging the whole string as one command is how `x && gh pr merge`
-# reads as an invocation of `x`.
-_SEGMENT_SPLIT = re.compile(r"(?:\|\||&&|\||;|\n)")
-
 _HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
@@ -290,7 +271,50 @@ def _strip_heredocs(command):
 
 
 def _segments(command):
-    for raw in _SEGMENT_SPLIT.split(_strip_heredocs(command)):
+    """The command's simple commands, split on `;` `&&` `||` `|` `&` and newlines.
+
+    Only the first word of each is the verb: judging the whole string as one
+    command is how `x && gh pr merge` reads as an invocation of `x`. The split is
+    made OUTSIDE quotes only. A commit message that says "; tee .env was wrong"
+    is prose, and splitting inside it made the prose a command (#267's write rule
+    reads far more prose than the merge rule ever did). `>|` and `2>&1` are
+    redirections, not separators.
+    """
+    # A backslash-newline is a continuation, not a separator, and left in place
+    # it would glue a newline onto the next word.
+    text = _strip_heredocs(command).replace("\\\n", " ")
+    out, cur, quote, i = [], [], None, 0
+    while i < len(text):
+        c = text[i]
+        if quote:
+            cur.append(c)
+            if c == "\\" and quote == '"' and i + 1 < len(text):
+                cur.append(text[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c == "\\" and i + 1 < len(text):
+            cur += [c, text[i + 1]]
+            i += 2
+            continue
+        if c in "'\"":
+            quote = c
+        elif text.startswith(("&&", "||"), i):
+            out.append("".join(cur))
+            cur, i = [], i + 2
+            continue
+        elif (c in ";\n" or (c == "|" and text[i - 1:i] != ">")
+              or (c == "&" and text[i - 1:i] != ">" and text[i + 1:i + 2] != ">")):
+            out.append("".join(cur))
+            cur, i = [], i + 1
+            continue
+        cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    for raw in out:
         raw = raw.strip()
         if raw:
             yield raw
@@ -450,11 +474,22 @@ def _shell_tokens(segment):
 
 _OPERATOR_CHARS = set("<>&|();")
 
-# Words that run the next word as the command. `FOO=1 cp ...` and `sudo cp ...`
-# are still `cp`.
-_WRAPPERS = ("sudo", "env", "command", "nohup", "time", "exec")
+# Words that run the next word as the command -- `sudo cp ...` is still `cp` --
+# with the flags of theirs that take a value, so `sudo -u x cp` is too.
+_WRAPPERS = {
+    "sudo": ("-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T"),
+    "env": ("-u", "-C", "-S"),
+    "command": (),
+    "nohup": (),
+    "time": ("-f", "-o"),
+    "exec": ("-a",),
+}
 
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# The switches after which the rest of a clustered word is that switch's value,
+# so an `i` there is not `-i`: perl's `-Mstrict`, sed's `-fscript`.
+_VALUE_SWITCHES = {"sed": "efl", "perl": "MmIxFdDCl0e"}
 
 
 def _in_place(words, verb):
@@ -462,73 +497,143 @@ def _in_place(words, verb):
     for w in words[1:]:
         if w == "--in-place" or w.startswith("--in-place="):
             return verb == "sed"
-        if len(w) > 1 and w[0] == "-" and w[1] != "-" and "i" in w[1:]:
-            # perl's `-I dir` is an include path, and capital, so it cannot
-            # land here; sed's `-i.bak` and perl's `-pi` both do.
-            return True
+        if len(w) < 2 or w[0] != "-" or w[1] == "-":
+            continue
+        for c in w[1:]:
+            if c == "i":
+                return True
+            if c in _VALUE_SWITCHES[verb]:
+                break
     return False
+
+
+def _unwrapped(words):
+    """`words` with leading assignments and wrapper commands peeled off."""
+    while words:
+        if _ASSIGNMENT.match(words[0]):
+            words = words[1:]
+            continue
+        takes_value = _WRAPPERS.get(_verb(words))
+        if takes_value is None:
+            return words
+        i = 1
+        while i < len(words) and (words[i].startswith("-") or _ASSIGNMENT.match(words[i])):
+            i += 2 if words[i] in takes_value else 1
+        words = words[i:]
+    return words
 
 
 def _git_args(words):
     """(`git`'s verb, the words after it, the `-C` dir), or (None, [], None)."""
     if _verb(words) != "git":
         return None, [], None
-    i, where = 1, None
+    i, c_dir = 1, None
     while i < len(words):
         w = words[i]
         if w in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
             if w == "-C" and i + 1 < len(words):
-                where = words[i + 1]
+                c_dir = words[i + 1]
             i += 2
             continue
         if w.startswith("-"):
             i += 1
             continue
-        return w, words[i + 1:], where
+        return w, words[i + 1:], c_dir
     return None, [], None
 
 
+def _restore_source(args):
+    """The revision `git restore` copies from, or None for the index."""
+    for k, w in enumerate(args):
+        if w in ("-s", "--source"):
+            return args[k + 1] if k + 1 < len(args) else ""
+        if w.startswith("--source="):
+            return w.split("=", 1)[1]
+        if w.startswith("-s") and not w.startswith("--"):
+            return w[2:]
+    return None
+
+
 def _git_written(words):
-    """The paths a `git` command rewrites in the working tree."""
-    verb, args, where = _git_args(words)
-    positional = [w for w in args if not w.startswith("-")]
+    """The paths a `git` command rewrites, in the working tree or the index.
+
+    The index counts: `git rm --cached` unpins a capture in the next commit as
+    surely as deleting the file does.
+    """
+    verb, args, c_dir = _git_args(words)
     written = []
     if verb == "rm":
-        written = positional
+        written = [w for w in args if not w.startswith("-")]
     elif verb == "checkout":
         # Only checking a path out of ANOTHER revision rewrites it. `git
-        # checkout -- <path>` puts back the bytes the index holds -- the pinned
-        # ones -- which is how a probe run gone wrong is undone, and refusing it
-        # would refuse the repair.
+        # checkout -- <path>` puts back the bytes the index holds -- and `HEAD`
+        # is the pin itself -- which is how a probe run gone wrong is undone;
+        # refusing that would refuse the repair.
         if "--" in args:
             cut = args.index("--")
             rev = [w for w in args[:cut] if not w.startswith("-")]
-            written = args[cut + 1:] if rev else []
-        elif len(positional) >= 2:
-            # `git checkout <rev> <path>`. A lone word is a branch, not a path.
-            written = positional[1:]
+            if rev and rev != ["HEAD"]:
+                written = args[cut + 1:]
+        elif not any(w in ("-b", "-B", "--orphan") for w in args):
+            # `git checkout <rev> <path>`. A lone word is a branch, not a path,
+            # and so are the two words of `-b <new> <start>`.
+            positional = [w for w in args if not w.startswith("-")]
+            if len(positional) >= 2 and positional[0] != "HEAD":
+                written = positional[1:]
     elif verb == "restore":
         # The same line: `git restore <path>` restores the pin, `--source`
-        # brings in somebody else's bytes.
-        if any(w in ("-s", "--source") or w.startswith("--source=")
-               or (w.startswith("-s") and not w.startswith("--")) for w in args):
-            written = positional
-    return written, where
+        # brings in another revision's bytes.
+        source = _restore_source(args)
+        if source not in (None, "HEAD"):
+            written = [w for w in args if not w.startswith("-") and w != source]
+    # A tree-wide write from another revision reaches everything under it.
+    return [(w, (), True) for w in written], c_dir
+
+
+def _target_dirs(words):
+    """The destination `cp`/`mv`/`install`/`ln` was given by `-t`, if any.
+
+    Clustered too: `cp -rt DIR` and `cp -tDIR`. Not for rsync, whose `-t` is
+    "preserve times".
+    """
+    dirs = []
+    for k, w in enumerate(words[1:], start=1):
+        if w == "--target-directory" and k + 1 < len(words):
+            dirs.append(words[k + 1])
+        elif w.startswith("--target-directory="):
+            dirs.append(w.split("=", 1)[1])
+        elif len(w) > 1 and w[0] == "-" and w[1] != "-" and "t" in w:
+            rest = w[w.index("t") + 1:]
+            if rest:
+                dirs.append(rest)
+            elif k + 1 < len(words):
+                dirs.append(words[k + 1])
+    return dirs
+
+
+def _recursive(words):
+    return any(w in ("--recursive", "-a", "--archive")
+               or (len(w) > 1 and w[0] == "-" and w[1] != "-" and ("r" in w or "R" in w))
+               for w in words[1:])
 
 
 def _written_paths(segment):
     """Every path this one command creates, replaces, moves or deletes.
 
     The routine spellings, not all of them: the redirect, the copy, the move,
-    `tee`, the in-place edit, and the git verbs that rewrite a tracked file.
-    `patch`, `git apply`, `dd` and an interpreter opening a file are not here,
-    and nothing claims they are -- the module docstring says what this is not.
+    `tee`, `rm`, the in-place edit, and the git verbs that rewrite a tracked
+    file. `patch`, `git apply`, `dd` and an interpreter opening a file are not
+    here, and nothing claims they are -- the module docstring says what this
+    is not.
 
-    Returns (verb, paths, base) -- `base` the `git -C` dir the paths are
-    relative to, if any.
+    Returns (verb, writes, c_dir): each write is (path, sources, reaches_all),
+    where `sources` are what a copy puts INTO `path` and `reaches_all` says the
+    write lands on everything beneath it -- which is what lets a write to a
+    PARENT of a protected directory be judged (see `_reaches_protected`).
+    `c_dir` is the `git -C` dir the paths are relative to, if any.
     """
     tokens = _shell_tokens(segment)
-    written, words, i = [], [], 0
+    redirected, words, i = [], [], 0
     while i < len(tokens):
         t = tokens[i]
         if t and set(t) <= _OPERATOR_CHARS:
@@ -541,7 +646,7 @@ def _written_paths(segment):
                 duplicates = t.endswith("&") and target is not None and (
                     target.isdigit() or target == "-")
                 if ">" in t and target is not None and not duplicates:
-                    written.append(target)
+                    redirected.append(target)
                 i += 2
             else:
                 i += 1
@@ -549,30 +654,45 @@ def _written_paths(segment):
         words.append(t)
         i += 1
 
-    while words and (_ASSIGNMENT.match(words[0]) or _verb(words) in _WRAPPERS):
-        words = words[1:]
+    writes = [(w, (), False) for w in redirected]
+    words = _unwrapped(words)
     verb = _verb(words)
-    positional = [w for w in words[1:] if not w.startswith("-")]
-    # `cp -t DIR src...` names its destination with a flag.
-    targets = [words[k + 1] for k, w in enumerate(words[:-1])
-               if w in ("-t", "--target-directory")]
-    targets += [w.split("=", 1)[1] for w in words if w.startswith("--target-directory=")]
-    base = None
+    c_dir = None
+    if verb in ("cp", "mv", "install", "ln"):
+        targets = _target_dirs(words)
+    else:
+        targets = []
+    positional = [w for w in words[1:] if not w.startswith("-") and w not in targets]
 
-    if verb in ("cp", "install", "ln", "rsync"):
-        written += targets or positional[-1:]
-    elif verb == "mv":
-        # Both ends: a move REMOVES its source, so moving a capture out of the
-        # tree unpins it as surely as copying a new one in.
-        written += positional + targets
-    elif verb in ("tee", "rm"):
-        written += positional
-    elif verb in ("sed", "perl") and _in_place(words, verb):
-        written += positional
+    if verb in ("cp", "install", "ln", "rsync", "mv"):
+        dest = targets or positional[-1:]
+        sources = tuple(positional if targets else positional[:-1])
+        # rsync's `src/` and cp's `src/.` pour a directory's CONTENTS into the
+        # destination, so whatever it holds lands beneath it.
+        pours = any(s.endswith("/") if verb == "rsync" else s.endswith("/.")
+                    for s in sources)
+        writes += [(d, sources, pours) for d in dest]
+        if verb == "mv":
+            # Both ends: a move REMOVES its source, so moving a capture -- or a
+            # directory holding the captures -- out of the tree unpins it.
+            writes += [(s, (), True) for s in sources]
+    elif verb == "tee":
+        writes += [(w, (), False) for w in positional]
+    elif verb == "rm":
+        writes += [(w, (), _recursive(words)) for w in positional]
+    elif verb in _VALUE_SWITCHES and _in_place(words, verb):
+        writes += [(w, (), False) for w in positional]
     elif verb == "git":
-        paths, base = _git_written(words)
-        written += paths
-    return verb, [w for w in written if w], base
+        paths, c_dir = _git_written(words)
+        writes += paths
+    return verb, [w for w in writes if w[0]], c_dir
+
+
+def _joined(prefix, path):
+    """`path` under `prefix`, uncollapsed. A falsy prefix leaves it alone."""
+    if path.startswith("/") or not prefix:
+        return path
+    return prefix.rstrip("/") + "/" + path
 
 
 def _join(prefix, path):
@@ -580,15 +700,9 @@ def _join(prefix, path):
 
     A `prefix` of None is "somewhere this cannot work out" and "" is "a
     relative root it does not know": either way the path is judged on its own
-    tail, which is what every rule here matches.
+    tail, which is what the path rules match.
     """
-    if path.startswith("/"):
-        joined = path
-    elif not prefix:
-        joined = path
-    else:
-        joined = prefix.rstrip("/") + "/" + path
-    collapsed = _collapse(joined)
+    collapsed = _collapse(_joined(prefix, path))
     return collapsed if collapsed else path
 
 
@@ -607,12 +721,7 @@ def _after_cd(prefix, words):
         return None
     if not target.startswith("/") and prefix is None:
         return None
-    joined = target if target.startswith("/") else (
-        prefix.rstrip("/") + "/" + target if prefix else target)
-    collapsed = _collapse(joined)
-    if collapsed is None:
-        return None
-    return collapsed
+    return _collapse(_joined(prefix, target))
 
 
 def _collapse(path):
@@ -637,16 +746,48 @@ def _collapse(path):
     return ("/" + joined) if rooted else joined
 
 
+def _reaches_protected(dest, sources, reaches_all, resolved):
+    """The refusal for a write to a PARENT of a protected directory that lands in it.
+
+    `rsync -a out/ server/contract/` and `git checkout main -- .` never name
+    captures/, and both rewrite it. A resolved parent is recognised by the
+    protected directory actually existing beneath it; a relative one, whose root
+    this cannot know, by the protected path's own leading parts
+    (`server/contract`) -- or, for the root itself, by the directory existing
+    beneath it. It lands there when the write reaches everything beneath it, or
+    when a copy's source carries the very name of the next directory down.
+    """
+    d = dest.rstrip("/") or "/"
+    names = {s.rstrip("/").rsplit("/", 1)[-1] for s in sources}
+    for where, _, _, _ in PROTECTED_PATHS:
+        parts = [p for p in where.split("/") if p]
+        for k in range(len(parts)):
+            head = "/".join(parts[:k])
+            if resolved or not head:
+                if not os.path.isdir(os.path.join(d, *parts[k:])):
+                    continue
+            elif d != head and not d.endswith("/" + head):
+                continue
+            if reaches_all or parts[k] in names:
+                return _refusal(d.rstrip("/") + "/" + "/".join(parts[k:]) + "/", resolved)
+    return None
+
+
 def _check_writes(segment, prefix):
     """Rule 3 from the shell: the paths a command writes, judged as an Edit is."""
-    verb, paths, base = _written_paths(segment)
-    if base is not None:
-        prefix = _join(prefix, base) if prefix is not None or base.startswith("/") else None
-    for path in paths:
+    verb, writes, c_dir = _written_paths(segment)
+    if c_dir is not None:
+        prefix = _join(prefix, c_dir) if prefix is not None or c_dir.startswith("/") else None
+    for path, sources, reaches_all in writes:
         full = _join(prefix, path)
+        # Absolute -- because the shell's cwd is known, or the path was -- means
+        # the protected paths are matched where they actually are, not on a tail
+        # that any scratch `/tmp/.../captures/` also ends in.
+        resolved = full.startswith("/")
         # A destination directory without its slash -- `cp x .../captures` --
         # writes INTO it, so it is judged as a directory too.
-        message = _refusal(full) or _refusal(full.rstrip("/") + "/")
+        message = (_refusal(full, resolved) or _refusal(full.rstrip("/") + "/", resolved)
+                   or _reaches_protected(full, sources, reaches_all, resolved))
         if message:
             deny(f"{message}\n(`{verb}` writes {path} -- the shell spelling of the "
                  "same write.)")
@@ -659,19 +800,26 @@ def check_bash(command, cwd=None):
     relative path after a `cd` still reaches the path rules as the file it is.
     """
     branch_cache = [None]
-    prefix = cwd if isinstance(cwd, str) and cwd.startswith("/") else ""
+    prefix = cwd if isinstance(cwd, str) else ""
     for segment in _segments(command):
         words = _words(segment)
         if not words:
             continue
+        # `(cd x && ...)`: the subshell's parenthesis is not part of the verb.
+        words[0] = words[0].lstrip("(")
         if _verb(words) in ("cd", "pushd"):
             # Before the prefix moves: a redirect on the `cd` line is written
             # where the shell already stands.
             _check_writes(segment, prefix)
             prefix = _after_cd(prefix, words)
             continue
-        # `bash -c "..."` is a command in an argument. Judge what it will run.
+        if _verb(words) == "popd":
+            prefix = None
+            continue
+        # `bash -c "..."` is a command in an argument. Judge what it will run --
+        # and, first, where its own output is redirected.
         if _verb(words) in ("bash", "sh", "zsh", "dash") and "-c" in words:
+            _check_writes(segment, prefix)
             idx = words.index("-c")
             if idx + 1 < len(words):
                 check_bash(words[idx + 1], prefix)
@@ -699,8 +847,14 @@ def _protected_tail(path):
     return None
 
 
-def _refusal(path):
-    """Why rule 3 refuses a write to `path`, or None. Edit and shell alike."""
+def _refusal(path, resolved=False):
+    """Why rule 3 refuses a write to `path`, or None. Edit and shell alike.
+
+    `resolved` says the path is known to be where it says -- an absolute path
+    the shell resolved -- so a protected path must appear in it whole. The tail
+    is for a path whose root this cannot see. Secrets keep their tails either
+    way: a token is a token in whatever directory it sits.
+    """
     normalised = path if path.startswith("/") else "/" + path
     tail = _protected_tail(path)
 
@@ -714,7 +868,8 @@ def _refusal(path):
         )
 
     for where, protected_tail, reason, regenerate in PROTECTED_PATHS:
-        if where in normalised or (protected_tail and tail == protected_tail):
+        if where in normalised or (
+                not resolved and protected_tail and tail == protected_tail):
             # The reason is the whole value of the rule: "blocked" with no why
             # sends the agent looking for a way around it -- and so is a rule
             # that refuses the write without naming the writer that may.
@@ -875,6 +1030,47 @@ SELFTEST = [
      "a quoted redirect in a commit message is not one"),
     ("Bash", {"command": "sed -i '' s/a/b/ src/app.c"}, 0, "an in-place edit of source is fine"),
     ("Bash", {"command": "echo hi > /tmp/note.txt"}, 0, "an ordinary redirect is fine"),
+    # What the review of the first cut found, both directions.
+    ("Bash", {"command": "bash -c 'probe' > server/contract/captures/a.json"}, 2,
+     "a redirect of bash -c's own output is judged, not only what it runs"),
+    ("Bash", {"command": "cp -rt server/contract/captures /tmp/a.json"}, 2,
+     "-t clustered with another flag still names the destination"),
+    ("Bash", {"command": "env -i cp /tmp/x .env"}, 2, "a wrapper's own flags are not the verb"),
+    ("Bash", {"command": "sudo -u x cp /tmp/x .env"}, 2, "...nor the value one of them takes"),
+    ("Bash", {"command": "echo x >| server/contract/captures/a.json"}, 2,
+     "`>|` is a redirect, not a pipe"),
+    ("Bash", {"command": "(cd server/contract/captures && cp /tmp/a.json 5.4.0/a.json)"}, 2,
+     "a cd inside a subshell is followed"),
+    ("Bash", {"command": "cp x \\\n  server/contract/captures/a.json"}, 2,
+     "a line continuation joins the line rather than hiding its second half"),
+    ("Bash", {"command": "rsync -a /tmp/out/ server/contract/"}, 2,
+     "pouring a directory's contents into a PARENT of captures/ reaches it"),
+    ("Bash", {"command": "cp -r /tmp/run/captures server/contract/"}, 2,
+     "...and so does copying a directory named captures into its parent"),
+    ("Bash", {"command": "git checkout main -- server/contract"}, 2,
+     "...and checking a parent out of another revision"),
+    ("Bash", {"command": "rm -rf server/contract"}, 2, "...and deleting a parent"),
+    ("Bash", {"command": "git rm --cached server/contract/captures/a.json"}, 2,
+     "unstaging a capture from the index unpins it in the next commit"),
+    ("Bash", {"command": "cp -r /tmp/out server/contract/"}, 0,
+     "a copy into the parent that lands beside captures/ is not into it"),
+    ("Bash", {"command": 'git commit -m "drop the stale .env; tee .env was wrong"'}, 0,
+     "a `;` inside a quoted message does not start a command"),
+    ("Bash", {"command": 'git commit -m "first line\n\nrm .env stays blocked"'}, 0,
+     "...nor does a newline inside one"),
+    ("Bash", {"command": "cp x /tmp/scratch/captures/a.json"}, 0,
+     "an absolute scratch dir named captures/ is not the pinned contract"),
+    ("Bash", {"command": "rm -rf /tmp/probe/captures"}, 0, "...nor is deleting one"),
+    ("Bash", {"command": "git checkout -b fix captures"}, 0,
+     "`-b <new> <start>` names two branches, not a path"),
+    ("Bash", {"command": "pushd server/contract/captures && popd && cp /tmp/x a.json"}, 0,
+     "a popd is followed -- to somewhere unknown, not to where pushd went"),
+    ("Bash", {"command": "perl -Mstrict -ne 'print' server/contract/captures/a.json"}, 0,
+     "perl's -Mstrict is not -i"),
+    ("Bash", {"command": "git checkout HEAD -- server/contract/captures/"}, 0,
+     "HEAD is the pin itself, so checking a capture out of it is the repair"),
+    ("Bash", {"command": "git restore --source=HEAD server/contract/captures/a.json"}, 0,
+     "...and so is restoring one from it"),
     ("Edit", {"file_path": "/w/demo/.claude/hooks/guard.py"}, 0,
      "the guards themselves are editable -- the diff and the maintainer's merge are their control"),
     ("Edit", {"file_path": "/w/demo/src/app.c"}, 0, "ordinary source files are editable"),
@@ -895,7 +1091,8 @@ SELFTEST = [
 # pinned contract and into each secret is refused, and reading the same path
 # by the routine read shapes is not.
 _WRITE_TARGETS = ("server/contract/captures/5.4.0/y.json", ".env",
-                  "token.dat", "device.dat", "config.ini")
+                  "token.dat", "device.dat", "config.ini",
+                  "server/testing/fixture-auth.env")
 _WRITE_SHAPES = (("cp /tmp/x {}", "cp"), ("mv /tmp/x {}", "mv"),
                  ("echo x | tee {}", "tee"), ("probe > {}", "a > redirect"),
                  ("probe >> {}", "a >> redirect"), ("sed -i '' s/a/b/ {}", "sed -i"))
@@ -914,6 +1111,17 @@ CWD_CASES = [
     ("/w/demo/server/contract/captures", "cd .. && cp /tmp/a.json b.json", 0,
      "...and a cd out of there is followed"),
     ("/w/demo", "cp /tmp/a.json b.json", 0, "...which is an ordinary directory usually"),
+    ("/w/demo", "mkdir -p build/captures && cp out.json build/captures/", 0,
+     "...and with the cwd known, a build/captures/ is not the pinned one"),
+]
+
+# A write to a PARENT of the protected directory, with the cwd known: that is
+# decided by the protected directory existing beneath it, so these run in a real
+# temporary tree holding one. (command, want, what)
+TREE_CASES = [
+    ("git checkout main -- .", 2, "checking the whole tree out of another revision reaches captures/"),
+    ("rsync -a /tmp/out/ server/contract/", 2, "...and so does pouring into its parent"),
+    ("cp -r /tmp/out .", 0, "...while a copy that lands beside it does not"),
 ]
 
 # Rule 4, which holds only in a linked worktree -- where agents work. Same
@@ -981,27 +1189,33 @@ def _run(tool, tool_input, cwd=None, said=None):
         return exc.code
 
 
-def _cwd_and_message_checks():
-    """CWD_CASES, and that a refusal names the writer that MAY write there.
+# A refusal with no way forward sends the agent looking for a way round, and
+# #267's own `cp` was exactly that: the probe's output, copied in by hand. So
+# both halves of rule 3 must name the writer that MAY write there.
+MESSAGE_CASES = [
+    ("Bash", {"command": "cp /tmp/x server/contract/captures/a.json"},
+     "the shell refusal names the sanctioned writer"),
+    ("Write", {"file_path": "/w/demo/server/contract/captures/a.json"},
+     "...and so does the Edit/Write one"),
+]
 
-    A refusal with no way forward sends the agent looking for a way round, and
-    #267's own `cp` was exactly that: the probe's output, copied in by hand.
-    """
+
+def _cwd_and_message_checks():
+    """CWD_CASES, TREE_CASES in a real tree, and MESSAGE_CASES."""
+    import tempfile
     failures = 0
-    for cwd, command, want, what in CWD_CASES:
-        got = _run("Bash", {"command": command}, cwd=cwd)
-        if got != want:
-            print(f"FAIL: {what} (expected exit {want}, got {got})", file=sys.stderr)
-            failures += 1
-        else:
-            print(f"  ok: {what}")
+    with tempfile.TemporaryDirectory() as tree:
+        os.makedirs(os.path.join(tree, "server", "contract", "captures"))
+        cases = CWD_CASES + [(tree, c, want, what) for c, want, what in TREE_CASES]
+        for cwd, command, want, what in cases:
+            got = _run("Bash", {"command": command}, cwd=cwd)
+            if got != want:
+                print(f"FAIL: {what} (expected exit {want}, got {got})", file=sys.stderr)
+                failures += 1
+            else:
+                print(f"  ok: {what}")
     hint = SELFTEST_PROJECT["protected_paths"][0]["regenerate"]
-    for tool, tool_input, what in (
-        ("Bash", {"command": "cp /tmp/x server/contract/captures/a.json"},
-         "the shell refusal names the sanctioned writer"),
-        ("Write", {"file_path": "/w/demo/server/contract/captures/a.json"},
-         "...and so does the Edit/Write one"),
-    ):
+    for tool, tool_input, what in MESSAGE_CASES:
         said = io.StringIO()
         got = _run(tool, tool_input, said=said)
         if got != 2 or hint not in said.getvalue():
@@ -1010,9 +1224,6 @@ def _cwd_and_message_checks():
         else:
             print(f"  ok: {what}")
     return failures
-
-
-MESSAGE_ASSERTIONS = 2
 
 
 def _bash_cases(cases):
@@ -1164,8 +1375,8 @@ def selftest():
     if failures:
         print(f"{failures} guard assertion(s) failed", file=sys.stderr)
         return 1
-    held = (len(SELFTEST) + len(AGENT_CASES) + len(CWD_CASES)
-            + MESSAGE_ASSERTIONS + PLUMBING_ASSERTIONS)
+    held = (len(SELFTEST) + len(AGENT_CASES) + len(CWD_CASES) + len(TREE_CASES)
+            + len(MESSAGE_CASES) + PLUMBING_ASSERTIONS)
     print(f"{held} guard assertions hold")
     return 0
 

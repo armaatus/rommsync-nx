@@ -149,6 +149,8 @@ assert_hook "$G" 0 '{"tool_name":"Bash","tool_input":{"command":"ctest --test-di
   "...and allows ordinary work the same way"
 assert_hook "$G" 2 '{"tool_name":"Bash","cwd":"/w","tool_input":{"command":"cp x server/contract/captures/5.4.0/y.json"}}' \
   "a shell write into the pinned contract blocks over stdin, against this repo's guard.json"
+assert_hook "$G" 2 '{"tool_name":"Bash","cwd":"/w","tool_input":{"command":"sed -i.bak s/a/b/ server/testing/fixture-auth.env"}}' \
+  "...and so does one into its fixture credentials"
 assert_hook "$G" 2 'not json at all' \
   "an unreadable payload blocks rather than failing open"
 
