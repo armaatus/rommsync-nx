@@ -505,11 +505,16 @@ and it is the only thing that ever sends `overwrite=true`:
    to undo, which is what a reboot already does -- and answers `cancelled`
    with the row `open`, both choices on offer again, plus a `sync.held` line
    naming the rom and slot. The cancel **races the landing**, and is decided
-   against it under `mutex_`: `LandHeldKeepLocal` claims a key there
-   (`SdEngine::landing_`) before the card is touched, so either the cancel
-   finds it still held and nothing has been written, or it finds it claimed
-   or armed and answers `landed`, the row `waiting`, and undoes nothing --
-   the kept bytes stay and the upload still goes with `overwrite=true`. A
+   against it under `mutex_`, where everything that puts kept bytes on the
+   card says so first: `LandHeldKeepLocal` claims a key
+   (`SdEngine::landing_`) before the card is touched, and a Keep local press
+   records its save when it is taken (`restore_kept_`) -- a second press for
+   a held row lands the bytes itself when no game runs. So either the cancel
+   finds the key still held and nothing is on its way to the card, or it
+   finds it claimed, pressed or armed and answers `landed`, the row
+   `waiting`, and undoes nothing -- the kept bytes stay and the upload still
+   goes with `overwrite=true`. (A press that then finds a game running holds
+   the choice again; the row reads `held` once more.) A
    `waiting` row offers no cancel: its bytes are on the card. Cancel never
    switches straight to Keep server (that would be a restore under a running
    game); the player cancels, then chooses. `not_held` answers anything else

@@ -660,8 +660,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// #279: drop a held Keep local from `keep_local_held_`, with nothing
   /// written, before the game closes. Decided under `mutex_`, which is where
   /// `LandHeldKeepLocal` claims a key before it writes (`landing_`), so the
-  /// two cannot both happen: a key the landing claimed, or one already armed,
-  /// answers `kLanded` and stands. Only the save's newest entry carries a
+  /// two cannot both happen: a key the landing claimed, one a Keep local
+  /// press is out for (`restore_kept_`), or one already armed, answers
+  /// `kLanded` and stands. Only the save's newest entry carries a
   /// choice, as `ListConflicts` draws it.
   ipc::CancelKeepLocalResult CancelKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
@@ -1099,10 +1100,17 @@ class SdEngine : public ipc::Engine, public power::Sink {
   void UnholdLocked(const state::Baseline::Key& key);
 
   /// Where `key`'s Keep local stands, for a conflict row and for a cancel's
-  /// answer (#279): `kHeld` while it waits for the game, `kWaiting` from the
-  /// moment the landing claims it (`landing_`) until its upload spends it,
-  /// `kOpen` otherwise. Caller holds `mutex_`.
+  /// answer (#279): `kWaiting` while a Keep local press for it is out
+  /// (`restore_kept_`) and from the moment the landing claims it
+  /// (`landing_`) until its upload spends it, `kHeld` while it waits for the
+  /// game, `kOpen` otherwise. Caller holds `mutex_`.
   ipc::KeepLocalState KeepLocalOfLocked(const state::Baseline::Key& key) const;
+
+  /// The save whose Keep local entry `entry_id` carries: its key when the
+  /// entry is a save conflict and its save's newest, which is the only entry
+  /// a choice is drawn on (`BuildConflictPage`). Takes `history_mutex_`, so
+  /// the caller holds neither it nor `mutex_`.
+  std::optional<state::Baseline::Key> ChoiceKeyOf(std::int64_t entry_id) const;
 
   /// `act(*card_)`, the card half of a restore -- `RunRestore`'s, and the
   /// held Keep local `LandHeldKeepLocal` runs later -- under the locks every
@@ -1411,6 +1419,15 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// The restore `restore_` names is a Keep local (#249). Guarded by `mutex_`.
   bool restore_keeps_local_ = false;
+
+  /// The save that Keep local restore is for, found when it is taken (#279).
+  /// From the press to its outcome the choice is past cancelling: a press
+  /// for a held row lands the kept bytes itself when no game runs, so a
+  /// cancel that took the held key meanwhile would answer `cancelled` over
+  /// bytes that then land. Read only while `restore_` is `kRunning` with
+  /// `restore_keeps_local_`; empty for an entry no choice is drawn on.
+  /// Guarded by `mutex_`.
+  std::optional<state::Baseline::Key> restore_kept_;
 
   /// The saves whose next upload goes over the server's copy: the player's
   /// Keep local, armed when its restore lands and spent by the plan that

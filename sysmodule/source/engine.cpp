@@ -3276,43 +3276,52 @@ ipc::Error SdEngine::ListConflicts(const ipc::ConflictQuery& query, ipc::Conflic
 }
 
 ipc::KeepLocalState SdEngine::KeepLocalOfLocked(const state::Baseline::Key& key) const {
+  // A key the landing has claimed, or one a Keep local press is out for, is
+  // past cancelling (#279) -- its bytes are about to be on the card, game
+  // or none -- so it reads as the waiting choice it is about to be, the same
+  // answer a cancel gets. Ahead of the held list, which a press for a held
+  // row leaves the key in until its outcome.
+  const bool pressed = restore_.phase == ipc::RestorePhase::kRunning && restore_keeps_local_ &&
+                       restore_kept_ == key;
+  if (pressed || landing_ == key) {
+    return ipc::KeepLocalState::kWaiting;
+  }
   if (sync::FindByKey(keep_local_held_, key) != nullptr) {
     return ipc::KeepLocalState::kHeld;
   }
-  // A key the landing has claimed is past cancelling (#279), so it reads as
-  // the waiting choice it is about to be -- the same answer a cancel gets.
-  if ((landing_.has_value() && *landing_ == key) ||
-      sync::FindByKey(keep_local_, key) != nullptr) {
+  if (sync::FindByKey(keep_local_, key) != nullptr) {
     return ipc::KeepLocalState::kWaiting;
   }
   return ipc::KeepLocalState::kOpen;
 }
 
+std::optional<state::Baseline::Key> SdEngine::ChoiceKeyOf(std::int64_t entry_id) const {
+  std::lock_guard<std::mutex> history(history_mutex_);
+  const conflicts::Entry* entry = history_.Find(entry_id);
+  if (entry == nullptr || !entry->save_conflict() ||
+      conflicts::NewestSaveEntry(history_, {entry->rom_id, entry->slot}) != entry) {
+    return std::nullopt;
+  }
+  return state::Baseline::Key{entry->rom_id, entry->slot};
+}
+
 ipc::CancelKeepLocalResult SdEngine::CancelKeepLocal(std::int64_t entry_id) {
   ipc::CancelKeepLocalResult result;
-  std::optional<state::Baseline::Key> key;
-  {
-    // The entry to its save, as `BuildConflictPage` draws a choice: only on
-    // the save's newest entry, so a row drawn open cannot cancel anything.
-    std::lock_guard<std::mutex> history(history_mutex_);
-    const conflicts::Entry* entry = history_.Find(entry_id);
-    if (entry != nullptr && entry->save_conflict() &&
-        conflicts::NewestSaveEntry(history_, {entry->rom_id, entry->slot}) == entry) {
-      key = state::Baseline::Key{entry->rom_id, entry->slot};
-    }
-  }
+  // A row drawn open cannot cancel anything: only the save's newest entry
+  // carries a choice.
+  const std::optional<state::Baseline::Key> key = ChoiceKeyOf(entry_id);
   if (!key.has_value()) {
     return result;
   }
   {
-    // After `history_mutex_` is let go, as `ListConflicts` takes the two. The
-    // landing claims a key under this same lock before it writes, so either
-    // the key is still held here and nothing has been written for it, or it
-    // is claimed or armed and its bytes are -- or are about to be -- on the
-    // card. Never both.
+    // After `history_mutex_` is let go, as `ListConflicts` takes the two.
+    // Everything that puts kept bytes on the card -- the worker's landing
+    // claiming its key, a Keep local press being taken -- says so under this
+    // same lock first, so either the key is held and nothing is on its way
+    // to the card, or it is not and this undoes nothing. Never both.
     std::lock_guard<std::mutex> lock(mutex_);
-    if (sync::FindByKey(keep_local_held_, *key) == nullptr) {
-      result.keep_local = KeepLocalOfLocked(*key);
+    result.keep_local = KeepLocalOfLocked(*key);
+    if (result.keep_local != ipc::KeepLocalState::kHeld) {
       result.outcome = result.keep_local == ipc::KeepLocalState::kOpen
                            ? ipc::CancelOutcome::kNotHeld
                            : ipc::CancelOutcome::kLanded;
@@ -3373,6 +3382,21 @@ ipc::RestoreState SdEngine::RequestKeepLocal(std::int64_t entry_id) {
 
 ipc::RestoreState SdEngine::TakeRestore(std::int64_t entry_id, bool keep_local) {
   bool handed = false;
+  std::optional<state::Baseline::Key> kept;
+  if (keep_local) {
+    {
+      // Answered at once while one runs, without waiting on the history its
+      // copy holds -- `ipc::RestoreState`'s promise, kept for Keep local too.
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (restore_.phase == ipc::RestorePhase::kRunning) {
+        return restore_;
+      }
+    }
+    // Which save the press is for, before it is taken (#279), and outside
+    // `mutex_`: every status poll waits on that one, and a history read can
+    // wait out a copy.
+    kept = ChoiceKeyOf(entry_id);
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (restore_.phase == ipc::RestorePhase::kRunning) {
@@ -3385,6 +3409,7 @@ ipc::RestoreState SdEngine::TakeRestore(std::int64_t entry_id, bool keep_local) 
     restore_.phase = ipc::RestorePhase::kRunning;
     restore_.entry_id = entry_id;
     restore_keeps_local_ = keep_local;
+    restore_kept_ = std::move(kept);
     if (worker_live_) {
       restore_pending_ = true;
       // The press must not wait out a rom, for `RequestSync`'s reason: the drain
@@ -3525,7 +3550,10 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
         unarmed = true;
       }
     }
+    // In the same breath as the hold or the arm above, so a cancel never
+    // finds the press over and its outcome not yet recorded (#279).
     restore_.phase = ipc::RestorePhase::kDone;
+    restore_kept_.reset();
     restore_.report = std::move(report);
   }
   if (unarmed) {
