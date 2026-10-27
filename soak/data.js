@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793005544709,
+  "lastUpdate": 1793092271343,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "soak": [
@@ -149,6 +149,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "soak: allocations a round",
             "value": 3546,
+            "unit": "allocations"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9575cc29df5c607bd7738642cb75ed6b2efd58a8",
+          "message": "M14: cancel a held Keep local; guard.py judges shell writes (#280)",
+          "timestamp": "2026-10-24T10:53:56Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/9575cc29df5c607bd7738642cb75ed6b2efd58a8"
+        },
+        "date": 1793092270917,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "soak: held between rounds",
+            "value": 67303,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: a round's peak over that",
+            "value": 51800,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: allocations a round",
+            "value": 3556,
             "unit": "allocations"
           }
         ]
