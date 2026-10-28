@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793092273408,
+  "lastUpdate": 1793181067653,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "image": [
@@ -207,6 +207,52 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/armaatus/rommsync-nx/commit/9575cc29df5c607bd7738642cb75ed6b2efd58a8"
         },
         "date": 1793092273080,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sysmodule mapped image",
+            "value": 2244608,
+            "unit": "bytes",
+            "extra": "budget 2359296"
+          },
+          {
+            "name": "sysmodule .bss",
+            "value": 1590368,
+            "unit": "bytes",
+            "extra": "heap 1572864"
+          },
+          {
+            "name": "sysmodule .text",
+            "value": 543600,
+            "unit": "bytes",
+            "extra": "ceiling 655360"
+          },
+          {
+            "name": "overlay .ovl",
+            "value": 610364,
+            "unit": "bytes",
+            "extra": "budget 1048576"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "9575cc29df5c607bd7738642cb75ed6b2efd58a8",
+          "message": "M14: cancel a held Keep local; guard.py judges shell writes (#280)",
+          "timestamp": "2026-10-24T10:53:56Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/9575cc29df5c607bd7738642cb75ed6b2efd58a8"
+        },
+        "date": 1793181067183,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
