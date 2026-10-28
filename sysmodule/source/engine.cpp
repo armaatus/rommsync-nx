@@ -2753,8 +2753,16 @@ sync::StateSyncReport SdEngine::RunStatesHalf(const TickInputs& inputs,
   };
   states = sync::SyncStates(*inputs.client, *inputs.files, inputs.token, *inputs.config,
                             library.index, &baseline, state_options);
-  // Persisting it is the caller's, deliberately (state_sync.hpp).
-  state::SaveBaseline(found.baseline_path, baseline);
+  // Persisting it is the caller's, deliberately (state_sync.hpp) -- and so is
+  // saying it failed, which nothing else will (#282).
+  const state::StoreResult stored = state::SaveBaseline(found.baseline_path, baseline);
+  if (!stored.ok()) {
+    log::Error(log::Event::kSaveFailed,
+               "the save states' baseline was not stored: " + stored.message);
+  }
+  for (const std::string& skipped : stored.skipped) {
+    log::Warn(log::Event::kSaveFailed, "the save states' baseline left a row out: " + skipped);
+  }
   std::lock_guard<std::mutex> history(history_mutex_);
   conflicts::RecordStates(&history_, states, record);
   return states;

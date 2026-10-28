@@ -5906,6 +5906,54 @@ int StatesGuarded(http::HttpClient& client, const std::string& base) {
              "revoked: and it is on the card");
     harness::DeleteDevice(client, base, fixture, device_id);
   }
+
+  // **A card that will not take state.db** (#282). Both halves write the
+  // baseline to the same file, and each failure is its own line naming the
+  // file: the saves half's `baseline=not stored` says *that*, never *why*, and
+  // the states half's said nothing at all.
+  {
+    const std::string device_id =
+        harness::CreateDevice(c, client, base, fixture, "engine-states-unstored");
+    rlog::Reset();
+    const TickLines ticks;
+    Console console(c, "engine-states-unstored");
+    const std::unique_ptr<fs::FileSystem> card = Card(console);
+    if (device_id.empty() || !set_up(console, device_id)) {
+      return c.failures();
+    }
+    Intercepting wire(client);
+    console.Boot();
+    console.engine.UseServer(&wire, std::string());
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    faulty::Plan plan;
+    plan.aimed_at = "state.db";
+    plan.error = ENOSPC;
+    plan.after = 0;
+    faulty::Disk full(plan);
+    TickEnds(console, ticks, c, "unstored: a tick on a card that refuses state.db");
+    c.Expect(full.refusals() > 0, "unstored: the card really did refuse state.db");
+    c.Expect(wire.Count(http::Method::kGet, "/api/states") > 0,
+             "unstored: the states half ran" + Rendered(console.Log()));
+
+    const ipc::LogTail tail = console.Log();
+    const auto said = [&tail](std::string_view fragment) {
+      for (const std::string& line : tail.lines) {
+        if (line.find(" save.failed ") != std::string::npos &&
+            line.find(fragment) != std::string::npos &&
+            line.find("state.db") != std::string::npos) {
+          return true;
+        }
+      }
+      return false;
+    };
+    c.Expect(said("the sync baseline was not stored"),
+             "unstored: the saves half says why its baseline was not stored" + Rendered(tail));
+    c.Expect(said("the save states' baseline was not stored"),
+             "unstored: and so does the states half" + Rendered(tail));
+    harness::DeleteDevice(client, base, fixture, device_id);
+  }
   ClearSlots(client, base, fixture, rom.id);
   return c.failures();
 }

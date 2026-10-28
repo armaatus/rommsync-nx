@@ -400,11 +400,14 @@ appear beside your saves and never turn into anything.
 
 ```
 9 error save.failed download rom 1234, slot autosave: the previous bytes could not be preserved: the card is full
-10 info sync.tick outcome=partial completed=3 failed=1 states_completed=0 states_failed=0 baseline=not stored
+10 error save.failed the sync baseline was not stored: /config/rommsync/state.db.tmp: could not be written completely: the card is full
+11 info sync.tick outcome=partial completed=3 failed=1 states_completed=0 states_failed=0 baseline=not stored
 ```
 
-**What is happening.** Something could not be written to the card. The important
-part is what *did not* happen as a result:
+**What is happening.** Something could not be written to the card — the line
+names the file and why. With `[sync] states = true`, the same failure for save
+states reads *the save states' baseline was not stored*. The important part is
+what *did not* happen as a result:
 
 - **A backup that fails aborts the overwrite it was protecting.** No backup, no
   overwrite — that is hard rule 2, and it means a full card costs you the

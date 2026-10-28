@@ -425,6 +425,12 @@ TickCompletion FinishTick(http::HttpClient& client, fs::FileSystem& files,
   for (const std::string& skipped : tick.stored.skipped) {
     AddWarning(&tick.warnings, "the baseline left a row out: " + skipped);
   }
+  // `ok()` alone reaches the log as `baseline=not stored`, which says that it
+  // failed and never why -- a full card and a missing folder are different
+  // fixes (#282).
+  if (!tick.stored.ok()) {
+    AddWarning(&tick.warnings, "the sync baseline was not stored: " + tick.stored.message);
+  }
   if (advanced != nullptr) {
     *advanced = std::move(update.value);
   }

@@ -474,6 +474,31 @@ void DuplicatesResolveToTheLastLine(checks::Checks& c) {
            "a repeated [sync] is reported like a repeated platform, not silently");
 }
 
+// docs/CONFIG.md: a later value the parser rejects leaves the earlier one in
+// force. [sources] retroarch and [tico] account fell back to `auto` instead, so
+// a typo on a second line undid a deliberate first one (#281).
+void ARejectedLaterLineKeepsTheEarlierOne(checks::Checks& c) {
+  const config::LoadResult sources =
+      config::ParseConfig(WithServer("[sources]\nretroarch = off\nretroarch = sometimes\n"));
+  c.Expect(sources.value.sources.retroarch == config::SourceMode::kOff,
+           "a rejected [sources] retroarch keeps the earlier off");
+  c.Expect(Mentions(sources, "keeping off"),
+           "and the warning names the value kept: " + sources.DescribeDiagnostics());
+
+  const config::LoadResult tico = config::ParseConfig(
+      WithServer("[tico]\naccount = 0123456789abcdef0123456789abcdef\naccount = 0123\n"));
+  c.Expect(tico.value.tico.account == config::TicoAccount::kNamed &&
+               tico.value.tico.uid == "0123456789abcdef0123456789abcdef",
+           "a rejected [tico] account keeps the earlier named account");
+  c.Expect(Mentions(tico, "keeping 0123456789abcdef0123456789abcdef"),
+           "and the warning names the account kept: " + tico.DescribeDiagnostics());
+
+  const config::LoadResult legacy =
+      config::ParseConfig(WithServer("[tico]\naccount = legacy\naccount = ../x\n"));
+  c.Expect(legacy.value.tico.account == config::TicoAccount::kLegacy,
+           "a rejected [tico] account keeps an earlier legacy");
+}
+
 // --- the folder map --------------------------------------------------------------
 
 void PlatformSectionsReplaceTheBuiltInEntry(checks::Checks& c) {
@@ -1006,6 +1031,7 @@ int main() {
   NumbersAndTheirBounds(c);
   TheSlotIsCheckedAndDefaultsToAutosave(c);
   DuplicatesResolveToTheLastLine(c);
+  ARejectedLaterLineKeepsTheEarlierOne(c);
   PlatformSectionsReplaceTheBuiltInEntry(c);
   PathsAreCheckedBeforeTheyAreUsed(c);
   EmulatorOverridesAreCheckedAndKeepTheFolders(c);
