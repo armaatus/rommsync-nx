@@ -298,7 +298,8 @@ the file instead and stops offering it
   nothing. Chosen while a game is running, Keep local waits for the game to
   close and then puts your bytes back -- over whatever the game saved as it
   closed, which is backed up first -- and the screen shows it as chosen until
-  then. It is refused with nothing written on a conflict a newer entry of the
+  then, with **Cancel Keep local** to take the choice back before it lands
+  ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#nothing-syncs-while-a-game-is-open)). It is refused with nothing written on a conflict a newer entry of the
   same save has replaced, and while four choices still wait for a sync; and if
   another device writes the save before that sync, its copy wins and the log
   says your choice was overtaken.

@@ -148,8 +148,8 @@ The `Y` button is the separate boot toggle: it only writes or removes
 |---|---|---|---|
 | **Not installed** | — | — | The files are not on the card. The overlay is not in the menu, and if you install only *it*, its status screen says **"sys-rommsync is not installed"** — it looks for `exefs.nsp` under the title id before it blames anything else. |
 | **Installed, not set to boot** | off | (read, not obeyed) | There is no process. Nothing syncs and nothing answers the overlay, which says **"sys-rommsync is not running"** and points you at ovl-sysmodules, rather than mislabelling it *disabled* — a switch that does nothing is worse than a missing one. It reads `config.ini` from the card so it can still show you which way the enable switch is set, labelled as the file rather than as the state. |
-| **Running, sync disabled** | on | off | The process is resident and answers the overlay, and nothing syncs. Automatic syncs stop, and the engine refuses an on-demand one with **"Sync is off"** rather than starting it — you are told which switch to flip instead of being shown a spinner that never moves. (The **Sync now** button that asks for one arrives with [#24](https://github.com/armaatus/rommsync-nx/issues/24); see step 5.) |
-| **Running, sync enabled** | on | on | The normal state: syncs on boot and on the timer — and on demand too, once [#24](https://github.com/armaatus/rommsync-nx/issues/24) lands **Sync now**. |
+| **Running, sync disabled** | on | off | The process is resident and answers the overlay, and nothing syncs. Automatic syncs stop, and the engine refuses an on-demand one with **"Sync is off"** rather than starting it — you are told which switch to flip instead of being shown a spinner that never moves. |
+| **Running, sync enabled** | on | on | The normal state: syncs on boot, on the timer and on demand with **Sync now** — never while a game is running (step 5). |
 
 The row that catches people is the second one. Turning rommsync-nx's *own*
 enable switch on while the boot toggle is off does nothing, because there is no
@@ -237,11 +237,18 @@ You do not need any of it to pair.
 ## 5. The first sync
 
 With the sysmodule running, paired, and `[sync] enabled = true`, a sync happens
-on boot and then on the interval in `config.ini`. You will also be able to ask
-for one on demand with **Sync now**, once
-[#24](https://github.com/armaatus/rommsync-nx/issues/24) lands it. That button
-needs the enable switch on: with `[sync] enabled = false` it answers
-**"Sync is off"** rather than syncing.
+on boot and then on the interval in `config.ini`. To ask for one now, open
+ovl-rommsync, press **Y** for Settings, choose **Sync**, and press **A** for
+**Sync now** (**X** on the same screen is the enable switch). That button needs
+the enable switch on: with `[sync] enabled = false` it answers **"Sync is off"**
+rather than syncing.
+
+**Nothing syncs while a game is running.** A sync that falls due while a game
+is open waits until you close it, and **Sync now** pressed from inside a game
+answers **"Syncs when the game closes"**. A save is only ever read or replaced
+when the emulator that wrote it is not holding it open. Putting the console to
+sleep is also safe: the sysmodule stops its work before the console sleeps and
+picks it up on wake.
 
 Two directions, and they use different folders:
 
@@ -269,9 +276,36 @@ One rule to read there before you edit the map: a `[platform.…]` section
 replaces that platform's defaults rather than adding to them
 ([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-defaults)).
 
+### When both sides changed: Conflicts
+
+When a save changed on the console *and* on the server since the last sync, the
+server's copy wins (it is the source of truth) and your copy is backed up first.
+With `[sync] conflict_show = true`, the default, each one is listed under
+Settings → **Conflicts**, where you choose:
+
+- **Keep server** — leave things as the sync left them.
+- **Keep local** — put this console's copy back and upload it over the
+  server's on the next sync. Chosen while a game is running, it waits: the
+  screen says it *lands when you close the game*, and you can cancel it until
+  then.
+- **Skip** — decide later.
+
+### Where the backups are
+
+Every save this client overwrites or removes is copied first, to
+`config/rommsync/.backup/` on the card. That includes a save you **deleted in
+RomM**: with the default `[sync] on_server_delete = remove` it is taken off the
+card too, after its backup. Set `on_server_delete = keep` to leave such saves
+on the card instead ([CONFIG.md](CONFIG.md)).
+
+### Sharing saves with other devices
+
 To share those saves with RetroArch on another device, RomM's web player, Argosy
 or Grout, [INTEROP.md](INTEROP.md) is what to set on each of them and which
-systems sync with which.
+systems sync with which. In this release, PSX, N64, PSP, Dreamcast, NDS and
+Saturn saves sync between Switch consoles only: their formats differ from
+RetroArch's and the converters wait on real save files captured on hardware
+([#262](https://github.com/armaatus/rommsync-nx/issues/262)).
 
 ---
 
@@ -280,7 +314,7 @@ systems sync with which.
 Download the newer release and unzip it over the top, onto the SD root, exactly
 as in step 1.
 
-The five files from step 1 are replaced. Nothing else is, because nothing else
+The six files from step 1 are replaced. Nothing else is, because nothing else
 is in the archive:
 
 | File | What happens |
@@ -290,6 +324,8 @@ is in the archive:
 | `config/rommsync/device.dat` | survives — the console keeps its identity |
 | `config/rommsync/state.db` | survives — the sync baseline is kept |
 | `config/rommsync/queue.json` | survives — a queued download is still queued |
+| `config/rommsync/conflicts.db` | survives — the Conflicts list is kept |
+| `config/rommsync/.backup/` | survives — every save backup is kept |
 | `config/rommsync/rommsync.log` | survives — so does `rommsync.log.old`, and the new build appends to it |
 | `atmosphere/contents/4200000000524D53/flags/boot2.flag` | survives — the sysmodule stays enabled |
 
@@ -342,15 +378,18 @@ Tico's folders in the layout before 0.8.0 only, under rc1's own folder names.
 Two things, and doing only the first leaves a live token on your server.
 
 **Remove the client.** Turn `sys-rommsync` off in ovl-sysmodules, then delete
-the two artifacts:
+its title folder and the overlay:
 
 ```
-atmosphere/contents/4200000000524D53/exefs.nsp
+atmosphere/contents/4200000000524D53/
 switch/.overlays/ovl-rommsync.ovl
 ```
 
-`config/rommsync/` is left behind on purpose; delete it too if you are done for
-good.
+Delete the whole folder, not only `exefs.nsp`: a `toolbox.json` left behind
+keeps an empty entry in ovl-sysmodules' list.
+
+`config/rommsync/` is left behind on purpose — it holds your save backups under
+`.backup/`. Delete it too only once you are sure you want none of them.
 
 **Revoke the token on the server.** Deleting `config/rommsync/token.dat` stops
 *this console* from using it and nothing more — a token that has been on an SD

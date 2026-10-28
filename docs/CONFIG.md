@@ -544,6 +544,9 @@ Each report carries a severity, the line number, and the section and key:
 - A UTF-8 BOM, CRLF line endings and a missing final newline are all fine.
 - A key set twice: the last **usable** line wins, `warning` — a later value the
   parser rejects leaves the earlier one in force, the same as anywhere else.
+  Two exceptions in this release: a rejected `[sources] retroarch` or `[tico]
+  account` falls back to `auto` rather than to an earlier line's value
+  ([#281](https://github.com/armaatus/rommsync-nx/issues/281)).
   A section repeated: the two are merged, `warning`.
 - A section this client does not know → `warning`, and everything under it is
   ignored without a second complaint per line.
@@ -578,7 +581,10 @@ Each report carries a severity, the line number, and the section and key:
 **`[sync]` / `[downloads]`**
 
 - Booleans are `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`, in any case.
-  Anything else → `warning`, and the previous value stands.
+  Anything else → `warning`, and the previous value stands. The same spellings
+  hold for every boolean in the file -- `[sources] retroarch_content_dir` and a
+  platform's `enabled` too -- and `[sources] retroarch` takes them as well as
+  `auto`, a true one meaning `on` and a false one `off`.
 - `verify_hash` decides two things, not one: whether a finished download is
   checked against the rom's `sha1_hash` (falling back to `md5_hash`), **and**
   whether "this rom is already on the card" can be answered at all. With it off
@@ -589,7 +595,7 @@ Each report carries a severity, the line number, and the section and key:
 - `slot` is 1–24 ASCII letters, digits, `-` and `_`. Anything else → `warning`,
   and the slot in force (`autosave` unless an earlier line set one) is kept.
 - `interval_min` is a whole number of minutes. Negative or unparseable →
-  `warning`, default kept. Above the 10080-minute (one week) maximum → clamped
+  `warning`, and the value in force (30 unless an earlier line set one) is kept. Above the 10080-minute (one week) maximum → clamped
   to it with a `warning`, because falling back to the 30-minute default would
   sync far more often than you asked for.
 
