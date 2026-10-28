@@ -192,7 +192,8 @@ struct TickCompletion {
   /// appended to `warnings` below, so a caller that logs one list does not
   /// silently miss a save that lost its row -- up to the same
   /// `state::kMaxDiagnostics` cap every list here has, past which this field is
-  /// the complete one.
+  /// the complete one. A failure is a line in `warnings` too, naming the reason
+  /// `ok()` alone does not carry (#282).
   state::StoreResult stored;
 
   /// What `CompleteSession` answered.
