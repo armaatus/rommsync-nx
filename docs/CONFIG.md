@@ -321,6 +321,8 @@ retroarch_content_dir = false  ; true reads saves RetroArch keeps beside the rom
   same saves. `off` reads no RetroArch folder at all — the map's included.
 - `retroarch_content_dir` is off by default because the folders it reads are
   rom folders.
+- A `retroarch` value that is none of those is a `warning`, and the value in
+  force stays (`auto` unless an earlier line set one).
 
 The overlay's settings screen shows `[sources]`, and a press on either row sets
 it to its next value — `auto`, `on`, `off`, and round again; `false`, `true` —
@@ -374,7 +376,7 @@ A custom root follows the same rule: a Tico folder `<root>/<folder>` is read at
 `<root>/users/<account>/<folder>` once `<root>/users/` exists. The map's folders
 themselves never change, so a file written by v1.0.0-rc1 means what it meant.
 An `account` that is not `auto`, `legacy` or 32 hex digits is a `warning`, and
-`auto` stays in force. The settings screen lists the accounts it found and names
+the account in force stays (`auto` unless an earlier line named one). The settings screen lists the accounts it found and names
 the one you press ([Editing from the overlay](#editing-from-the-overlay));
 v1.0.0-rc1 ignores `[tico]` with a warning.
 
@@ -544,9 +546,6 @@ Each report carries a severity, the line number, and the section and key:
 - A UTF-8 BOM, CRLF line endings and a missing final newline are all fine.
 - A key set twice: the last **usable** line wins, `warning` — a later value the
   parser rejects leaves the earlier one in force, the same as anywhere else.
-  Two exceptions in this release: a rejected `[sources] retroarch` or `[tico]
-  account` falls back to `auto` rather than to an earlier line's value
-  ([#281](https://github.com/armaatus/rommsync-nx/issues/281)).
   A section repeated: the two are merged, `warning`.
 - A section this client does not know → `warning`, and everything under it is
   ignored without a second complaint per line.

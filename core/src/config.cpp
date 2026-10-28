@@ -372,9 +372,11 @@ void ApplySources(const ParseState& state, int line, std::string_view key, std::
     } else if (ParseBool(lowered, &flag)) {
       config->sources.retroarch = flag ? SourceMode::kOn : SourceMode::kOff;
     } else {
+      // The value in force stays, as for every other key (#281): `auto` only
+      // when no earlier line set one.
       diags->Add(Severity::kWarning, line, state.section, key,
-                 "expected auto, on or off, got '" + Redact(value) + "'; keeping auto");
-      config->sources.retroarch = SourceMode::kAuto;
+                 "expected auto, on or off, got '" + Redact(value) + "'; keeping " +
+                     ToString(config->sources.retroarch));
     }
     return;
   }
@@ -426,8 +428,8 @@ void ApplyTico(const ParseState& state, int line, std::string_view key, std::str
     // anything but 32 hex digits is either a typo or a path.
     diags->Add(Severity::kWarning, line, state.section, key,
                "expected auto, legacy or an account's 32-digit id, got '" + Redact(value) +
-                   "'; keeping auto");
-    tico.emplace();
+                   "'; keeping " + AccountText(config->tico));
+    return;
   }
   config->tico = std::move(*tico);
 }
