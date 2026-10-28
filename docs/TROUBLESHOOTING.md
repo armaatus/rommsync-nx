@@ -40,7 +40,7 @@ Every line is the same four fields:
 ```
 
 ```
-1 info boot rommsync-nx/0.1.0
+1 info boot rommsync-nx/1.0.0-rc2
 2 info auth.token server=https://romm.example.com device=console-1 scopes=[roms.read] credential=present(68 chars) expires=never
 3 warn net.offline GET /api/roms: connection failed; the rom index could not be fetched: connection failed (Connection refused)
 4 info sync.tick outcome=offline completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
@@ -130,7 +130,7 @@ in RomM and never come back from it. Nothing changes on the card.
 
 ```
 3 warn net.offline GET /api/roms: body ended early; the rom index could not be fetched: body ended early (transfer closed with 14822 bytes remaining to read)
-3 warn net.offline negotiate: connection failed; the negotiation never completed
+3 warn net.offline negotiate: connection failed; the negotiation did not complete: connection failed
 2 warn net.offline tick skipped: this build has no transport
 ```
 
@@ -172,7 +172,7 @@ was working and then stopped, all at once, without the network changing.
 
 ```
 3 error auth.rejected GET /api/roms answered 401; the rom index was refused with status 401
-7 error auth.rejected the server stopped accepting this console's token: refused with 401
+7 error auth.rejected the server stopped accepting this console's token: the negotiation was rejected: HTTP 401; the token has been revoked
 2 error auth.rejected tick skipped: this console has no usable token; pair it again
 ```
 
@@ -292,7 +292,7 @@ nothing obviously different about them.
 
 ```
 5 warn scan.skipped unmatched /retroarch/saves/Game (USA).srm: no rom named "Game (USA)"
-6 warn scan.skipped ambiguous /retroarch/saves/Game.srm: "Game" matches 2 roms (gb, gba)
+6 warn scan.skipped ambiguous /retroarch/saves/Game.srm: "Game" matches 2 roms (gb, gba); map the folder to one platform to resolve it
 ```
 
 **What is happening.** A save is matched to a rom by its **base name** — the
@@ -399,8 +399,8 @@ appear beside your saves and never turn into anything.
 **Log line.**
 
 ```
-9 error save.failed download Game (USA).srm: the previous bytes could not be backed up
-9 error save.failed the baseline could not be written
+9 error save.failed download rom 1234, slot autosave: the previous bytes could not be preserved: the card is full
+10 info sync.tick outcome=partial completed=3 failed=1 states_completed=0 states_failed=0 baseline=not stored
 ```
 
 **What is happening.** Something could not be written to the card. The important
@@ -419,7 +419,7 @@ part is what *did not* happen as a result:
 
 - **A rom that will not fit is refused before it starts.** Before the first
   byte of a download moves, the sysmodule asks the card how much space is left;
-  a rom bigger than that fails at once, and the queue screen says how much is
+  a rom bigger than that fails at once, and the Downloads screen says how much is
   free and how much the rom needs. A card that fills up *during* a download
   anyway fails the rom with "the card is full" and deletes the partial file, so
   the space it took comes back. The rom already on the card under that name, if
@@ -429,7 +429,7 @@ A full card also stops the client's own records being written, and one of those
 has a line of its own:
 
 ```
-9 error play.failed /config/rommsync/play.db: the bytes did not all reach the card
+9 error play.failed /config/rommsync/play.db.tmp: could not be written completely: the card is full
 ```
 
 `play.failed` is play time, not save data — **no save is ever at risk from it**
@@ -494,7 +494,7 @@ server**.
 
 ```
 3 warn sync.refused GET /api/roms: the rom index is not the shape this client reads: at offset 8: expected ':' after an object key
-7 warn sync.refused no such device: the device was deleted in RomM's web UI
+7 warn sync.refused no_such_device: the negotiation was answered 404; this device was deleted in RomM
 7 warn sync.refused sync_disabled: sync is turned off for this device in RomM; turn it back on there
 7 info sync.tick outcome=server_disabled completed=0 failed=0 states_completed=0 states_failed=0 baseline=not stored
 ```
@@ -563,7 +563,7 @@ time as the server being unreachable and retries.
 
 ## A queued rom never arrives
 
-**Symptom.** You queued a rom from the overlay's library screen, the queue
+**Symptom.** You queued a rom from the overlay's library screen, the Downloads
 screen shows it waiting, and it never turns into a file.
 
 **Log line.**
@@ -577,7 +577,7 @@ screen shows it waiting, and it never turns into a file.
 **What is happening.** The sysmodule drains the queue on the same thread that
 runs the sync tick, and it does it **last** — a sync that is due and a list page
 the overlay is waiting for both go first. So a rom that is not moving is usually
-one of seven things, and the queue screen names which:
+one of seven things, and the Downloads screen names which:
 
 1. **`[downloads] enabled = false`.** Nothing is opened and nothing is lost;
    switching it back on resumes exactly what was there.
@@ -589,7 +589,7 @@ one of seven things, and the queue screen names which:
    goes up, and the drain tries again on a backoff that starts at 30 seconds and
    doubles to 15 minutes. That is the `retryable` line above.
 4. **It is a disc set.** A multi-file rom is skipped deliberately and never
-   downloaded as a zip — the queue screen says so on the row.
+   downloaded as a zip — the Downloads screen says so on the row.
 5. **Something asked for the thread.** Pressing **Sync now**, taking the rom out
    of the queue, or terminating the sysmodule all stop the transfer where it
    stands. The bytes already on the card are kept as a `.part`, so the next
@@ -613,7 +613,7 @@ one of seven things, and the queue screen names which:
    the same answer comes back. This version has no way past it; deleting old
    saves, states and screenshots of that rom in RomM's web UI shrinks the answer.
 
-**The fix.** Read the row on the overlay's queue screen first; it carries the
+**The fix.** Read the row on the overlay's Downloads screen first; it carries the
 reason for that rom. For 3, the drain is already retrying and nothing needs
 doing. For 1 and 2, the settings and pairing screens are where both are fixed.
 
@@ -823,8 +823,9 @@ finished — only when that second question could not settle it:
 The next sync settles it.
 
 **The fix.** Usually nothing. To keep the card's version after a conflict,
-restore it from the **Conflicts** screen; the next sync decides again, and will
-most likely offer it to RomM as new progress. If the same 409 line comes back on every sync with no game open,
+choose **Keep local** on the **Conflicts** screen: the card's bytes go back on
+the card and the next sync uploads them over the server's copy (with a game
+open, it lands when you close the game). If the same 409 line comes back on every sync with no game open,
 attach the log ([What to attach to a bug report](#what-to-attach-to-a-bug-report)).
 
 ---
@@ -877,7 +878,7 @@ the new layout, and move a save you still need into your account's folder.
 
 ## RomM calls a platform something else
 
-**Symptom.** One system's roms never download — the queue screen says no folder
+**Symptom.** One system's roms never download — the Downloads screen says no folder
 is mapped for its platform — and its saves never sync, while every other system
 works.
 
@@ -1001,7 +1002,7 @@ Five things, and the log has four of them:
    screen:
 
    ```
-   1 info boot rommsync-nx/0.1.0
+   1 info boot rommsync-nx/1.0.0-rc2
    ```
 
 2. **The pairing line.** Which server, which device, which scopes — and *not*

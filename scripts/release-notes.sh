@@ -188,13 +188,19 @@ cat <<EOF
 
 Download **\`$ZIP\`** below and unzip it onto the **root** of your SD card.
 It merges with what is already there; it does not replace your
-\`config.ini\`, your pairing or your sync state.
+\`config.ini\`, your pairing, your sync state or your save backups. It does
+replace a \`README.txt\` or \`LICENSE\` at the root of the card.
 
-The sysmodule ships **disabled** — nothing runs until you enable it with
+You need Ultrahand (or Tesla), ovl-sysmodules, and a RomM 5.4.0 or later
+server. The sysmodule ships **disabled** — nothing runs until you enable it with
 ovl-sysmodules. \`README.txt\` inside the archive is the short version; the full
-guide is here:
+guide — install, pairing, upgrading and uninstalling — is here:
 
-  $URL#readme
+  $URL/blob/$TAG/docs/INSTALL.md
+
+and when something does not sync, every log line and what to do about it:
+
+  $URL/blob/$TAG/docs/TROUBLESHOOTING.md
 
 Built with $(toolchain), for $ATMOSPHERE_TARGET.
 

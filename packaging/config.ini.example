@@ -65,9 +65,10 @@ account = auto
 ;
 ; A built-in map ships for the Switch-capable systems (nes, snes, gb, gbc, gba,
 ; n64, genesis, sms, gamegear, segacd, psx, nds, dc, dreamcast, psp, saturn,
-; fbneo, arcade), in Tico's folder names (sms is /tico/roms/master-system), so
-; this file only needs the ones you want to change. Uncomment a section to
-; override that platform.
+; fbneo, arcade), in Tico's folder names -- which differ from the slug for sms,
+; gamegear, segacd, dreamcast and arcade (sms is /tico/roms/master-system; the
+; full table is in docs/CONFIG.md) -- so this file only needs the ones you want
+; to change. Uncomment a section to override that platform.
 ;
 ; gc, wii and 3ds are off by default. Turn one on with its built-in folders:
 ;

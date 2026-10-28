@@ -72,8 +72,10 @@ RUNTIME_SUBDIRS = ("flags",)
 
 # Runtime state that lives beside the shipped config, and is named by the guide
 # precisely because it is NOT in the archive: an upgrade must leave it alone.
+# `.backup` is a directory, named for the same reason: it holds every save
+# backup, and an upgrade or an uninstall that took it would take those too.
 RUNTIME_FILES = ("config.ini", "token.dat", "device.dat", "state.db", "queue.json",
-                 "rommsync.log", "rommsync.log.old")
+                 "conflicts.db", "rommsync.log", "rommsync.log.old", ".backup")
 
 # The ten sections of #35, in the order a user meets them.
 SECTIONS = [
@@ -387,15 +389,17 @@ def phase_pairing(args) -> int:
     # is asserted against the source that draws it. The guide's convention is
     # that **"..."** is verbatim overlay text and nothing else is; italics are
     # for a word being discussed, not for a line being quoted.
-    views = "\n".join(read(os.path.join(repo, "core", "src", name))
-                      for name in ("overlay_pairing_view.cpp", "overlay_status_view.cpp"))
+    # overlay_sync_actions.cpp since step 5 quotes what Sync now answers.
+    view_files = ("overlay_pairing_view.cpp", "overlay_status_view.cpp",
+                  "overlay_sync_actions.cpp")
+    views = "\n".join(read(os.path.join(repo, "core", "src", name)) for name in view_files)
     quoted = {row[0] for row in rows.values()}
     quoted |= set(re.findall(r'\*\*"([^"]+)"\*\*', text))
     for line in sorted(quoted):
         if f'"{line}"' not in views:
             return fail(f"docs/INSTALL.md quotes the overlay as saying {line!r}; "
-                        "no such string is drawn by core/src/overlay_pairing_view.cpp "
-                        "or core/src/overlay_status_view.cpp")
+                        "no such string is drawn by any of core/src/"
+                        + ", core/src/".join(view_files))
 
     print(f"the pairing table is exactly {', '.join(states)}, three failures apart; "
           f"{len(quoted)} quoted screen lines are drawn by the views")

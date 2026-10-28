@@ -8,6 +8,21 @@ Ultrahand / Tesla overlay (ovl-rommsync) to drive it.
 
   https://github.com/armaatus/rommsync-nx
 
+This is a PRE-RELEASE that has not yet been run on a real console. Try it
+on a spare SD card or an emuMMC with a NAND backup, against a RomM you do
+not mind losing saves on.
+
+
+YOU NEED
+--------
+
+  - A console running Atmosphere (the versions this build targets are
+    under "Before you start" in docs/INSTALL.md)
+  - Ultrahand (or Tesla), with the overlay menu working
+  - ovl-sysmodules, to turn the sysmodule on and off
+  - A RomM 5.4.0 or later server the console can reach, and an account
+    on it you can sign into from a phone or a computer
+
 
 INSTALL
 -------
@@ -16,12 +31,12 @@ Unzip this archive onto the ROOT of your SD card, keeping the folder
 structure. It merges with what is already there, adding six files and
 one empty folder, and changing nothing else:
 
-  atmosphere/contents/@TITLE_ID@/exefs.nsp   the sysmodule
-  atmosphere/contents/@TITLE_ID@/toolbox.json  what ovl-sysmodules lists it by
-  atmosphere/contents/@TITLE_ID@/flags/      empty: the sysmodule is off
-  switch/.overlays/ovl-rommsync.ovl                the overlay
-  config/rommsync/config.ini.example               a starting configuration
-  README.txt                                       this file
+  atmosphere/contents/@TITLE_ID@/exefs.nsp    the sysmodule
+  atmosphere/contents/@TITLE_ID@/toolbox.json what ovl-sysmodules lists it by
+  atmosphere/contents/@TITLE_ID@/flags/       empty: the sysmodule is off
+  switch/.overlays/ovl-rommsync.ovl                 the overlay
+  config/rommsync/config.ini.example                a starting configuration
+  README.txt                                        this file
   LICENSE
 
 Note the last two: they land at the ROOT of the card under those names, so an
@@ -35,18 +50,43 @@ Then, in order:
      empty flags/ folder this archive ships; do not make it by hand.
   2. Copy config/rommsync/config.ini.example to config/rommsync/config.ini
      and set [server] url to your RomM.
-  3. Open ovl-rommsync from the Ultrahand overlay menu and pair. You type a
-     short code into RomM in a browser; no password is ever typed on the
-     console.
+  3. Open ovl-rommsync from the Ultrahand overlay menu, press Y for
+     Settings, choose Pairing and press Pair. Open the address it shows in
+     a browser signed in to RomM and enter the eight-character code; no
+     password is ever typed on the console.
+
+
+USING IT
+--------
+
+Saves sync on boot, every 30 minutes, and when you press Sync now
+(Settings > Sync, then A). Nothing syncs while a game is running: a sync
+that falls due waits until you close the game.
+
+The server is the source of truth. Every save the console overwrites or
+removes is copied to config/rommsync/.backup/ first. When a save changed
+on both sides, Settings > Conflicts lets you keep the server's copy or put
+this console's back and upload it (Keep local).
+
+A save you delete in RomM is removed from the card too, after its backup.
+Set on_server_delete = keep in config.ini to stop that.
+
+Something not syncing? Settings > Log shows what the sysmodule last said.
 
 
 UPGRADING
 ---------
 
 Unzip a newer release over the top. The only files replaced are the six
-listed above. config.ini, token.dat, device.dat, state.db, queue.json and
-rommsync.log are not in the archive, so your settings, your pairing, your
-sync state and your log survive.
+listed above. config.ini, token.dat, device.dat, state.db, queue.json,
+conflicts.db, rommsync.log and the .backup/ folder are not in the archive,
+so your settings, your pairing, your sync state, your save backups and
+your log survive.
+
+From v1.0.0-rc1: saves now sync in RomM's shared "autosave" slot. The
+first sync offers each save there: a newer copy already in RomM comes
+down (yours backed up first), and a newer copy on the card shows up under
+Conflicts. See "Upgrading" in docs/INSTALL.md.
 
 
 THE FULL GUIDE

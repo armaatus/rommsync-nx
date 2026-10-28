@@ -12,9 +12,10 @@ you control from an **Ultrahand / Tesla overlay**.
 
 > Status: **built and tested off-console, not yet run on a Switch.** The
 > sysmodule and the overlay are written: pairing, the download queue, save sync
-> with backups and a conflicts screen, opt-in save states, and — on `main` since
-> the v1.0.0-rc1 pre-release — saves shared with RetroArch, RomM's web player,
-> Argosy and Grout ([`docs/INTEROP.md`](docs/INTEROP.md)). Sync, downloads and
+> with backups and a conflicts screen, opt-in save states, and — new in the
+> v1.0.0-rc2 pre-release — saves shared with RetroArch, RomM's web player,
+> Argosy and Grout ([`docs/INTEROP.md`](docs/INTEROP.md)), sync held while a
+> game is running, and sleep handled. Sync, downloads and
 > pairing are tested against a real RomM and the overlay's screens on the host;
 > nothing has booted on a console yet, and the first
 > real-console run is M8-2. It needs RomM 5.4.0 or later and refuses to sync
@@ -42,17 +43,22 @@ the Switch homebrew scene does:
   and edit config. Built on [libultrahand], so it appears in your Ultrahand
   overlay list like sys-clk or ovl-sysmodules.
 
-## The experience we're building
+## How it works
 
 1. Open the overlay, browse your RomM library, tap games to queue.
 2. `sys-rommsync` downloads them in the background into the right Tico / RetroArch
    folders.
-3. Play offline. On the next sync tick (boot, timer, or "Sync now" in the
-   overlay), saves reconcile with RomM — **server is the source of truth**, so
-   all your devices converge to the same save.
+3. Play offline. On the next sync — on boot, on the timer, or "Sync now" in the
+   overlay, and never while a game is running — saves reconcile with RomM.
+   **The server is the source of truth**, so all your devices converge to the
+   same save; any save the console overwrites is backed up on the card first.
+4. When both sides changed, the overlay's Conflicts screen lets you keep the
+   server's copy or put this console's back and upload it.
 
 ## Installing it (users)
 
+Download the zip from the [Releases](https://github.com/armaatus/rommsync-nx/releases)
+page — the current build is a **pre-release**, not yet run on a console.
 [`docs/INSTALL.md`](docs/INSTALL.md) is the one page written for the person
 holding the console: unpacking the release zip onto the SD, enabling the
 sysmodule with ovl-sysmodules, pointing it at your RomM, and pairing without
@@ -93,7 +99,7 @@ Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 |------|------|
 | `docs/` | Architecture, the pinned RomM API contract, auth & sync protocol, config, security, dev environment |
 | `sysmodule/` | `sys-rommsync` — the background engine: pairing, the download queue, the sync tick, IPC |
-| `overlay/` | `ovl-rommsync` — the libultrahand overlay: status, library, queue, conflicts, settings |
+| `overlay/` | `ovl-rommsync` — the libultrahand overlay: status, settings, sync, library and downloads, conflicts, pairing, log |
 | `switch.mk` | Shared devkitPro rules for both Switch targets |
 | `core/` | The portable engine — auth, sync, downloads, config, state. Builds and is tested natively. |
 | `server/` | API snapshot (source of truth), contract-probe script, and the docker RomM test fixture |
