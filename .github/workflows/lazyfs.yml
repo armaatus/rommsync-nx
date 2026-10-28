@@ -46,7 +46,14 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build libcurl4-openssl-dev libfuse3-dev fuse3
 
+      # lazyfs fetches toml11 at a commit whose cmake_minimum_required predates
+      # 3.5, and the runner's CMake 4 refuses to configure it at all -- every
+      # run since 2026-10-23 died here, before a single check. The variable is
+      # CMake 4's own escape hatch for exactly that, and reaches the nested
+      # configure through the environment build.sh does not touch.
       - name: Build lazyfs at its pin
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: |
           git clone https://github.com/dsrhaslab/lazyfs.git "$RUNNER_TEMP/lazyfs"
           git -C "$RUNNER_TEMP/lazyfs" checkout --detach "$LAZYFS_REF"
