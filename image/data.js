@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793355129892,
+  "lastUpdate": 1793440089194,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "image": [
@@ -299,6 +299,52 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/armaatus/rommsync-nx/commit/b4daa301ce59f09518d735170bf87bef5612b332"
         },
         "date": 1793355129330,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sysmodule mapped image",
+            "value": 2244608,
+            "unit": "bytes",
+            "extra": "budget 2359296"
+          },
+          {
+            "name": "sysmodule .bss",
+            "value": 1590368,
+            "unit": "bytes",
+            "extra": "heap 1572864"
+          },
+          {
+            "name": "sysmodule .text",
+            "value": 543856,
+            "unit": "bytes",
+            "extra": "ceiling 655360"
+          },
+          {
+            "name": "overlay .ovl",
+            "value": 610364,
+            "unit": "bytes",
+            "extra": "budget 1048576"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b4daa301ce59f09518d735170bf87bef5612b332",
+          "message": "Merge pull request #284 from armaatus/fix-281-282",
+          "timestamp": "2026-10-28T20:55:50Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/b4daa301ce59f09518d735170bf87bef5612b332"
+        },
+        "date": 1793440088810,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
