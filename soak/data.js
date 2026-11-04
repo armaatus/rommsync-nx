@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1793617818754,
+  "lastUpdate": 1793790323513,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "soak": [
@@ -371,6 +371,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "soak: allocations a round",
             "value": 3515,
+            "unit": "allocations"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "b4daa301ce59f09518d735170bf87bef5612b332",
+          "message": "Merge pull request #284 from armaatus/fix-281-282",
+          "timestamp": "2026-10-28T20:55:50Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/b4daa301ce59f09518d735170bf87bef5612b332"
+        },
+        "date": 1793790322842,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "soak: held between rounds",
+            "value": 67301,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: a round's peak over that",
+            "value": 51800,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: allocations a round",
+            "value": 3539,
             "unit": "allocations"
           }
         ]
