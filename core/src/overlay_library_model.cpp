@@ -304,6 +304,10 @@ int LibraryBrowserModel::Tail(const Level& level) {
   return level.first + static_cast<int>(level.rows.size());
 }
 
+int LibraryBrowserModel::LastPlace(const Level& level) {
+  return Tail(level) - 1 + (HasMoreRow(level) ? 1 : 0);
+}
+
 bool LibraryBrowserModel::Rewinding(const Level& level) {
   return level.first > 0 && (level.cursor == 0 || level.consumed < level.first);
 }
@@ -371,7 +375,7 @@ void LibraryBrowserModel::DropAbove(Level& level) {
 }
 
 void LibraryBrowserModel::ClampSelection(Level& level) {
-  const int highest = Tail(level) - 1 + (HasMoreRow(level) ? 1 : 0);
+  const int highest = LastPlace(level);
   level.selected = std::clamp(level.selected, level.first, std::max(level.first, highest));
 }
 
@@ -779,7 +783,7 @@ void LibraryBrowserModel::MoveSelection(int delta) {
   // row above them it may not: what is above is read again by the time the
   // selection gets there, and a selection resting on "Loading..." would be
   // moved onto a rom by rows arriving, which is the invisible press.
-  const int highest = Tail(level) - 1 + (HasMoreRow(level) ? 1 : 0);
+  const int highest = LastPlace(level);
   // In 64 bits: a page key held at full speed is a large delta, and a place
   // near the end of a long list plus one must not wrap.
   const std::int64_t wanted = std::int64_t{level.selected} + delta;
@@ -1074,8 +1078,8 @@ LibraryRow LibraryBrowserModel::MoreRow(const Level& level) {
 LibraryView LibraryBrowserModel::Render() const {
   // Far enough either way to take in every place a level can hold, and small
   // enough that adding it to a place cannot overflow.
-  constexpr int kEverything = 1 << 24;
-  return Render(kEverything, kEverything);
+  constexpr int kWholeLevel = 1 << 24;
+  return Render(kWholeLevel, kWholeLevel);
 }
 
 LibraryView LibraryBrowserModel::Render(int above, int below) const {
@@ -1103,9 +1107,8 @@ LibraryView LibraryBrowserModel::Render(int above, int below) const {
   // within `above`/`below` of the selection are copied (#298).
   const int tail = Tail(level);
   const bool top_row = level.first > 0;
-  const bool more_row = HasMoreRow(level);
   const int lowest = level.first - (top_row ? 1 : 0);
-  const int highest = tail - 1 + (more_row ? 1 : 0);
+  const int highest = LastPlace(level);
   if (highest >= level.first) {
     const int selected = std::clamp(level.selected, level.first, highest);
     const int from = std::max(lowest, selected - std::max(above, 0));

@@ -429,6 +429,11 @@ class LibraryBrowserModel {
   /// One past the last loaded row's place.
   static int Tail(const Level& level);
 
+  /// The last place the selection may stand: the `kMore` row when there is
+  /// one, else the last loaded row. Shared by `MoveSelection`,
+  /// `ClampSelection` and `Render` so the three cannot disagree about it.
+  static int LastPlace(const Level& level);
+
   /// The cursor is behind the window's first row: rows above it are being
   /// read again, or a reclaimed cursor is catching up to it. A page that fails
   /// then is drawn above the rows, where the user is, not below them.
