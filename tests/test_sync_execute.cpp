@@ -326,6 +326,70 @@ void Staging(rig::Checks& checks) {
   checks.Expect(!std::filesystem::exists(io::PreviousPathFor(to)), "and the .old is cleaned up");
 }
 
+// --- foreign_old --------------------------------------------------------------
+//
+// #293. A `<save>.old` that is already there when a commit starts was not
+// written by that commit: the boot sweep leaves it alone because it is
+// indistinguishable from a `Game.srm.old` a human made by hand, and the commit
+// has to be no less careful. It used to remove it, unbacked, to make way for
+// its own.
+
+/// Every file in `directory` whose bytes are exactly `bytes`.
+std::vector<std::string> FilesHolding(const std::string& directory, const std::string& bytes) {
+  std::vector<std::string> found;
+  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+    if (entry.is_regular_file() && rig::ReadFile(entry.path().string()) == bytes) {
+      found.push_back(entry.path().filename().string());
+    }
+  }
+  return found;
+}
+
+void ForeignOld(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-foreign-old");
+  const std::string directory = sandbox.Host("/retroarch/saves");
+  std::filesystem::create_directories(directory);
+  const std::string save = directory + "/Game.srm";
+  const std::string manual = io::PreviousPathFor(save);
+  const std::string staged = io::TempPathFor(save);
+
+  checks.Expect(rig::WriteFile(save, "the save before\n"), "a save is on the card");
+  checks.Expect(rig::WriteFile(manual, "a backup the player made by hand\n"),
+                "and beside it a Game.srm.old the player made");
+  checks.Expect(rig::WriteFile(staged, "the verified bytes\n"), "a download is staged");
+
+  const io::WriteResult committed = io::CommitStaged(staged, save);
+  checks.Expect(committed.ok(), "the commit succeeds: " + committed.message);
+  checks.ExpectEq(rig::ReadFile(save), std::string("the verified bytes\n"),
+                  "and the save holds the new bytes");
+  checks.ExpectEq(FilesHolding(directory, "a backup the player made by hand\n").size(),
+                  std::size_t{1}, "the player's own .old survives the commit, once");
+  checks.Expect(FilesHolding(directory, "the save before\n").empty(),
+                "while the commit's own .old is still cleaned up");
+
+  // A second one, a commit later, is a second file the commit did not write --
+  // and must not land on the first one's new name.
+  checks.Expect(rig::WriteFile(manual, "a second backup by hand\n"), "another .old appears");
+  checks.Expect(rig::WriteFile(staged, "newer bytes\n"), "another download is staged");
+  checks.Expect(io::CommitStaged(staged, save).ok(), "and committed");
+  checks.ExpectEq(FilesHolding(directory, "a backup the player made by hand\n").size(),
+                  std::size_t{1}, "the first set-aside file is still there");
+  checks.ExpectEq(FilesHolding(directory, "a second backup by hand\n").size(), std::size_t{1},
+                  "and so is the second");
+
+  // `Shred` is the other side of it: a `token.dat.old` set aside still holds a
+  // bearer token, and Re-pair has to discard it with the rest.
+  const std::string token = sandbox.Host("/config/rommsync/token.dat");
+  checks.Expect(rig::WriteFile(token, "the token\n"), "a token is on the card");
+  checks.Expect(rig::WriteFile(io::PreviousPathFor(token), "an older token\n"),
+                "with a stale .old beside it");
+  checks.Expect(rig::WriteFile(io::TempPathFor(token), "a newer token\n"), "a new one staged");
+  checks.Expect(io::CommitStaged(io::TempPathFor(token), token).ok(), "and committed");
+  checks.Expect(io::Shred(token), "Shred reports the token gone");
+  checks.Expect(FilesHolding(sandbox.Host("/config/rommsync"), "an older token\n").empty(),
+                "including the .old the commit set aside");
+}
+
 // --- crash_model --------------------------------------------------------------
 //
 // M9-14 (#203). `staging` proves the two primitives an overwrite goes through
@@ -3255,7 +3319,7 @@ int main(int argc, char** argv) {
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
       scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
       scenario == "delete" || scenario == "crash_delete" || scenario == "isolated" ||
-      scenario == "late_write" || scenario == "declined") {
+      scenario == "late_write" || scenario == "declined" || scenario == "foreign_old") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -3264,6 +3328,8 @@ int main(int argc, char** argv) {
       ContentHash(checks);
     } else if (scenario == "staging") {
       Staging(checks);
+    } else if (scenario == "foreign_old") {
+      ForeignOld(checks);
     } else if (scenario == "crash_model") {
       CrashModel(checks);
     } else if (scenario == "delete") {

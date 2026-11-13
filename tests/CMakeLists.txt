@@ -953,6 +953,7 @@ target_compile_definitions(test_sync_execute PRIVATE
 set(EXECUTE_UNIT_SCENARIOS
   naming   # the backup path carries the slot, so one rom's two saves are two files
   staging  # the streamed copy and the two-rename commit an overwrite goes through
+  foreign_old # #293: a <save>.old the commit did not write survives it
   counting # no-op, a downgraded action, and the two refusals that need no server
   crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
   overwrite # #232: overwrite=false unless Keep local, and a 409 named as a newer save in the slot
