@@ -20,16 +20,16 @@ std::string Span(std::int64_t seconds) {
   const auto unit = [](std::int64_t count, const char* name) {
     return std::to_string(count) + " " + name + (count == 1 ? "" : "s");
   };
-  if (magnitude >= 2 * 86400) {
+  if (magnitude >= 86400) {
     return unit(magnitude / 86400, "day");
   }
-  if (magnitude >= 2 * 3600) {
+  if (magnitude >= 3600) {
     return unit(magnitude / 3600, "hour");
   }
   return unit(magnitude / 60, "minute");
 }
 
-/// Two digits at `text[at]`, or -1.
+/// The `count` digits at `text[at]` as a number, or -1.
 int Digits(std::string_view text, std::size_t at, std::size_t count) {
   if (at + count > text.size()) {
     return -1;
@@ -107,11 +107,11 @@ ClockCheck CheckClock(const ClockReading& reading) {
       {ClockReference::kNetwork, &reading.network},
       {ClockReference::kServer, &reading.server},
   }};
-  for (const auto& [which, at] : references) {
-    if (!at->has_value()) {
+  for (const auto& [which, instant] : references) {
+    if (!instant->has_value()) {
       continue;
     }
-    const std::int64_t skew = SecondsBetween(reading.local, **at);
+    const std::int64_t skew = SecondsBetween(reading.local, **instant);
     if (check.reference == ClockReference::kNone) {
       // Kept even when inside the limit, so a trusted check names what it was
       // compared with.
