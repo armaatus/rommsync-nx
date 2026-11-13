@@ -61,8 +61,9 @@ Ultrahand overlay list.
 - **The parts of this directory that need no renderer are compiled and run on a
   host.** `source/card_probe.cpp`, `source/conflicts_pump.cpp`,
   `source/ipc_client.cpp`, `source/library_pump.cpp`, `source/lifecycle.cpp`,
-  `source/log_paint.cpp`,
-  `source/screen_frame.cpp` and `source/status_paint.cpp` are built into
+  `source/log_paint.cpp`, `source/pairing_pump.cpp`, `source/poller.cpp`,
+  `source/screen_frame.cpp`, `source/status_paint.cpp`,
+  `source/status_pump.cpp` and `source/sync_pump.cpp` are built into
   `test_overlay_native` and driven against the real `ipc::Dispatch` and the real
   `sysmodule::ToResult` — so a payload the two halves disagree about is a red
   test rather than a first-boot surprise. libnx comes from
@@ -147,6 +148,19 @@ Ultrahand overlay list.
   takes for the life of the overlay -- a session, a thread, a handle -- is given
   back from `Stop`, and `overlay.cycles` is where it gets balanced. nx-ovlloader's
   process never exits, so what is not given back is gone until a reboot.
+- **A screen that polls does not wait for the poll** (M11-15, #299). The budget
+  above bounds one frame, not every frame: a screen sending a command from each
+  `update()` and waiting for it runs at the sysmodule's pace, and an answer in
+  300 ms -- `SetConfig` under the card mutex while a download writes -- is an
+  overlay at three frames a second. The status, sync and pairing screens go
+  through `source/poller.*` instead: it posts (`IpcClient::Post`), collects on
+  a later frame, reads about four times a second, and turns a press out past
+  the budget into *still applying* rather than a failure. A new screen that
+  polls takes a `Poller` and puts its frame in a `<thing>_pump.*`;
+  `ctest -R overlay.frames` is where its frames get timed. The library,
+  conflicts, log and settings screens still wait, within the budget, for at
+  most one command a frame; they were outside #299's scope, and moving one is
+  moving its pump onto a `Poller`.
 - **A screen polls by `Cadence`, never by a frame count of its own.** `update()`
   does not run while the overlay is hidden, so a member a screen increments to
   decide when to ask again resumes mid-count after a hide and draws what it read

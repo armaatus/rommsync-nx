@@ -505,7 +505,8 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `log_paint.cpp`, each split out of a screen so the claim about it runs;
 # M11-1 (#285) `library_pump.cpp`, the library browser's IPC and teardown;
 # M11-15 (#299) `status_pump.cpp`, `sync_pump.cpp` and `pairing_pump.cpp`, the
-# three screens that poll, so a frame against a slow sysmodule can be timed.
+# three screens that poll, so a frame against a slow sysmodule can be timed,
+# and `poller.cpp`, the line they poll through without waiting.
 # `sysmodule/source/ipc/result.cpp` is the far side's `Error` -> `Result`
 # mapping, compiled in so the overlay's inverse is tested against the real
 # one rather than against a copy of it.
@@ -529,6 +530,7 @@ add_executable(test_overlay_native
   "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/log_paint.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/pairing_pump.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/poller.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_pump.cpp"

@@ -222,6 +222,14 @@ production RomM or a real library.
     *"sys-rommsync is not running"*. Before M11-1 (#285) each
     such exit left one session open on a sysmodule that allows three, so the
     fourth open found none left until reboot.
+16. **A busy sysmodule does not slow the panel.** Queue a large rom from the
+    library, and while it downloads open the status screen, then the sync
+    screen, then pairing, scrolling and pressing B between them. Expect each to
+    move as smoothly as with nothing downloading, and the download's progress
+    to advance a few times a second. On the sync screen flip the switch with X:
+    expect it to move within a second, or *"Still applying..."* first and then
+    the switch -- never *"not responding"*. Before M11-15 (#299) these screens
+    waited for every answer on the draw thread.
 
 Record what each step actually drew in #44, including the layout constants that
 had to move — every screen file keeps them in one block at the top for exactly

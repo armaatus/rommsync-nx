@@ -95,6 +95,10 @@ struct LastCommand {
     kNone,        ///< nothing has been pressed since the screen opened
     kSetEnabled,  ///< `SetEnabled` answered; `write` is what it did
     kSyncNow,     ///< `SyncNow` answered; `sync` is what it did
+    /// A press is out past the overlay's budget, or its answer was lost (#299).
+    /// Not a failure: the write is the sysmodule's and lands when the card lets
+    /// it, and the next `Status` says what it changed.
+    kApplying,
   };
 
   Kind kind = Kind::kNone;
@@ -144,6 +148,9 @@ struct LastCommand {
   /// `WriteOutcome` that means nothing, and a filler value is one somebody
   /// eventually reads.
   static LastCommand SetEnabled(ipc::WriteOutcome outcome, bool enabled_now);
+
+  /// A press is still out (`kApplying`).
+  static LastCommand Applying();
 };
 
 /// Everything the sync screen draws, and nothing about how.

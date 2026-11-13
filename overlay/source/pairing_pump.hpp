@@ -9,6 +9,8 @@
 #pragma once
 
 #include "ipc_client.hpp"
+#include "poller.hpp"
+#include "rommsync/ipc.hpp"
 #include "rommsync/overlay_pairing_view.hpp"
 #include "screen_frame.hpp"
 
@@ -22,7 +24,8 @@ class PairingPump {
   PairingPump(const PairingPump&) = delete;
   PairingPump& operator=(const PairingPump&) = delete;
 
-  /// `update()`.
+  /// `update()`. Never waits on the sysmodule: the poll and the press go
+  /// through `Poller`, and a frame only collects what came back.
   void Frame();
 
   /// A: start a pairing attempt, or start a new one over a dead code. Both are
@@ -39,18 +42,19 @@ class PairingPump {
   const PairingView& view() const { return view_; }
 
  private:
-  /// The port and the version handshake, which every command on a fresh session
-  /// waits for. Answers false when they could not be completed, having already
-  /// put the reason in `view_`.
-  bool Ready();
+  /// What `StartPair`, or the `GetStatus` after a refused one, answered.
+  void Answered(ipc::Command command, Result rc);
+
+  /// Draw `link` instead.
+  void Unreachable(Link link);
 
   IpcClient& client_;
   ScreenFrame frame_{client_};
+  Poller poller_{frame_, client_, ipc::Command::kGetPairState};
 
-  /// What the last poll produced. Starts as "not running" rather than as an
-  /// empty screen: the first frame is drawn before the first poll returns, and
-  /// a blank one there is indistinguishable from a broken overlay.
-  PairingView view_ = RenderPairingUnreachable(Link::kNotRunning);
+  /// What the last answer produced. Blank until the first, for
+  /// `StatusPump::view_`'s reason: nothing is offered, so nothing is drawn.
+  PairingView view_;
 
   /// Set by a `StartPair` the sysmodule refused, and cleared only by the next
   /// press or by a transport failure.

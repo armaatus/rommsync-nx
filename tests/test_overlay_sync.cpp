@@ -377,6 +377,16 @@ void CheckWriteThatDidNotTake(Checks& checks) {
   checks.Expect(ViewOf(off, overlay::LastCommand::SetEnabled(ipc::WriteOutcome::kApplied, false))
                     .notice.empty(),
                 "a write that took needs no notice: the switch having moved is the answer");
+
+  // #299: a press out past the overlay's budget is still applying -- said, and
+  // not in the colour of a failure, because the write lands.
+  {
+    const overlay::SyncActionsView view = ViewOf(Working(), overlay::LastCommand::Applying());
+    checks.ExpectEq(view.notice, std::string("Still applying..."),
+                    "a press still out says so rather than nothing or 'not responding'");
+    checks.Expect(view.notice_tone == overlay::Tone::kNeutral, "...and not as a failure");
+    checks.Expect(view.link == overlay::Link::kOk, "...over a sysmodule that is there");
+  }
 }
 
 /// Every `SyncNow` outcome is a sentence, and no two of them are the same one.

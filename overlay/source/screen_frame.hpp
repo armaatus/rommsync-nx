@@ -65,6 +65,17 @@ class ScreenFrame {
   /// reason it exists.
   Link Ready();
 
+  /// `Ready()` in the two halves a screen that may not wait needs (#299): the
+  /// first opens the port and never asks the sysmodule anything; the second
+  /// judges the handshake's answer, however it was sent. `Ready()` is the
+  /// two of them with a waited-for `GetInterfaceVersion` between.
+  ///
+  /// `Connect` answers `kOk` or `kNotRunning`; `checked()` then says whether a
+  /// handshake is still owed on this session.
+  Link Connect();
+  bool checked() const { return version_checked_; }
+  Link Admit(Result rc, std::uint32_t sysmodule_interface);
+
   /// What a failed typed call means.
   ///
   /// `MalformedResponse()` is a payload this build cannot read -- the sysmodule

@@ -11,6 +11,16 @@
 namespace rommsync::overlay {
 
 Link ScreenFrame::Ready() {
+  const Link connected = Connect();
+  if (connected != Link::kOk || version_checked_) {
+    return connected;
+  }
+  std::uint32_t interface = 0;
+  const Result rc = client_.GetInterfaceVersion(&interface);
+  return Admit(rc, interface);
+}
+
+Link ScreenFrame::Connect() {
   if (!client_.open()) {
     if (retired_) {
       return Link::kNotRunning;
@@ -23,12 +33,11 @@ Link ScreenFrame::Ready() {
     }
     version_checked_ = false;
   }
-  if (version_checked_) {
-    return Link::kOk;
-  }
+  return Link::kOk;
+}
 
-  sysmodule_interface_ = 0;
-  const Result rc = client_.GetInterfaceVersion(&sysmodule_interface_);
+Link ScreenFrame::Admit(Result rc, std::uint32_t sysmodule_interface) {
+  sysmodule_interface_ = R_SUCCEEDED(rc) ? sysmodule_interface : 0;
   if (rc == NotResponding()) {
     // Nothing came back in time. The session is the worker's until it does, so
     // it is neither reopened nor judged: the next frame asks again (#209).

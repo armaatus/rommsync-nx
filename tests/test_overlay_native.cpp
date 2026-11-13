@@ -26,6 +26,7 @@
 //                      destructor runs (#285).
 //   `status_pump.cpp`, `sync_pump.cpp`, `pairing_pump.cpp`
 //                      the three polling screens' IPC frames (#299).
+//   `poller.cpp`       the line those three poll through without waiting (#299).
 //
 // The far side of the wire is the *real* dispatch table -- `ipc::Dispatch` over
 // an `ipc::ServiceCore` -- and the real `Error` -> `Result` mapping the
@@ -1100,6 +1101,13 @@ bool RunFramesUntil(Frame frame, Done done, std::chrono::milliseconds* slowest) 
   return false;
 }
 
+/// The screen is drawing an answer: linked, and saying something. A view is
+/// blank until its first answer arrives, and blank is `Link::kOk` by default.
+template <typename View>
+bool Drawn(const View& view) {
+  return view.link == overlay::Link::kOk && !view.headline.empty();
+}
+
 std::string Took(std::chrono::milliseconds slowest) {
   return " (the slowest frame took " + std::to_string(slowest.count()) + "ms)";
 }
@@ -1127,7 +1135,7 @@ int RunFrames(Checks& checks) {
     overlay::StatusPump pump(client, &NoCard);
     std::chrono::milliseconds slowest{0};
     const bool answered = RunFramesUntil(
-        [&] { pump.Frame(); }, [&] { return pump.view().link == overlay::Link::kOk; }, &slowest);
+        [&] { pump.Frame(); }, [&] { return Drawn(pump.view()); }, &slowest);
     checks.Expect(answered, "the status screen draws the sysmodule's answer" + Took(slowest));
     checks.Expect(slowest < kFrameBound,
                   "and no status frame waited for a 300 ms answer" + Took(slowest));
@@ -1137,7 +1145,7 @@ int RunFrames(Checks& checks) {
     overlay::SyncPump pump(client);
     std::chrono::milliseconds slowest{0};
     checks.Expect(RunFramesUntil([&] { pump.Frame(); },
-                                 [&] { return pump.view().link == overlay::Link::kOk; }, &slowest),
+                                 [&] { return Drawn(pump.view()); }, &slowest),
                   "the sync screen draws the sysmodule's answer" + Took(slowest));
     // Sync now first: the toggle below turns sync off, which blocks it.
     {
@@ -1193,7 +1201,7 @@ int RunFrames(Checks& checks) {
     overlay::SyncPump pump(client);
     std::chrono::milliseconds slowest{0};
     checks.Expect(RunFramesUntil([&] { pump.Frame(); },
-                                 [&] { return pump.view().link == overlay::Link::kOk; }, &slowest),
+                                 [&] { return Drawn(pump.view()); }, &slowest),
                   "the sync screen is up" + Took(slowest));
     const bool was = pump.view().enabled;
     pump.PressToggle();
@@ -1213,6 +1221,83 @@ int RunFrames(Checks& checks) {
     checks.Expect(pump.view().notice.find("applying") == std::string::npos,
                   "the notice goes once the answer is in: " + pump.view().notice);
     checks.Expect(slowest < kFrameBound, "and no frame waited for it" + Took(slowest));
+  }
+
+  // A write that does not come back at all is not "still applying" forever:
+  // past `kBudgetsBeforeStuck` budgets it is a sysmodule that is stuck, and
+  // its answer is still used when it does come.
+  {
+    console.sysmodule().slow_command = -1;
+    console.sysmodule().delay_ms = 0;
+    overlay::IpcClient quick(kTestBudget);
+    overlay::SyncPump pump(quick);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); }, [&] { return Drawn(pump.view()); },
+                                 &slowest),
+                  "the sync screen is up" + Took(slowest));
+    const bool was = pump.view().enabled;
+    console.sysmodule().hold.Arm();
+    pump.PressToggle();
+    bool applying = false;
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        pump.Frame();
+                        applying = applying ||
+                                   pump.view().notice.find("applying") != std::string::npos;
+                      },
+                      [&] { return pump.view().link == overlay::Link::kNotResponding; },
+                      &slowest),
+                  "a write stuck for twenty budgets is reported as not responding" +
+                      Took(slowest));
+    checks.Expect(applying, "after it said still applying");
+    console.sysmodule().hold.Release();
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return Drawn(pump.view()) && pump.view().enabled != was; },
+                                 &slowest),
+                  "and when it lands at last, the switch moves and the screen is back" +
+                      Took(slowest));
+    checks.Expect(slowest < kFrameBound, "and no frame waited for any of it" + Took(slowest));
+    quick.Shutdown();
+  }
+
+  // The rate. A screen that is answered at once asks about four times a
+  // second, not once a frame: a busy sysmodule is asked a quarter as often.
+  {
+    overlay::StatusPump pump(client, &NoCard);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); }, [&] { return Drawn(pump.view()); },
+                                 &slowest),
+                  "the status screen is up" + Took(slowest));
+    const int before = console.sysmodule().calls.load();
+    for (int frame = 0; frame < 60; ++frame) {
+      pump.Frame();
+      std::this_thread::sleep_for(kFramePeriod);
+    }
+    const int reads = console.sysmodule().calls.load() - before;
+    checks.Expect(reads >= 2 && reads <= 6,
+                  "sixty frames ask 60 / Poller::kFramesBetweenReads times, give or take one: "
+                  "asked " + std::to_string(reads));
+  }
+
+  // A posted call and a waited-for one share the slot. A screen above a poller
+  // that left a call out waits for it within its own budget and drops it; the
+  // poster learns it was lost rather than being handed somebody else's answer.
+  {
+    overlay::ScreenFrame frame(client);
+    checks.Expect(frame.Ready() == overlay::Link::kOk, "the handshake passes");
+    console.sysmodule().delay_ms = 100;
+    overlay::IpcClient::Ticket ticket = 0;
+    checks.ExpectEq(client.Post(ipc::Command::kGetStatus, ipc::EncodeEmpty(), &ticket), Result{0},
+                    "a post is taken at once");
+    Result rc = 0;
+    checks.Expect(client.Collect(ticket, &rc) == overlay::IpcClient::Arrival::kPending,
+                  "and is pending while the far side works");
+    ipc::ConfigView view;
+    checks.ExpectEq(client.GetConfig(&view), Result{0},
+                    "a waited-for call behind it is answered, within its budget");
+    checks.Expect(client.Collect(ticket, &rc) == overlay::IpcClient::Arrival::kLost,
+                  "and the posted answer it waited out is lost to its poster, not handed on");
+    console.sysmodule().delay_ms = 0;
   }
 
   client.Shutdown();
@@ -1689,6 +1774,7 @@ constexpr const char* kPortableFiles[] = {
     "lifecycle.hpp",    "lifecycle.cpp",    "log_paint.hpp",      "log_paint.cpp",
     "library_pump.hpp", "library_pump.cpp", "status_pump.hpp",    "status_pump.cpp",
     "sync_pump.hpp",    "sync_pump.cpp",    "pairing_pump.hpp",   "pairing_pump.cpp",
+    "poller.hpp",       "poller.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately

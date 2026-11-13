@@ -11,6 +11,8 @@
 #include "card_probe.hpp"
 #include "ipc_client.hpp"
 #include "lifecycle.hpp"
+#include "poller.hpp"
+#include "rommsync/ipc.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "screen_frame.hpp"
 
@@ -28,12 +30,16 @@ class StatusPump {
   StatusPump(const StatusPump&) = delete;
   StatusPump& operator=(const StatusPump&) = delete;
 
-  /// `update()`.
+  /// `update()`. Never waits on the sysmodule: the poll is `Poller`'s, about
+  /// four times a second, and a frame only collects what came back.
   void Frame();
 
   const StatusView& view() const { return view_; }
 
  private:
+  /// Draw `link` instead, with the card when it is the card that knows why.
+  void Unreachable(Link link);
+
   /// What the card says about the two switches, re-reading it if this poll is
   /// the one due to.
   ///
@@ -48,12 +54,15 @@ class StatusPump {
 
   IpcClient& client_;
   ScreenFrame frame_{client_};
+  Poller poller_{frame_, client_, ipc::Command::kGetStatus};
   Probe probe_;
 
-  /// What the last poll produced. Starts as "not running" rather than as an
-  /// empty screen: the first frame is drawn before the first poll returns, and
-  /// a blank one there is indistinguishable from a broken overlay.
-  StatusView view_ = RenderUnreachable(Link::kNotRunning);
+  /// What the last answer produced. Blank until the first: on a console that
+  /// answers that is two frames, and on one that does not it is "not running"
+  /// at once or "not responding" after the budget -- where a "not running"
+  /// drawn ahead of the first answer would flash a wrong sentence on every
+  /// open (#299).
+  StatusView view_;
 
   /// The last look at the card, and when the next one is due. Due on the first
   /// poll that needs it, so that poll reads the card rather than drawing a

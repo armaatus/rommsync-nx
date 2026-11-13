@@ -6,6 +6,7 @@
 #pragma once
 
 #include "ipc_client.hpp"
+#include "poller.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_sync_actions.hpp"
 #include "screen_frame.hpp"
@@ -20,19 +21,28 @@ class SyncPump {
   SyncPump(const SyncPump&) = delete;
   SyncPump& operator=(const SyncPump&) = delete;
 
-  /// `update()`.
+  /// `update()`. Never waits on the sysmodule: the poll and the presses go
+  /// through `Poller`, and a frame only collects what came back.
   void Frame();
 
   /// Send `SyncNow`, or draw the refusal this screen already knows is coming.
+  /// The answer arrives on a later frame.
   void PressSyncNow();
 
   /// Send `SetEnabled` for the opposite of what the sysmodule currently
-  /// reports, and redraw the switch as whatever came back.
+  /// reports. The switch moves when the answer arrives, to whatever it says;
+  /// past the budget the screen says *still applying* until then (#299).
   void PressToggle();
 
   const SyncActionsView& view() const { return view_; }
 
  private:
+  /// What a press answered.
+  void Answered(ipc::Command command, Result rc);
+
+  /// Draw `link` instead.
+  void Unreachable(Link link);
+
   /// `view_` from `status_` and `last_`. Every path that changes either of them
   /// ends here, so the screen is one function of the two rather than a set of
   /// places that each write a view.
@@ -40,6 +50,7 @@ class SyncPump {
 
   IpcClient& client_;
   ScreenFrame frame_{client_};
+  Poller poller_{frame_, client_, ipc::Command::kGetStatus};
 
   /// The last status the sysmodule answered with.
   ///
@@ -53,10 +64,9 @@ class SyncPump {
   /// that took -- see `LastCommand`.
   LastCommand last_;
 
-  /// What the last poll produced. Starts as "not running" rather than as an
-  /// empty screen: the first frame is drawn before the first poll returns, and
-  /// a blank one there is indistinguishable from a broken overlay.
-  SyncActionsView view_ = RenderSyncActionsUnreachable(Link::kNotRunning);
+  /// What the last answer produced. Blank until the first, for
+  /// `StatusPump::view_`'s reason: both controls are `kInert` and not drawn.
+  SyncActionsView view_;
 };
 
 }  // namespace rommsync::overlay

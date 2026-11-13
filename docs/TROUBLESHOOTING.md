@@ -1008,6 +1008,37 @@ the lines before this one say what it was doing. If it happens on every boot,
 move `config/rommsync/queue.json` out of the way first — a queue is the one
 thing a boot reads that grows with what you asked for.
 
+### Running, but "not responding" or "still applying"
+
+No log line marks this one, which is why it lives here rather than in a
+section of its own: the overlay says it, not the log.
+
+**Symptom.** A screen says `sys-rommsync is not responding`, or a press on the
+sync screen says `Still applying...`.
+
+**What it means.** The sysmodule is running and has not answered within half a
+second. Usually it is busy: a download writing to the card holds the same lock a
+settings change needs, and an answer can take a few hundred milliseconds. The
+overlay never waits for it — the status, sync and pairing screens ask about
+four times a second and draw the last answer they have — so the panel stays
+responsive and B still leaves. A press that is out says *still applying* rather
+than failing: the change is the sysmodule's to make, and it lands when the card
+lets it; the screen redraws from the next answer. A press still out after ten
+seconds is no longer called busy: the screen says *not responding*, and moves
+the switch anyway if the answer comes later.
+
+**One case that is not.** If the sysmodule stops answering altogether — its IPC
+thread is stuck rather than busy — the overlay cannot unload while one of its
+calls is still out: the call cannot be cancelled, and the overlay's code cannot
+be unloaded underneath it. Closing it then waits, holding neither the panel nor
+your input, and **every Tesla/Ultrahand overlay is unavailable until the console
+reboots**. This is a deliberate trade (the alternative is a crash), and it has
+not been seen on a console.
+
+**What to do.** Wait for *still applying* to clear; it does by itself. For
+*not responding* that does not clear within a minute, reboot, and report it with
+the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug-report)).
+
 ---
 
 ## What to attach to a bug report
