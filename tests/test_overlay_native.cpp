@@ -24,6 +24,8 @@
 //   `log_paint.cpp`    the log screen's layout (#209).
 //   `library_pump.cpp` the library browser's IPC frame, and the teardown its
 //                      destructor runs (#285).
+//   `status_pump.cpp`, `sync_pump.cpp`, `pairing_pump.cpp`
+//                      the three polling screens' IPC frames (#299).
 //
 // The far side of the wire is the *real* dispatch table -- `ipc::Dispatch` over
 // an `ipc::ServiceCore` -- and the real `Error` -> `Result` mapping the
@@ -76,10 +78,13 @@
 #include "library_pump.hpp"
 #include "lifecycle.hpp"
 #include "log_paint.hpp"
+#include "pairing_pump.hpp"
 #include "prompts.hpp"
 #include "result.hpp"
 #include "screen_frame.hpp"
 #include "status_paint.hpp"
+#include "status_pump.hpp"
+#include "sync_pump.hpp"
 
 namespace {
 
@@ -1521,7 +1526,8 @@ constexpr const char* kPortableFiles[] = {
     "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",   "screen_frame.cpp",
     "status_paint.hpp", "status_paint.cpp", "conflicts_pump.hpp", "conflicts_pump.cpp",
     "lifecycle.hpp",    "lifecycle.cpp",    "log_paint.hpp",      "log_paint.cpp",
-    "library_pump.hpp", "library_pump.cpp",
+    "library_pump.hpp", "library_pump.cpp", "status_pump.hpp",    "status_pump.cpp",
+    "sync_pump.hpp",    "sync_pump.cpp",    "pairing_pump.hpp",   "pairing_pump.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately

@@ -503,7 +503,9 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `tests/hostswitch/switch.h` instead, which stubs only what those two files
 # name. M9-6 (#209) added `conflicts_pump.cpp`, `lifecycle.cpp` and
 # `log_paint.cpp`, each split out of a screen so the claim about it runs;
-# M11-1 (#285) `library_pump.cpp`, the library browser's IPC and teardown.
+# M11-1 (#285) `library_pump.cpp`, the library browser's IPC and teardown;
+# M11-15 (#299) `status_pump.cpp`, `sync_pump.cpp` and `pairing_pump.cpp`, the
+# three screens that poll, so a frame against a slow sysmodule can be timed.
 # `sysmodule/source/ipc/result.cpp` is the far side's `Error` -> `Result`
 # mapping, compiled in so the overlay's inverse is tested against the real
 # one rather than against a copy of it.
@@ -526,8 +528,11 @@ add_executable(test_overlay_native
   "${CMAKE_SOURCE_DIR}/overlay/source/library_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/log_paint.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/pairing_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/status_pump.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/sync_pump.cpp"
   "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc/result.cpp")
 target_link_libraries(test_overlay_native PRIVATE rommsync::core Threads::Threads)
 target_include_directories(test_overlay_native PRIVATE
