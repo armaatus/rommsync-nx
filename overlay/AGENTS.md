@@ -161,6 +161,13 @@ Ultrahand overlay list.
   conflicts, log and settings screens still wait, within the budget, for at
   most one command a frame; they were outside #299's scope, and moving one is
   moving its pump onto a `Poller`.
+- **A list repeats a held key itself** (M11-14, #298). libtesla repeats only by
+  moving focus, and a `CustomDrawer` is never focused, so a held D-pad on the
+  library or the conflicts screen used to be one row. Those screens turn their
+  buttons into a key with `source/scroll_keys.hpp` and ask
+  `rommsync/overlay_scroll.hpp`'s `ScrollRepeat` how many rows it is worth this
+  frame -- L/R are a page. A new list screen does the same; the rate is pinned
+  by `ctest -R overlay.library` with a fake clock.
 - **A screen polls by `Cadence`, never by a frame count of its own.** `update()`
   does not run while the overlay is hidden, so a member a screen increments to
   decide when to ask again resumes mid-count after a hide and draws what it read

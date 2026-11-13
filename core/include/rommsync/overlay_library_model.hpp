@@ -334,7 +334,24 @@ class LibraryBrowserModel {
   std::size_t open_cursors() const;
 
  private:
-  /// One level of the stack: a list, as far as it has been loaded.
+  /// One level of the stack: a list, as much of it as is held.
+  ///
+  /// **The rows are a window, not the list** (#298). `rows[0]` is row `first`
+  /// of the list, and every index below that is not a `rows` index is a place
+  /// in the whole list -- `selected` included. Rows far above the selection
+  /// are dropped as rows below it arrive, so a level holds at most
+  /// `kMaxLoadedRows` however far down it is scrolled; scrolling back up to
+  /// them reads them again.
+  ///
+  /// A cursor only goes forward (`list_service.hpp`), so reading them again is
+  /// a **rewind**: the cursor is ended, a new one is opened, and the rows up to
+  /// `rewind_from` are read and dropped on the way, the ones from there to
+  /// `first` gathered into `above`, which is put in front of the window when it
+  /// is complete. Every row the new cursor hands over is routed by its place:
+  /// above the window, inside it (where it replaces the row it is a fresher
+  /// copy of), or at its end. A reclaimed cursor is re-opened the same way --
+  /// up to the window, gathering nothing -- which is why a page off a fresh
+  /// cursor cannot double the rows already drawn.
   struct Level {
     LibraryLevel kind = LibraryLevel::kPlatforms;
 
@@ -346,27 +363,33 @@ class LibraryBrowserModel {
     ipc::Cursor cursor = 0;
 
     std::vector<LibraryRow> rows;
+
+    /// The list's place of `rows[0]`.
+    int first = 0;
+
+    /// A place in the list, never on the row drawn above `first`.
     int selected = 0;
 
-    /// Another page would follow. True until a page says otherwise, so a level
-    /// that has loaded nothing yet still asks for its first page.
+    /// The rows the cursor has handed over: the place of the next one.
+    int consumed = 0;
+
+    /// The cursor would hand over more. True until a page says otherwise, so a
+    /// level that has loaded nothing yet still asks for its first page.
     bool has_more = true;
+
+    /// The window's last row is the list's last row.
+    bool at_end = false;
+
+    /// A rewind's rows, from `rewind_from`, waiting to be put above `first`.
+    std::vector<LibraryRow> above;
+    int rewind_from = 0;
 
     /// A page is in flight, or the last one came back `pending`.
     bool loading = false;
 
-    /// The next page to arrive replaces the loaded rows rather than extending
-    /// them. Set when a reclaimed cursor is re-opened: the fresh cursor starts
-    /// at the beginning of the list.
-    bool replace_rows = false;
-
     /// What went wrong with the last page, and nothing about the ones before
     /// it. `kOk` when nothing did.
     ipc::Error page_error = ipc::Error::kOk;
-
-    /// The level stopped at `kMaxLoadedRows` with more still on the server.
-    /// Not the same as reaching the end, and drawn as a different sentence.
-    bool truncated = false;
 
     /// Items on the pages loaded so far that this build could not read. Kept
     /// and rendered rather than only dropped: a page whose items all failed to
@@ -400,8 +423,37 @@ class LibraryBrowserModel {
   /// is a cursor on a row nobody drew.
   static bool HasMoreRow(const Level& level);
 
-  /// The last loaded row's index, or `0` for a level with none.
+  /// The last loaded row's place, or `first` for a level with none.
   static int LastRowIndex(const Level& level);
+
+  /// One past the last loaded row's place.
+  static int Tail(const Level& level);
+
+  /// The cursor is behind the window's first row: rows above it are being
+  /// read again, or a reclaimed cursor is catching up to it. A page that fails
+  /// then is drawn above the rows, where the user is, not below them.
+  static bool Rewinding(const Level& level);
+
+  /// `level.above`, put in front of the window once the rewind has read up to
+  /// it, and the window cut back to `kMaxLoadedRows` from the far end.
+  static void PutAbove(Level& level);
+
+  /// The cursor said the list ended. Whatever the window held past that point
+  /// is gone from the server, and is dropped here too.
+  void EndOfList(Level& level);
+
+  /// Rows past `kMaxLoadedRows`, dropped from the top of the window.
+  static void DropAbove(Level& level);
+
+  /// The selection back on a row this level can draw.
+  static void ClampSelection(Level& level);
+
+  /// The rows drawn above and below the loaded ones.
+  static LibraryRow TopRow(const Level& level);
+  static LibraryRow MoreRow(const Level& level);
+
+  /// The answer to `Next()`, before it is counted as a change.
+  Command NextCommand();
 
   /// Fill in a row from one `ipc::ListItem`, or answer false for an item this
   /// build cannot read. A malformed item is dropped rather than rendered
@@ -446,6 +498,9 @@ class LibraryBrowserModel {
 
   /// What `GetInterfaceVersion` last answered, for `kIncompatible`'s hint.
   std::uint32_t sysmodule_interface_ = 0;
+
+  /// See `revision()`.
+  std::uint64_t revision_ = 0;
 };
 
 /// How far ahead of the selection the next page is asked for.
@@ -456,18 +511,27 @@ class LibraryBrowserModel {
 /// stick should not stop at the bottom of every page.
 inline constexpr int kPrefetchRows = 8;
 
-/// How many rows one level may hold before it stops asking for more.
+/// How many rows one level's window holds.
 ///
 /// The one structure here that would otherwise grow with the size of the
 /// library, which is the thing `ipc.hpp` bounds everything else against: a
 /// `LibraryRow` is four strings, and a user scrolling a ten-thousand-rom
-/// platform would accumulate one per rom on an overlay's heap. Eight full pages
-/// is more than a person scrolls past looking for a game, and the row at the
-/// end says the list was cut rather than pretending it ended.
+/// platform would accumulate one per rom on an overlay's heap. Until #298 a
+/// level *stopped* here, with "Too many to list here", and the 513th rom of a
+/// platform could not be reached; now it is the window, and the rows furthest
+/// above the selection are dropped instead (`Level`).
 ///
 /// Narrowing the list instead of scrolling it is `ListRequest::search`, which
-/// no screen sends yet -- there is no keyboard in v1 (#25). Recorded there.
+/// no screen sends -- there is no keyboard in an overlay (#25, #298).
 inline constexpr int kMaxLoadedRows = 8 * ipc::kMaxPageSize;
+
+/// How many rows a rewind reads back above the window.
+///
+/// A cursor only goes forward, so every rewind re-reads the list from its first
+/// row; the more each one gathers, the fewer of them a long scroll up costs.
+/// Half the window: the window is cut back from its far end when they land, and
+/// the selection, which is near its top, keeps the half below it.
+inline constexpr int kRewindRows = kMaxLoadedRows / 2;
 
 /// How many consecutive empty pages with `has_more` still set are tolerated
 /// before the list is treated as ended.

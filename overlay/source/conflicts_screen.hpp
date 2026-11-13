@@ -36,6 +36,7 @@
 #include "ipc_client.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_conflicts_view.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "screen_frame.hpp"
 
 namespace rommsync::overlay {
@@ -61,7 +62,8 @@ class ConflictsScreen : public tsl::Gui {
   void update() override;
 
   /// Up/Down move the selection -- or, on a save conflict's choice, between
-  /// Keep server, Keep local and Skip (#249) -- A opens an entry and then
+  /// Keep server, Keep local and Skip (#249) -- and L/R move it a page, both
+  /// repeating while held (#298); A opens an entry and then
   /// confirms the restore or the choice, B steps back out.
   ///
   /// A press on an entry the model already knows cannot be restored sends
@@ -98,6 +100,9 @@ class ConflictsScreen : public tsl::Gui {
   /// The link the model was last told about, so a session that came back is
   /// noticed once rather than restarting the screen every frame.
   Link link_ = Link::kOk;
+
+  /// The held Up/Down/L/R, and how many rows it is worth this frame (#298).
+  ScrollRepeat repeat_;
 };
 
 }  // namespace rommsync::overlay

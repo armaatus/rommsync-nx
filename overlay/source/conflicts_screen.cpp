@@ -11,8 +11,10 @@
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_conflicts_view.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "screen_frame.hpp"
+#include "scroll_keys.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -80,8 +82,13 @@ tsl::elm::Element* ConflictsScreen::createUI() {
 
 void ConflictsScreen::update() { Pump(); }
 
-bool ConflictsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAnalogStickState,
-                                  HidAnalogStickState) {
+bool ConflictsScreen::handleInput(u64 keys_down, u64 keys_held, const HidTouchState&,
+                                  HidAnalogStickState, HidAnalogStickState) {
+  // Every frame, so a key released while the link was down starts again from
+  // one row (#298).
+  const ScrollKey key = ScrollKeyOf(keys_down, keys_held);
+  const int rows = repeat_.Update(key, ScrollRepeat::Clock::now());
+
   if (view_.link != Link::kOk) {
     // Nothing to read and nothing to press. Not handled, so B still leaves the
     // screen and Tesla keeps its own bindings -- and the headline already says
@@ -89,14 +96,13 @@ bool ConflictsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidA
     return false;
   }
 
-  if ((keys_down & HidNpadButton_AnyDown) != 0) {
-    model_.MoveSelection(1);
-    view_ = model_.Render();
-    return true;
-  }
-  if ((keys_down & HidNpadButton_AnyUp) != 0) {
-    model_.MoveSelection(-1);
-    view_ = model_.Render();
+  if (key != ScrollKey::kNone) {
+    // Held, it repeats; L/R move a page. On an entry's choice the model clamps
+    // a page to the last choice, which is what a page there should do.
+    if (rows != 0) {
+      model_.MoveSelection(rows);
+      view_ = model_.Render();
+    }
     return true;
   }
   if ((keys_down & HidNpadButton_A) != 0) {

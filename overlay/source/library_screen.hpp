@@ -26,9 +26,12 @@
 
 #include <tesla.hpp>
 
+#include <cstdint>
+
 #include "ipc_client.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_library_model.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "screen_frame.hpp"
 
 namespace rommsync::overlay {
@@ -55,8 +58,9 @@ class LibraryScreen : public tsl::Gui {
   /// are enough for what is on screen.
   void update() override;
 
-  /// Up/Down move the selection, A activates the row, B leaves the level, and
-  /// Y opens the download queue.
+  /// Up/Down move the selection and L/R move it a page, repeating while held
+  /// (`rommsync/overlay_scroll.hpp`, #298); A activates the row, B leaves the
+  /// level, and Y opens the download queue.
   ///
   /// A press on a row the model already knows would be refused sends nothing
   /// and leaves the reason on the row -- the same rule `sync_screen.cpp` keeps
@@ -91,9 +95,17 @@ class LibraryScreen : public tsl::Gui {
 
   LibraryBrowserModel model_;
 
-  /// What the last `Render()` produced. Kept rather than rebuilt in `Draw`,
-  /// which is `const` and is called by libtesla rather than by us.
+  /// What the last `Render()` produced: the rows around the selection, and
+  /// rebuilt only when the model changed (`RenderLibrary`, #298). Kept rather
+  /// than rebuilt in `Draw`, which is `const` and is called by libtesla rather
+  /// than by us.
   LibraryView view_ = LibraryView{};
+
+  /// The model's `revision()` `view_` was rendered at.
+  std::uint64_t rendered_ = ~std::uint64_t{0};
+
+  /// The held Up/Down/L/R, and how many rows it is worth this frame.
+  ScrollRepeat repeat_;
 
   /// The link the model was last told about, so a session that came back is
   /// noticed once rather than restarting the browser every frame.

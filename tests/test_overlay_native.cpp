@@ -1721,10 +1721,10 @@ int RunScroll(Checks& checks) {
   const auto at = [&frame] {
     return ScrollClock::time_point{} + std::chrono::microseconds(std::int64_t{frame} * 16'667);
   };
-  for (; frame < 20 && library.view.rows.empty(); ++frame) {
+  for (; frame < 20 && library.model.selected_position() < 0; ++frame) {
     library.Frame(overlay::ScrollKey::kNone, at());
   }
-  checks.Expect(!library.view.rows.empty(), "the platform list loaded");
+  checks.ExpectEq(library.model.selected_position(), 0, "the platform list loaded");
   library.model.Activate();
 
   // R held, at 60 Hz, until the selection is past row 1990.
@@ -1732,8 +1732,11 @@ int RunScroll(Checks& checks) {
   std::optional<count_new::Snapshot> baseline;
   for (; frame < held_from + 600 && library.model.selected_position() < 1990; ++frame) {
     library.Frame(overlay::ScrollKey::kPageDown, at());
-    if (!baseline.has_value() && library.model.selected_position() >= 700) {
+    if (!baseline.has_value() &&
+        library.model.loaded_rows() >= static_cast<std::size_t>(overlay::kMaxLoadedRows)) {
       // The window has filled: from here on the rows held should not grow.
+      // (Not the selection's place: a held R outruns the pages, and rides the
+      // "Loading..." row, which is no place in the list.)
       baseline = count_new::Now();
       count_new::ResetPeak();
     }
@@ -1745,24 +1748,32 @@ int RunScroll(Checks& checks) {
   checks.Expect(held_frames <= 6 * 60,
                 "within six seconds at 60 Hz: " + std::to_string(held_frames) + " frames");
 
-  // Released, then single presses onto row 2000 exactly.
-  for (int press = 0; press < 64 && library.model.selected_position() != 1999; ++press) {
+  // Released past it, then taps onto row 2000 exactly: a page at a time while
+  // a page away, a row at a time after.
+  for (int press = 0; press < 128 && library.model.selected_position() != 1999; ++press) {
     library.Frame(overlay::ScrollKey::kNone, at());
     ++frame;
-    const overlay::ScrollKey key = library.model.selected_position() < 1999
-                                       ? overlay::ScrollKey::kDown
-                                       : overlay::ScrollKey::kUp;
+    const int away = 1999 - library.model.selected_position();
+    overlay::ScrollKey key = away > 0 ? overlay::ScrollKey::kDown : overlay::ScrollKey::kUp;
+    if (away >= overlay::kPageRows) {
+      key = overlay::ScrollKey::kPageDown;
+    } else if (away <= -overlay::kPageRows) {
+      key = overlay::ScrollKey::kPageUp;
+    }
     library.Frame(key, at());
     ++frame;
   }
   checks.ExpectEq(library.SelectedRom(), std::int64_t{2000}, "row 2000 is the 2000th rom");
 
+  checks.Expect(baseline.has_value(), "the window filled on the way down");
   if (count_new::kActive && baseline.has_value()) {
     const count_new::Snapshot now = count_new::Now();
     const std::int64_t grew = now.outstanding_bytes - baseline->outstanding_bytes;
+    // A row is ~200 bytes here, so a heap that kept one per row scrolled past
+    // would have grown ~300 KiB over these ~1500 rows.
     checks.Expect(grew < 16 * 1024,
                   "the heap does not grow with the rows scrolled past: " + std::to_string(grew) +
-                      " bytes over ~1300 rows");
+                      " bytes over ~1500 rows");
     const std::int64_t peak = now.peak_bytes - baseline->outstanding_bytes;
     checks.Expect(peak < 256 * 1024, "nor peak far above it: " + std::to_string(peak) + " bytes");
 

@@ -661,7 +661,10 @@ void ConflictsModel::MoveSelection(int delta) {
   // recovery would need an undocumented Up-then-Down.
   //
   // It is one retry per press and not one per frame: `MoveSelection` is called
-  // from `handleInput` on a key event, never from `update()`.
+  // from `handleInput` on a key event, never from `update()`. A held key is a
+  // press per repeat (#298), at most twenty a second -- and `ListConflicts` is
+  // answered from memory, so that is not a rate anything has to be protected
+  // from.
   if (selected_ != before || delta > 0) {
     page_error_ = ipc::Error::kOk;
   }

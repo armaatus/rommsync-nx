@@ -11,8 +11,10 @@
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_library_model.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "screen_frame.hpp"
+#include "scroll_keys.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -66,7 +68,7 @@ const char* ActionFor(const LibraryRow& row) {
 }  // namespace
 
 LibraryScreen::LibraryScreen(IpcClient& client) : client_(client) {
-  view_ = model_.Render();
+  RenderLibrary(model_, &view_, &rendered_);
 }
 
 LibraryScreen::~LibraryScreen() { CloseLibrary(frame_, client_, model_); }
@@ -86,8 +88,13 @@ tsl::elm::Element* LibraryScreen::createUI() {
 
 void LibraryScreen::update() { Pump(); }
 
-bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAnalogStickState,
-                                HidAnalogStickState) {
+bool LibraryScreen::handleInput(u64 keys_down, u64 keys_held, const HidTouchState&,
+                                HidAnalogStickState, HidAnalogStickState) {
+  // Every frame, whatever else happens: a key released while the link was down
+  // is a key released, and the next press has to start from one row.
+  const ScrollKey key = ScrollKeyOf(keys_down, keys_held);
+  const int rows = repeat_.Update(key, ScrollRepeat::Clock::now());
+
   if (view_.link != Link::kOk) {
     // Nothing to browse and nothing to press. Not handled, so B still leaves
     // the screen and Tesla keeps its own bindings -- and the headline is
@@ -95,14 +102,13 @@ bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
     return false;
   }
 
-  if ((keys_down & HidNpadButton_AnyDown) != 0) {
-    model_.MoveSelection(1);
-    view_ = model_.Render();
-    return true;
-  }
-  if ((keys_down & HidNpadButton_AnyUp) != 0) {
-    model_.MoveSelection(-1);
-    view_ = model_.Render();
+  if (key != ScrollKey::kNone) {
+    // Handled on the frames between repeats too: a held direction passed on to
+    // Tesla would be moving its focus under this screen's selection.
+    if (rows != 0) {
+      model_.MoveSelection(rows);
+      RenderLibrary(model_, &view_, &rendered_);
+    }
     return true;
   }
   if ((keys_down & HidNpadButton_A) != 0) {
@@ -111,7 +117,7 @@ bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
     // the press was on a row this screen owns, and passing it on would give it
     // to Tesla.
     model_.Activate();
-    view_ = model_.Render();
+    RenderLibrary(model_, &view_, &rendered_);
     return true;
   }
   if ((keys_down & HidNpadButton_B) != 0) {
@@ -120,12 +126,12 @@ bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
       // overlay rather than this screen inventing a second way out.
       return false;
     }
-    view_ = model_.Render();
+    RenderLibrary(model_, &view_, &rendered_);
     return true;
   }
   if ((keys_down & HidNpadButton_Y) != 0) {
     model_.OpenQueue();
-    view_ = model_.Render();
+    RenderLibrary(model_, &view_, &rendered_);
     return true;
   }
   return false;
@@ -133,7 +139,7 @@ bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
 
 void LibraryScreen::Pump() {
   PumpLibrary(frame_, client_, model_, link_);
-  view_ = model_.Render();
+  RenderLibrary(model_, &view_, &rendered_);
 }
 
 s32 LibraryScreen::PromptRows() const {

@@ -1328,7 +1328,9 @@ void CheckHeldKeyRepeats(Checks& checks) {
                     "and twice as far a repeat after a second of it");
     checks.ExpectEq(Held(repeat, overlay::ScrollKey::kDown, start, 138, 60), 4 * 20,
                     "four times after two");
-    // Ten seconds on, the step is capped at kMaxRepeatStep.
+    // Held on through the fourth second and past it, the step is capped at
+    // kMaxRepeatStep: frames 438..1037 are 7.3 s to 17.3 s in.
+    Held(repeat, overlay::ScrollKey::kDown, start, 198, 240);
     checks.ExpectEq(Held(repeat, overlay::ScrollKey::kDown, start, 438, 600),
                     overlay::kMaxRepeatStep * 200,
                     "and never more than kMaxRepeatStep rows a repeat");
@@ -1543,10 +1545,12 @@ void CheckRenderIsASliceOnChange(Checks& checks) {
     library.Answer(checks, model);
   }
   model.Activate();
-  for (int frame = 0; frame < 16; ++frame) {
+  // A row a frame, which the pages keep ahead of: the first frame opens the
+  // list and has nothing to move onto, so 101 frames is row 100.
+  for (int frame = 0; frame < 101; ++frame) {
     library.Answer(checks, model);
+    model.MoveSelection(1);
   }
-  model.MoveSelection(100);
   for (int frame = 0; frame < 16; ++frame) {
     library.Answer(checks, model);
   }

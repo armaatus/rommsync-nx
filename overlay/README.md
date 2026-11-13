@@ -230,6 +230,17 @@ production RomM or a real library.
     expect it to move within a second, or *"Still applying..."* first and then
     the switch -- never *"not responding"*. Before M11-15 (#299) these screens
     waited for every answer on the draw thread.
+17. **A long platform, held.** Open the library on the platform with the most
+    roms (ideally well over 512). Hold Down: expect one row, a pause of about a
+    third of a second, then a steady repeat that speeds up the longer it is
+    held. Hold R: expect it to move a panel at a time, and to reach the end of
+    the list in seconds, riding *"Loading..."* while pages arrive. Tap Up and
+    Down: one row each, never two. Then hold L back to the top, and expect a
+    *"Loading..."* above the first row now and then while rows the browser
+    dropped are read again -- slower than going down, never a wrong rom under
+    the selection. Do the same with L/R and Down on the conflicts screen. Before
+    M11-14 (#298) every press was one row and nothing past row 512 of a
+    platform could be reached.
 
 Record what each step actually drew in #44, including the layout constants that
 had to move — every screen file keeps them in one block at the top for exactly

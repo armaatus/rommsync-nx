@@ -819,7 +819,7 @@ ctest --test-dir build --output-on-failure
   eight needs Docker, a rig, or a resolver, so none of them ever skips.
 - The `overlay.card`, `overlay.wire`, `overlay.roundtrip`, `overlay.version`,
   `overlay.errors`, `overlay.timeout`, `overlay.restore`, `overlay.frames`, `overlay.cycles`,
-  `overlay.hidden`, `overlay.log`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
+  `overlay.hidden`, `overlay.scroll`, `overlay.log`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
   compiled by a host compiler and run** (M9-7, #198). Everything else in the
   `overlay.*` group tests the view models in `core/` -- what a screen *says* --
   and greps the directory for what it must not contain; until #198 not one of
@@ -849,7 +849,10 @@ ctest --test-dir build --output-on-failure
   threads and -- through `count_new.hpp` -- the heap, after grepping
   `tesla.hpp` for the loop's one tail; `overlay.hidden` pins that a poll is due
   on the first frame of every showing, because `update()` does not run while
-  the overlay is hidden. The far side is the **real** `ipc::Dispatch` over a real
+  the overlay is hidden; `overlay.scroll` (M11-14, #298) holds R at 60 Hz on a
+  2500-rom platform until row 2000, asserts the heap stays flat past the
+  library's 512-row window and that a still frame allocates nothing, then holds
+  L back to row 1 through the re-reads. The far side is the **real** `ipc::Dispatch` over a real
   `ipc::ServiceCore`, answering through the **real** `sysmodule::ToResult` --
   split into `sysmodule/source/ipc/result.cpp` so the overlay's `DecodeError` is
   held against the mapping that ships rather than against a copy of it. So an

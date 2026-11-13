@@ -101,8 +101,13 @@ void PumpLibrary(ScreenFrame& frame, IpcClient& client, LibraryBrowserModel& mod
 }
 
 bool RenderLibrary(const LibraryBrowserModel& model, LibraryView* view, std::uint64_t* seen) {
+  // A browser sitting still costs nothing: not a command, and not a copy of the
+  // rows it already drew (#298).
+  if (model.revision() == *seen) {
+    return false;
+  }
   *seen = model.revision();
-  *view = model.Render();
+  *view = model.Render(kViewRowsAbove, kViewRowsBelow);
   return true;
 }
 
