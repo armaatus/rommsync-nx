@@ -367,6 +367,10 @@ const char* ToString(Event event) {
       return "play.recorded";
     case Event::kTerminated:
       return "process.terminated";
+    case Event::kClockSkew:
+      return "clock.skew";
+    case Event::kNetTlsClock:
+      return "net.tls_clock";
   }
   return "unknown";
 }

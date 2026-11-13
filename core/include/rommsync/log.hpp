@@ -218,6 +218,19 @@ enum class Event {
   /// read. Written by `WriteLast`, which allocates nothing, because the usual
   /// cause is that there is nothing left to allocate.
   kTerminated,
+
+  /// The console's clock is not believed (M11-11, #295): before 2026, or more
+  /// than a day from the network clock or the server's. Uploads RomM decided on
+  /// timestamps are held until it is set. Written when the finding changes --
+  /// it turns wrong, moves the other way, or comes right again -- not every
+  /// tick, because the held saves already say so as `save.failed` lines.
+  kClockSkew,
+
+  /// A TLS failure the clock is the likely cause of (#295): a certificate is
+  /// valid between two dates, and a console outside them refuses every one.
+  /// Kept apart from `kNetTls` because the remedy is the console's date, not
+  /// the certificate, the scheme or the proxy.
+  kNetTlsClock,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -231,7 +244,7 @@ inline constexpr std::array kAllEvents = {
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
     Event::kSyncHeld,    Event::kSaveDeleted, Event::kBackupPruned, Event::kRemoteInstall,
-    Event::kPlayRecorded, Event::kTerminated,
+    Event::kPlayRecorded, Event::kTerminated, Event::kClockSkew, Event::kNetTlsClock,
 };
 
 /// Stable tag -- `net.offline`. Never null.

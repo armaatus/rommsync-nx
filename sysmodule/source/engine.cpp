@@ -173,6 +173,49 @@ void SdEngine::UseNetworkClock(NetworkClock clock) {
   network_clock_ = std::move(clock);
 }
 
+sync::ClockCheck SdEngine::LocalClock() const {
+  NetworkClock network;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    network = network_clock_;
+  }
+  sync::ClockReading reading;
+  reading.local = std::chrono::system_clock::now();
+  if (network) {
+    reading.network = network();
+  }
+  return sync::CheckClock(reading);
+}
+
+void SdEngine::NoteClock(const sync::TickResult& tick) {
+  if (!tick.clock.has_value()) {
+    return;
+  }
+  const sync::ClockCheck& found = *tick.clock;
+  bool changed = false;
+  bool was_trusted = true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    was_trusted = clock_check_.trusted();
+    changed = found.verdict != clock_check_.verdict ||
+              (!found.trusted() && found.reference != clock_check_.reference);
+    clock_check_ = found;
+  }
+  // Outside the lock: a sink writes to the card. Once per change, not per
+  // tick: the saves it holds say so every tick as `save.failed` lines.
+  if (!changed) {
+    return;
+  }
+  if (!found.trusted()) {
+    log::Warn(log::Event::kClockSkew,
+              found.Describe() +
+                  "; saves the server would choose by comparing timestamps are not uploaded "
+                  "until the console's date and time are set");
+  } else if (!was_trusted) {
+    log::Info(log::Event::kClockSkew, found.Describe() + "; held uploads go again");
+  }
+}
+
 void SdEngine::UseForegroundProbe(ForegroundProbe probe, std::chrono::milliseconds poll) {
   std::lock_guard<std::mutex> lock(mutex_);
   foreground_probe_ = std::move(probe);
@@ -638,6 +681,8 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
                       last_sync_result_ == ipc::SyncResult::kServerDisabled || server_too_old_;
     snapshot.server_version = server_caps_.version;
     snapshot.server_supported = !server_too_old_;
+    snapshot.clock_trusted = clock_check_.trusted();
+    snapshot.clock_skew_seconds = clock_check_.skew_seconds;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -1687,10 +1732,18 @@ std::vector<play::SaveObservation> ObservationsOf(const std::vector<scan::SaveFi
 /// `SchedulerConfig::max_tls_attempts` is what acts on it).
 /// docs/TROUBLESHOOTING.md has a section per event and this is what keys them.
 void LogTransportFailure(http::Error transport, const std::string& where,
-                         const std::string& detail) {
+                         const std::string& detail, const sync::ClockCheck& clock) {
   const std::string message =
       where + ": " + http::ToString(transport) + (detail.empty() ? "" : "; " + detail);
-  if (transport == http::Error::kTls) {
+  if (sync::TlsClockFault(transport, detail, clock)) {
+    // A certificate is valid between two dates, and a console outside them
+    // refuses every one: the remedy is the date, not the certificate (#295).
+    log::Error(log::Event::kNetTlsClock,
+               message + "; " + (clock.trusted() ? "the certificate's dates do not include now"
+                                                 : clock.Describe()) +
+                   " -- set the console's date and time, or let it synchronise over the "
+                   "internet");
+  } else if (transport == http::Error::kTls) {
     log::Error(log::Event::kNetTls, message);
   } else {
     log::Warn(log::Event::kNetOffline, message);
@@ -2078,7 +2131,8 @@ namespace {
 /// Everything the tick's outcome has to say, after both halves: why it did not
 /// complete, what the sweep and the finish could not write, and the summary
 /// line last.
-void LogTickOutcome(const sync::TickResult& tick, const sync::StateSyncReport& states) {
+void LogTickOutcome(const sync::TickResult& tick, const sync::StateSyncReport& states,
+                    const sync::ClockCheck& clock) {
   // Why the negotiation is classified again here rather than trusted from
   // `tick.outcome`: `kOffline` collapses "the link is down" and "the certificate
   // is wrong", which is right for a scheduler -- both mean back off -- and
@@ -2096,7 +2150,8 @@ void LogTickOutcome(const sync::TickResult& tick, const sync::StateSyncReport& s
       // `net.offline negotiate: ok`, which reads as the client blaming a
       // successful request.
       if (tick.negotiated.transport != http::Error::kNone) {
-        LogTransportFailure(tick.negotiated.transport, "negotiate", tick.negotiated.message);
+        LogTransportFailure(tick.negotiated.transport, "negotiate", tick.negotiated.message,
+                            clock);
       } else {
         // The server answered and could not serve. Still `net.offline` rather
         // than `sync.refused`, because the next tick genuinely may work -- which
@@ -2225,7 +2280,8 @@ SdEngine::TickRun SdEngine::RunOneTick() {
   // Everything the tick has to say, before the counters go under `mutex_`: a
   // sink writes to the SD card, and holding the lock the frame-polled `GetStatus`
   // needs across that would make the status screen wait on the card.
-  LogTickOutcome(tick, states);
+  LogTickOutcome(tick, states, LocalClock());
+  NoteClock(tick);
   // A card the scan stopped short of is not a clean sync, however well the saves
   // it did see went (#246): the status screen says partial, beside the
   // `scan.skipped` line that says why.
@@ -2396,7 +2452,8 @@ bool SdEngine::ReadServerForTick(TickInputs* inputs) {
       } else if (probe.transient()) {
         outcome = sync::TickOutcome::kOffline;
         if (probe.transport != http::Error::kNone) {
-          LogTransportFailure(probe.transport, "GET /api/heartbeat", probe.message);
+          LogTransportFailure(probe.transport, "GET /api/heartbeat", probe.message,
+                              LocalClock());
         } else {
           log::Warn(log::Event::kNetOffline, "GET /api/heartbeat: " + probe.message);
         }
@@ -2484,7 +2541,7 @@ roms::FetchResult SdEngine::FetchLibraryForTick(const TickInputs& inputs) {
                  "GET /api/roms answered " + std::to_string(library.status) + "; " +
                      library.message);
     } else if (library.transport != http::Error::kNone) {
-      LogTransportFailure(library.transport, "GET /api/roms", library.message);
+      LogTransportFailure(library.transport, "GET /api/roms", library.message, LocalClock());
     } else {
       // A status this client cannot proceed from, or a 200 that was not a rom
       // page. Retrying does not change either, which is what `sync.refused`
@@ -2636,6 +2693,8 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
   {
     std::lock_guard<std::mutex> lock(mutex_);
     options.execute.keep_local = keep_local_;
+    // The network clock is one of the two a tick holds the console's to (#295).
+    options.network_clock = network_clock_;
   }
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = inputs.cancel.get();

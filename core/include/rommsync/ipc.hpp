@@ -174,7 +174,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// sysmodule answers it `kUnknownCommand`, but an overlay that offers Cancel on
 /// a held row has to be talking to one that can withdraw it, so the two say
 /// "update" to each other rather than drawing a button that is refused.
-inline constexpr std::uint32_t kVersion = 14;
+///
+/// **15** since M11-11 (#295), which added `clock_trusted` and
+/// `clock_skew_seconds` to `Status` -- required fields, so a v14 overlay
+/// reading a v15 sysmodule's `Status` fails to decode it.
+inline constexpr std::uint32_t kVersion = 15;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

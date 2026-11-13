@@ -840,6 +840,8 @@ std::string EncodeStatus(const Status& status) {
   AppendInteger(&out, "config_error_count", status.config_error_count);
   AppendText(&out, "server_version", status.server_version);
   AppendBool(&out, "server_supported", status.server_supported);
+  AppendBool(&out, "clock_trusted", status.clock_trusted);
+  AppendInteger(&out, "clock_skew_seconds", status.clock_skew_seconds);
   AppendKey(&out, "download");
   out += '{';
   AppendText(&out, "state", ToString(status.download.state), /*first=*/true);
@@ -874,7 +876,10 @@ Decoded<Status> DecodeStatus(std::string_view text) {
         !ReadInteger(object, "config_error_count", &out->config_error_count, 0, kMaxCount,
                      error) ||
         !ReadText(object, "server_version", &out->server_version, error) ||
-        !ReadBool(object, "server_supported", &out->server_supported, error)) {
+        !ReadBool(object, "server_supported", &out->server_supported, error) ||
+        !ReadBool(object, "clock_trusted", &out->clock_trusted, error) ||
+        !ReadInteger(object, "clock_skew_seconds", &out->clock_skew_seconds,
+                     -sync::kMaxTimestampSeconds, sync::kMaxTimestampSeconds, error)) {
       return;
     }
     out->interface = static_cast<std::uint32_t>(interface_version);

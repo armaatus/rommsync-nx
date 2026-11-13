@@ -267,7 +267,8 @@ dropped *downwards* — rounding 11:36:27.9 up to :28 would claim a file is newe
 than it is and win an arbitration it should have lost. A timestamp at or before
 the epoch is refused rather than sent: that is a console whose clock never got
 set, and the server would read it as "very old" and plan a `download` over what
-may be the only copy of the save.
+may be the only copy of the save. A clock that is set, and wrong, is the next
+section's.
 
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
 total_upload, total_download, total_conflict, total_no_op, total_delete }` —
@@ -316,6 +317,67 @@ A server save the device *has* synced and that has not changed since is read as
 save the client loses locally is not silently restored. Untracked saves
 (`is_untracked` on the device's sync row) come back as `no_op` /
 `Save is untracked on this device`.
+
+### The console's clock (#295)
+
+A save with no sync history is arbitrated on timestamps alone (`Client save is
+newer (no sync history)` / `Server save is newer (no sync history)`), and the
+client's timestamp is the console's clock at the moment the save was written.
+An RTC that reset — a drained battery, a NAND restore — or a clock set by hand
+to the wrong day decides that arbitration. In the past it loses: the server's
+copy is downloaded over the local save, which is backed up first, so it costs a
+restore from `.backup/`. In the future it wins: the local save is uploaded over
+a newer one on the server, and nothing on the console backed that up.
+
+So before each plan runs, `sync::CheckClock`
+([`clock_check.hpp`](../core/include/rommsync/clock_check.hpp)) holds the
+console's clock to:
+
+- **a floor**, `2026-01-01T00:00:00Z` — no correct clock running this build is
+  before it, and a reset one is decades before it. Needs no reference, so it
+  catches the commonest case: a console offline since its battery ran out.
+- **the network clock** — Horizon's `time:s` network system clock, which nifm
+  keeps in step with Nintendo's time service. Absent until the console has
+  synchronised it (and on the host).
+- **the server's `Date` header**, off the negotiation that produced the plan.
+  The one the arbitration actually compares against: RomM sets its own
+  timestamps.
+
+More than `kMaxClockSkew` — a day — from either reference, either way, or before
+the floor, and the clock is not trusted. A day is wider than any time zone
+mistaken for UTC, and narrower than a clock set to the wrong date.
+
+**What an untrusted clock holds: the upload RomM decided on the timestamp** —
+`Reason::kClientNewerNoHistory`, and nothing else. It is failed
+`OperationError::kClockUntrusted` before a byte is read or sent, so the tick is
+`partial` and the save is planned again next tick. Every other operation runs:
+
+- a download, `Server save is newer (no sync history)` included, backs the local
+  save up before it writes, as every overwrite does (hard rule 2);
+- an upload into an empty slot (`Save exists on client but not on server`) has
+  nothing to overwrite;
+- an upload past a sync record (`Client save is newer than last sync`) is
+  decided by the digest baseline as well as the time (#234);
+- a player's **Keep local** is their choice, not the clock's.
+
+The engine writes `clock.skew` when the finding changes — wrong, wrong the other
+way, right again — and `Status` carries `clock_trusted` and `clock_skew_seconds`
+to the overlay's **Clock** row. A TLS failure while the clock is not trusted
+against the floor or the network clock, or one whose message says a certificate
+is expired or not yet valid, is `net.tls_clock` rather than `net.tls`: a
+certificate is valid between two dates, and Horizon's `SslVerifyOption_DateCheck`
+refuses the handshake outside them. `tick.clock`, `sync.clock` and
+`engine.clock` hold this.
+
+**Open until M12: is `st_mtime` UTC?** `sysmodule/source/card.cpp` takes a
+save's `st_mtime` as it is, and `updated_at` above assumes it is UTC. FAT stores
+a file's time as local time with no zone, and whether libnx's fsdev converts it
+is unverified. If it does not, a console at UTC+X reports every save X hours
+newer than it is — inside the day this check allows, so a first sync's
+arbitration would lean that way unseen. The measurement — write a save at a
+known UTC instant on a console set to a non-UTC zone, read its `st_mtime` back —
+needs hardware, and is a step of the M12 hardware test plan (#307). Its answer
+belongs here.
 
 ## Step 2 — execute the plan
 

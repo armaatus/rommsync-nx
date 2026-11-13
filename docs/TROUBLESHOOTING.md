@@ -113,6 +113,8 @@ and a log is not worth it. A save is never in that position; see
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
+| `clock.skew` | the console's clock is not believed — unset, or a day or more off the network clock or the server's — so saves the server would choose by timestamp are held; or it agrees again | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
+| `net.tls_clock` | a TLS failure the console's clock is the likely cause of | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -281,6 +283,56 @@ certificate, then check the proxy's minimum TLS version.
 stack. What is checked today is that the client reports them as `net.tls` rather
 than as a dropped connection, and the M0-1 probe under `tlsprobe/` is what
 measured the 1.2 ceiling.
+
+---
+
+## The console's clock is wrong
+
+**Symptom.** The status screen has a **Clock** row — *3 days ahead; uploads
+held*, or *Not set; uploads held* — and a save you played on this console never
+reaches RomM, while saves from RomM still arrive. Or every request fails at the
+TLS handshake on a console whose battery ran flat.
+
+**Log line.**
+
+```
+14 warn clock.skew the console clock is 3 days ahead of the server's clock; saves the server would choose by comparing timestamps are not uploaded until the console's date and time are set
+15 warn save.failed upload rom 12, slot autosave: held, not uploaded: the console clock is 3 days ahead of the server's clock, and the server chose this upload by comparing timestamps; set the console's date and time, and it goes next sync
+```
+
+or, over `https://`:
+
+```
+2 error net.tls_clock GET /api/heartbeat: TLS failure; the server's certificate was refused; the console clock is not set: it reads a date before 2026 -- set the console's date and time, or let it synchronise over the internet
+```
+
+**What is happening.** The first time this console syncs a save RomM already
+holds, RomM decides which copy wins by comparing the two timestamps — and this
+console's timestamp is its clock. A clock set days ahead would upload over a
+newer save on the server, which nothing on the console backed up. So while the
+clock disagrees by more than a day with the network clock or with the server's
+own clock — or reads a date before 2026, which is what a reset clock does —
+those uploads are held. Everything else carries on: a save RomM sends is still
+backed up under `.backup/` before it is written, and an upload RomM decided by
+the save's contents rather than its time still goes. A **Keep local** you chose
+on the Conflicts screen goes too: that is your decision, not the clock's.
+
+A TLS certificate is valid between two dates, so a console whose clock is
+outside them refuses every certificate; that is `net.tls_clock` rather than
+`net.tls`, because the fix is the date and not the certificate.
+
+**The fix.** System Settings → System → Date and Time: turn on
+**Synchronise Clock via Internet**, or set the date and time by hand. The next
+sync checks again, and the log says so:
+
+```
+16 info clock.skew the console clock agrees with the server's clock; held uploads go again
+```
+
+*Not verified until M12:* whether the file times the card reports are UTC or the
+console's local time ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#the-consoles-clock-295)).
+A console in a time zone far from UTC is inside the day this check allows
+either way.
 
 ---
 

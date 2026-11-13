@@ -219,9 +219,10 @@ int Version() {
   // `game_running` and `keep_local_full`. 13 since M10-34 (#275): `held`
   // replaced `game_running`, and a conflict row gained a required
   // `keep_local`. 14 since M10-35 (#279): `CancelKeepLocal`, whose answer an
-  // older overlay has no decoder for. What is frozen is command 0's
+  // older overlay has no decoder for. 15 since M11-11 (#295): `Status` gained
+  // `clock_trusted` and `clock_skew_seconds`. What is frozen is command 0's
   // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{14},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{15},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");

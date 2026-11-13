@@ -1047,6 +1047,15 @@ class SdEngine : public ipc::Engine, public power::Sink {
   void RecordTick(const sync::TickResult& tick, const sync::StateSyncReport& states,
                   const SavesTally& tally, bool scan_cut, bool states_held);
 
+  /// What a tick made of the console's clock (#295), for `Snapshot`, and a
+  /// `clock.skew` line when the finding changed. A tick no negotiation answered
+  /// found nothing and changes nothing.
+  void NoteClock(const sync::TickResult& tick);
+
+  /// The console's clock against the network clock and the floor, with no
+  /// server to ask: what a TLS failure is judged by (`sync::TlsClockFault`).
+  sync::ClockCheck LocalClock() const;
+
   /// Run `write` under `mutex_` -- **unless the server changed** since
   /// `generation` was read: `ForgetServerLocked` or a wake that asks again
   /// (`Resume`) bumped `server_generation_`, and what the old server answered
