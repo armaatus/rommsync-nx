@@ -30,7 +30,8 @@
 //     and it is the one leftover that must not be deleted: when `<save>` is
 //     missing it is the only copy. It is renamed back. When `<save>` *is* there
 //     the commit finished -- only the tidy-up did not -- and the previous bytes
-//     are already under `.backup/`, so it goes.
+//     are already under `.backup/`, but it is left alone all the same: a
+//     `Game.srm.old` made by hand has the same shape (`previous_left`).
 //
 //   - **Nothing under `.backup/` is ever a leftover.** A backup is never
 //     garbage: it is the copy M7-1 restores from, including the one written for
@@ -99,7 +100,8 @@ struct RecoveryReport {
   /// the same shape -- and deleting it would be this code destroying something
   /// it did not write. The cost of keeping it is one stale file, and a rare one:
   /// `io::CommitStaged` removes its own on success, so reaching here means even
-  /// that failed.
+  /// that failed -- and the next commit sets it aside as `<save>.old.<n>`
+  /// rather than removing it either (#293).
   std::size_t previous_left = 0;
 
   /// Leftovers the card would not let go of, and directories that would not

@@ -674,7 +674,9 @@ durable before the next one can be:
 3. The new bytes are staged beside the save and **synced** — by
    `io::CopyStaged` for a restore, by the HTTP backend before it renames its
    `.part` for a download.
-4. `io::CommitStaged`: the save to `<save>.old`, the staged file onto the save,
+4. `io::CommitStaged`: any `<save>.old` already there set aside to the first free
+   `<save>.old.<n>` (#293: the commit did not write it, so it never removes it),
+   the save to `<save>.old`, the staged file onto the save,
    `<save>.old` removed, and the save's directory synced. A cut between the two
    renames leaves `.old` and no save, which the boot sweep renames back.
 
@@ -1305,7 +1307,7 @@ no cleanup got to run — `sync::RecoverStaging`, over the save folders and
 |---|---|---|
 | `<save>.tmp.part` | a download the process died during | removed. `DownloadTarget::resume` is false for a save, so nothing in it is worth keeping and the next tick refetches |
 | `<save>.tmp` | a download whose body ended and whose commit did not | **removed, not committed.** See below |
-| `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save. When `<save>` *is* there the commit finished, and the file is counted and **left alone**: a `Game.srm.old` a human made by hand has exactly that shape, and this sweep does not delete files it did not write |
+| `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save. When `<save>` *is* there the commit finished, and the file is counted and **left alone**: a `Game.srm.old` a human made by hand has exactly that shape, and this sweep does not delete files it did not write. The next commit into `<save>` does not either: it renames it to `<save>.old.<n>`, which this sweep never matches (#293) |
 | `.backup/<rom_id>-<slot>-<ts>.<ext>` | any overwrite | never touched. A backup is never garbage: it is the copy M7-1 restores from, including one written for an overwrite that then failed |
 
 **A `<save>.tmp` is discarded rather than finished, and an earlier revision of

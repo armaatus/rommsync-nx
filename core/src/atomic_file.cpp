@@ -39,6 +39,31 @@ std::string DirectoryOf(const std::string& path) {
 constexpr const char* kTempSuffix = ".tmp";
 constexpr const char* kPreviousSuffix = ".old";
 
+/// How many `.old.<n>` names a commit tries before refusing. A `.old` reaches a
+/// commit only when an earlier one's tidy-up failed or a human made it, so one
+/// name is nearly always enough; the bound is what keeps a card where neither
+/// ever stops from filling with them, and what `Shred` sweeps.
+constexpr int kMaxAside = 16;
+
+/// Where a `.old` this commit did not write is set aside. Deliberately not a
+/// name ending in `.old`: the boot sweep reads that suffix as a commit to
+/// finish, and this file is no commit's.
+std::string AsidePathFor(const std::string& path, int index) {
+  return path + kPreviousSuffix + "." + std::to_string(index);
+}
+
+/// The first `AsidePathFor` name nothing holds, or empty when every one is
+/// taken.
+std::string FreeAsidePathFor(const std::string& path) {
+  for (int index = 1; index <= kMaxAside; ++index) {
+    std::string aside = AsidePathFor(path, index);
+    if (!Exists(aside)) {
+      return aside;
+    }
+  }
+  return {};
+}
+
 std::string Describe(const std::string& path, std::string_view what) {
   return path + ": " + std::string(what);
 }
@@ -149,12 +174,31 @@ WriteResult CommitStaged(const std::string& staged, const std::string& path) {
   const std::string previous = PreviousPathFor(path);
   const bool replacing = Exists(path);
   if (replacing) {
-    // A stale one has to go first, because the rename below is the Horizon one
-    // that refuses an existing destination. Only when there is something to
-    // move aside, though: a `.old` left by an interrupted commit is the only
-    // copy of the record when `path` is missing, and removing it before the new
-    // one is committed would turn a recoverable interruption into a loss.
-    Remove(previous);
+    // One already there has to move first, because the rename below is the
+    // Horizon one that refuses an existing destination. Only when there is
+    // something to move aside, though: a `.old` left by an interrupted commit
+    // is the only copy of the record when `path` is missing, and moving it
+    // before the new one is committed would hide a recoverable interruption.
+    //
+    // Moved, not removed (#293). This commit did not write it, and the boot
+    // sweep refuses to delete exactly this shape because it cannot tell it
+    // from a `Game.srm.old` a human made by hand -- removing it here was the
+    // one place that caution did not hold, with no backup behind it.
+    if (Exists(previous)) {
+      const std::string aside = FreeAsidePathFor(path);
+      if (aside.empty()) {
+        Remove(staged);
+        return {WriteError::kCommitFailed,
+                Describe(previous, "is not this commit's to remove, and every name to set it "
+                                   "aside under is taken")};
+      }
+      if (Rename(previous, aside) != 0) {
+        Remove(staged);
+        return {WriteError::kCommitFailed,
+                Describe(previous, "is not this commit's to remove, and could not be set "
+                                   "aside to " + aside)};
+      }
+    }
     if (Rename(path, previous) != 0) {
       Remove(staged);
       return {WriteError::kCommitFailed, Describe(path, "could not be moved aside to " + previous)};
@@ -459,6 +503,14 @@ bool Shred(const std::string& path) {
   bool gone = ShredOne(path);
   gone = ShredOne(TempPathFor(path)) && gone;
   gone = ShredOne(PreviousPathFor(path)) && gone;
+  // A `.old` `CommitStaged` set aside holds a record just as much -- for
+  // `token.dat`, a bearer token Re-pair has to discard with the rest.
+  for (int index = 1; index <= kMaxAside; ++index) {
+    const std::string aside = AsidePathFor(path, index);
+    if (Exists(aside)) {
+      gone = ShredOne(aside) && gone;
+    }
+  }
   return gone;
 }
 
