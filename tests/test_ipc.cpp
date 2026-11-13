@@ -85,6 +85,8 @@ ipc::Status LoadedStatus() {
   status.config_error_count = 2;
   status.server_version = "5.3.1";
   status.server_supported = false;
+  status.clock_trusted = false;
+  status.clock_skew_seconds = -7 * 86400;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -350,6 +352,9 @@ int RoundTrip() {
     checks.ExpectEq(back.value.server_version, sent.server_version, "server_version survives");
     checks.ExpectEq(back.value.server_supported, sent.server_supported,
                     "server_supported survives");
+    checks.ExpectEq(back.value.clock_trusted, sent.clock_trusted, "clock_trusted survives");
+    checks.ExpectEq(back.value.clock_skew_seconds, sent.clock_skew_seconds,
+                    "clock_skew_seconds survives, negative and all");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");

@@ -4051,6 +4051,87 @@ int RommVersion(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// The value of the status screen's row `label`, or "" when it has none.
+std::string ValueOfRow(const rommsync::overlay::StatusView& view, const std::string& label) {
+  for (const rommsync::overlay::Line& line : view.lines) {
+    if (line.label == label) {
+      return line.value;
+    }
+  }
+  return "";
+}
+
+/// M11-11 (#295): a console whose clock disagrees with its network clock by a
+/// month says so -- a `clock.skew` line, and a status the overlay draws a row
+/// from -- and agrees again once the network clock does. The console clock is
+/// the host's own; the network clock is the probe's, which `main.cpp` reads off
+/// `time:s` and a test can put anywhere.
+int ClockSkew(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  rig::DisarmFault(client, base);
+  rommsync::log::Reset();
+  Console console(c, "engine-clock");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\n"),
+           "the console points at the rig");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = fixture.device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "with the fixture pairing on the card");
+
+  std::atomic<std::int64_t> network_offset_s{-30 * 86400};
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  c.Expect(console.Status().clock_trusted, "before a tick nothing has been found");
+  console.engine.UseNetworkClock([&network_offset_s]() -> std::optional<std::chrono::system_clock::time_point> {
+    return std::chrono::system_clock::now() + std::chrono::seconds{network_offset_s.load()};
+  });
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  const auto tick = [&console, &c](int number) {
+    const std::int64_t before = console.Status().last_sync_at;
+    c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
+             "tick " + std::to_string(number) + " is asked for");
+    ipc::Status status = console.Status();
+    for (int waited = 0;
+         waited < 400 && (status.sync_in_progress ||
+                          status.last_sync_result == ipc::SyncResult::kNever ||
+                          (number > 1 && status.last_sync_at == before && waited < 80));
+         ++waited) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{25});
+      status = console.Status();
+    }
+    return status;
+  };
+
+  const ipc::Status first = tick(1);
+  c.Expect(!first.clock_trusted, "a month ahead of the network clock is not trusted");
+  c.Expect(first.clock_skew_seconds > 29 * 86400 && first.clock_skew_seconds < 31 * 86400,
+           "and the status says by how much: " + std::to_string(first.clock_skew_seconds));
+  const ipc::LogTail tail = console.Log();
+  c.Expect(Logged(tail, "clock.skew"), "the finding is a named event:" + Rendered(tail));
+  c.ExpectEq(ValueOfRow(rommsync::overlay::Render(first, 0), "Clock"),
+             std::string("30 days ahead; uploads held"), "which the overlay draws as a row");
+
+  network_offset_s.store(0);
+  const ipc::Status second = tick(2);
+  c.Expect(second.clock_trusted, "a clock the network clock agrees with is trusted again");
+  return c.failures();
+}
+
 /// A server whose heartbeat is held until the test lets it answer, and which
 /// counts heartbeats and negotiations. Everything else answers as an empty
 /// library, and a negotiation as a dropped connection.
@@ -7130,6 +7211,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"shutdown", DrainShutdown},
       {"sleep_download", SleepDownload},
       {"romm_version", RommVersion},
+      {"clock", ClockSkew},
       {"foreground", Foreground},
       {"tico_accounts", TicoAccounts},
       {"download_restores", DownloadRestores},

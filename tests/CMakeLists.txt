@@ -2463,6 +2463,7 @@ set(ENGINE_RIG_SCENARIOS
   server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
   drains       # M9-5: a rom queued over IPC becomes a file on the card
   romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
+  clock        # #295: a console clock a month off the network clock is logged and drawn, then trusted again
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed

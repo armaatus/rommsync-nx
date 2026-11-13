@@ -506,6 +506,19 @@ struct Status {
   /// asked -- "too old" is a finding, never a default.
   bool server_supported = true;
 
+  /// False when the last tick found the console's clock not to be believed
+  /// (`sync::CheckClock`, #295): before 2026, or more than a day from the
+  /// network clock or the server's. Uploads RomM decided on timestamps are held
+  /// while it is. True before anything was checked -- a finding, never a
+  /// default, as `server_supported` is.
+  bool clock_trusted = true;
+
+  /// The console minus the reference it was found against, in whole seconds:
+  /// positive is ahead. Zero when there was no reference -- a clock before the
+  /// floor on a console that could compare it with nothing, which the overlay
+  /// draws as "not set".
+  std::int64_t clock_skew_seconds = 0;
+
   DownloadSnapshot download;
 };
 
@@ -1192,6 +1205,9 @@ struct EngineSnapshot {
   /// See `Status::server_version` and `Status::server_supported` (#228).
   std::string server_version;
   bool server_supported = true;
+  /// See `Status::clock_trusted` and `Status::clock_skew_seconds` (#295).
+  bool clock_trusted = true;
+  std::int64_t clock_skew_seconds = 0;
   DownloadSnapshot download;
 };
 

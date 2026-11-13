@@ -88,6 +88,16 @@ bool HasLabel(const overlay::StatusView& view, const std::string& label) {
   return false;
 }
 
+/// The tone of the row beside `label`, or neutral when there is none.
+overlay::Tone ToneOf(const overlay::StatusView& view, const std::string& label) {
+  for (const overlay::Line& line : view.lines) {
+    if (line.label == label) {
+      return line.tone;
+    }
+  }
+  return overlay::Tone::kNeutral;
+}
+
 /// The guarantee the whole view model exists for, asserted on every screen this
 /// file renders rather than on one of them: an empty string where a value goes
 /// is indistinguishable from an overlay that failed to read something.
@@ -682,8 +692,45 @@ void CheckServerVersion(Checks& checks) {
   ExpectNothingBlank(checks, nameless, "too old, unnamed");
 }
 
+// M11-11 (#295): a console whose clock is not believed holds the uploads RomM
+// decided on its timestamp, and the screen says so -- otherwise a save that
+// never goes up looks like a sync that is working.
+void CheckClock(Checks& checks) {
+  const overlay::StatusView fine = RenderOverWire(checks, Healthy());
+  checks.Expect(!HasLabel(fine, "Clock"), "a trusted clock draws no row");
+
+  ipc::Status ahead = Healthy();
+  ahead.clock_trusted = false;
+  ahead.clock_skew_seconds = 3 * 86400 + 600;
+  const overlay::StatusView shown = RenderOverWire(checks, ahead);
+  checks.ExpectEq(ValueOf(shown, "Clock"), std::string("3 days ahead; uploads held"),
+                  "a clock ahead says how far, and what it costs");
+  checks.Expect(ToneOf(shown, "Clock") == overlay::Tone::kWarn, "in the warning tone");
+  checks.ExpectEq(shown.hint, std::string("Set the console's date and time"),
+                  "and the hint is the remedy");
+  ExpectNothingBlank(checks, shown, "clock ahead");
+
+  ipc::Status behind = ahead;
+  behind.clock_skew_seconds = -5 * 3600;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, behind), "Clock"),
+                  std::string("5 hours behind; uploads held"), "and a clock behind, in hours");
+
+  ipc::Status unset = ahead;
+  unset.clock_skew_seconds = 0;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, unset), "Clock"),
+                  std::string("Not set; uploads held"),
+                  "a clock reset with nothing to compare it to is not set");
+
+  // A worse problem keeps the hint: pairing is still the next step.
+  ipc::Status unpaired = ahead;
+  unpaired.auth = ipc::AuthState::kNeverPaired;
+  checks.Expect(RenderOverWire(checks, unpaired).hint != "Set the console's date and time",
+                "pairing outranks the clock in the hint");
+}
+
 int main() {
   Checks checks;
+  CheckClock(checks);
   CheckServerVersion(checks);
   CheckHealthy(checks);
   CheckNever(checks);

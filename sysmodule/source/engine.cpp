@@ -168,6 +168,11 @@ void SdEngine::UseNetworkProbe(NetworkProbe probe) {
   network_probe_ = std::move(probe);
 }
 
+void SdEngine::UseNetworkClock(NetworkClock clock) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  network_clock_ = std::move(clock);
+}
+
 void SdEngine::UseForegroundProbe(ForegroundProbe probe, std::chrono::milliseconds poll) {
   std::lock_guard<std::mutex> lock(mutex_);
   foreground_probe_ = std::move(probe);

@@ -406,6 +406,19 @@ class SdEngine : public ipc::Engine, public power::Sink {
   void UseForegroundProbe(ForegroundProbe probe,
                           std::chrono::milliseconds poll = kForegroundPollInterval);
 
+  /// The network system clock -- Horizon's `time:s`, which nifm keeps in step
+  /// with Nintendo's time service -- or empty when the console has none
+  /// synchronised (M11-11, #295).
+  ///
+  /// One of the two references a tick holds the console's own clock to
+  /// (`sync::CheckClock`): a clock a day or more off it does not upload a save
+  /// the server chose by timestamp. Injected for `NetworkProbe`'s reason --
+  /// `time` is libnx and this file names no libnx type. Null is no reference,
+  /// which leaves the server's `Date` header and the floor; what a host build
+  /// has. Called on the worker, never under `mutex_`.
+  using NetworkClock = std::function<std::optional<std::chrono::system_clock::time_point>()>;
+  void UseNetworkClock(NetworkClock clock);
+
   /// The probe's answer, now, noted as a sighting when it names an application.
   /// `ipc::ServiceCore::SyncNow` reads it to say a press is held rather than
   /// started (`ipc::SyncOutcome::kDeferred`).
@@ -1586,6 +1599,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `mutex_`, and the probe is copied out and called outside it.
   ForegroundProbe foreground_probe_;
   std::chrono::milliseconds foreground_poll_ = kForegroundPollInterval;
+
+  /// `UseNetworkClock`'s. Guarded by `mutex_`, copied out and called outside it.
+  NetworkClock network_clock_;
+
+  /// What the last tick that negotiated made of the console's clock (#295):
+  /// `Status::clock_trusted` and `clock_skew_seconds`. Guarded by `mutex_`.
+  sync::ClockCheck clock_check_;
 
   /// What the probe named since the play window last moved (#261). Guarded by
   /// `mutex_`; `mutable` because `application_running` is the one place that
