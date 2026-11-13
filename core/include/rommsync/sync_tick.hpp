@@ -53,6 +53,7 @@
 
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/clock_check.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/server_capabilities.hpp"
@@ -388,6 +389,17 @@ struct TickOptions {
   /// A `cancel` set on one of the three option blocks instead is overwritten by
   /// this one; setting it here is how a caller says it.
   const http::CancelToken* cancel = nullptr;
+
+  /// The console's own clock -- what a save's mtime was stamped from -- read
+  /// once per plan for `CheckClock` (#295). Null is `system_clock::now`, which
+  /// is that clock on the console; a test puts the console anywhere with it.
+  /// Not `execute.now`, which only names backups and which tests pin to 2025.
+  std::function<Timestamp()> console_clock;
+
+  /// The network system clock, when the console has one synchronised. Null,
+  /// or an empty answer, is no such reference -- the host's, and a console
+  /// that has never reached Nintendo's time service.
+  std::function<std::optional<Timestamp>()> network_clock;
 };
 
 /// Everything one tick did, stage by stage.
@@ -471,6 +483,11 @@ struct TickResult {
   /// and the baseline is on the card, so the answer is the next tick's own
   /// negotiation and not this one's second attempt.
   bool session_gone = false;
+
+  /// What `CheckClock` made of the console's clock (#295): an untrusted check
+  /// from any plan, or the last plan's. Empty when no negotiation answered, so
+  /// there was no `Date` header to read -- and no upload to hold.
+  std::optional<ClockCheck> clock;
 
   /// True only for `kCompleted`. A caller that wants "the save data is safe"
   /// wants `finished.stored.ok()`.

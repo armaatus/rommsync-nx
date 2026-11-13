@@ -1621,6 +1621,7 @@ set(TICK_UNIT_SCENARIOS
   newer_bounds # #232: ...held while a game runs (#242), and never placed where step 0 found nothing
   migrated_kept  # #236: a delete #233 kept stays withheld when rc1's row moves to the shared slot
   too_large    # #248: a plan past the transport ceiling is a plan too large, which a scoped tick splits
+  clock        # #295: an untrusted console clock holds the uploads decided on its timestamp
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because

@@ -378,6 +378,8 @@ const char* ToString(OperationError error) {
       return "unconfirmed";
     case OperationError::kCanceled:
       return "canceled";
+    case OperationError::kClockUntrusted:
+      return "clock_untrusted";
   }
   return "none";
 }
@@ -405,6 +407,7 @@ auth::Answer AnswerOf(OperationError error) {
     case OperationError::kCommitFailed:
     case OperationError::kUnconfirmed:
     case OperationError::kCanceled:
+    case OperationError::kClockUntrusted:
       break;
   }
   return auth::Answer::kSilent;

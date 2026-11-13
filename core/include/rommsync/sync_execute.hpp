@@ -72,6 +72,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/clock_check.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
@@ -374,6 +375,13 @@ enum class OperationError {
 
   /// The caller's `http::CancelToken` fired. Nothing after this operation ran.
   kCanceled,
+
+  /// An upload the server decided on the console's timestamp alone
+  /// (`DecidedByClock`), on a console whose clock failed `CheckClock` (#295).
+  /// **Nothing was sent and nothing local was touched.** A failure rather than
+  /// a decline: it is planned again every tick until the clock is right, and
+  /// that is a fault the user has to fix -- the message says how.
+  kClockUntrusted,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -806,6 +814,15 @@ struct ExecuteOptions {
   /// when `Declines::Note` says it is news, and one that did what the plan asked
   /// is forgotten. Null says every decline, every time.
   Declines* declines = nullptr;
+
+  /// What `CheckClock` made of the console's clock against this plan's
+  /// references (#295). Not trusted, an upload `DecidedByClock` is failed
+  /// `OperationError::kClockUntrusted` before anything is read or sent -- unless
+  /// it is a player's Keep local (`keep_local`), which is their choice and not
+  /// the clock's. Every other operation runs: a download backs the local save
+  /// up first. `RunTick` sets it per plan; the default is trusted, which is
+  /// what a caller with no reference to check against has.
+  ClockCheck clock;
 
   /// Optional, not owned; must outlive the call. Checked between operations and
   /// passed to every request, so a shutdown ends the tick at an operation
