@@ -78,6 +78,18 @@ class ScreenFrame {
   /// evidence.
   Link Diagnose(Result rc);
 
+  /// From here on, never open a session: `Ready()` answers `kNotRunning` when
+  /// none is open, and a transport failure drops the session without trying
+  /// the port again.
+  ///
+  /// For a screen's destructor, which is all that calls it (#285). The gui
+  /// stack is libtesla's and is emptied by `~Overlay`, after `exitServices`
+  /// has stopped the client, so a destructor that opened a session would open
+  /// one nothing ever closes -- and nx-ovlloader's process never exits, so
+  /// three of those are the sysmodule's whole session table. A destructor may
+  /// use the session that is already open, and nothing else.
+  void Retire() { retired_ = true; }
+
   /// What `GetInterfaceVersion` last answered. Only meaningful for
   /// `kIncompatible`, where the two numbers are the whole diagnosis.
   std::uint32_t sysmodule_interface() const { return sysmodule_interface_; }
@@ -95,6 +107,9 @@ class ScreenFrame {
   bool version_checked_ = false;
 
   std::uint32_t sysmodule_interface_ = 0;
+
+  /// `Retire()` was called.
+  bool retired_ = false;
 };
 
 }  // namespace rommsync::overlay

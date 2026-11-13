@@ -215,6 +215,14 @@ production RomM or a real library.
     the sixth attempt"* (Ultrahand#278) is a counted resource running out;
     `overlay.cycles` is the host half of this step.
 
+15. **Exit with Library open.** Open Settings → **Library**, then leave the
+    overlay with Ultrahand's combo while the library is still on screen. Do it
+    four times, then open the overlay again. Expect the status screen to show
+    the sysmodule's state (*"Up to date"*, *"Ready"* or whatever applies), not
+    *"sys-rommsync is not running"*. Before M11-1 (#285) each
+    such exit left one session open on a sysmodule that allows three, so the
+    fourth open found none left until reboot.
+
 Record what each step actually drew in #44, including the layout constants that
 had to move — every screen file keeps them in one block at the top for exactly
 that.

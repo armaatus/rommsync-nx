@@ -1257,16 +1257,34 @@ int RunCycles(Checks& checks) {
     const std::filesystem::path dir(ROMMSYNC_OVERLAY_SOURCE_DIR);
     int destructors = 0;
     for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(dir)) {
+      // Headers too: a destructor defined inline in `<thing>_screen.hpp` is as
+      // much a screen's destructor as one in the `.cpp`.
       const std::string name = entry.path().filename().string();
-      if (name.size() < 11 || name.substr(name.size() - 11) != "_screen.cpp") {
+      const std::string stem = entry.path().stem().string();
+      constexpr std::string_view kScreenSuffix = "_screen";
+      if (stem.size() < kScreenSuffix.size() ||
+          stem.compare(stem.size() - kScreenSuffix.size(), kScreenSuffix.size(), kScreenSuffix) !=
+              0) {
         continue;
       }
       const std::string code = CodeOnly(ReadWhole(entry.path()));
-      for (std::size_t at = code.find("::~"); at != std::string::npos;
-           at = code.find("::~", at + 3)) {
+      for (std::size_t at = code.find('~'); at != std::string::npos; at = code.find('~', at + 1)) {
+        // `~SomethingScreen(`, and not a bitwise not.
+        std::size_t after = at + 1;
+        while (after < code.size() && IsIdentifier(code[after])) {
+          ++after;
+        }
+        const std::string_view identifier(code.data() + at + 1, after - at - 1);
+        if (after >= code.size() || code[after] != '(' || identifier.size() < 6 ||
+            identifier.substr(identifier.size() - 6) != "Screen") {
+          continue;
+        }
+        // Only a definition has a body: `{` before the next `;`. A declaration
+        // (`~LibraryScreen() override;`) is checked where it is defined.
         const std::size_t open = code.find('{', at);
-        if (open == std::string::npos) {
-          break;
+        const std::size_t semicolon = code.find(';', at);
+        if (open == std::string::npos || (semicolon != std::string::npos && semicolon < open)) {
+          continue;
         }
         int depth = 0;
         std::size_t close = open;

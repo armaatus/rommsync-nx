@@ -102,9 +102,14 @@ void PumpLibrary(ScreenFrame& frame, IpcClient& client, LibraryBrowserModel& mod
 
 void CloseLibrary(ScreenFrame& frame, IpcClient& client, LibraryBrowserModel& model) {
   model.Close();
-  // The port and the handshake, as before any other command
-  // (`overlay/AGENTS.md`). A session that has gone has no cursors left to close
-  // and nothing to say about it, so this is where the teardown stops.
+  // Retired first: this runs from `~LibraryScreen`, which libtesla may run
+  // after `exitServices` has stopped the client, and a session opened then is
+  // one nothing closes (#285). Every cursor belongs to the session that is
+  // open, so a session that is not open has none left to close anyway.
+  frame.Retire();
+  // The handshake, as before any other command (`overlay/AGENTS.md`). A
+  // session that has gone has no cursors left to close and nothing to say
+  // about it, so this is where the teardown stops.
   if (frame.Ready() != Link::kOk) {
     return;
   }

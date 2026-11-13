@@ -12,6 +12,9 @@ namespace rommsync::overlay {
 
 Link ScreenFrame::Ready() {
   if (!client_.open()) {
+    if (retired_) {
+      return Link::kNotRunning;
+    }
     if (R_FAILED(client_.Open())) {
       // No `rommsync` port. Not installed, not enabled, or it aborted at boot --
       // and it is the state a user who forgot to switch it on is in, so it is
@@ -70,6 +73,11 @@ Link ScreenFrame::Reopen() {
   // re-opened here rather than on the next frame. See the note on `Diagnose`.
   client_.Close();
   version_checked_ = false;
+  if (retired_) {
+    // Nobody draws a retired frame, so which sentence applies does not matter
+    // -- only that it is not `kOk` and that no session was opened to find out.
+    return Link::kNotRunning;
+  }
   return R_SUCCEEDED(client_.Open()) ? Link::kUnreadable : Link::kNotRunning;
 }
 
