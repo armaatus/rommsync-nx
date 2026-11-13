@@ -562,6 +562,7 @@ foreach(scenario
         errors     # a refusal is not a transport failure, and neither is a bad payload
         timeout    # a sysmodule that does not answer holds no frame past one budget
         restore    # a restore that is still copying holds no frame at all
+        frames     # a sysmodule that answers in 300 ms holds no frame past 2 ms
         cycles     # every exit path gives back everything, the same way, every time
         hidden     # polling is by showing, because update() stops while hidden
         log        # the log the sysmodule serves, readable without an SD reader

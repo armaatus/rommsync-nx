@@ -165,6 +165,12 @@ class HostSysmodule : public hostswitch::Server {
   /// Armed, every call blocks before it is dispatched. See `Hold`.
   Hold hold;
 
+  /// How long every call takes to answer -- or, with `slow_command` set, only
+  /// that one (#299). A sysmodule that is busy rather than stuck: `SetConfig`
+  /// under the card mutex while a download writes is a few hundred ms.
+  std::atomic<int> delay_ms{0};
+  std::atomic<int> slow_command{-1};
+
   /// Atomic because a call the overlay gave up on is still running on the
   /// client's worker while the test reads this.
   std::atomic<int> calls{0};
@@ -175,6 +181,10 @@ class HostSysmodule : public hostswitch::Server {
                 std::size_t capacity, u64* length) override {
     ++calls;
     hold.Pass();
+    const int slow = slow_command.load();
+    if (slow < 0 || static_cast<u32>(slow) == command_id) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms.load()});
+    }
     last_command = command_id;
     last_request.assign(static_cast<const char*>(request), request_size);
     *length = 0;
@@ -1056,6 +1066,157 @@ int RunRestore(Checks& checks) {
   checks.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
                 "and the polling stops");
   checks.Expect(slowest < kPrompt, "and still no frame was held");
+  return checks.failures();
+}
+
+// --- overlay.frames -----------------------------------------------------------
+
+/// The longest a frame callback may take while the sysmodule is slow (#299):
+/// the issue's bound. A frame at 60 Hz is 16.7 ms, and these are a few
+/// microseconds of work when nothing is waited for.
+constexpr std::chrono::milliseconds kFrameBound{2};
+
+/// A frame at 60 Hz, between two `update()`s.
+constexpr std::chrono::milliseconds kFramePeriod{16};
+
+/// No card: the sysmodule answers in every frame these drive, so a probe that
+/// ran would be a probe the status pump should not have made.
+overlay::CardState NoCard() { return overlay::CardState{}; }
+
+/// Run `frame` at 60 Hz until `done` holds or `kPatience` runs out, timing every
+/// call. Answers whether `done` held.
+template <typename Frame, typename Done>
+bool RunFramesUntil(Frame frame, Done done, std::chrono::milliseconds* slowest) {
+  const Clock::time_point start = Clock::now();
+  while (Since(start) < kPatience) {
+    const Clock::time_point began = Clock::now();
+    frame();
+    *slowest = std::max(*slowest, Since(began));
+    if (done()) {
+      return true;
+    }
+    std::this_thread::sleep_for(kFramePeriod);
+  }
+  return false;
+}
+
+std::string Took(std::chrono::milliseconds slowest) {
+  return " (the slowest frame took " + std::to_string(slowest.count()) + "ms)";
+}
+
+/// M11-15 (#299): a sysmodule that takes 300 ms to answer does not slow the
+/// overlay down.
+///
+/// Before this, the status, sync and pairing screens each sent a command from
+/// every `update()` and waited for it, up to the 500 ms budget (#209): an
+/// answer anywhere between a frame and the budget held the draw thread for
+/// that long, every frame -- a few frames a second while a download had the
+/// card. Every frame below is timed against the issue's 2 ms, with the client
+/// at the device's own budget so that 300 ms is an answer, not a timeout.
+int RunFrames(Checks& checks) {
+  Console console;
+  console.engine().settings.server.url = "http://romm.test";
+  console.engine().settings.sync.enabled = true;
+  console.engine().snapshot.auth = ipc::AuthState::kPaired;
+  console.engine().start_pairing_starts = true;
+  console.Start();
+  console.sysmodule().delay_ms = 300;
+  overlay::IpcClient client;
+
+  {
+    overlay::StatusPump pump(client, &NoCard);
+    std::chrono::milliseconds slowest{0};
+    const bool answered = RunFramesUntil(
+        [&] { pump.Frame(); }, [&] { return pump.view().link == overlay::Link::kOk; }, &slowest);
+    checks.Expect(answered, "the status screen draws the sysmodule's answer" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no status frame waited for a 300 ms answer" + Took(slowest));
+  }
+
+  {
+    overlay::SyncPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().link == overlay::Link::kOk; }, &slowest),
+                  "the sync screen draws the sysmodule's answer" + Took(slowest));
+    // Sync now first: the toggle below turns sync off, which blocks it.
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressSyncNow();
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return !pump.view().notice.empty(); }, &slowest),
+                  "Sync now's answer is drawn" + Took(slowest));
+    checks.ExpectEq(console.engine().sync_requests, 1, "and it was sent once");
+    const bool was = pump.view().enabled;
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressToggle();
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().enabled != was; }, &slowest),
+                  "the switch moves once the write is answered" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no sync frame or press waited for a 300 ms answer" + Took(slowest));
+  }
+
+  {
+    overlay::PairingPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().start; }, &slowest),
+                  "the pairing screen offers Pair" + Took(slowest));
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressStart();
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] {
+                                   return pump.view().state ==
+                                          rommsync::auth::PairingState::kStarting;
+                                 },
+                                 &slowest),
+                  "the press arrives, and the screen says it is starting" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no pairing frame or press waited for a 300 ms answer" + Took(slowest));
+  }
+
+  // A write past the budget is still applying, not "not responding" (#299):
+  // the edit lands, late, and the screen says so rather than calling it a
+  // failure and dropping the answer.
+  {
+    console.sysmodule().slow_command = static_cast<int>(ipc::Command::kSetEnabled);
+    console.sysmodule().delay_ms = static_cast<int>(overlay::IpcClient::kCallBudget.count()) + 300;
+    overlay::SyncPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().link == overlay::Link::kOk; }, &slowest),
+                  "the sync screen is up" + Took(slowest));
+    const bool was = pump.view().enabled;
+    pump.PressToggle();
+    bool applying = false;
+    bool unreachable = false;
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        pump.Frame();
+                        applying = applying ||
+                                   pump.view().notice.find("applying") != std::string::npos;
+                        unreachable = unreachable || pump.view().link != overlay::Link::kOk;
+                      },
+                      [&] { return pump.view().enabled != was; }, &slowest),
+                  "the late write is not lost: the switch moves when it lands" + Took(slowest));
+    checks.Expect(applying, "while it was out past the budget, the screen said still applying");
+    checks.Expect(!unreachable, "and never that the sysmodule was not responding");
+    checks.Expect(pump.view().notice.find("applying") == std::string::npos,
+                  "the notice goes once the answer is in: " + pump.view().notice);
+    checks.Expect(slowest < kFrameBound, "and no frame waited for it" + Took(slowest));
+  }
+
+  client.Shutdown();
+  checks.ExpectEq(hostswitch::OpenSessions(), 0, "every session this scenario opened is closed");
   return checks.failures();
 }
 
@@ -1993,6 +2154,9 @@ int main(int argc, char** argv) {
   }
   if (scenario == "restore") {
     return RunRestore(checks);
+  }
+  if (scenario == "frames") {
+    return RunFrames(checks);
   }
   if (scenario == "timeout") {
     return RunTimeout(checks);

@@ -95,7 +95,16 @@ class FakeEngine : public ipc::Engine {
   bool application_running_now = false;
   bool application_running() const override { return application_running_now; }
 
-  ipc::Error StartPairing() override { return start_pairing_error; }
+  /// True: a `StartPairing` that is taken moves `pairing` to `kStarting`, as the
+  /// real engine's does, so a screen can see that its press arrived (#299).
+  bool start_pairing_starts = false;
+
+  ipc::Error StartPairing() override {
+    if (start_pairing_starts && start_pairing_error == ipc::Error::kOk) {
+      pairing.state = auth::PairingState::kStarting;
+    }
+    return start_pairing_error;
+  }
   ipc::Error Unpair() override { return unpair_error; }
 
   ipc::Error Enqueue(std::int64_t rom_id, std::int32_t* position) override {
