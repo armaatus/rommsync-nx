@@ -109,6 +109,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
+| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists | [The SD card is full](#the-sd-card-is-full) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
@@ -444,10 +445,22 @@ keep syncing throughout.
 **The fix.** Free space on the card. Then look for leftovers:
 
 - `<save>.part` and `<save>.tmp` next to your saves are swept on the next sync.
-- `sdmc:/config/rommsync/.backup/` holds every save this client has ever
-  overwritten. It is not swept, deliberately — it is what the overlay's
-  **Conflicts** screen restores from. Deleting old backups by hand is safe and
-  is the fastest space you will find.
+- `sdmc:/config/rommsync/.backup/` holds the saves this client has
+  overwritten — what the overlay's **Conflicts** screen restores from. After
+  every sync that completed it is pruned to `[backup]`'s limits
+  ([CONFIG.md](CONFIG.md#backup-how-much-of-backup-is-kept)): the newest ten of
+  each save, everything from the last thirty days, toward 512 MiB in all.
+
+```
+31 info backup.pruned 14 of 52 backups pruned, 9437184 bytes freed; 402653184 bytes in 38 left; 6 kept past the retention rule because no other copy of their bytes could be found
+```
+
+**A backup whose bytes exist nowhere else is never pruned**, which is what the
+last clause counts — save states mostly, since RomM keeps one copy of a state
+and no digest to compare. If the card is still full, those are what is left:
+copy any you want to keep to a computer, then delete them by hand; that is safe
+and is the fastest space you will find. Lowering `max_mib` does not remove them,
+by design.
 
 ---
 

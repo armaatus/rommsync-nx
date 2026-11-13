@@ -32,6 +32,11 @@ retroarch_content_dir = false      ; read RetroArch saves kept beside the roms
 [tico]
 account = auto                     ; auto | legacy | a 32-digit account id; see "Tico" below
 
+[backup]
+keep      = 10                     ; the newest backups of each save kept, at least 1
+keep_days = 30                     ; and every one younger than this; 0 = none by age
+max_mib   = 512                    ; the size .backup/ is held to; 0 = no cap
+
 ; Platform folder map: RomM platform_fs_slug -> SD folders.
 ; roms   = where downloads land (first entry is the write target)
 ; saves  = dirs to scan/sync for SRAM saves
@@ -483,6 +488,38 @@ asks it not to upload that copy again ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#a-sav
 Anything else is a `warning` and the current value stays. The overlay's
 settings screen shows it under `[sync]`, and a press switches it between
 `remove` and `keep`.
+
+### `[backup]`: how much of `.backup/` is kept
+
+Every save and state this client overwrites or removes is copied under
+`/config/rommsync/.backup/` first. Without a limit that directory grows by one
+file per download for as long as the console syncs — two devices taking turns
+on one game make one each tick — until the card fills, and then every download
+fails with `backup_failed` ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-sd-card-is-full)).
+At the end of every sync that completed, the sysmodule prunes it:
+
+| key | default | what it keeps |
+|---|---|---|
+| `keep` | `10` | the newest this many backups of each save (a rom and slot) and of each state |
+| `keep_days` | `30` | every backup younger than this many days, whatever `keep` says; `0` keeps none by age |
+| `max_mib` | `512` | while the directory is still larger than this, older backups go oldest first across every game — but never the newest of a save; `0` is no cap |
+
+**A backup is only ever deleted when its bytes are somewhere else**, and no
+setting changes that: RomM holds a save with the same MD5 for that game (every
+upload is kept there as a version), or a newer backup of the same save holds the
+same bytes. A backup of progress that exists nowhere else — a state, which RomM
+keeps one copy of and computes no digest for; a save whose old versions RomM has
+since pruned; any game while RomM cannot be asked — stays however old it is or
+however far over `max_mib` the directory is. The `backup.pruned` line says how
+many were kept for that reason ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-sd-card-is-full)).
+
+The live save on the card is deliberately not counted as a second copy: it is
+the file the game writes next. A file in `.backup/` this client did not name —
+one you put there — is never touched.
+
+`keep` below `1`, or a value that is not a whole number, is a `warning` and the
+current value stays; a value past the maximum (1000, 3650 days, 1 TiB) is
+clamped to it. The overlay does not edit these yet.
 
 ### Where a rom lands
 

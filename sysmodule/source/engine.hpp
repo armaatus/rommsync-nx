@@ -708,6 +708,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// wait, and the end of it.
   mutable std::timed_mutex save_write_mutex_;
 
+  /// A prune has run since boot (#292). Touched only by the sync worker, under
+  /// `save_write_mutex_`.
+  bool backups_pruned_ = false;
+
   /// The conflict history, for the tick that writes it.
   ///
   /// **The worker is what appends to it** (M7-2, #37): `conflicts::RecordSaves`
@@ -1011,6 +1015,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
                                       const TickScan& found, place::Placer* placer,
                                       const conflicts::RecordOptions& record,
                                       sync::TickOutcome saves, bool* held);
+
+  /// `.backup/` held to `[backup]` (#292), at the end of a tick that completed,
+  /// once after boot and then after any tick that wrote a backup. Under
+  /// `save_write_mutex_`, so a restore never reads a backup this removes.
+  void PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
+                    const sync::StateSyncReport& states, const SavesTally& tally,
+                    bool states_held);
 
   /// The tick's outcome and counts, under `mutex_`, for `Snapshot` and the
   /// scheduler.

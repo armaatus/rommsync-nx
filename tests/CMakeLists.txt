@@ -1272,6 +1272,35 @@ endif()
 # this uploads and deletes saves on the shared fixture device.
 set_tests_properties(conflicts.recorded PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# --- M11-8 (#292): `.backup/` bounded, and nothing pruned is the only copy ----
+add_executable(test_backup_prune test_backup_prune.cpp)
+target_link_libraries(test_backup_prune PRIVATE rommsync::host)
+target_include_directories(test_backup_prune PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_backup_prune PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+set(PRUNE_UNIT_SCENARIOS
+  names      # a backup name reads back; anything else is not a backup
+  count      # the newest `keep` of a group stay; older copies the server holds go
+  age        # younger than `keep_days` stays whatever the count says
+  cap        # over `max_bytes`, oldest first across the tree, never a group's newest
+  unique     # bytes on neither the server nor a newer backup are never pruned
+  duplicate  # an older identical copy goes when a newer one stays
+  truncated  # past one listing, the rom it cuts sits the prune out, all its groups
+  crash      # a power cut at every call of a prune loses no backup's bytes
+)
+foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
+  add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})
+  set_tests_properties(prune.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+add_test(NAME prune.server COMMAND test_backup_prune server)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(prune.server PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL: it arms the fault proxy, which every rig test shares.
+set_tests_properties(prune.server PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+
 # --- the host harness, and the edge cases only the fault proxy can force -----
 # M0-5. One CTest entry per scenario, same shape as the rest of this file, so a
 # red run names the behaviour rather than "the harness tests".
@@ -2415,6 +2444,7 @@ set(ENGINE_RIG_SCENARIOS
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
+  backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
   placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save

@@ -714,6 +714,21 @@ of a death rather than a power cut, and `oom.tick` asks it at every allocation a
 tick makes (#250, docs/TESTING.md): the save is old or new, new only beside a
 backup of the old, and the log's last line says the sysmodule stopped.
 
+#### How long a backup stays (#292)
+
+`.backup/` is pruned at the end of a tick that completed — never during an
+operation, and under the same lock a restore takes — to `[backup]`'s limits
+([CONFIG.md](CONFIG.md#backup-how-much-of-backup-is-kept),
+[`backup_prune.hpp`](../core/include/rommsync/backup_prune.hpp)). Count and age
+decide which backups *may* go; whether one *does* is a digest check, and the
+answer is keep unless its MD5 is a `content_hash` RomM holds for that rom
+(`GET /api/saves?rom_id=`, asked only for roms that have a candidate) or a newer
+backup of the same save holds the same bytes. That is hard rule 3 applied to
+retention: the server is what makes deleting a local copy safe. The live save is
+not a second copy, and a state, with no server digest, goes only as a duplicate.
+Each removal is one `remove()` of bytes already proven elsewhere, so a power cut
+leaves a subset of the removals and nothing else; `prune.crash` replays it.
+
 #### A write after the backup (#263)
 
 A backup is a copy of the save *as it was when copied*. A game that writes the

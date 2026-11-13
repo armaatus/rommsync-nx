@@ -191,6 +191,13 @@ enum class Event {
   /// leaving the card, so it is written for every one.
   kSaveDeleted,
 
+  /// `.backup/` was pruned to its retention rule at the end of a tick (M11-8,
+  /// #292): how many went, the bytes freed and left, and how many were kept
+  /// past the rule because no other copy of their bytes could be found. Only
+  /// written when something was pruned or something was kept, so a card under
+  /// its limits says nothing.
+  kBackupPruned,
+
   /// A rom queued for this console in RomM's web UI (M10-19, #245): taken into
   /// the download queue, reported back, or -- as a warning -- an exchange with
   /// the install endpoints that did not work. **Never a reason to fail a
@@ -223,7 +230,7 @@ inline constexpr std::array kAllEvents = {
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
-    Event::kSyncHeld,    Event::kSaveDeleted, Event::kRemoteInstall,
+    Event::kSyncHeld,    Event::kSaveDeleted, Event::kBackupPruned, Event::kRemoteInstall,
     Event::kPlayRecorded, Event::kTerminated,
 };
 

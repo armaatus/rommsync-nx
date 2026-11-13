@@ -13,6 +13,7 @@
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/backup_prune.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
 #include "rommsync/conflict_record.hpp"
@@ -1992,6 +1993,9 @@ struct SdEngine::SavesTally {
   std::int64_t uploaded = 0;
   std::int64_t downloaded = 0;
   std::int64_t arbitrated = 0;
+  // Backups this tick wrote, removals included: what makes `.backup/` worth
+  // pruning again (#292).
+  std::int64_t backed_up = 0;
 };
 
 namespace {
@@ -2131,6 +2135,7 @@ SdEngine::TickRun SdEngine::RunOneTick() {
   bool states_held = false;
   const sync::StateSyncReport states =
       RunStatesHalf(inputs, library, found, &placer, record, tick.outcome, &states_held);
+  PruneBackups(inputs, tick, states, tally, states_held);
   writing.unlock();
   // The states half's requests went out on the same token, so what they were
   // answered counts towards the one verdict, as the saves half's did.
@@ -2151,6 +2156,47 @@ SdEngine::TickRun SdEngine::RunOneTick() {
   // `scan.skipped` line that says why.
   RecordTick(tick, states, tally, found.scanned.stopped_at_bound, states_held);
   return TickRun::kFinished;
+}
+
+void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
+                            const sync::StateSyncReport& states, const SavesTally& tally,
+                            bool states_held) {
+  // Only at the end of a tick that did everything it set out to: a backup an
+  // operation that failed half way wrote is the one most likely to be wanted,
+  // and the retention rule is not the place to second-guess that tick.
+  if (tick.outcome != sync::TickOutcome::kCompleted || tick.held || states_held ||
+      states.failed > 0 || states.canceled) {
+    return;
+  }
+  std::int64_t backed_up = tally.backed_up;
+  for (const sync::StateOperationResult& operation : states.operations) {
+    if (!operation.backup_sd_path.empty()) ++backed_up;
+  }
+  // Once after boot, and then when a tick wrote a backup: a prune over an
+  // unchanged directory finds what the last one found, and hashing the backups
+  // it kept every half hour would be card time spent on nothing.
+  if (backed_up == 0 && backups_pruned_) {
+    return;
+  }
+
+  backup::PruneOptions options;
+  options.backup_dir = sync::kBackupDir;
+  options.retention = backup::RetentionFor(inputs.config->backup);
+  http::HttpClient* client = inputs.client;
+  const auth::StoredToken* token = &inputs.token;
+  sync::CallPolicy policy;
+  policy.cancel = inputs.cancel.get();
+  options.server_digests = [client, token, policy](std::int64_t rom_id) {
+    return backup::ListServerSaveDigests(*client, *token, rom_id, policy);
+  };
+  const backup::PruneReport report = backup::Prune(*inputs.files, options);
+  // A prune that could not read or remove something is asked again next tick,
+  // rather than waiting for the next backup to be written.
+  backups_pruned_ = report.warnings.empty();
+  log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
+  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap) {
+    log::Info(log::Event::kBackupPruned, backup::Describe(report));
+  }
 }
 
 bool SdEngine::StartTick(TickInputs* inputs) {
@@ -2688,6 +2734,9 @@ void SdEngine::TallyPlan(const sync::SyncPlan& plan, const sync::ExecutionReport
       ++tally->uploaded;
     } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
       ++tally->downloaded;
+    }
+    if (!operation.backup_sd_path.empty()) {
+      ++tally->backed_up;
     }
     // A removal (#233) leaves a backup too, and is not an arbitration.
     if (!operation.backup_sd_path.empty() &&
