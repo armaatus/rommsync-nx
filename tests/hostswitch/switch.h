@@ -135,6 +135,12 @@ const Dispatched& LastDispatched();
 /// the life of the console, because nx-ovlloader's process never exits.
 int OpenSessions();
 
+/// How many sessions `smGetService` has handed out, ever. `OpenSessions`
+/// cannot see a session opened after the overlay stopped if something later
+/// closes it again, and on a console nothing does -- so `overlay.cycles`
+/// counts the opens across a teardown instead (#285).
+int SessionsOpened();
+
 /// How many `smGetService` calls named a service nobody had registered.
 ///
 /// **On a console each of these never returns.** Atmosphere's sm *defers* a

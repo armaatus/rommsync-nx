@@ -45,6 +45,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -1065,12 +1067,46 @@ std::vector<bool>& ForegroundCalls() {
 }
 void RecordForeground(bool enabled) { ForegroundCalls().push_back(enabled); }
 
-/// `RommsyncOverlay`, minus `tsl::Overlay`: the client and the lifecycle it
-/// owns, declared in the same order `main.cpp` declares them.
-struct OverlayUnderTest {
+/// `LibraryScreen` on the gui stack, minus the `tsl::Gui`: its IPC frame, and
+/// the destructor `~LibraryScreen` runs (`library_pump.hpp`). The library is
+/// the screen this is about because it is the one whose destructor talks to
+/// the sysmodule -- it closes the cursors it holds (#285).
+struct LibraryUnderTest {
+  explicit LibraryUnderTest(overlay::IpcClient& borrowed) : client(borrowed) {}
+  ~LibraryUnderTest() { overlay::CloseLibrary(frame, client, model); }
+
+  LibraryUnderTest(const LibraryUnderTest&) = delete;
+  LibraryUnderTest& operator=(const LibraryUnderTest&) = delete;
+
+  /// `update()`.
+  void Frame() { overlay::PumpLibrary(frame, client, model, link); }
+
+  overlay::IpcClient& client;
+  overlay::ScreenFrame frame{client};
+  overlay::LibraryBrowserModel model;
+  overlay::Link link = overlay::Link::kOk;
+};
+
+/// `tsl::Overlay`'s part: the gui stack. A private member of the **base**
+/// class, so `~Overlay` destroys it after everything `RommsyncOverlay` owns,
+/// and nothing in the pinned `tsl::loop` empties it before `delete overlay`
+/// (#285). Whatever screen is open when the overlay exits is destroyed here.
+struct TeslaOverlayPart {
+  virtual ~TeslaOverlayPart() = default;
+  std::list<std::unique_ptr<LibraryUnderTest>> gui_stack;
+};
+
+/// `RommsyncOverlay`'s own part: the client and the lifecycle it owns, in the
+/// order `main.cpp`'s `OverlayServices` declares them.
+struct OverlayServicesPart {
   overlay::IpcClient client{kTestBudget};
   overlay::Lifecycle lifecycle{client, &RecordForeground};
 };
+
+/// `RommsyncOverlay`, laid out as `main.cpp` lays it out: services first, so
+/// they are destroyed *after* the gui stack and a screen's destructor never
+/// finds the client gone. `RunCycles` greps `main.cpp` for that base list.
+struct OverlayUnderTest : OverlayServicesPart, TeslaOverlayPart {};
 
 /// One way libtesla's loop ends, as our overlay's hooks see it.
 ///
@@ -1202,6 +1238,64 @@ int RunCycles(Checks& checks) {
     }
     checks.Expect(main.find("client_.Close()") == std::string::npos,
                   "and none of them closes the session around the lifecycle");
+    // The layout `OverlayUnderTest` copies (#285). `tsl::Overlay`'s gui stack is
+    // destroyed by its own destructor, so whatever owns the client has to be a
+    // base declared before it to outlive the screens on that stack.
+    checks.Expect(main.find("class RommsyncOverlay : private OverlayServices, public tsl::Overlay") !=
+                      std::string::npos,
+                  "main.cpp's client and lifecycle are a base declared before tsl::Overlay, so "
+                  "they outlive the gui stack");
+  }
+
+  // No screen's destructor can open a session (#285). It runs whenever the
+  // stack is emptied -- after `exitServices` on every exit libtesla's loop
+  // has -- so a destructor that reached `Ready()` or `Diagnose()` would
+  // `smGetService` on a client that had already stopped, and nothing after it
+  // closes what it opens. The library's teardown is `CloseLibrary`, which is
+  // held to retiring its frame first; any other screen may not touch the wire.
+  {
+    const std::filesystem::path dir(ROMMSYNC_OVERLAY_SOURCE_DIR);
+    int destructors = 0;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(dir)) {
+      const std::string name = entry.path().filename().string();
+      if (name.size() < 11 || name.substr(name.size() - 11) != "_screen.cpp") {
+        continue;
+      }
+      const std::string code = CodeOnly(ReadWhole(entry.path()));
+      for (std::size_t at = code.find("::~"); at != std::string::npos;
+           at = code.find("::~", at + 3)) {
+        const std::size_t open = code.find('{', at);
+        if (open == std::string::npos) {
+          break;
+        }
+        int depth = 0;
+        std::size_t close = open;
+        for (; close < code.size(); ++close) {
+          depth += code[close] == '{' ? 1 : code[close] == '}' ? -1 : 0;
+          if (depth == 0) {
+            break;
+          }
+        }
+        const std::string body = code.substr(open, close - open);
+        ++destructors;
+        for (const char* banned : {"Ready(", "Open(", "Diagnose(", "Pump", "client_."}) {
+          checks.Expect(body.find(banned) == std::string::npos,
+                        name + "'s destructor names " + banned +
+                            ": a screen destroyed after the overlay stopped would open a session "
+                            "nothing closes");
+        }
+      }
+    }
+    checks.Expect(destructors > 0, "the screen destructor grep found ~LibraryScreen to check");
+
+    const std::string pump = CodeOnly(ReadWhole(dir / "library_pump.cpp"));
+    const std::size_t teardown = pump.find("void CloseLibrary(");
+    const std::size_t retired = pump.find("frame.Retire();", teardown);
+    const std::size_t ready = pump.find("frame.Ready()", teardown);
+    checks.Expect(teardown != std::string::npos && retired != std::string::npos &&
+                      retired < ready,
+                  "CloseLibrary retires its frame before asking it anything, so the teardown "
+                  "only ever uses a session that is already open");
   }
 
   Console console;
@@ -1214,6 +1308,7 @@ int RunCycles(Checks& checks) {
       const std::string where = std::string(path.name) + ", cycle " + std::to_string(cycle);
       ForegroundCalls().clear();
       const int teardowns = overlay::Lifecycle::Teardowns();
+      int opened_before_teardown = 0;
       {
         auto under_test = std::make_unique<OverlayUnderTest>();
         under_test->lifecycle.Start();  // initServices
@@ -1223,6 +1318,11 @@ int RunCycles(Checks& checks) {
         checks.Expect(ForegroundCalls() == std::vector<bool>{false},
                       "the overlay gives input back the moment it starts: " + where);
 
+        // The library is the screen left open: pushed, and never popped, so
+        // `~Overlay` is what destroys it (#285).
+        under_test->gui_stack.push_back(std::make_unique<LibraryUnderTest>(under_test->client));
+        LibraryUnderTest& library = *under_test->gui_stack.back();
+
         overlay::ScreenFrame frame(under_test->client);
         for (int show = 0; show < path.shows; ++show) {
           under_test->lifecycle.Shown();
@@ -1230,7 +1330,16 @@ int RunCycles(Checks& checks) {
           ipc::Status status;
           checks.Expect(R_SUCCEEDED(under_test->client.GetStatus(&status)),
                         "and polls: " + where);
+          for (int tick = 0; tick < 4; ++tick) {
+            library.Frame();
+          }
+          checks.Expect(library.model.open_cursors() > 0,
+                        "the library holds a cursor its destructor has to close: " + where);
         }
+        // Every session the teardown below opens is one opened after the
+        // overlay's own part stopped, and on a console nothing closes it: one
+        // of `kMaxSessions` gone until reboot, per exit (#285).
+        opened_before_teardown = hostswitch::SessionsOpened();
         // One call that ran out of budget and is still out when the overlay
         // closes -- the worst case for a teardown, released a moment later.
         if (path.shows > 0) {
@@ -1254,6 +1363,10 @@ int RunCycles(Checks& checks) {
           under_test.reset();
         }
       }
+      checks.ExpectEq(hostswitch::SessionsOpened(), opened_before_teardown,
+                      "a screen destroyed with the overlay opens no session -- with Library "
+                      "open and no pop, every exit would otherwise take one of kMaxSessions: " +
+                          where);
       checks.ExpectEq(overlay::Lifecycle::Teardowns(), teardowns + 1,
                       "the one teardown ran exactly once: " + where);
       checks.ExpectEq(hostswitch::OpenSessions(), 0, "no session is left open: " + where);

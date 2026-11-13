@@ -41,6 +41,11 @@ std::atomic<int>& Open() {
   return open;
 }
 
+std::atomic<int>& Opened() {
+  static std::atomic<int> opened{0};
+  return opened;
+}
+
 std::atomic<int>& Deferred() {
   static std::atomic<int> deferred{0};
   return deferred;
@@ -67,6 +72,8 @@ void Unregister(const char* name, Server* server) {
 const Dispatched& LastDispatched() { return LastDispatchedMutable(); }
 
 int OpenSessions() { return Open().load(); }
+
+int SessionsOpened() { return Opened().load(); }
 
 int DeferredRequests() { return Deferred().load(); }
 
@@ -149,6 +156,7 @@ Result smGetService(Service* out, const char* name) {
   out->server = RegisteredServer();
   out->generation = Generation();
   ++Open();
+  ++Opened();
   return 0;
 }
 
