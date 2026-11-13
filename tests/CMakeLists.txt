@@ -567,6 +567,7 @@ foreach(scenario
         frames     # a sysmodule that answers in 300 ms holds no frame past 2 ms
         cycles     # every exit path gives back everything, the same way, every time
         hidden     # polling is by showing, because update() stops while hidden
+        scroll     # row 2000 of a platform, by a held R, with the heap flat
         log        # the log the sysmodule serves, readable without an SD reader
         portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn

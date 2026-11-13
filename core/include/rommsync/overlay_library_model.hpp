@@ -301,7 +301,32 @@ class LibraryBrowserModel {
   /// the caller should keep pumping `Next()` until it answers `kNone`.
   void Close();
 
+  /// Every loaded row of the level on top. For the suite, which reads rows by
+  /// index; a screen calls the overload below.
   LibraryView Render() const;
+
+  /// The rows from `above` before the selection to `below` after it, and
+  /// nothing else (#298).
+  ///
+  /// What a screen draws is a panel's worth around the selection, and a view of
+  /// the whole window is `kMaxLoadedRows` rows of four strings each -- copied on
+  /// every frame, that was ~2k allocations a frame for rows nobody drew.
+  /// `selected` indexes the slice.
+  LibraryView Render(int above, int below) const;
+
+  /// Bumped by everything that changes what `Render` would draw, so a screen
+  /// renders on a change rather than on every frame (#298).
+  std::uint64_t revision() const;
+
+  /// The selected row's place in the whole list, 0-based, or `-1` when the
+  /// selection is on no loaded row. Published for the suite: with the rows
+  /// windowed, an index into a view says nothing about how far down the list
+  /// it is.
+  int selected_position() const;
+
+  /// Rows this model holds across every level, the ones being gathered above a
+  /// window included. Published for the suite: it is the number #298 bounds.
+  std::size_t loaded_rows() const;
 
   /// How many cursors this model believes are open, `Close()`'s pending ones
   /// included. Published for the test rather than for a screen: a browser that

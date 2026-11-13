@@ -67,7 +67,9 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/overlay_conflicts_view.hpp"
+#include "rommsync/overlay_library_model.hpp"
 #include "rommsync/overlay_log_view.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 // The overlay's own headers, and the sysmodule's half of the error mapping.
@@ -1662,6 +1664,136 @@ int RunCycles(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.scroll -----------------------------------------------------------
+
+/// `LibraryScreen` minus the `tsl::Gui`, as #298 left it: the held key turned
+/// into rows by `ScrollRepeat`, the IPC frame, and the view re-rendered only
+/// when the model changed -- `update()` and `handleInput()` in one call.
+struct LibraryOnScreen {
+  explicit LibraryOnScreen(overlay::IpcClient& borrowed) : client(borrowed) {}
+  ~LibraryOnScreen() { overlay::CloseLibrary(frame, client, model); }
+
+  LibraryOnScreen(const LibraryOnScreen&) = delete;
+  LibraryOnScreen& operator=(const LibraryOnScreen&) = delete;
+
+  void Frame(overlay::ScrollKey held, overlay::ScrollRepeat::Clock::time_point now) {
+    const int rows = repeat.Update(held, now);
+    if (rows != 0) {
+      model.MoveSelection(rows);
+    }
+    overlay::PumpLibrary(frame, client, model, link);
+    overlay::RenderLibrary(model, &view, &seen);
+  }
+
+  std::int64_t SelectedRom() const {
+    if (view.selected < 0) {
+      return 0;
+    }
+    return view.rows[static_cast<std::size_t>(view.selected)].rom_id;
+  }
+
+  overlay::IpcClient& client;
+  overlay::ScreenFrame frame{client};
+  overlay::LibraryBrowserModel model;
+  overlay::Link link = overlay::Link::kOk;
+  overlay::LibraryView view;
+  std::uint64_t seen = ~std::uint64_t{0};
+  overlay::ScrollRepeat repeat;
+};
+
+/// Row 2000 of a 2500-rom platform, reached with a held R through the real
+/// dispatch, and the heap flat all the way down (#298).
+///
+/// Before #298 the level stopped at row 512 with "Too many to list here", a
+/// held key moved one row per press, and every frame copied every loaded row
+/// into the view.
+int RunScroll(Checks& checks) {
+  using ScrollClock = overlay::ScrollRepeat::Clock;
+  Console console;
+  console.engine().library_roms = 2500;
+  console.Start();
+  // A generous budget: this is about rows, not time, and a loaded host must not
+  // turn a page into "not responding".
+  overlay::IpcClient client(std::chrono::milliseconds{2000});
+  LibraryOnScreen library(client);
+
+  int frame = 0;
+  const auto at = [&frame] {
+    return ScrollClock::time_point{} + std::chrono::microseconds(std::int64_t{frame} * 16'667);
+  };
+  for (; frame < 20 && library.view.rows.empty(); ++frame) {
+    library.Frame(overlay::ScrollKey::kNone, at());
+  }
+  checks.Expect(!library.view.rows.empty(), "the platform list loaded");
+  library.model.Activate();
+
+  // R held, at 60 Hz, until the selection is past row 1990.
+  const int held_from = frame;
+  std::optional<count_new::Snapshot> baseline;
+  for (; frame < held_from + 600 && library.model.selected_position() < 1990; ++frame) {
+    library.Frame(overlay::ScrollKey::kPageDown, at());
+    if (!baseline.has_value() && library.model.selected_position() >= 700) {
+      // The window has filled: from here on the rows held should not grow.
+      baseline = count_new::Now();
+      count_new::ResetPeak();
+    }
+  }
+  const int held_frames = frame - held_from;
+  checks.Expect(library.model.selected_position() >= 1990,
+                "a held R gets past row 1990: at " +
+                    std::to_string(library.model.selected_position()));
+  checks.Expect(held_frames <= 6 * 60,
+                "within six seconds at 60 Hz: " + std::to_string(held_frames) + " frames");
+
+  // Released, then single presses onto row 2000 exactly.
+  for (int press = 0; press < 64 && library.model.selected_position() != 1999; ++press) {
+    library.Frame(overlay::ScrollKey::kNone, at());
+    ++frame;
+    const overlay::ScrollKey key = library.model.selected_position() < 1999
+                                       ? overlay::ScrollKey::kDown
+                                       : overlay::ScrollKey::kUp;
+    library.Frame(key, at());
+    ++frame;
+  }
+  checks.ExpectEq(library.SelectedRom(), std::int64_t{2000}, "row 2000 is the 2000th rom");
+
+  if (count_new::kActive && baseline.has_value()) {
+    const count_new::Snapshot now = count_new::Now();
+    const std::int64_t grew = now.outstanding_bytes - baseline->outstanding_bytes;
+    checks.Expect(grew < 16 * 1024,
+                  "the heap does not grow with the rows scrolled past: " + std::to_string(grew) +
+                      " bytes over ~1300 rows");
+    const std::int64_t peak = now.peak_bytes - baseline->outstanding_bytes;
+    checks.Expect(peak < 256 * 1024, "nor peak far above it: " + std::to_string(peak) + " bytes");
+
+    // Still, with nothing to fetch: a frame allocates nothing at all.
+    for (int settle = 0; settle < 8; ++settle, ++frame) {
+      library.Frame(overlay::ScrollKey::kNone, at());
+    }
+    const count_new::Window idle;
+    for (int still = 0; still < 30; ++still, ++frame) {
+      library.Frame(overlay::ScrollKey::kNone, at());
+    }
+    checks.ExpectEq(idle.allocations(), std::int64_t{0},
+                    "thirty frames with nothing to do allocate nothing");
+  }
+
+  // And L back to the top: the rows dropped above the window are read again.
+  for (int release = 0; release < 2; ++release, ++frame) {
+    library.Frame(overlay::ScrollKey::kNone, at());
+  }
+  const int up_from = frame;
+  for (; frame < up_from + 1800 && library.model.selected_position() != 0; ++frame) {
+    library.Frame(overlay::ScrollKey::kPageUp, at());
+  }
+  checks.ExpectEq(library.model.selected_position(), 0, "a held L gets back to row 1");
+  checks.ExpectEq(library.SelectedRom(), std::int64_t{1}, "which is the first rom");
+  checks.Expect(console.engine().library_cursors.size() <= 2,
+                "every cursor a rewind replaced was ended: " +
+                    std::to_string(console.engine().library_cursors.size()) + " open");
+  return checks.failures();
+}
+
 // --- overlay.hidden -----------------------------------------------------------
 
 /// M9-6 (#209): `update()` does not run while the overlay is hidden.
@@ -2238,6 +2370,9 @@ int main(int argc, char** argv) {
   if (scenario == "hidden") {
     return RunHidden(checks);
   }
+  if (scenario == "scroll") {
+    return RunScroll(checks);
+  }
   if (scenario == "restore") {
     return RunRestore(checks);
   }
@@ -2254,6 +2389,7 @@ int main(int argc, char** argv) {
     return RunDraw(checks);
   }
   std::cerr << "usage: test_overlay_native "
-               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|log|portable|draw>\n";
+               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|scroll|log|"
+               "portable|draw>\n";
   return 2;
 }

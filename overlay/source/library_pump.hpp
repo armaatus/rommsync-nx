@@ -9,6 +9,8 @@
 // type, which `overlay.portable` holds it to.
 #pragma once
 
+#include <cstdint>
+
 #include "ipc_client.hpp"
 #include "rommsync/overlay_library_model.hpp"
 #include "rommsync/overlay_status_view.hpp"
@@ -22,6 +24,16 @@ namespace rommsync::overlay {
 /// between frames so a session that came back is noticed once rather than
 /// restarting the browser every frame.
 void PumpLibrary(ScreenFrame& frame, IpcClient& client, LibraryBrowserModel& model, Link& link);
+
+/// How many rows around the selection the screen is handed (#298): the two of
+/// context `library_screen.cpp` draws above it, and more below than a panel
+/// holds.
+inline constexpr int kViewRowsAbove = 2;
+inline constexpr int kViewRowsBelow = 24;
+
+/// `view` re-rendered from `model` if anything changed since `*seen`, and
+/// whether it was. A frame on which nothing changed copies nothing (#298).
+bool RenderLibrary(const LibraryBrowserModel& model, LibraryView* view, std::uint64_t* seen);
 
 /// The screen's teardown: every cursor the model still holds closed, best
 /// effort, because a `ListEnd` that never arrives costs the sysmodule one of a

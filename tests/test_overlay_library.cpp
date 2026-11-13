@@ -17,17 +17,21 @@
 //
 // No server, no console, no emulator -- pure decisions over pure data, so this
 // never skips.
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "checks.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_library_model.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 namespace {
@@ -1127,42 +1131,51 @@ void CheckATransientRefusalCanBeRetried(Checks& checks) {
                 "and a rom already in the queue stops sending");
 }
 
-/// A level stops loading at `kMaxLoadedRows`, and says it was cut.
+/// A level holds at most `kMaxLoadedRows`, and never stops for it (#298).
 ///
 /// The one structure here that would otherwise grow with the size of the
-/// library. "Cut" and "finished" are two different sentences: a user told a
-/// list ended stops looking for what is not in it.
+/// library. It used to stop at the cap with "Too many to list here", which left
+/// every rom past row 512 of a platform unreachable; now the rows far above the
+/// selection are dropped instead, and the list goes on.
 void CheckLoadedRowsAreBounded(Checks& checks) {
   overlay::LibraryBrowserModel model;
   Begin(checks, model, 291);
 
   // Full pages, forever, exactly as a ten-thousand-rom library would answer.
+  int pages = 0;
   for (int page = 0; page < 64; ++page) {
     const Command command = model.Next();
-    if (command.kind == Command::Kind::kNone) {
+    if (command.kind != Command::Kind::kListNext) {
       break;
     }
-    checks.Expect(command.kind == Command::Kind::kListNext, "it keeps asking while it has room");
+    ++pages;
     std::vector<ipc::ListItem> items;
     for (int index = 0; index < 32; ++index) {
       const int id = page * 32 + index + 1;
       items.push_back(Platform(id, "Platform " + std::to_string(id), "p", 1, true));
     }
     model.OnPage(Page(checks, std::move(items), true));
+    checks.Expect(model.loaded_rows() <= static_cast<std::size_t>(overlay::kMaxLoadedRows),
+                  "the level never holds more than kMaxLoadedRows");
     // Follow the selection down, which is what asks for the next page.
     model.MoveSelection(32);
   }
 
+  checks.ExpectEq(pages, 64, "it keeps asking for pages past kMaxLoadedRows rows");
+  checks.Expect(model.Next().kind == Command::Kind::kListNext, "and is still asking");
   const overlay::LibraryView view = model.Render();
-  checks.ExpectEq(static_cast<int>(ListRows(view).size()), overlay::kMaxLoadedRows,
-                  "the level stops at kMaxLoadedRows");
-  checks.Expect(model.Next().kind == Command::Kind::kNone, "and stops asking for more");
-  const overlay::LibraryRow* more = MoreRow(view);
-  checks.Expect(more != nullptr, "with a row saying so");
-  if (more != nullptr) {
-    checks.Expect(Contains(more->label, "Too many"), "and it says the list was cut");
-    checks.Expect(more->tone == overlay::Tone::kWarn, "as a warning rather than as the end");
+  checks.Expect(static_cast<int>(ListRows(view).size()) <= overlay::kMaxLoadedRows,
+                "the view is the window, not the 2048 rows scrolled past");
+  for (const overlay::LibraryRow& row : view.rows) {
+    checks.Expect(!Contains(row.label, "Too many"), "and nothing says the list was cut");
   }
+  // The selection rides the "Loading..." row at the end of 2048 loaded rows.
+  // Forty up from there is row 2008, which is the 2009th platform.
+  model.MoveSelection(-40);
+  checks.ExpectEq(model.selected_position(), 2008, "the selection is at row 2008 of the list");
+  const overlay::LibraryView deep = model.Render();
+  checks.ExpectEq(deep.rows[static_cast<std::size_t>(deep.selected)].label,
+                  std::string("Platform 2009"), "on the row that is there");
 }
 
 /// Items this build cannot read are counted and said out loud.
@@ -1272,6 +1285,295 @@ void CheckAnArrivingPageDoesNotMoveTheSelection(Checks& checks) {
   // next one. What matters is that the press produced no `Enqueue`.
   checks.Expect(roms.Next().kind != Command::Kind::kEnqueue,
                 "A on the more row enqueues no rom the user never selected");
+}
+
+// --- reaching any rom (#298) --------------------------------------------------
+
+using Clock = overlay::ScrollRepeat::Clock;
+
+/// A frame at 60 Hz, `n` frames after `start`.
+Clock::time_point FrameAt(Clock::time_point start, int n) {
+  return start + std::chrono::microseconds(std::int64_t{n} * 16'667);
+}
+
+/// Rows a key moves over `frames` frames held from `start`, one `Update` each.
+int Held(overlay::ScrollRepeat& repeat, overlay::ScrollKey key, Clock::time_point start,
+         int first_frame, int frames) {
+  int moved = 0;
+  for (int frame = first_frame; frame < first_frame + frames; ++frame) {
+    moved += repeat.Update(key, FrameAt(start, frame));
+  }
+  return moved;
+}
+
+/// A held key repeats, at the rate `overlay_scroll.hpp` specifies.
+///
+/// libtesla repeats only by moving focus, and a `CustomDrawer` is never
+/// focused, so before #298 a held D-pad was one row per press.
+void CheckHeldKeyRepeats(Checks& checks) {
+  const Clock::time_point start{};
+  {
+    overlay::ScrollRepeat repeat;
+    checks.ExpectEq(repeat.Update(overlay::ScrollKey::kDown, start), 1,
+                    "the first frame of a press moves one row at once");
+    // 300 ms is frame 18; nothing until then.
+    checks.ExpectEq(Held(repeat, overlay::ScrollKey::kDown, start, 1, 17), 0,
+                    "then nothing for the repeat delay, so a tap is one row");
+    // From 300 ms, a row every 50 ms -- three frames -- for the first second:
+    // 20 repeats in [300, 1300) ms, which is frames 18..77.
+    checks.ExpectEq(Held(repeat, overlay::ScrollKey::kDown, start, 18, 60), 20,
+                    "then one row every 50 ms");
+    // The second second repeats twice as far, the third four times.
+    checks.ExpectEq(Held(repeat, overlay::ScrollKey::kDown, start, 78, 60), 2 * 20,
+                    "and twice as far a repeat after a second of it");
+    checks.ExpectEq(Held(repeat, overlay::ScrollKey::kDown, start, 138, 60), 4 * 20,
+                    "four times after two");
+    // Ten seconds on, the step is capped at kMaxRepeatStep.
+    checks.ExpectEq(Held(repeat, overlay::ScrollKey::kDown, start, 438, 600),
+                    overlay::kMaxRepeatStep * 200,
+                    "and never more than kMaxRepeatStep rows a repeat");
+    checks.ExpectEq(repeat.Update(overlay::ScrollKey::kNone, FrameAt(start, 1038)), 0,
+                    "a released key moves nothing");
+    checks.ExpectEq(repeat.Update(overlay::ScrollKey::kDown, FrameAt(start, 1039)), 1,
+                    "and the next press starts again at one row");
+  }
+  {
+    overlay::ScrollRepeat repeat;
+    checks.ExpectEq(repeat.Update(overlay::ScrollKey::kUp, start), -1, "up is negative");
+    checks.ExpectEq(Held(repeat, overlay::ScrollKey::kUp, start, 1, 77), -20,
+                    "and repeats the same way");
+    checks.ExpectEq(repeat.Update(overlay::ScrollKey::kPageDown, FrameAt(start, 78)),
+                    overlay::kPageRows, "another key is a new press: a page is kPageRows rows");
+    checks.ExpectEq(Held(repeat, overlay::ScrollKey::kPageDown, start, 79, 77),
+                    20 * overlay::kPageRows, "and a held page key repeats a page at a time");
+  }
+  {
+    // The overlay hidden with a key held: `handleInput` does not run, and the
+    // first frame back is a new press rather than an accelerated repeat.
+    overlay::ScrollRepeat repeat;
+    Held(repeat, overlay::ScrollKey::kDown, start, 0, 300);
+    checks.ExpectEq(repeat.Update(overlay::ScrollKey::kDown, FrameAt(start, 600)), 1,
+                    "a key still held after a gap is a new press");
+    checks.ExpectEq(repeat.Update(overlay::ScrollKey::kDown, FrameAt(start, 601)), 0,
+                    "with the delay ahead of it again");
+  }
+  {
+    // A frame that arrives late fires once rather than catching up.
+    overlay::ScrollRepeat repeat;
+    repeat.Update(overlay::ScrollKey::kDown, start);
+    checks.ExpectEq(
+        repeat.Update(overlay::ScrollKey::kDown, start + std::chrono::milliseconds{200}), 0,
+        "inside the delay");
+    checks.ExpectEq(
+        repeat.Update(overlay::ScrollKey::kDown, start + std::chrono::milliseconds{420}), 1,
+        "a frame arriving three repeats late moves one step, not three");
+  }
+}
+
+/// Which key a frame's buttons mean.
+void CheckHeldScrollKey(Checks& checks) {
+  using overlay::HeldScrollKey;
+  using overlay::ScrollKey;
+  checks.Expect(HeldScrollKey(false, false, false, false) == ScrollKey::kNone, "nothing held");
+  checks.Expect(HeldScrollKey(true, false, false, false) == ScrollKey::kUp, "up");
+  checks.Expect(HeldScrollKey(false, true, false, false) == ScrollKey::kDown, "down");
+  checks.Expect(HeldScrollKey(false, false, true, false) == ScrollKey::kPageUp, "L");
+  checks.Expect(HeldScrollKey(false, false, false, true) == ScrollKey::kPageDown, "R");
+  checks.Expect(HeldScrollKey(false, true, true, false) == ScrollKey::kPageUp,
+                "a page key beats a row key");
+  checks.Expect(HeldScrollKey(true, true, false, false) == ScrollKey::kNone,
+                "opposite rows cancel");
+  checks.Expect(HeldScrollKey(false, true, true, true) == ScrollKey::kDown,
+                "opposite pages cancel, leaving the row key");
+}
+
+/// A platform of `roms` roms behind cursors that hold an offset -- the shape
+/// `lists::Service` has -- so a test can scroll further than any page and back.
+struct LongLibrary {
+  struct Open {
+    ipc::ListKind kind = ipc::ListKind::kPlatforms;
+    int offset = 0;
+  };
+
+  int roms = 0;
+  ipc::Cursor next_cursor = 1000;
+  std::map<ipc::Cursor, Open> cursors;
+
+  /// Answer whatever the model asks for this frame, through the codec.
+  void Answer(Checks& checks, overlay::LibraryBrowserModel& model) {
+    const Command command = model.Next();
+    switch (command.kind) {
+      case Command::Kind::kListBegin: {
+        const ipc::Cursor cursor = next_cursor++;
+        cursors[cursor] = Open{command.request.kind, 0};
+        model.OnCursor(cursor);
+        return;
+      }
+      case Command::Kind::kListNext: {
+        const auto found = cursors.find(command.cursor);
+        if (found == cursors.end()) {
+          model.OnRefused(ipc::Error::kBadCursor);
+          return;
+        }
+        Open& open = found->second;
+        std::vector<ipc::ListItem> items;
+        if (open.kind == ipc::ListKind::kPlatforms) {
+          if (open.offset == 0) {
+            items.push_back(Platform(1, "Game Boy Advance", "gba", roms, true));
+          }
+          open.offset = 1;
+          model.OnPage(Page(checks, std::move(items), false));
+          return;
+        }
+        // As a producer fills one: until the next rom would not fit (#31).
+        ipc::ListPage page;
+        while (open.offset < roms &&
+               ipc::AppendIfItFits(&page, Rom(open.offset + 1,
+                                              "Rom " + std::to_string(open.offset + 1), 1024))) {
+          ++open.offset;
+        }
+        model.OnPage(Page(checks, std::move(page.items), open.offset < roms));
+        return;
+      }
+      case Command::Kind::kListEnd:
+        cursors.erase(command.cursor);
+        model.OnEnded();
+        return;
+      case Command::Kind::kEnqueue:
+        model.OnEnqueued(1);
+        return;
+      case Command::Kind::kNone:
+        return;
+    }
+  }
+};
+
+/// The selected row is the rom at the selected place in the list -- which, with
+/// rows dropped and gathered again around a window, is the thing that can drift.
+bool SelectionIsConsistent(const overlay::LibraryBrowserModel& model) {
+  const int position = model.selected_position();
+  if (position < 0) {
+    return true;  // on a "Loading..." row
+  }
+  const overlay::LibraryView view = model.Render(0, 0);
+  return view.selected >= 0 &&
+         view.rows[static_cast<std::size_t>(view.selected)].rom_id == position + 1;
+}
+
+/// Row 2000 of a 2500-rom platform is reachable, and so is row 1 after it,
+/// with the heap held to the window all the way (#298).
+///
+/// Before, a level stopped at `kMaxLoadedRows` and said "Too many to list
+/// here": the 2000th rom of a platform could not be reached at all.
+void CheckRow2000IsReachable(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  LongLibrary library;
+  library.roms = 2500;
+  for (int frame = 0; frame < 8 && ListRows(model.Render()).empty(); ++frame) {
+    library.Answer(checks, model);
+  }
+  model.Activate();
+
+  // Down, a held page key's worth a frame -- the fastest the screen moves.
+  const int step = overlay::kPageRows * overlay::kMaxRepeatStep;
+  bool consistent = true;
+  bool bounded = true;
+  int frames = 0;
+  for (; frames < 400 && model.selected_position() < 1999; ++frames) {
+    library.Answer(checks, model);
+    model.MoveSelection(std::min(step, 1999 - std::max(model.selected_position(), 0)));
+    consistent = consistent && SelectionIsConsistent(model);
+    bounded = bounded && model.loaded_rows() <= static_cast<std::size_t>(
+                                                    overlay::kMaxLoadedRows + 1);
+  }
+  checks.ExpectEq(model.selected_position(), 1999, "the selection reaches row 2000");
+  const overlay::LibraryView there = model.Render();
+  if (there.selected >= 0) {
+    checks.ExpectEq(there.rows[static_cast<std::size_t>(there.selected)].rom_id,
+                    std::int64_t{2000}, "and the row there is the 2000th rom");
+  }
+  checks.Expect(frames <= 120, "within 120 frames of one page each: " + std::to_string(frames));
+  checks.Expect(consistent, "every selected row on the way down was the rom at its place");
+  checks.Expect(bounded, "and the rows held never passed the window");
+
+  // And A there enqueues that rom, not one near it.
+  model.Activate();
+  const Command press = model.Next();
+  checks.Expect(press.kind == Command::Kind::kEnqueue && press.rom_id == 2000,
+                "A on row 2000 enqueues rom 2000");
+  model.OnEnqueued(1);
+
+  // Back to the top: rows dropped above the window are read again.
+  int up_frames = 0;
+  for (; up_frames < 2000 && model.selected_position() != 0; ++up_frames) {
+    library.Answer(checks, model);
+    model.MoveSelection(-step);
+    consistent = consistent && SelectionIsConsistent(model);
+    bounded = bounded && model.loaded_rows() <= static_cast<std::size_t>(
+                                                    overlay::kMaxLoadedRows * 3 / 2 + 1);
+  }
+  checks.ExpectEq(model.selected_position(), 0, "the selection gets back to row 1");
+  const overlay::LibraryView top = model.Render();
+  if (top.selected >= 0) {
+    checks.ExpectEq(top.rows[static_cast<std::size_t>(top.selected)].rom_id, std::int64_t{1},
+                    "and the row there is the first rom");
+  }
+  checks.Expect(up_frames <= 400,
+                "within 400 frames, re-reading what was dropped: " + std::to_string(up_frames));
+  checks.Expect(consistent, "every selected row on the way up was the rom at its place");
+  checks.Expect(bounded, "and the rows held stayed bounded while it was gathered again");
+  checks.Expect(model.open_cursors() <= 2,
+                "a rewind closes the cursor it replaces: " + std::to_string(model.open_cursors()));
+
+  // The library closes, and every cursor it left open on the server is ended.
+  model.Close();
+  for (int frame = 0; frame < 8; ++frame) {
+    library.Answer(checks, model);
+  }
+  checks.Expect(library.cursors.empty(), "no cursor is left open on the server");
+}
+
+/// What a screen renders is the rows around the selection, and only when
+/// something changed (#298).
+void CheckRenderIsASliceOnChange(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  LongLibrary library;
+  library.roms = 400;
+  for (int frame = 0; frame < 8 && ListRows(model.Render()).empty(); ++frame) {
+    library.Answer(checks, model);
+  }
+  model.Activate();
+  for (int frame = 0; frame < 16; ++frame) {
+    library.Answer(checks, model);
+  }
+  model.MoveSelection(100);
+  for (int frame = 0; frame < 16; ++frame) {
+    library.Answer(checks, model);
+  }
+
+  const overlay::LibraryView slice = model.Render(2, 24);
+  checks.ExpectEq(slice.rows.size(), std::size_t{27},
+                  "two rows above the selection, the selection, and 24 below");
+  checks.ExpectEq(slice.selected, 2, "the selection indexes the slice");
+  if (slice.rows.size() > 2) {
+    checks.ExpectEq(slice.rows[2].rom_id, std::int64_t{101}, "and is the 101st rom");
+    checks.ExpectEq(slice.rows[0].rom_id, std::int64_t{99}, "starting two above it");
+  }
+
+  // Settled: nothing to fetch, and nothing changes from one frame to the next.
+  const std::uint64_t settled = model.revision();
+  for (int frame = 0; frame < 8; ++frame) {
+    library.Answer(checks, model);
+  }
+  checks.ExpectEq(model.revision(), settled, "a frame with nothing to do changes nothing");
+  model.MoveSelection(1);
+  checks.Expect(model.revision() != settled, "a move is a change");
+  const std::uint64_t moved = model.revision();
+  model.MoveSelection(-1000);
+  checks.Expect(model.revision() != moved, "so is a move to the top");
+  const std::uint64_t at_top = model.revision();
+  model.MoveSelection(-1);
+  checks.ExpectEq(model.revision(), at_top, "but a move that went nowhere is not");
 }
 
 // --- the code rather than the behaviour ---------------------------------------
@@ -1430,6 +1732,10 @@ int main() {
   CheckUnreadableItemsAreReported(checks);
   CheckAPageCannotLandInTheWrongLevel(checks);
   CheckAnArrivingPageDoesNotMoveTheSelection(checks);
+  CheckHeldKeyRepeats(checks);
+  CheckHeldScrollKey(checks);
+  CheckRow2000IsReachable(checks);
+  CheckRenderIsASliceOnChange(checks);
   CheckQueueRowUsesEveryPinnedField(checks);
   CheckLibraryScreenWritesNothing(checks);
   CheckLibraryScreenCallsNoEngine(checks);

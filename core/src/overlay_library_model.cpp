@@ -742,6 +742,23 @@ void LibraryBrowserModel::Close() {
   enqueue_wanted_ = 0;
 }
 
+LibraryView LibraryBrowserModel::Render(int, int) const { return Render(); }
+
+std::uint64_t LibraryBrowserModel::revision() const { return 0; }
+
+int LibraryBrowserModel::selected_position() const {
+  const Level& level = top();
+  return level.selected < static_cast<int>(level.rows.size()) ? level.selected : -1;
+}
+
+std::size_t LibraryBrowserModel::loaded_rows() const {
+  std::size_t rows = 0;
+  for (const Level& level : stack_) {
+    rows += level.rows.size();
+  }
+  return rows;
+}
+
 // --- reading the projections --------------------------------------------------
 
 bool LibraryBrowserModel::ReadPlatform(const ipc::ListItem& item, LibraryRow* row) {

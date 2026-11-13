@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -120,8 +121,21 @@ class FakeEngine : public ipc::Engine {
     return dequeue_error;
   }
 
+  /// Non-zero: the three list commands serve one platform of this many roms,
+  /// from cursors that each hold an offset -- `lists::Service`'s shape -- so a
+  /// screen can scroll further than any page and back again (#298). `page`
+  /// and the cursor knobs above are then unused.
+  int library_roms = 0;
+  /// The cursors such a library has open, by id: kind and offset.
+  std::map<ipc::Cursor, std::pair<ipc::ListKind, int>> library_cursors;
+
   ipc::Error ListBegin(const ipc::ListRequest& request, ipc::Cursor* cursor) override {
     last_list = request;
+    if (library_roms > 0) {
+      *cursor = issued_cursor++;
+      library_cursors[*cursor] = {request.kind, 0};
+      return ipc::Error::kOk;
+    }
     if (list_begin_error == ipc::Error::kOk) {
       *cursor = issued_cursor;
     }
@@ -130,6 +144,9 @@ class FakeEngine : public ipc::Engine {
 
   ipc::Error ListNext(ipc::Cursor cursor, ipc::ListPage* out) override {
     last_cursor = cursor;
+    if (library_roms > 0) {
+      return LibraryPage(cursor, out);
+    }
     if (list_next_error == ipc::Error::kOk) {
       *out = page;
     }
@@ -138,7 +155,58 @@ class FakeEngine : public ipc::Engine {
 
   ipc::Error ListEnd(ipc::Cursor cursor) override {
     last_cursor = cursor;
+    if (library_roms > 0) {
+      return library_cursors.erase(cursor) == 1 ? ipc::Error::kOk : ipc::Error::kBadCursor;
+    }
     return list_end_error;
+  }
+
+  /// One page of the `library_roms` library. Names long enough to be on the
+  /// heap, so a test counting it sees every row a screen holds.
+  ipc::Error LibraryPage(ipc::Cursor cursor, ipc::ListPage* out) {
+    namespace keys = ipc::list_keys;
+    const auto found = library_cursors.find(cursor);
+    if (found == library_cursors.end()) {
+      return ipc::Error::kBadCursor;
+    }
+    int& offset = found->second.second;
+    if (found->second.first == ipc::ListKind::kPlatforms) {
+      if (offset == 0) {
+        ipc::ListItem item;
+        item.fields.push_back({std::string(keys::kPlatformId), ipc::ListValue::Integer(1)});
+        item.fields.push_back(
+            {std::string(keys::kPlatformName), ipc::ListValue::Text("Game Boy Advance")});
+        item.fields.push_back({std::string(keys::kPlatformFsSlug), ipc::ListValue::Text("gba")});
+        item.fields.push_back(
+            {std::string(keys::kPlatformRomCount), ipc::ListValue::Integer(library_roms)});
+        item.fields.push_back({std::string(keys::kPlatformMapped), ipc::ListValue::Flag(true)});
+        ipc::AppendIfItFits(out, std::move(item));
+      }
+      offset = 1;
+      out->has_more = false;
+      return ipc::Error::kOk;
+    }
+    while (offset < library_roms &&
+           out->items.size() < static_cast<std::size_t>(ipc::kMaxPageSize)) {
+      const int id = offset + 1;
+      const std::string name =
+          "A rom whose name is long enough to be allocated, number " + std::to_string(id);
+      ipc::ListItem item;
+      item.fields.push_back({std::string(keys::kRomId), ipc::ListValue::Integer(id)});
+      item.fields.push_back({std::string(keys::kRomName), ipc::ListValue::Text(name)});
+      item.fields.push_back({std::string(keys::kRomFsName), ipc::ListValue::Text(name + ".gba")});
+      item.fields.push_back({std::string(keys::kRomPlatformFsSlug), ipc::ListValue::Text("gba")});
+      item.fields.push_back({std::string(keys::kRomSizeBytes), ipc::ListValue::Integer(1 << 20)});
+      item.fields.push_back({std::string(keys::kRomHasMultipleFiles), ipc::ListValue::Flag(false)});
+      item.fields.push_back({std::string(keys::kRomOnDisk), ipc::ListValue::Flag(false)});
+      item.fields.push_back({std::string(keys::kRomQueued), ipc::ListValue::Flag(false)});
+      if (!ipc::AppendIfItFits(out, std::move(item))) {
+        break;
+      }
+      ++offset;
+    }
+    out->has_more = offset < library_roms;
+    return ipc::Error::kOk;
   }
 
   ipc::Error ListConflicts(const ipc::ConflictQuery& query, ipc::ConflictPage* page) override {

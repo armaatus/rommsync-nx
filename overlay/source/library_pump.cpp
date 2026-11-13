@@ -100,6 +100,12 @@ void PumpLibrary(ScreenFrame& frame, IpcClient& client, LibraryBrowserModel& mod
   }
 }
 
+bool RenderLibrary(const LibraryBrowserModel& model, LibraryView* view, std::uint64_t* seen) {
+  *seen = model.revision();
+  *view = model.Render();
+  return true;
+}
+
 void CloseLibrary(ScreenFrame& frame, IpcClient& client, LibraryBrowserModel& model) {
   model.Close();
   // Retired first: this runs from `~LibraryScreen`, which libtesla may run
