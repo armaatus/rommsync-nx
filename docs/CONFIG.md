@@ -767,6 +767,17 @@ client at a different server discards it rather than sending your bearer token
 to a host that never issued it. Pair again from the overlay. Editing anything
 else leaves the pairing alone.
 
+**And the sync history goes with it.** `state.db`, the download queue and any
+unsent play time were written against the old server's rom ids, which mean
+nothing to a new one. The first sync against a different `url` — whether you
+changed it here or edited `config.ini` with the console off — sets each aside
+beside itself as `<file>.<old server>` (`state.db.http-192.168.1.5-8080`) and
+syncs as a first sync: every save is offered with no history, and every one the
+server would overwrite is backed up first. Nothing is deleted; pointing back at
+the old server starts its history afresh too, and the set-aside files are there
+for a person to look at. A save you kept on the card after deleting it in the
+old RomM (`on_server_delete = keep`) is offered to the new one.
+
 If the write itself cannot happen — no card, a full one — the answer says so and
 your settings are unchanged: the file is committed with the same two-rename
 write the token and device records use, so an interrupted one leaves your

@@ -1016,12 +1016,18 @@ class SdEngine : public ipc::Engine, public power::Sink {
                                       const conflicts::RecordOptions& record,
                                       sync::TickOutcome saves, bool* held);
 
+  /// `queue.json` and `play.db` held to `server` (`binding::BindRecords`):
+  /// another server's are set aside, and what this engine held of them
+  /// dropped. Nothing when `server` is the one they were last held to. From
+  /// `Load`, and then from the worker only: `play_` is the worker's.
+  void BindResidentRecords(const std::string& server);
+
   /// `.backup/` held to `[backup]` (#292), at the end of a tick that completed,
   /// once after boot and then after any tick that wrote a backup. Under
   /// `save_write_mutex_`, so a restore never reads a backup this removes.
   void PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
                     const sync::StateSyncReport& states, const SavesTally& tally,
-                    bool states_held);
+                    bool states_held, std::int64_t bound_since);
 
   /// The tick's outcome and counts, under `mutex_`, for `Snapshot` and the
   /// scheduler.
@@ -1230,6 +1236,17 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `queue.json` was readable, so writing it back loses nothing. False only
   /// after a read that failed on a file that is there -- see `queue_writable`.
   bool queue_trusted_ = true;
+
+  /// The server `queue.json` and `play.db` were last held to
+  /// (`BindResidentRecords`, #294) -- an identity, compared with
+  /// `config.ini`'s each pass of the worker so the card is read only when the
+  /// URL moved. Written by `Load`, before the worker exists, and then by the
+  /// worker alone.
+  std::string records_server_;
+
+  /// When the worker may try again after a binding the card would not settle.
+  /// The worker's alone, as `records_server_` is.
+  std::chrono::steady_clock::time_point records_retry_due_{};
 
   /// The configuration in force, behind a pointer.
   ///

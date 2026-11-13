@@ -177,7 +177,11 @@ class Pruner {
   void Offer(std::size_t at) {
     Backup& backup = backups_[at];
     const std::string& digest = DigestOf(at);
-    if (digest.empty() || !(InNewerCopy(at, digest) || OnServer(backup.parsed.rom_id, digest))) {
+    // A backup from before this server is another server's rom id (#294): the
+    // digests this one holds under it prove nothing about it.
+    const bool this_server = backup.parsed.unix_seconds >= options_.server_since;
+    if (digest.empty() ||
+        !(InNewerCopy(at, digest) || (this_server && OnServer(backup.parsed.rom_id, digest)))) {
       backup.kept = true;
       ++report_->kept_unique;
       return;

@@ -90,6 +90,10 @@ struct Rebound {
   /// caller drops what it holds of them in memory.
   bool rebound = false;
 
+  /// The marker names `identity` now. False when it could not be read or
+  /// written, or a record could not be set aside -- the next call tries again.
+  bool bound = false;
+
   /// One line per thing worth a log: what was set aside and where, and any
   /// file that could not be.
   std::vector<std::string> lines;
@@ -107,6 +111,8 @@ struct Rebound {
 ///     aside under that server's suffix (`Archive`), then writes the marker.
 ///     In that order, so a power cut between them is the same mismatch at the
 ///     next call, and a record already moved is simply not there to move again.
+///     A record that could not be set aside leaves the marker as it was, for
+///     the same reason: the next call tries again rather than read it.
 ///   - **A marker that is there and will not read** is a bad moment rather than
 ///     an answer: nothing is touched, and the next call asks again.
 ///

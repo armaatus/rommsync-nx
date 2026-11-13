@@ -3719,8 +3719,13 @@ int DrainRepointed(http::HttpClient& client, const std::string& base) {
 
   c.Expect(!console.sandbox.Exists("/tico/roms/gba/synthetic-large.gba"),
            "the rom did not arrive on credentials the console no longer holds");
-  c.Expect(console.Status().queue_depth > 0,
-           "and stays queued, for a console that pairs with the new server");
+  // Not kept for the new server since #294: its rom id is the old server's, and
+  // may name another game there. Set aside with the queue it was in.
+  c.ExpectEq(console.Status().queue_depth, std::int64_t{0},
+             "and the queue, the old server's rom ids, is not carried to the new one");
+  c.Expect(console.sandbox.Exists("/config/rommsync/queue.json." +
+                                  binding::ArchiveSuffix(binding::IdentityOf(base))),
+           "it is set aside under the old server's name");
   return c.failures();
 }
 
@@ -4899,6 +4904,11 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
   console.sandbox.Write(backup(300), held);
   console.sandbox.Write(backup(200), unique);
   console.sandbox.Write(backup(100), newest);
+  // Backups that old are an upgraded card's, whose rc2 `state.db` names no
+  // server and is adopted by this one from the epoch (#294). A card with no
+  // `state.db` at all names no server for its backups, and none of them would
+  // be this server's to prove.
+  console.sandbox.Write("/config/rommsync/state.db", "rommsync-state 3\n");
 
   auth::StoredToken token;
   token.server_url = base;
@@ -5039,125 +5049,6 @@ bool TickOnce(Console& console, const TickLines& ticks, rig::Checks& c, const st
            what + ": the tick ran clean -- " + ipc::ToString(status.last_sync_result) +
                Rendered(console.Log()));
   return ran;
-}
-
-/// M11-10 (#294)'s acceptance: a console moved to another server does not carry
-/// the old one's sync decisions there. Under `on_server_delete = keep`, a save
-/// RomM deleted stays on the card and is never offered back to *that* server --
-/// but the next server never saw it, and it is uploaded there.
-///
-/// "Another server" is the same RomM under another spelling of its address
-/// (`localhost` for `127.0.0.1`): a server is its URL (server_binding.hpp), and
-/// it is what makes the upload observable here. The switch is the one a user
-/// makes with the console off -- `config.ini` edited by hand, then a boot --
-/// because that is the path no command of this engine's ever sees.
-int ServerSwitched(http::HttpClient& client, const std::string& base) {
-  rig::Checks c;
-  harness::Fixture fixture;
-  if (!harness::LoadFixture(&fixture)) {
-    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
-    return 1;
-  }
-  const std::string::size_type loopback = base.find("127.0.0.1");
-  if (loopback == std::string::npos) {
-    c.Expect(false, "the rig is on 127.0.0.1, so localhost is another spelling of it: " + base);
-    return c.failures();
-  }
-  const std::string other = base.substr(0, loopback) + "localhost" + base.substr(loopback + 9);
-  harness::Rom rom;
-  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
-           "the fixture library has nova.nes");
-  if (rom.id == 0) {
-    return c.failures();
-  }
-  const OtherConsolesSaves others(c, client, base, fixture);
-  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-switched");
-  if (device_id.empty()) {
-    return c.failures();
-  }
-  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
-  const auto ours = [&]() {
-    std::vector<std::int64_t> uploaded;
-    for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
-      if (std::find(before.begin(), before.end(), id) == before.end()) {
-        uploaded.push_back(id);
-      }
-    }
-    return uploaded;
-  };
-  const auto configure = [&](Console& console, const std::string& url) {
-    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
-                                   "[server]\nurl = " + url +
-                                       "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
-                                       "on_boot = false\nstates = false\non_server_delete = keep\n"),
-             "the console points at " + url);
-    auth::StoredToken token;
-    token.server_url = url;
-    token.access_token = fixture.token;
-    token.device_id = device_id;
-    token.scopes = {"roms.read"};
-    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
-             "and is paired with it");
-  };
-
-  const std::string save = "/tico/saves/nes/nova.srm";
-  const std::string bytes = "a save RomM deleted and this console kept\n";
-  // Before the consoles, so each engine has stopped its worker before the card
-  // it was handed goes. The first stays up, idle -- `interval_min = 0` -- because
-  // its sandbox is the card both boots share.
-  std::unique_ptr<fs::FileSystem> card;
-  std::unique_ptr<fs::FileSystem> card_again;
-  Console first(c, "engine-switched");
-  configure(first, base);
-  first.sandbox.MakeDirs("/tico/saves/nes");
-  first.sandbox.SeedSave(save, bytes);
-  {
-    rlog::Reset();
-    const TickLines ticks;
-    card = rommsync::host::MakeNativeFileSystem(first.sandbox.root().string());
-    first.Boot();
-    first.engine.UseServer(&client, fixture.token);
-    first.engine.UseCard(card.get());
-    first.engine.StartWorker();
-
-    TickOnce(first, ticks, c, "the first server's first tick");
-    const std::vector<std::int64_t> uploaded = ours();
-    c.ExpectEq(uploaded.size(), std::size_t{1}, "the save is uploaded to the first server");
-    for (const std::int64_t id : uploaded) {
-      harness::DeleteSave(client, base, fixture, id);
-    }
-    TickOnce(first, ticks, c, "the tick that meets the deletion");
-    c.ExpectEq(first.sandbox.Read(save), bytes, "keep: the save stays on the card");
-    TickOnce(first, ticks, c, "the tick after");
-    c.Expect(ours().empty(), "and the first server is never offered it again");
-  }
-
-  // The console off, `config.ini` repointed by hand, and a boot.
-  Console second(c, "engine-switched-2", first.directory);
-  configure(second, other);
-  {
-    rlog::Reset();
-    const TickLines ticks;
-    card_again = rommsync::host::MakeNativeFileSystem(first.sandbox.root().string());
-    second.Boot();
-    second.engine.UseServer(&client, fixture.token);
-    second.engine.UseCard(card_again.get());
-    second.engine.StartWorker();
-
-    TickOnce(second, ticks, c, "the new server's first tick");
-    const std::vector<std::int64_t> uploaded = ours();
-    c.ExpectEq(uploaded.size(), std::size_t{1},
-               "the kept save is uploaded to the new server, which never deleted it" +
-                   Rendered(second.Log()));
-    c.Expect(first.sandbox.Exists("/config/rommsync/state.db." + binding::ArchiveSuffix(
-                                                                       binding::IdentityOf(base))),
-             "and the first server's state.db is set aside under its name, not deleted");
-    for (const std::int64_t id : uploaded) {
-      harness::DeleteSave(client, base, fixture, id);
-    }
-  }
-  harness::DeleteDevice(client, base, fixture, device_id);
-  return c.failures();
 }
 
 /// #236's interop acceptance, through the real engine: RetroArch's Cloud Sync
@@ -5446,9 +5337,11 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
              std::string(game.rom_file) + ": rc1's row is still in tico-srm, as rc1 left it");
   }
   const std::string state_db = console.sandbox.Read("/config/rommsync/state.db");
-  c.Expect(state_db.rfind("rommsync-state 3\n", 0) == 0 &&
+  // Version 4 since #294, bound from the epoch: rc1's rows are adopted by the
+  // server the console is configured for, not set aside.
+  c.Expect(state_db.rfind("rommsync-state 4 0 ", 0) == 0 &&
                state_db.find("\"tico-srm\"") == std::string::npos,
-           "state.db is version 3, with nothing left under the old slot:\n" + state_db);
+           "state.db is version 4, adopted, with nothing left under the old slot:\n" + state_db);
 
   // The second tick: nothing to send.
   TickOnce(console, ticks, c, "the second tick");
@@ -5957,6 +5850,167 @@ class Intercepting final : public http::HttpClient {
   Hook hook_;
   std::vector<std::pair<http::Method, std::string>> seen_;
 };
+
+/// M11-10 (#294)'s acceptance: a console moved to another server does not carry
+/// the old one's sync decisions there. Under `on_server_delete = keep`, a save
+/// RomM deleted stays on the card and is never offered back to *that* server --
+/// but the next server never saw it, and it is offered there.
+///
+/// "Another server" is the same RomM under another spelling of its address
+/// (`localhost` for `127.0.0.1`): a server is its URL (server_binding.hpp). That
+/// RomM remembers, per user, that the save was deleted, and answers the offer
+/// with the deletion again -- which a server that never held the save could
+/// not. So what is asserted is the client's half, which is the defect: the
+/// negotiate the new server is sent carries the save, where before #294 the
+/// old server's mark kept it out of every negotiate for good. The switch is
+/// the one a user makes with the console off -- `config.ini` edited by hand,
+/// then a boot -- because that is the path no command of this engine's ever
+/// sees.
+int ServerSwitched(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string::size_type loopback = base.find("127.0.0.1");
+  if (loopback == std::string::npos) {
+    c.Expect(false, "the rig is on 127.0.0.1, so localhost is another spelling of it: " + base);
+    return c.failures();
+  }
+  const std::string other = base.substr(0, loopback) + "localhost" + base.substr(loopback + 9);
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const OtherConsolesSaves others(c, client, base, fixture);
+  const std::string device_id = harness::CreateDevice(c, client, base, fixture, "engine-switched");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+  const auto ours = [&]() {
+    std::vector<std::int64_t> uploaded;
+    for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+      if (std::find(before.begin(), before.end(), id) == before.end()) {
+        uploaded.push_back(id);
+      }
+    }
+    return uploaded;
+  };
+  // The new server's pairing is a device of its own, as pairing with another
+  // RomM registers one. Kept on the first device, the shared RomM behind both
+  // spellings would answer from that device's own history -- it deleted the
+  // save -- which another server could not have.
+  const std::string new_device =
+      harness::CreateDevice(c, client, base, fixture, "engine-switched-new");
+  if (new_device.empty()) {
+    harness::DeleteDevice(client, base, fixture, device_id);
+    return c.failures();
+  }
+  const auto configure = [&](Console& console, const std::string& url, const std::string& device) {
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + url +
+                                       "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\nstates = false\non_server_delete = keep\n"),
+             "the console points at " + url);
+    auth::StoredToken token;
+    token.server_url = url;
+    token.access_token = fixture.token;
+    token.device_id = device;
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             "and is paired with it");
+  };
+
+  const std::string save = "/tico/saves/nes/nova.srm";
+  const std::string bytes = "a save RomM deleted and this console kept\n";
+  const std::string digest = crypto::Md5Hex(bytes);
+  // Every negotiate body, so "offered" is read off the wire.
+  std::mutex offered_mutex;
+  std::vector<std::string> negotiated;
+  Intercepting wire(client);
+  wire.Use([&](const http::Request& request) -> std::optional<http::Result> {
+    if (request.url.find("/api/sync/negotiate") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(offered_mutex);
+      negotiated.push_back(request.body);
+    }
+    return std::nullopt;
+  });
+  const auto offered = [&]() {
+    std::lock_guard<std::mutex> lock(offered_mutex);
+    std::size_t count = 0;
+    for (const std::string& body : negotiated) {
+      count += body.find(digest) != std::string::npos ? 1 : 0;
+    }
+    negotiated.clear();
+    return count;
+  };
+  // Before the consoles, so each engine has stopped its worker before the card
+  // it was handed goes. The first stays up, idle -- `interval_min = 0` -- because
+  // its sandbox is the card both boots share.
+  std::unique_ptr<fs::FileSystem> card;
+  std::unique_ptr<fs::FileSystem> card_again;
+  Console first(c, "engine-switched");
+  configure(first, base, device_id);
+  first.sandbox.MakeDirs("/tico/saves/nes");
+  first.sandbox.SeedSave(save, bytes);
+  {
+    rlog::Reset();
+    const TickLines ticks;
+    card = rommsync::host::MakeNativeFileSystem(first.sandbox.root().string());
+    first.Boot();
+    first.engine.UseServer(&wire, fixture.token);
+    first.engine.UseCard(card.get());
+    first.engine.StartWorker();
+
+    TickOnce(first, ticks, c, "the first server's first tick");
+    const std::vector<std::int64_t> uploaded = ours();
+    c.ExpectEq(uploaded.size(), std::size_t{1}, "the save is uploaded to the first server");
+    for (const std::int64_t id : uploaded) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+    TickOnce(first, ticks, c, "the tick that meets the deletion");
+    c.ExpectEq(first.sandbox.Read(save), bytes, "keep: the save stays on the card");
+    offered();
+    TickOnce(first, ticks, c, "the tick after");
+    c.ExpectEq(offered(), std::size_t{0}, "and the first server is never offered it again");
+    c.Expect(ours().empty(), "nor sent it");
+  }
+
+  // The console off, `config.ini` repointed by hand, and a boot.
+  Console second(c, "engine-switched-2", first.directory);
+  // Through the first console's sandbox: it is the card, and the second's own
+  // is only there for the teardown audit.
+  configure(first, other, new_device);
+  {
+    rlog::Reset();
+    const TickLines ticks;
+    card_again = rommsync::host::MakeNativeFileSystem(first.sandbox.root().string());
+    second.Boot();
+    second.engine.UseServer(&wire, fixture.token);
+    second.engine.UseCard(card_again.get());
+    second.engine.StartWorker();
+
+    TickOnce(second, ticks, c, "the new server's first tick");
+    c.ExpectEq(offered(), std::size_t{1},
+               "the kept save is offered to the new server, which never deleted it" +
+                   Rendered(second.Log()));
+    const std::vector<std::int64_t> uploaded = ours();
+    c.Expect(first.sandbox.Exists("/config/rommsync/state.db." + binding::ArchiveSuffix(
+                                                                       binding::IdentityOf(base))),
+             "and the first server's state.db is set aside under its name, not deleted");
+    for (const std::int64_t id : uploaded) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  }
+  harness::DeleteDevice(client, base, fixture, new_device);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 
 /// A status from "the server", with a body that is none of RomM's shapes.
 http::Result Answered(int status) {

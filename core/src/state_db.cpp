@@ -20,6 +20,7 @@
 #include "rommsync/json.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/newer_release.hpp"
+#include "rommsync/server_binding.hpp"
 #include "rommsync/sync.hpp"
 
 namespace rommsync::state {
@@ -379,6 +380,44 @@ std::string FormatHeader() {
   return std::string(kFormatMagic) + " " + std::to_string(kFormatVersion);
 }
 
+/// ...and `baseline`'s own: the server it is bound to, when it is bound to one
+/// (#294). Through `IdentityOf`, which is a no-op on an identity and makes
+/// anything else one token, so a `BindTo` by hand cannot split the line.
+std::string FormatHeader(const Baseline& baseline) {
+  if (baseline.server().empty()) {
+    return FormatHeader();
+  }
+  return FormatHeader() + " " + std::to_string(baseline.bound_since()) + " " +
+         binding::IdentityOf(baseline.server());
+}
+
+/// A version 4 header's binding, `<since> <server>`, read into `*since` and
+/// `*server`; empty `rest` is a file nobody bound. False for anything else,
+/// which makes the file one this build cannot vouch for.
+bool ParseBinding(std::string_view rest, std::int64_t* since, std::string* server) {
+  if (rest.empty()) {
+    return true;
+  }
+  const std::size_t space = rest.find(' ');
+  if (space == std::string_view::npos || space == 0 || space > 18) {
+    return false;
+  }
+  std::int64_t value = 0;
+  for (const char digit : rest.substr(0, space)) {
+    if (digit < '0' || digit > '9') {
+      return false;
+    }
+    value = value * 10 + (digit - '0');
+  }
+  const std::string_view name = rest.substr(space + 1);
+  if (name.empty() || name.find(' ') != std::string_view::npos) {
+    return false;
+  }
+  *since = value;
+  *server = std::string(name);
+  return true;
+}
+
 /// One line of `text`, `\r` trimmed so a file edited on a desktop still reads.
 std::string_view TrimCarriageReturn(std::string_view line) {
   while (!line.empty() && line.back() == '\r') {
@@ -458,10 +497,17 @@ class Parser {
       // The version before #236 is read too: its rows are this version's, keyed
       // on slots that moved, and they are the migration's input
       // (`legacy_saves`).
-      version_ = line == FormatHeader() ? kFormatVersion
-                 : line == std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion)
-                     ? kSourceSlotVersion
-                     : 0;
+      // And rc2's, which is this version's rows with no server named (#294).
+      const std::string current = FormatHeader();
+      if (line == current || line.starts_with(current + " ")) {
+        const std::string_view rest =
+            line.size() > current.size() ? line.substr(current.size() + 1) : std::string_view();
+        version_ = ParseBinding(rest, &since_, &server_) ? kFormatVersion : 0;
+      } else if (line == std::string(kFormatMagic) + " " + std::to_string(kUnboundVersion)) {
+        version_ = kUnboundVersion;
+      } else if (line == std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion)) {
+        version_ = kSourceSlotVersion;
+      }
       newer_ = records::NewerVersion(line, kFormatMagic, kFormatVersion);
       return;
     }
@@ -539,6 +585,7 @@ class Parser {
           " row(s) were let go, slotted saves before states and the last in (rom_id, slot) "
           "order first -- those are hashed again");
     }
+    baseline_.BindTo(std::move(server_), since_);
     loaded.value = std::move(baseline_);
     loaded.legacy_saves = std::move(legacy_);
     loaded.version = version_;
@@ -656,6 +703,8 @@ class Parser {
   std::size_t dropped_ = 0;
   int version_ = 0;
   int newer_ = 0;
+  std::int64_t since_ = 0;
+  std::string server_;
   bool over_ = false;
   Baseline baseline_;
   std::vector<SaveRecord> legacy_;  ///< sorted by key
@@ -791,7 +840,7 @@ const char* ToString(HashError error) {
 }
 
 std::string SerializeBaseline(const Baseline& baseline) {
-  std::string out = FormatHeader();
+  std::string out = FormatHeader(baseline);
   out += "\n";
   for (const auto& [key, record] : baseline.rows()) {
     (void)key;
@@ -818,7 +867,7 @@ std::size_t SerializedSize(const StateRecord& record) {
 }
 
 std::size_t SerializedSize(const Baseline& baseline) {
-  std::size_t bytes = FormatHeader().size() + 1;
+  std::size_t bytes = FormatHeader(baseline).size() + 1;
   for (const auto& [key, record] : baseline.rows()) {
     (void)key;
     bytes += SerializedSize(record);
@@ -875,8 +924,37 @@ std::size_t AdoptLegacySaves(
   return adopted;
 }
 
-std::string BindToServer(LoadedBaseline*, const std::string&, std::string_view, std::int64_t) {
-  return {};
+std::string BindToServer(LoadedBaseline* loaded, const std::string& path, std::string_view server,
+                         std::int64_t now_unix) {
+  if (server.empty() || loaded->value.server() == server) {
+    return {};
+  }
+  if (loaded->value.server().empty()) {
+    // rc2's version 3, rc1's version 2, or a version 4 nobody bound: every row
+    // this console has, adopted by the only server the card can name -- from
+    // the epoch, so the backups taken beside them stay the server's to prove.
+    // No rows at all names no server for any backup, so that binds from now.
+    const bool adopted = loaded->version == kUnboundVersion ||
+                         loaded->version == kSourceSlotVersion ||
+                         (loaded->version == kFormatVersion &&
+                          !(loaded->value.empty() && loaded->legacy_saves.empty()));
+    loaded->value.BindTo(std::string(server), adopted ? 0 : now_unix);
+    return {};
+  }
+  // Another server's rows. Set aside rather than removed -- they are that
+  // server's history, and the player may go back to it -- and never read here.
+  const std::string old = loaded->value.server();
+  const binding::Archived archived = binding::Archive(path, old);
+  loaded->value = Baseline{};
+  loaded->legacy_saves.clear();
+  loaded->value.BindTo(std::string(server), now_unix);
+  const std::string why = "state.db was synced against " + old + ", not " + std::string(server);
+  if (!archived.ok()) {
+    return why + ", so its rows are not read; " + archived.message +
+           ", and the next baseline written replaces it";
+  }
+  return why + ", so it is set aside as " + archived.to +
+         " and this server is synced as a first sync: every save negotiated with no history";
 }
 
 LoadedBaseline LoadBaseline(const std::string& path) {
@@ -953,6 +1031,7 @@ StoreResult SaveBaseline(const std::string& path, const Baseline& baseline) {
   // why this is a skip and not a refusal -- an unset RTC stamping one save with
   // the epoch must not cost the whole library its baseline forever.
   Baseline writable;
+  writable.BindTo(baseline.server(), baseline.bound_since());
   for (const auto& [key, record] : baseline.rows()) {
     (void)key;
     std::string why;

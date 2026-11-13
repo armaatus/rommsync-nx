@@ -31,6 +31,7 @@
 #include "rommsync/rom_scope.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
+#include "rommsync/server_binding.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_finish.hpp"
@@ -457,6 +458,13 @@ void SdEngine::Load(const std::string& config_dir) {
               "the folder map yields no save directories; no save will be synced");
   }
   AdoptConfigLocked(std::move(loaded));
+  // The queue and the play sessions were read above, before the configuration
+  // that says which server they are for; a card repointed by hand while the
+  // console was off has them for another (#294). Here and not in
+  // `AdoptConfigLocked`, which `SetConfig` also runs, on the IPC thread: a
+  // change made there is the worker's to apply (`RunWorker`), because `play_`
+  // is the worker's alone.
+  BindResidentRecords(binding::IdentityOf(ConfigSnapshot()->server.url));
 }
 
 void SdEngine::UsePairingBackend(PairingBackend backend) {
@@ -493,6 +501,30 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
   diagnostics_.reserve(diagnostics_.size() + loaded.diagnostics.size());
   for (config::Diagnostic& diagnostic : loaded.diagnostics) {
     diagnostics_.push_back(std::move(diagnostic));
+  }
+}
+
+void SdEngine::BindResidentRecords(const std::string& server) {
+  if (server.empty() || server == records_server_) {
+    return;
+  }
+  const binding::Rebound rebound = binding::BindRecords(
+      PathTo(binding::kMarkerFileName),
+      {PathTo(download::kQueueFileName), PathTo(play::kBufferFileName)}, server);
+  log::WriteEach(log::Level::kWarn, log::Event::kServerVersion, rebound.lines);
+  if (rebound.rebound) {
+    // What was held of them is the old server's too. Emptied, not re-read: the
+    // files are set aside, and an empty queue and buffer are what a first boot
+    // has. The next change to either writes it under this server.
+    // `queue_trusted_` is left as it is: the IPC thread reads it unlocked, and
+    // a queue that would not read at boot stays unwritable until the next one,
+    // which finds no file there and trusts it.
+    queue_.Reset({});
+    queue_.set_queue_message(std::string());
+    play_ = play::Buffer(PathTo(play::kBufferFileName));
+  }
+  if (rebound.bound) {
+    records_server_ = server;
   }
 }
 
@@ -1036,6 +1068,25 @@ void SdEngine::RunWorker() {
       continue;
     }
 
+    // The queue and the play sessions, held to the server `config.ini` names
+    // now (#294): a `server.url` change is applied on the IPC thread, and the
+    // play buffer is this thread's alone. Ahead of everything below, because a
+    // drain or a tick is what would read them against the new server. The
+    // URL is compared in memory, so a pass with nothing changed reads nothing.
+    if (const std::string server = binding::IdentityOf(ConfigSnapshot()->server.url);
+        !server.empty() && server != records_server_ && clock_->Steady() >= records_retry_due_) {
+      lock.unlock();
+      BindResidentRecords(server);
+      lock.lock();
+      if (server != records_server_) {
+        // The card would not settle it -- a marker it would not read or write,
+        // a record it would not move. Asked again a minute on, on whichever
+        // pass comes then, rather than on every pass of this loop.
+        records_retry_due_ = clock_->Steady() + std::chrono::minutes{1};
+      }
+      continue;
+    }
+
     // A restore first: somebody pressed A on the conflicts screen and is
     // watching it say "Restoring", and it is one copy on the card rather than a
     // tick's worth of network (#209). Here rather than beside the list pump,
@@ -1552,8 +1603,24 @@ namespace {
 ///
 /// Both of a tick's reads go through this: the states half re-reads the file
 /// the saves half wrote, which on a tick that wrote none is still version 2.
+///
+/// **Held to the configured server first** (#294): rows synced against another
+/// RomM are set aside, never read -- a rom id names a game only on the server
+/// that issued it, and a `deleted_on_server` mark from the old one would keep a
+/// save off the new one forever. Every tick, rather than only when the URL
+/// changes, because the change is as often a hand edit with the console off,
+/// and because a tick still running against the old server when the overlay
+/// moves it writes its rows bound to that server: the next one sets them aside.
 state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config) {
   state::LoadedBaseline loaded = state::LoadBaseline(path);
+  const std::string rebound = state::BindToServer(
+      &loaded, path, binding::IdentityOf(config.server.url),
+      static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count()));
+  if (!rebound.empty()) {
+    log::Warn(log::Event::kServerVersion, rebound);
+  }
   state::AdoptLegacySaves(&loaded,
                           [&config](std::string_view old_slot) -> std::optional<std::string> {
                             return scan::MigratedSlot(config.sync.slot, old_slot);
@@ -1984,6 +2051,9 @@ struct SdEngine::TickScan {
   // `play::Reconcile` matches the answer to this list by index, so the two
   // must be the same list.
   std::vector<play::BufferedSession> play_sent;
+  // When this console began syncing with this server (#294), for the prune:
+  // `loaded` is moved into the saves half, and this is all the prune needs of it.
+  std::int64_t bound_since = 0;
 };
 
 /// What the saves half's plans did, counted plan by plan (`TallyPlan`).
@@ -2135,7 +2205,7 @@ SdEngine::TickRun SdEngine::RunOneTick() {
   bool states_held = false;
   const sync::StateSyncReport states =
       RunStatesHalf(inputs, library, found, &placer, record, tick.outcome, &states_held);
-  PruneBackups(inputs, tick, states, tally, states_held);
+  PruneBackups(inputs, tick, states, tally, states_held, found.bound_since);
   writing.unlock();
   // The states half's requests went out on the same token, so what they were
   // answered counts towards the one verdict, as the saves half's did.
@@ -2160,7 +2230,7 @@ SdEngine::TickRun SdEngine::RunOneTick() {
 
 void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
                             const sync::StateSyncReport& states, const SavesTally& tally,
-                            bool states_held) {
+                            bool states_held, std::int64_t bound_since) {
   // Only at the end of a tick that did everything it set out to: a backup an
   // operation that failed half way wrote is the one most likely to be wanted,
   // and the retention rule is not the place to second-guess that tick.
@@ -2189,6 +2259,9 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   options.server_digests = [client, token, policy](std::int64_t rom_id) {
     return backup::ListServerSaveDigests(*client, *token, rom_id, policy);
   };
+  // A backup from before this console synced with this server names another
+  // server's rom id, so this one's digests are not its proof (#294).
+  options.server_since = bound_since;
   const backup::PruneReport report = backup::Prune(*inputs.files, options);
   // A prune that could not read or remove something is asked again next tick,
   // rather than waiting for the next backup to be written.
@@ -2438,6 +2511,7 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   TickScan found;
   found.baseline_path = files.Resolve(sync::kStateSdPath);
   found.loaded = LoadBaselineFor(found.baseline_path, config);
+  found.bound_since = found.loaded.value.bound_since();
   {
     std::lock_guard<std::mutex> lock(mutex_);
     found.fresh = fresh_roms_;

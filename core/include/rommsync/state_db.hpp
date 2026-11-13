@@ -78,6 +78,19 @@
 // row let go costs its save one re-hash, and is said; a row repeating one let
 // go is a second row, and discards the file as any second row does.
 //
+// ## Version 4: the server (#294)
+//
+// A rom id means something only on the RomM that issued it, so the rows are
+// held to that server: the header names it, `rommsync-state 4 <bound since>
+// <server>` (`binding::IdentityOf`), and `BindToServer` sets aside a file that
+// names another rather than read its rows -- a `deleted_on_server` mark from
+// the old server would otherwise keep a save from ever reaching the new one.
+// rc2's version 3 is the same rows with no server named; it is read, and
+// adopted by the server the console is configured for. A bare
+// `rommsync-state 4` is a baseline nobody bound -- one a test or a tool built
+// -- and is read as rc2's is. rc2 itself reads version 4 as a newer release's
+// file and rebuilds its baseline from the card, which is #255's rule.
+//
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two
 // ways -- which the string can: this client writes `Z` and RomM writes `+00:00`
@@ -111,7 +124,7 @@ inline constexpr const char* kStateFileName = "state.db";
 /// The first line of a well-formed file, `<magic> <version>`, and since #294
 /// `<magic> <version> <bound since> <server>` -- see "Version 4" above.
 inline constexpr const char* kFormatMagic = "rommsync-state";
-inline constexpr int kFormatVersion = 3;
+inline constexpr int kFormatVersion = 4;
 
 /// The version before #294 bound the file to a server: rc2's, the same rows
 /// with no server in the header. Read, and adopted as the configured server's
