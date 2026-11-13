@@ -1931,11 +1931,21 @@ foreach(scenario
         pins        # every file naming the image names the pin; :latest only in the canary
         submodule   # the libultrahand gitlink is the tag .gitmodules records
         floor       # the libnx comparison orders 4.9 below 4.10
-        check)      # ...and the check CI runs says why it refused, against a stub pacman
+        check       # ...and the check CI runs says why it refused, against a stub pacman
+        upstream_check) # the behind-upstream check, against a scratch repo (#297)
   add_test(NAME toolchain.${scenario}
            COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" ${scenario})
   set_tests_properties(toolchain.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# Is the libultrahand pin behind upstream's newest tag? Asked of GitHub, so it
+# warns and never fails: upstream tagging a release is news, not a break, and
+# moving the pin is a reviewed change of its own (#297). Offline it skips. Not
+# in the `toolchain` label: that suite fails on a skip, and this entry needs a
+# network rather than the image.
+add_test(NAME toolchain.upstream
+         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" upstream)
+set_tests_properties(toolchain.upstream PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
 # The pinned image's libnx is >= 4.10.0 -- asked of the image, not assumed.
 # Its SKIP_RETURN_CODE is unwrapped for switch.builds' reason, given at length
