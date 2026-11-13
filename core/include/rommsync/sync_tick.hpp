@@ -30,7 +30,8 @@
 //     and it is the one leftover that must not be deleted: when `<save>` is
 //     missing it is the only copy. It is renamed back. When `<save>` *is* there
 //     the commit finished -- only the tidy-up did not -- and the previous bytes
-//     are already under `.backup/`, so it goes.
+//     are already under `.backup/`, but it is left alone all the same: a
+//     `Game.srm.old` made by hand has the same shape (`previous_left`).
 //
 //   - **Nothing under `.backup/` is ever a leftover.** A backup is never
 //     garbage: it is the copy M7-1 restores from, including the one written for
@@ -52,6 +53,7 @@
 
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/clock_check.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/server_capabilities.hpp"
@@ -99,7 +101,8 @@ struct RecoveryReport {
   /// the same shape -- and deleting it would be this code destroying something
   /// it did not write. The cost of keeping it is one stale file, and a rare one:
   /// `io::CommitStaged` removes its own on success, so reaching here means even
-  /// that failed.
+  /// that failed -- and the next commit sets it aside as `<save>.old.<n>`
+  /// rather than removing it either (#293).
   std::size_t previous_left = 0;
 
   /// Leftovers the card would not let go of, and directories that would not
@@ -386,6 +389,17 @@ struct TickOptions {
   /// A `cancel` set on one of the three option blocks instead is overwritten by
   /// this one; setting it here is how a caller says it.
   const http::CancelToken* cancel = nullptr;
+
+  /// The console's own clock -- what a save's mtime was stamped from -- read
+  /// once per plan for `CheckClock` (#295). Null is `system_clock::now`, which
+  /// is that clock on the console; a test puts the console anywhere with it.
+  /// Not `execute.now`, which only names backups and which tests pin to 2025.
+  std::function<Timestamp()> console_clock;
+
+  /// The network system clock, when the console has one synchronised. Null,
+  /// or an empty answer, is no such reference -- the host's, and a console
+  /// that has never reached Nintendo's time service.
+  std::function<std::optional<Timestamp>()> network_clock;
 };
 
 /// Everything one tick did, stage by stage.
@@ -469,6 +483,11 @@ struct TickResult {
   /// and the baseline is on the card, so the answer is the next tick's own
   /// negotiation and not this one's second attempt.
   bool session_gone = false;
+
+  /// What `CheckClock` made of the console's clock (#295): an untrusted check
+  /// from any plan, or the last plan's. Empty when no negotiation answered, so
+  /// there was no `Date` header to read -- and no upload to hold.
+  std::optional<ClockCheck> clock;
 
   /// True only for `kCompleted`. A caller that wants "the save data is safe"
   /// wants `finished.stored.ok()`.

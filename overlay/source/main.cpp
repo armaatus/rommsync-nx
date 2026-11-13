@@ -43,7 +43,28 @@ namespace {
 /// in the shape `Lifecycle::Foreground` takes.
 void RequestForeground(bool enabled) { tsl::hlp::requestForeground(enabled); }
 
-class RommsyncOverlay : public tsl::Overlay {
+/// The session and its lifecycle, as a base of `RommsyncOverlay` rather than
+/// members of it (M11-1, #285).
+///
+/// `tsl::Overlay` keeps its gui stack as a private member of its own, and
+/// nothing in the pinned `tsl::loop` empties it before `delete overlay` -- so
+/// the screens open when the overlay exits are destroyed by `~Overlay`. As
+/// members of the derived class these were destroyed *before* that, and
+/// `~LibraryScreen` ran against a client that no longer existed. As a base
+/// declared ahead of `tsl::Overlay` they are constructed first and destroyed
+/// last, which is the one order C++ will guarantee here: the stack is private
+/// and `tsl::pop` on an empty one is undefined, so it cannot be emptied from
+/// `exitServices` instead. A screen destroyed after `Stop` still finds a
+/// stopped client, and `ScreenFrame::Retire` is what keeps it from reopening
+/// one.
+struct OverlayServices {
+  rommsync::overlay::IpcClient client_;
+  /// After `client_`, so it is destroyed first and its `Stop` finds the client
+  /// still there.
+  rommsync::overlay::Lifecycle lifecycle_{client_, &RequestForeground};
+};
+
+class RommsyncOverlay : private OverlayServices, public tsl::Overlay {
  public:
   std::unique_ptr<tsl::Gui> loadInitialGui() override {
     return initially<rommsync::overlay::StatusScreen>(client_);
@@ -61,12 +82,6 @@ class RommsyncOverlay : public tsl::Overlay {
   /// runs the same `Stop`, for a library that ever deleted the overlay without
   /// calling this.
   void exitServices() override { lifecycle_.Stop(); }
-
- private:
-  rommsync::overlay::IpcClient client_;
-  /// After `client_`, so it is destroyed first and its `Stop` finds the client
-  /// still there.
-  rommsync::overlay::Lifecycle lifecycle_{client_, &RequestForeground};
 };
 
 }  // namespace

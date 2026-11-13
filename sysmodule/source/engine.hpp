@@ -406,6 +406,19 @@ class SdEngine : public ipc::Engine, public power::Sink {
   void UseForegroundProbe(ForegroundProbe probe,
                           std::chrono::milliseconds poll = kForegroundPollInterval);
 
+  /// The network system clock -- Horizon's `time:s`, which nifm keeps in step
+  /// with Nintendo's time service -- or empty when the console has none
+  /// synchronised (M11-11, #295).
+  ///
+  /// One of the two references a tick holds the console's own clock to
+  /// (`sync::CheckClock`): a clock a day or more off it does not upload a save
+  /// the server chose by timestamp. Injected for `NetworkProbe`'s reason --
+  /// `time` is libnx and this file names no libnx type. Null is no reference,
+  /// which leaves the server's `Date` header and the floor; what a host build
+  /// has. Called on the worker, never under `mutex_`.
+  using NetworkClock = std::function<std::optional<std::chrono::system_clock::time_point>()>;
+  void UseNetworkClock(NetworkClock clock);
+
   /// The probe's answer, now, noted as a sighting when it names an application.
   /// `ipc::ServiceCore::SyncNow` reads it to say a press is held rather than
   /// started (`ipc::SyncOutcome::kDeferred`).
@@ -707,6 +720,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// sleep at all (sys-con#155). `try_lock_for` is both halves of that -- the
   /// wait, and the end of it.
   mutable std::timed_mutex save_write_mutex_;
+
+  /// A prune has run since boot (#292). Touched only by the sync worker, under
+  /// `save_write_mutex_`.
+  bool backups_pruned_ = false;
 
   /// The conflict history, for the tick that writes it.
   ///
@@ -1012,10 +1029,32 @@ class SdEngine : public ipc::Engine, public power::Sink {
                                       const conflicts::RecordOptions& record,
                                       sync::TickOutcome saves, bool* held);
 
+  /// `queue.json` and `play.db` held to `server` (`binding::BindRecords`):
+  /// another server's are set aside, and what this engine held of them
+  /// dropped. Nothing when `server` is the one they were last held to. From
+  /// `Load`, and then from the worker only: `play_` is the worker's.
+  void BindResidentRecords(const std::string& server);
+
+  /// `.backup/` held to `[backup]` (#292), at the end of a tick that completed,
+  /// once after boot and then after any tick that wrote a backup. Under
+  /// `save_write_mutex_`, so a restore never reads a backup this removes.
+  void PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
+                    const sync::StateSyncReport& states, const SavesTally& tally,
+                    bool states_held, std::int64_t bound_since);
+
   /// The tick's outcome and counts, under `mutex_`, for `Snapshot` and the
   /// scheduler.
   void RecordTick(const sync::TickResult& tick, const sync::StateSyncReport& states,
                   const SavesTally& tally, bool scan_cut, bool states_held);
+
+  /// What a tick made of the console's clock (#295), for `Snapshot`, and a
+  /// `clock.skew` line when the finding changed. A tick no negotiation answered
+  /// found nothing and changes nothing.
+  void NoteClock(const sync::TickResult& tick);
+
+  /// The console's clock against the network clock and the floor, with no
+  /// server to ask: what a TLS failure is judged by (`sync::TlsClockFault`).
+  sync::ClockCheck LocalClock() const;
 
   /// Run `write` under `mutex_` -- **unless the server changed** since
   /// `generation` was read: `ForgetServerLocked` or a wake that asks again
@@ -1219,6 +1258,17 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `queue.json` was readable, so writing it back loses nothing. False only
   /// after a read that failed on a file that is there -- see `queue_writable`.
   bool queue_trusted_ = true;
+
+  /// The server `queue.json` and `play.db` were last held to
+  /// (`BindResidentRecords`, #294) -- an identity, compared with
+  /// `config.ini`'s each pass of the worker so the card is read only when the
+  /// URL moved. Written by `Load`, before the worker exists, and then by the
+  /// worker alone.
+  std::string records_server_;
+
+  /// When the worker may try again after a binding the card would not settle.
+  /// The worker's alone, as `records_server_` is.
+  std::chrono::steady_clock::time_point records_retry_due_{};
 
   /// The configuration in force, behind a pointer.
   ///
@@ -1454,6 +1504,19 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// held choice waits for one that does; a console always starts it.
   std::vector<state::Baseline::Key> keep_local_held_;
 
+  /// Bumped by every `server.url` change (`ForgetServerLocked`), which drops
+  /// both lists above (#317). A Keep local that read it before its copy and
+  /// finds it moved after arms nothing: the choice was the old server's.
+  /// Guarded by `mutex_`.
+  std::uint64_t server_switches_ = 0;
+
+  /// `binding::TagOf` the server `config.ini` names: what a conflict entry's
+  /// `server` is compared with before Keep local (#317). Set with the bump
+  /// above, in the same slice, so a Keep local reading both never pairs the
+  /// new count with the old server; and again whenever a configuration is
+  /// adopted. Guarded by `mutex_`.
+  std::uint64_t server_tag_ = 0;
+
   /// The held key `LandHeldKeepLocal` is writing now, taken out of
   /// `keep_local_held_` under `mutex_` before the card is touched (#279).
   /// That claim is what a cancel is decided against: before it, the key is
@@ -1558,6 +1621,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `mutex_`, and the probe is copied out and called outside it.
   ForegroundProbe foreground_probe_;
   std::chrono::milliseconds foreground_poll_ = kForegroundPollInterval;
+
+  /// `UseNetworkClock`'s. Guarded by `mutex_`, copied out and called outside it.
+  NetworkClock network_clock_;
+
+  /// What the last tick that negotiated made of the console's clock (#295):
+  /// `Status::clock_trusted` and `clock_skew_seconds`. Guarded by `mutex_`.
+  sync::ClockCheck clock_check_;
 
   /// What the probe named since the play window last moved (#261). Guarded by
   /// `mutex_`; `mutable` because `application_running` is the one place that

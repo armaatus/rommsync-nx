@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -280,6 +281,7 @@ void LibraryBrowserModel::Reset() {
   enqueue_wanted_ = 0;
   issued_ = Command::Kind::kNone;
   closed_ = false;
+  ++revision_;
 
   Level platforms;
   platforms.kind = LibraryLevel::kPlatforms;
@@ -289,12 +291,92 @@ void LibraryBrowserModel::Reset() {
 }
 
 bool LibraryBrowserModel::HasMoreRow(const Level& level) {
-  return level.has_more || level.loading || level.page_error != ipc::Error::kOk ||
-         level.truncated;
+  // A failure while rewinding is drawn above the window, where the selection
+  // is, rather than here.
+  return !level.at_end || (level.page_error != ipc::Error::kOk && !Rewinding(level));
 }
 
 int LibraryBrowserModel::LastRowIndex(const Level& level) {
-  return level.rows.empty() ? 0 : static_cast<int>(level.rows.size()) - 1;
+  return level.rows.empty() ? level.first : Tail(level) - 1;
+}
+
+int LibraryBrowserModel::Tail(const Level& level) {
+  return level.first + static_cast<int>(level.rows.size());
+}
+
+int LibraryBrowserModel::LastPlace(const Level& level) {
+  return Tail(level) - 1 + (HasMoreRow(level) ? 1 : 0);
+}
+
+bool LibraryBrowserModel::Rewinding(const Level& level) {
+  return level.first > 0 && (level.cursor == 0 || level.consumed < level.first);
+}
+
+void LibraryBrowserModel::PutAbove(Level& level) {
+  if (level.above.empty()) {
+    return;
+  }
+  // The selection may have gone well down the window while the rows above it
+  // were read. Putting them in now would cut the window from the bottom, under
+  // the selection, so they are dropped instead -- it has scrolled away from
+  // them, and the next rewind reads them again if it comes back.
+  if (level.selected < level.rewind_from + kMaxLoadedRows - 2 * kPrefetchRows) {
+    level.rows.insert(level.rows.begin(), std::make_move_iterator(level.above.begin()),
+                      std::make_move_iterator(level.above.end()));
+    level.first = level.rewind_from;
+    if (level.rows.size() > static_cast<std::size_t>(kMaxLoadedRows)) {
+      // Cut from the far end. The cursor is at the old `first`, which is above
+      // the new end, so the rows cut are read again on the way down rather than
+      // skipped.
+      level.rows.resize(static_cast<std::size_t>(kMaxLoadedRows));
+      level.at_end = false;
+    }
+  }
+  // Swapped out rather than cleared: a cleared vector keeps its capacity, and
+  // half a window of it held for nothing is the heap #298 is about.
+  std::vector<LibraryRow>().swap(level.above);
+}
+
+void LibraryBrowserModel::EndOfList(Level& level) {
+  if (level.consumed < level.first) {
+    // The list ended above the window: it shrank under a rewind, which a cursor
+    // is allowed to see (`list_service.hpp`). What was gathered is the list's
+    // end now.
+    level.first = level.consumed - static_cast<int>(level.above.size());
+    level.rows = std::move(level.above);
+    std::vector<LibraryRow>().swap(level.above);
+  } else if (level.consumed < Tail(level)) {
+    level.rows.resize(static_cast<std::size_t>(level.consumed - level.first));
+  }
+  level.at_end = true;
+  if (level.rows.empty() && level.first > 0) {
+    // Nothing of the window is left, and the list's last rows are above where
+    // it was. Read it again from the top rather than draw an empty window in
+    // the middle of a list.
+    if (level.cursor != 0) {
+      closing_.push_back(level.cursor);
+    }
+    level.cursor = 0;
+    level.first = 0;
+    level.selected = 0;
+    level.consumed = 0;
+    level.has_more = true;
+    level.at_end = false;
+  }
+}
+
+void LibraryBrowserModel::DropAbove(Level& level) {
+  if (level.rows.size() <= static_cast<std::size_t>(kMaxLoadedRows)) {
+    return;
+  }
+  const std::size_t drop = level.rows.size() - static_cast<std::size_t>(kMaxLoadedRows);
+  level.rows.erase(level.rows.begin(), level.rows.begin() + static_cast<std::ptrdiff_t>(drop));
+  level.first += static_cast<int>(drop);
+}
+
+void LibraryBrowserModel::ClampSelection(Level& level) {
+  const int highest = LastPlace(level);
+  level.selected = std::clamp(level.selected, level.first, std::max(level.first, highest));
 }
 
 LibraryBrowserModel::Level& LibraryBrowserModel::top() { return stack_.back(); }
@@ -311,6 +393,18 @@ std::size_t LibraryBrowserModel::open_cursors() const {
 }
 
 LibraryBrowserModel::Command LibraryBrowserModel::Next() {
+  const bool was_loading = top().loading;
+  const Command command = NextCommand();
+  // A command handed out is a change -- a level opening, a page asked for --
+  // and so is a level that stopped loading. A frame that asks for nothing and
+  // changes nothing is not, which is what lets a still screen render nothing.
+  if (command.kind != Command::Kind::kNone || top().loading != was_loading) {
+    ++revision_;
+  }
+  return command;
+}
+
+LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
   Command command;
   if (link_ != Link::kOk) {
     // Nothing to send and nothing to close: the session those cursors belonged
@@ -367,10 +461,28 @@ LibraryBrowserModel::Command LibraryBrowserModel::Next() {
     return command;
   }
 
-  const bool near_the_end =
-      level.rows.empty() ||
-      level.selected + kPrefetchRows >= static_cast<int>(level.rows.size());
-  if (level.has_more && level.page_error == ipc::Error::kOk && near_the_end) {
+  if (level.first > 0 && level.page_error == ipc::Error::kOk && level.consumed >= level.first &&
+      level.selected - level.first < kPrefetchRows) {
+    // The selection is coming up to rows that were dropped (#298). A cursor
+    // only goes forward, so this one is ended and the list read again from the
+    // top, gathering `kRewindRows` above the window on the way. Ended first:
+    // #31 caps how many may be open.
+    closing_.push_back(level.cursor);
+    level.cursor = 0;
+    level.consumed = 0;
+    level.has_more = true;
+    level.rewind_from = std::max(0, level.first - kRewindRows);
+    level.above.clear();
+    return NextCommand();
+  }
+
+  // Behind the window, the cursor reads on whatever the selection does: the
+  // rows it is catching up to are already drawn, and it has to pass them to
+  // reach the ones that are not.
+  const bool behind = level.consumed < level.first;
+  const bool near_the_end = level.selected + kPrefetchRows >= Tail(level);
+  if (level.has_more && level.page_error == ipc::Error::kOk &&
+      (behind || (near_the_end && !level.at_end))) {
     command.kind = Command::Kind::kListNext;
     command.cursor = level.cursor;
     level.loading = true;
@@ -399,10 +511,11 @@ void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
   level.page_error = ipc::Error::kOk;
   level.empty_pages = 0;
   // A fresh cursor starts at the beginning of the list, so whatever is on
-  // screen is about to be said again. `replace_rows` is what stops the second
-  // telling from being appended to the first.
-  level.replace_rows = !level.rows.empty();
+  // screen is about to be said again. Counting from zero is what routes the
+  // second telling onto the rows it repeats rather than after them (`Level`).
+  level.consumed = 0;
   level.has_more = true;
+  ++revision_;
 }
 
 void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
@@ -412,6 +525,7 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
   issued_ = Command::Kind::kNone;
   Level& level = top();
   level.page_error = ipc::Error::kOk;
+  ++revision_;
 
   if (page.pending) {
     // The engine is still fetching it and the IPC thread did not wait (#31).
@@ -430,15 +544,7 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
   // at `0`, which is the sentinel's index *and* the first row's; reading that
   // as "resting on the sentinel" would push the selection past the whole first
   // page of every list the browser opens.
-  const bool was_on_more =
-      !level.rows.empty() && level.selected >= static_cast<int>(level.rows.size());
-
-  if (level.replace_rows) {
-    level.rows.clear();
-    level.unreadable_items = 0;
-    level.truncated = false;
-    level.replace_rows = false;
-  }
+  const bool was_on_more = !level.rows.empty() && level.selected >= Tail(level);
 
   for (const ipc::ListItem& item : page.items) {
     LibraryRow row;
@@ -465,10 +571,30 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
       // whole page -- and a queue screen saying "nothing in the download queue"
       // while a download is running is the worst possible way to report a
       // contract mismatch.
-      ++level.unreadable_items;
+      //
+      // Only at the window's end: an item read again on a rewind was counted
+      // the first time it went past.
+      if (level.consumed == Tail(level)) {
+        ++level.unreadable_items;
+      }
       continue;
     }
-    level.rows.push_back(std::move(row));
+    // Routed by its place in the list (`Level`).
+    const int place = level.consumed++;
+    if (place < level.first) {
+      if (place >= level.rewind_from) {
+        level.above.push_back(std::move(row));
+      }
+      if (level.consumed == level.first) {
+        PutAbove(level);
+      }
+    } else if (place < Tail(level)) {
+      // A fresher copy of a row already drawn: a reclaimed cursor re-read, or a
+      // rewind passing through the window on its way down.
+      level.rows[static_cast<std::size_t>(place - level.first)] = std::move(row);
+    } else {
+      level.rows.push_back(std::move(row));
+    }
   }
 
   if (page.items.empty() && page.has_more) {
@@ -485,14 +611,12 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
   }
 
   level.has_more = page.has_more;
-  if (static_cast<int>(level.rows.size()) >= kMaxLoadedRows) {
-    // Bounded, like everything else on this wire (`kMaxLoadedRows`). The row at
-    // the end says the list was *cut* rather than that it ended, which is not
-    // the same sentence: a user who is told a list finished stops looking.
-    level.truncated = level.has_more || level.rows.size() > static_cast<std::size_t>(kMaxLoadedRows);
-    level.has_more = false;
-    level.rows.resize(static_cast<std::size_t>(kMaxLoadedRows));
+  if (!page.has_more) {
+    EndOfList(level);
   }
+  // Bounded, like everything else on this wire (`kMaxLoadedRows`): the rows
+  // furthest above the selection make room for the ones arriving under it.
+  DropAbove(level);
   level.loading = false;
 
   // Keep the selection on the thing it was on, not on the index it was at.
@@ -504,11 +628,9 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
   // rom>" under the cursor with no input, and the next A press enqueues it.
   // That is the invisible press this screen exists not to make.
   if (was_on_more) {
-    level.selected = HasMoreRow(level) ? static_cast<int>(level.rows.size())
-                                       : LastRowIndex(level);
-  } else if (level.selected >= static_cast<int>(level.rows.size())) {
-    level.selected = LastRowIndex(level);
+    level.selected = HasMoreRow(level) ? Tail(level) : LastRowIndex(level);
   }
+  ClampSelection(level);
 }
 
 void LibraryBrowserModel::OnEnded() {
@@ -526,6 +648,7 @@ void LibraryBrowserModel::OnEnqueued(std::int32_t position) {
     return;
   }
   issued_ = Command::Kind::kNone;
+  ++revision_;
   const std::int64_t rom_id = enqueueing_;
   enqueueing_ = 0;
   enqueue_wanted_ = 0;
@@ -551,6 +674,7 @@ void LibraryBrowserModel::OnEnqueued(std::int32_t position) {
 void LibraryBrowserModel::OnRefused(ipc::Error error) {
   const Command::Kind issued = issued_;
   issued_ = Command::Kind::kNone;
+  ++revision_;
 
   switch (issued) {
     case Command::Kind::kListEnd:
@@ -589,10 +713,16 @@ void LibraryBrowserModel::OnRefused(ipc::Error error) {
       level.loading = false;
       if (error == ipc::Error::kBadCursor) {
         // Reclaimed, never issued, or ended (#31): re-open rather than report.
-        // The rows already loaded stay on screen until the first page off the
-        // new cursor replaces them, so this costs the user nothing visible.
+        // The rows already loaded stay on screen while the new cursor reads
+        // its way back to them, so this costs the user nothing visible. A
+        // rewind that was gathering rows above the window starts its gathering
+        // again; anything else gathers nothing and only catches up.
+        if (!Rewinding(level)) {
+          level.rewind_from = level.first;
+        }
+        std::vector<LibraryRow>().swap(level.above);
         level.cursor = 0;
-        level.replace_rows = !level.rows.empty();
+        level.consumed = 0;
         level.has_more = true;
         level.page_error = ipc::Error::kOk;
         return;
@@ -614,6 +744,10 @@ void LibraryBrowserModel::OnUnreachable(Link link, std::uint32_t sysmodule_inter
   if (link == Link::kOk) {
     return;
   }
+  // Told again every frame while the sysmodule stays away, which is no change.
+  if (link != link_ || sysmodule_interface != sysmodule_interface_) {
+    ++revision_;
+  }
   link_ = link;
   sysmodule_interface_ = sysmodule_interface;
   enqueueing_ = 0;
@@ -630,24 +764,41 @@ void LibraryBrowserModel::OnLinkRestored() {
 
 void LibraryBrowserModel::MoveSelection(int delta) {
   Level& level = top();
-  if (level.rows.empty() && level.page_error == ipc::Error::kOk && !level.has_more) {
+  if (level.rows.empty() && level.page_error == ipc::Error::kOk && level.at_end) {
+    return;
+  }
+  if (delta < 0 && level.selected <= level.first && Rewinding(level) &&
+      level.page_error != ipc::Error::kOk) {
+    // Up against the row saying the rows above could not be read: the selection
+    // cannot stand on that row (`Render`), so pushing up into it is the retry,
+    // as A on the row at the bottom is.
+    level.page_error = ipc::Error::kOk;
+    level.empty_pages = 0;
+    level.has_more = true;
+    ++revision_;
     return;
   }
   // The `kMore` row is drawn below the loaded ones when there is one, so the
-  // selection may stand on it -- that is how a failed page is retried.
-  const int rows = static_cast<int>(level.rows.size());
-  const int last = rows + (HasMoreRow(level) ? 1 : 0) - 1;
-  if (last < 0) {
-    level.selected = 0;
-    return;
+  // selection may stand on it -- that is how a failed page is retried. The
+  // row above them it may not: what is above is read again by the time the
+  // selection gets there, and a selection resting on "Loading..." would be
+  // moved onto a rom by rows arriving, which is the invisible press.
+  const int highest = LastPlace(level);
+  // In 64 bits: a page key held at full speed is a large delta, and a place
+  // near the end of a long list plus one must not wrap.
+  const std::int64_t wanted = std::int64_t{level.selected} + delta;
+  const int moved = static_cast<int>(
+      std::clamp<std::int64_t>(wanted, level.first, std::max(level.first, highest)));
+  if (moved != level.selected) {
+    level.selected = moved;
+    ++revision_;
   }
-  level.selected = std::clamp(level.selected + delta, 0, last);
 }
 
 void LibraryBrowserModel::Activate() {
   Level& level = top();
-  const int rows = static_cast<int>(level.rows.size());
-  if (level.selected >= rows) {
+  ++revision_;
+  if (level.selected >= Tail(level)) {
     // The `kMore` row. A page in flight has nothing to press; a page that
     // failed is asked for again, which is either a `ListNext` on the cursor
     // that is still good or a `ListBegin` for a list that never opened.
@@ -657,13 +808,12 @@ void LibraryBrowserModel::Activate() {
       level.has_more = true;
     }
     return;
-
   }
-  if (level.selected < 0 || rows == 0) {
+  if (level.selected < level.first || level.rows.empty()) {
     return;
   }
 
-  const LibraryRow& row = level.rows[static_cast<std::size_t>(level.selected)];
+  const LibraryRow& row = level.rows[static_cast<std::size_t>(level.selected - level.first)];
   switch (row.kind) {
     case RowKind::kPlatform: {
       Level roms;
@@ -710,6 +860,7 @@ bool LibraryBrowserModel::Back() {
     closing_.push_back(top().cursor);
   }
   stack_.pop_back();
+  ++revision_;
   // The level underneath kept its rows, its cursor and its selection while this
   // one was open, which is the whole reason the stack holds levels rather than
   // a level: re-opening the platform list to get back to where the user was
@@ -729,10 +880,12 @@ void LibraryBrowserModel::OpenQueue() {
   queue.request.kind = ipc::ListKind::kQueue;
   queue.title = "Downloads";
   stack_.push_back(std::move(queue));
+  ++revision_;
 }
 
 void LibraryBrowserModel::Close() {
   closed_ = true;
+  ++revision_;
   for (Level& level : stack_) {
     if (level.cursor != 0) {
       closing_.push_back(level.cursor);
@@ -740,6 +893,21 @@ void LibraryBrowserModel::Close() {
     }
   }
   enqueue_wanted_ = 0;
+}
+
+std::uint64_t LibraryBrowserModel::revision() const { return revision_; }
+
+int LibraryBrowserModel::selected_position() const {
+  const Level& level = top();
+  return level.selected >= level.first && level.selected < Tail(level) ? level.selected : -1;
+}
+
+std::size_t LibraryBrowserModel::loaded_rows() const {
+  std::size_t rows = 0;
+  for (const Level& level : stack_) {
+    rows += level.rows.size() + level.above.size();
+  }
+  return rows;
 }
 
 // --- reading the projections --------------------------------------------------
@@ -864,7 +1032,57 @@ bool LibraryBrowserModel::ReadQueueEntry(const ipc::ListItem& item, LibraryRow* 
 
 // --- rendering ----------------------------------------------------------------
 
+LibraryRow LibraryBrowserModel::TopRow(const Level& level) {
+  LibraryRow top;
+  top.kind = RowKind::kMore;
+  top.state = RowState::kInert;
+  // Never selectable: the selection does not stand here (`MoveSelection`).
+  top.selectable = false;
+  if (level.page_error != ipc::Error::kOk && Rewinding(level)) {
+    top.label = "The rows above could not be loaded";
+    top.value = ipc::ToString(level.page_error);
+    top.note = "Press up to try again";
+    top.tone = Tone::kWarn;
+  } else {
+    // The rows above the window. The screen draws two rows above the selection
+    // and a rewind starts `kPrefetchRows` short of here, so this is on screen
+    // only while they are being read again.
+    top.label = "Loading...";
+    top.tone = Tone::kNeutral;
+  }
+  return top;
+}
+
+LibraryRow LibraryBrowserModel::MoreRow(const Level& level) {
+  LibraryRow more;
+  more.kind = RowKind::kMore;
+  more.state = RowState::kInert;
+  more.rom_id = 0;
+  if (level.page_error != ipc::Error::kOk && !Rewinding(level)) {
+    more.label = level.cursor == 0 ? "This list could not be opened"
+                                   : "The next page could not be loaded";
+    more.value = ipc::ToString(level.page_error);
+    more.note = "Press A to try again";
+    more.tone = Tone::kWarn;
+    more.selectable = true;
+  } else {
+    more.label = "Loading...";
+    more.tone = Tone::kNeutral;
+    // Nothing to press while a page is on its way. `MoveSelection` still lets
+    // the selection rest here, which is what asks for the page after it.
+    more.selectable = false;
+  }
+  return more;
+}
+
 LibraryView LibraryBrowserModel::Render() const {
+  // Far enough either way to take in every place a level can hold, and small
+  // enough that adding it to a place cannot overflow.
+  constexpr int kWholeLevel = 1 << 24;
+  return Render(kWholeLevel, kWholeLevel);
+}
+
+LibraryView LibraryBrowserModel::Render(int above, int below) const {
   LibraryView view;
   view.link = link_;
   if (link_ != Link::kOk) {
@@ -882,42 +1100,31 @@ LibraryView LibraryBrowserModel::Render() const {
   const Level& level = top();
   view.level = level.kind;
   view.title = level.title.empty() ? std::string(kUnnamed) : level.title;
-  view.rows = level.rows;
   view.can_go_back = stack_.size() > 1;
 
-  if (HasMoreRow(level)) {
-    LibraryRow more;
-    more.kind = RowKind::kMore;
-    more.state = RowState::kInert;
-    more.rom_id = 0;
-    if (level.page_error != ipc::Error::kOk) {
-      more.label = level.cursor == 0 ? "This list could not be opened"
-                                     : "The next page could not be loaded";
-      more.value = ipc::ToString(level.page_error);
-      more.note = "Press A to try again";
-      more.tone = Tone::kWarn;
-      more.selectable = true;
-    } else if (level.truncated) {
-      // Cut, not finished. Two different sentences, because a user told a list
-      // ended stops looking for what is not in it (`kMaxLoadedRows`).
-      more.label = "Too many to list here";
-      more.value = std::to_string(level.rows.size()) + " shown";
-      more.note = "Narrowing the library is not in this version";
-      more.tone = Tone::kWarn;
-      more.selectable = false;
-    } else {
-      more.label = "Loading...";
-      more.tone = Tone::kNeutral;
-      // Nothing to press while a page is on its way. `MoveSelection` still lets
-      // the selection rest here, which is what asks for the page after it.
-      more.selectable = false;
+  // The places this level can draw: the row above the window when rows were
+  // dropped there, the window, and the `kMore` row below it. Only the ones
+  // within `above`/`below` of the selection are copied (#298).
+  const int tail = Tail(level);
+  const bool top_row = level.first > 0;
+  const int lowest = level.first - (top_row ? 1 : 0);
+  const int highest = LastPlace(level);
+  if (highest >= level.first) {
+    const int selected = std::clamp(level.selected, level.first, highest);
+    const int from = std::max(lowest, selected - std::max(above, 0));
+    const int to = std::min(highest, selected + std::max(below, 0));
+    view.rows.reserve(static_cast<std::size_t>(to - from + 1));
+    for (int place = from; place <= to; ++place) {
+      if (place < level.first) {
+        view.rows.push_back(TopRow(level));
+      } else if (place >= tail) {
+        view.rows.push_back(MoreRow(level));
+      } else {
+        view.rows.push_back(level.rows[static_cast<std::size_t>(place - level.first)]);
+      }
     }
-    view.rows.push_back(std::move(more));
+    view.selected = selected - from;
   }
-
-  view.selected = view.rows.empty()
-                      ? -1
-                      : std::clamp(level.selected, 0, static_cast<int>(view.rows.size()) - 1);
 
   // The headline. An empty level is a sentence rather than a blank screen, and
   // a level with **nothing loaded under the failure** is the one case where the
@@ -945,7 +1152,7 @@ LibraryView LibraryBrowserModel::Render() const {
     return view;
   }
   if (level.rows.empty()) {
-    if (level.loading || level.has_more) {
+    if (!level.at_end) {
       view.headline = "Loading...";
       view.tone = Tone::kNeutral;
       return view;

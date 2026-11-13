@@ -359,12 +359,18 @@ const char* ToString(Event event) {
       return "sync.held";
     case Event::kSaveDeleted:
       return "save.deleted";
+    case Event::kBackupPruned:
+      return "backup.pruned";
     case Event::kRemoteInstall:
       return "download.remote";
     case Event::kPlayRecorded:
       return "play.recorded";
     case Event::kTerminated:
       return "process.terminated";
+    case Event::kClockSkew:
+      return "clock.skew";
+    case Event::kNetTlsClock:
+      return "net.tls_clock";
   }
   return "unknown";
 }

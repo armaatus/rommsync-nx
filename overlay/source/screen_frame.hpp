@@ -65,6 +65,17 @@ class ScreenFrame {
   /// reason it exists.
   Link Ready();
 
+  /// `Ready()` in the two halves a screen that may not wait needs (#299): the
+  /// first opens the port and never asks the sysmodule anything; the second
+  /// judges the handshake's answer, however it was sent. `Ready()` is the
+  /// two of them with a waited-for `GetInterfaceVersion` between.
+  ///
+  /// `Connect` answers `kOk` or `kNotRunning`; `checked()` then says whether a
+  /// handshake is still owed on this session.
+  Link Connect();
+  bool checked() const { return version_checked_; }
+  Link Admit(Result rc, std::uint32_t sysmodule_interface);
+
   /// What a failed typed call means.
   ///
   /// `MalformedResponse()` is a payload this build cannot read -- the sysmodule
@@ -77,6 +88,18 @@ class ScreenFrame {
   /// user gets, and deferring it would draw one of them for a frame on no
   /// evidence.
   Link Diagnose(Result rc);
+
+  /// From here on, never open a session: `Ready()` answers `kNotRunning` when
+  /// none is open, and a transport failure drops the session without trying
+  /// the port again.
+  ///
+  /// For a screen's destructor, which is all that calls it (#285). The gui
+  /// stack is libtesla's and is emptied by `~Overlay`, after `exitServices`
+  /// has stopped the client, so a destructor that opened a session would open
+  /// one nothing ever closes -- and nx-ovlloader's process never exits, so
+  /// three of those are the sysmodule's whole session table. A destructor may
+  /// use the session that is already open, and nothing else.
+  void Retire() { retired_ = true; }
 
   /// What `GetInterfaceVersion` last answered. Only meaningful for
   /// `kIncompatible`, where the two numbers are the whole diagnosis.
@@ -95,6 +118,9 @@ class ScreenFrame {
   bool version_checked_ = false;
 
   std::uint32_t sysmodule_interface_ = 0;
+
+  /// `Retire()` was called.
+  bool retired_ = false;
 };
 
 }  // namespace rommsync::overlay

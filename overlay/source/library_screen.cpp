@@ -6,12 +6,15 @@
 #include <string>
 
 #include "ipc_client.hpp"
+#include "library_pump.hpp"
 #include "palette.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_library_model.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "rommsync/overlay_status_view.hpp"
 #include "screen_frame.hpp"
+#include "scroll_keys.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -65,31 +68,10 @@ const char* ActionFor(const LibraryRow& row) {
 }  // namespace
 
 LibraryScreen::LibraryScreen(IpcClient& client) : client_(client) {
-  view_ = model_.Render();
+  RenderLibrary(model_, &view_, &rendered_);
 }
 
-LibraryScreen::~LibraryScreen() {
-  model_.Close();
-  // The port and the handshake, as before any other command
-  // (`overlay/AGENTS.md`). A session that has gone has no cursors left to close
-  // and nothing to say about it, so this is where the teardown stops.
-  if (frame_.Ready() != Link::kOk) {
-    return;
-  }
-  // This terminates, and it is worth saying why rather than capping it: after
-  // `Close()` the only command the model will hand out is a `ListEnd` for a
-  // cursor it holds, and every answer retires one -- `OnEnded` and a refused
-  // `ListEnd` both drop it, and a transport failure puts the model behind a
-  // link that is not `kOk`, which answers `kNone`. So each turn of this loop
-  // either closes a cursor or ends the loop, and there are at most three.
-  // A count here would be worse than none: it is the kind that gets read in the
-  // condition while each answer shrinks it, and stops one cursor short.
-  for (LibraryBrowserModel::Command command = model_.Next();
-       command.kind != LibraryBrowserModel::Command::Kind::kNone;
-       command = model_.Next()) {
-    Send(command);
-  }
-}
+LibraryScreen::~LibraryScreen() { CloseLibrary(frame_, client_, model_); }
 
 tsl::elm::Element* LibraryScreen::createUI() {
   auto* frame = new tsl::elm::OverlayFrame("rommsync", version());
@@ -106,8 +88,13 @@ tsl::elm::Element* LibraryScreen::createUI() {
 
 void LibraryScreen::update() { Pump(); }
 
-bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAnalogStickState,
-                                HidAnalogStickState) {
+bool LibraryScreen::handleInput(u64 keys_down, u64 keys_held, const HidTouchState&,
+                                HidAnalogStickState, HidAnalogStickState) {
+  // Every frame, whatever else happens: a key released while the link was down
+  // is a key released, and the next press has to start from one row.
+  const ScrollKey key = ScrollKeyOf(keys_down, keys_held);
+  const int rows = repeat_.Update(key, ScrollRepeat::Clock::now());
+
   if (view_.link != Link::kOk) {
     // Nothing to browse and nothing to press. Not handled, so B still leaves
     // the screen and Tesla keeps its own bindings -- and the headline is
@@ -115,14 +102,13 @@ bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
     return false;
   }
 
-  if ((keys_down & HidNpadButton_AnyDown) != 0) {
-    model_.MoveSelection(1);
-    view_ = model_.Render();
-    return true;
-  }
-  if ((keys_down & HidNpadButton_AnyUp) != 0) {
-    model_.MoveSelection(-1);
-    view_ = model_.Render();
+  if (key != ScrollKey::kNone) {
+    // Handled on the frames between repeats too: a held direction passed on to
+    // Tesla would be moving its focus under this screen's selection.
+    if (rows != 0) {
+      model_.MoveSelection(rows);
+      RenderLibrary(model_, &view_, &rendered_);
+    }
     return true;
   }
   if ((keys_down & HidNpadButton_A) != 0) {
@@ -131,7 +117,7 @@ bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
     // the press was on a row this screen owns, and passing it on would give it
     // to Tesla.
     model_.Activate();
-    view_ = model_.Render();
+    RenderLibrary(model_, &view_, &rendered_);
     return true;
   }
   if ((keys_down & HidNpadButton_B) != 0) {
@@ -140,100 +126,20 @@ bool LibraryScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAna
       // overlay rather than this screen inventing a second way out.
       return false;
     }
-    view_ = model_.Render();
+    RenderLibrary(model_, &view_, &rendered_);
     return true;
   }
   if ((keys_down & HidNpadButton_Y) != 0) {
     model_.OpenQueue();
-    view_ = model_.Render();
+    RenderLibrary(model_, &view_, &rendered_);
     return true;
   }
   return false;
 }
 
 void LibraryScreen::Pump() {
-  // The port and the version handshake, both of which every screen needs and
-  // none of which is this screen's own (`screen_frame.hpp`).
-  const Link link = frame_.Ready();
-  if (link != Link::kOk) {
-    model_.OnUnreachable(link, frame_.sysmodule_interface());
-    link_ = link;
-    view_ = model_.Render();
-    return;
-  }
-  if (link_ != Link::kOk) {
-    // The session came back. Everything loaded belonged to the one that went
-    // away, so the browser starts again rather than asking the new session
-    // about cursor numbers it never issued.
-    link_ = Link::kOk;
-    model_.OnLinkRestored();
-  }
-
-  // One command per frame. The model answers `kNone` as soon as the loaded
-  // pages cover what is on screen, so a browser sitting still costs nothing.
-  const LibraryBrowserModel::Command command = model_.Next();
-  if (command.kind != LibraryBrowserModel::Command::Kind::kNone) {
-    Send(command);
-  }
-  view_ = model_.Render();
-}
-
-void LibraryScreen::Send(const LibraryBrowserModel::Command& command) {
-  Result rc = 0;
-  ipc::Cursor cursor = 0;
-  ipc::ListPage page;
-  std::int32_t position = 0;
-
-  switch (command.kind) {
-    case LibraryBrowserModel::Command::Kind::kListBegin:
-      rc = client_.ListBegin(command.request, &cursor);
-      break;
-    case LibraryBrowserModel::Command::Kind::kListNext:
-      rc = client_.ListNext(command.cursor, &page);
-      break;
-    case LibraryBrowserModel::Command::Kind::kListEnd:
-      rc = client_.ListEnd(command.cursor);
-      break;
-    case LibraryBrowserModel::Command::Kind::kEnqueue:
-      rc = client_.Enqueue(command.rom_id, &position);
-      break;
-    case LibraryBrowserModel::Command::Kind::kNone:
-      return;
-  }
-
-  if (R_FAILED(rc)) {
-    // A refusal the sysmodule named, or the transport. Telling them apart is
-    // the whole reason `DecodeError` exists: without it a rom that is already
-    // queued and a sysmodule that is not running arrive here identically, and
-    // the screen would draw the second sentence over the first
-    // (`ipc_client.hpp`).
-    ipc::Error error = ipc::Error::kOk;
-    if (DecodeError(rc, &error)) {
-      model_.OnRefused(error);
-      return;
-    }
-    const Link link = frame_.Diagnose(rc);
-    model_.OnUnreachable(link, frame_.sysmodule_interface());
-    link_ = link;
-    return;
-  }
-
-  switch (command.kind) {
-    case LibraryBrowserModel::Command::Kind::kListBegin:
-      model_.OnCursor(cursor);
-      return;
-    case LibraryBrowserModel::Command::Kind::kListNext:
-      model_.OnPage(page);
-      return;
-    case LibraryBrowserModel::Command::Kind::kListEnd:
-      model_.OnEnded();
-      return;
-    case LibraryBrowserModel::Command::Kind::kEnqueue:
-      model_.OnEnqueued(position);
-      return;
-    case LibraryBrowserModel::Command::Kind::kNone:
-      return;
-  }
+  PumpLibrary(frame_, client_, model_, link_);
+  RenderLibrary(model_, &view_, &rendered_);
 }
 
 s32 LibraryScreen::PromptRows() const {

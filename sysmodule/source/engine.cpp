@@ -13,6 +13,7 @@
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
+#include "rommsync/backup_prune.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
 #include "rommsync/conflict_record.hpp"
@@ -30,6 +31,7 @@
 #include "rommsync/rom_scope.hpp"
 #include "rommsync/save_scan.hpp"
 #include "rommsync/scheduler.hpp"
+#include "rommsync/server_binding.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/state_sync.hpp"
 #include "rommsync/sync_finish.hpp"
@@ -166,6 +168,54 @@ void SdEngine::UseNetworkProbe(NetworkProbe probe) {
   network_probe_ = std::move(probe);
 }
 
+void SdEngine::UseNetworkClock(NetworkClock clock) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  network_clock_ = std::move(clock);
+}
+
+sync::ClockCheck SdEngine::LocalClock() const {
+  NetworkClock network;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    network = network_clock_;
+  }
+  sync::ClockReading reading;
+  reading.local = std::chrono::system_clock::now();
+  if (network) {
+    reading.network = network();
+  }
+  return sync::CheckClock(reading);
+}
+
+void SdEngine::NoteClock(const sync::TickResult& tick) {
+  if (!tick.clock.has_value()) {
+    return;
+  }
+  const sync::ClockCheck& found = *tick.clock;
+  bool changed = false;
+  bool was_trusted = true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    was_trusted = clock_check_.trusted();
+    changed = found.verdict != clock_check_.verdict ||
+              (!found.trusted() && found.reference != clock_check_.reference);
+    clock_check_ = found;
+  }
+  // Outside the lock: a sink writes to the card. Once per change, not per
+  // tick: the saves it holds say so every tick as `save.failed` lines.
+  if (!changed) {
+    return;
+  }
+  if (!found.trusted()) {
+    log::Warn(log::Event::kClockSkew,
+              found.Describe() +
+                  "; saves the server would choose by comparing timestamps are not uploaded "
+                  "until the console's date and time are set");
+  } else if (!was_trusted) {
+    log::Info(log::Event::kClockSkew, found.Describe() + "; held uploads go again");
+  }
+}
+
 void SdEngine::UseForegroundProbe(ForegroundProbe probe, std::chrono::milliseconds poll) {
   std::lock_guard<std::mutex> lock(mutex_);
   foreground_probe_ = std::move(probe);
@@ -248,6 +298,14 @@ void SdEngine::ForgetServerLocked(bool different_server) {
     server_too_old_ = false;
     // Another server's rom ids.
     fresh_roms_.clear();
+    // ...and so are the Keep local choices (#317): an armed key would send
+    // `overwrite=true` for whatever the new server calls that rom id, and a
+    // held one would land bytes the new server never weighed, then arm. A
+    // choice already on its way to the card checks `server_switches_` before
+    // it arms.
+    std::vector<state::Baseline::Key>().swap(keep_local_);
+    std::vector<state::Baseline::Key>().swap(keep_local_held_);
+    ++server_switches_;
   }
 }
 
@@ -456,6 +514,13 @@ void SdEngine::Load(const std::string& config_dir) {
               "the folder map yields no save directories; no save will be synced");
   }
   AdoptConfigLocked(std::move(loaded));
+  // The queue and the play sessions were read above, before the configuration
+  // that says which server they are for; a card repointed by hand while the
+  // console was off has them for another (#294). Here and not in
+  // `AdoptConfigLocked`, which `SetConfig` also runs, on the IPC thread: a
+  // change made there is the worker's to apply (`RunWorker`), because `play_`
+  // is the worker's alone.
+  BindResidentRecords(binding::IdentityOf(ConfigSnapshot()->server.url));
 }
 
 void SdEngine::UsePairingBackend(PairingBackend backend) {
@@ -485,6 +550,7 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
     previous_config_ = config_;
     config_ = std::make_shared<const config::Config>(std::move(loaded.value));
   }
+  server_tag_ = binding::TagOf(binding::IdentityOf(ConfigSnapshot()->server.url));
   // In the same breath, so a changed interval takes effect with no reboot and a
   // changed `server.url` lifts a TLS park (`sync::Scheduler::Reconfigure`).
   scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
@@ -492,6 +558,53 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
   diagnostics_.reserve(diagnostics_.size() + loaded.diagnostics.size());
   for (config::Diagnostic& diagnostic : loaded.diagnostics) {
     diagnostics_.push_back(std::move(diagnostic));
+  }
+}
+
+void SdEngine::BindResidentRecords(const std::string& server) {
+  if (server.empty() || server == records_server_) {
+    return;
+  }
+  const binding::Rebound rebound = binding::BindRecords(
+      PathTo(binding::kMarkerFileName),
+      {PathTo(download::kQueueFileName), PathTo(play::kBufferFileName)}, server);
+  log::WriteEach(log::Level::kWarn, log::Event::kServerVersion, rebound.lines);
+  if (rebound.rebound) {
+    // What was held of them is the old server's too. Emptied, not re-read: the
+    // files are set aside, and an empty queue and buffer are what a first boot
+    // has. The next change to either writes it under this server.
+    // `queue_trusted_` is left as it is: the IPC thread reads it unlocked, and
+    // a queue that would not read at boot stays unwritable until the next one,
+    // which finds no file there and trusts it.
+    queue_.Reset({});
+    queue_.set_queue_message(std::string());
+    play_ = play::Buffer(PathTo(play::kBufferFileName));
+  }
+  if (rebound.bound) {
+    records_server_ = server;
+  }
+  // conflicts.db stays where it is -- its backups are this card's, and a plain
+  // restore of one is local -- but a row from before #317 names no server, and
+  // Keep local must know which it was recorded on. The marker says: the server
+  // it named before this call, or this one when it already named this one or
+  // nothing (an upgrade, which `BindRecords` adopts the same way). A marker
+  // naming nothing usable stands for a server no configured URL is.
+  //
+  // At boot this writes the card under `mutex_`, as `BindRecords` above does:
+  // `Load`'s one exception, and only once, when an old row is first claimed.
+  if (rebound.rebound || rebound.bound) {
+    std::string_view owner = server;
+    if (rebound.rebound) {
+      owner = rebound.previous.empty() ? std::string_view("unknown:") : rebound.previous;
+    }
+    std::lock_guard<std::mutex> history(history_mutex_);
+    const conflicts::StoreResult claimed = history_.Claim(binding::TagOf(owner));
+    if (!claimed.ok()) {
+      log::Warn(log::Event::kServerVersion,
+                "the conflict history could not be marked with its server (" + claimed.message +
+                    "); this boot holds the marks, and a boot that reads them unmarked gives "
+                    "them to the server it is configured for");
+    }
   }
 }
 
@@ -600,6 +713,8 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
                       last_sync_result_ == ipc::SyncResult::kServerDisabled || server_too_old_;
     snapshot.server_version = server_caps_.version;
     snapshot.server_supported = !server_too_old_;
+    snapshot.clock_trusted = clock_check_.trusted();
+    snapshot.clock_skew_seconds = clock_check_.skew_seconds;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -752,8 +867,10 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
     // server that has just been replaced. Its grant would be a token issued by
     // one RomM committed under a `config.ini` naming another -- the same
     // confusion the discard above exists to prevent, arriving a minute later.
+    std::size_t choices_dropped = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      choices_dropped = keep_local_.size() + keep_local_held_.size();
       AbandonPairingLocked();
       // ...and so is the drain, which since M9-5 (#197) copied `base_url` and
       // the token at its start and would carry on fetching rom bodies from the
@@ -777,6 +894,15 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       // about its version is not drawn beside the new one, and the next tick
       // asks.
       ForgetServerLocked(/*different_server=*/true);
+      // The new server's, from here: a Keep local between this slice and the
+      // adoption below is weighed against it, not against the one just left.
+      server_tag_ = binding::TagOf(binding::IdentityOf(parsed.value.server.url));
+    }
+    if (choices_dropped > 0) {
+      log::Info(log::Event::kSyncRefused,
+                std::to_string(choices_dropped) +
+                    " Keep local choice(s) made against the previous server are dropped with it; "
+                    "nothing goes up with overwrite=true to the new one");
     }
     // Every other write to `attempt_` notifies, and this one has the longest
     // wait to cut short: the thread is parked in `AwaitNextPoll` until the
@@ -1031,6 +1157,25 @@ void SdEngine::RunWorker() {
         lock.unlock();
         network_seen = AwaitNetwork();
         lock.lock();
+      }
+      continue;
+    }
+
+    // The queue and the play sessions, held to the server `config.ini` names
+    // now (#294): a `server.url` change is applied on the IPC thread, and the
+    // play buffer is this thread's alone. Ahead of everything below, because a
+    // drain or a tick is what would read them against the new server. The
+    // URL is compared in memory, so a pass with nothing changed reads nothing.
+    if (const std::string server = binding::IdentityOf(ConfigSnapshot()->server.url);
+        !server.empty() && server != records_server_ && clock_->Steady() >= records_retry_due_) {
+      lock.unlock();
+      BindResidentRecords(server);
+      lock.lock();
+      if (server != records_server_) {
+        // The card would not settle it -- a marker it would not read or write,
+        // a record it would not move. Asked again a minute on, on whichever
+        // pass comes then, rather than on every pass of this loop.
+        records_retry_due_ = clock_->Steady() + std::chrono::minutes{1};
       }
       continue;
     }
@@ -1551,8 +1696,24 @@ namespace {
 ///
 /// Both of a tick's reads go through this: the states half re-reads the file
 /// the saves half wrote, which on a tick that wrote none is still version 2.
+///
+/// **Held to the configured server first** (#294): rows synced against another
+/// RomM are set aside, never read -- a rom id names a game only on the server
+/// that issued it, and a `deleted_on_server` mark from the old one would keep a
+/// save off the new one forever. Every tick, rather than only when the URL
+/// changes, because the change is as often a hand edit with the console off,
+/// and because a tick still running against the old server when the overlay
+/// moves it writes its rows bound to that server: the next one sets them aside.
 state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config) {
   state::LoadedBaseline loaded = state::LoadBaseline(path);
+  const std::string rebound = state::BindToServer(
+      &loaded, path, binding::IdentityOf(config.server.url),
+      static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count()));
+  if (!rebound.empty()) {
+    log::Warn(log::Event::kServerVersion, rebound);
+  }
   state::AdoptLegacySaves(&loaded,
                           [&config](std::string_view old_slot) -> std::optional<std::string> {
                             return scan::MigratedSlot(config.sync.slot, old_slot);
@@ -1614,10 +1775,18 @@ std::vector<play::SaveObservation> ObservationsOf(const std::vector<scan::SaveFi
 /// `SchedulerConfig::max_tls_attempts` is what acts on it).
 /// docs/TROUBLESHOOTING.md has a section per event and this is what keys them.
 void LogTransportFailure(http::Error transport, const std::string& where,
-                         const std::string& detail) {
+                         const std::string& detail, const sync::ClockCheck& clock) {
   const std::string message =
       where + ": " + http::ToString(transport) + (detail.empty() ? "" : "; " + detail);
-  if (transport == http::Error::kTls) {
+  if (sync::TlsClockFault(transport, detail, clock)) {
+    // A certificate is valid between two dates, and a console outside them
+    // refuses every one: the remedy is the date, not the certificate (#295).
+    log::Error(log::Event::kNetTlsClock,
+               message + "; " + (clock.trusted() ? "the certificate's dates do not include now"
+                                                 : clock.Describe()) +
+                   " -- set the console's date and time, or let it synchronise over the "
+                   "internet");
+  } else if (transport == http::Error::kTls) {
     log::Error(log::Event::kNetTls, message);
   } else {
     log::Warn(log::Event::kNetOffline, message);
@@ -1964,6 +2133,10 @@ struct SdEngine::TickInputs {
   // landing while the heartbeat is in flight bumps it, and the old server's
   // answer must not overwrite the "ask again" that stands for the new one.
   std::uint64_t generation = 0;
+  // `server_switches_` when this tick took its token (#317). A Keep local
+  // armed after a switch is the next server's, and a tick still running
+  // against the last one sends none of them.
+  std::uint64_t switches = 0;
 };
 
 /// What the card held this tick, and what the saves half is handed of it.
@@ -1983,6 +2156,9 @@ struct SdEngine::TickScan {
   // `play::Reconcile` matches the answer to this list by index, so the two
   // must be the same list.
   std::vector<play::BufferedSession> play_sent;
+  // When this console began syncing with this server (#294), for the prune:
+  // `loaded` is moved into the saves half, and this is all the prune needs of it.
+  std::int64_t bound_since = 0;
 };
 
 /// What the saves half's plans did, counted plan by plan (`TallyPlan`).
@@ -1992,6 +2168,9 @@ struct SdEngine::SavesTally {
   std::int64_t uploaded = 0;
   std::int64_t downloaded = 0;
   std::int64_t arbitrated = 0;
+  // Backups this tick wrote, removals included: what makes `.backup/` worth
+  // pruning again (#292).
+  std::int64_t backed_up = 0;
 };
 
 namespace {
@@ -1999,7 +2178,8 @@ namespace {
 /// Everything the tick's outcome has to say, after both halves: why it did not
 /// complete, what the sweep and the finish could not write, and the summary
 /// line last.
-void LogTickOutcome(const sync::TickResult& tick, const sync::StateSyncReport& states) {
+void LogTickOutcome(const sync::TickResult& tick, const sync::StateSyncReport& states,
+                    const sync::ClockCheck& clock) {
   // Why the negotiation is classified again here rather than trusted from
   // `tick.outcome`: `kOffline` collapses "the link is down" and "the certificate
   // is wrong", which is right for a scheduler -- both mean back off -- and
@@ -2017,7 +2197,8 @@ void LogTickOutcome(const sync::TickResult& tick, const sync::StateSyncReport& s
       // `net.offline negotiate: ok`, which reads as the client blaming a
       // successful request.
       if (tick.negotiated.transport != http::Error::kNone) {
-        LogTransportFailure(tick.negotiated.transport, "negotiate", tick.negotiated.message);
+        LogTransportFailure(tick.negotiated.transport, "negotiate", tick.negotiated.message,
+                            clock);
       } else {
         // The server answered and could not serve. Still `net.offline` rather
         // than `sync.refused`, because the next tick genuinely may work -- which
@@ -2125,12 +2306,16 @@ SdEngine::TickRun SdEngine::RunOneTick() {
     // failure: the screen falls back to the file name.
     return rom == nullptr ? std::string() : rom->fs_name_no_ext;
   };
+  // The server this tick runs against, which is the one its rom ids are of
+  // (#317), even if `server.url` moves before it ends.
+  record.server = binding::TagOf(binding::IdentityOf(inputs.config->server.url));
 
   SavesTally tally;
   const sync::TickResult tick = RunSavesHalf(inputs, library, &options, &found, record, &tally);
   bool states_held = false;
   const sync::StateSyncReport states =
       RunStatesHalf(inputs, library, found, &placer, record, tick.outcome, &states_held);
+  PruneBackups(inputs, tick, states, tally, states_held, found.bound_since);
   writing.unlock();
   // The states half's requests went out on the same token, so what they were
   // answered counts towards the one verdict, as the saves half's did.
@@ -2145,12 +2330,57 @@ SdEngine::TickRun SdEngine::RunOneTick() {
   // Everything the tick has to say, before the counters go under `mutex_`: a
   // sink writes to the SD card, and holding the lock the frame-polled `GetStatus`
   // needs across that would make the status screen wait on the card.
-  LogTickOutcome(tick, states);
+  LogTickOutcome(tick, states, LocalClock());
+  NoteClock(tick);
   // A card the scan stopped short of is not a clean sync, however well the saves
   // it did see went (#246): the status screen says partial, beside the
   // `scan.skipped` line that says why.
   RecordTick(tick, states, tally, found.scanned.stopped_at_bound, states_held);
   return TickRun::kFinished;
+}
+
+void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
+                            const sync::StateSyncReport& states, const SavesTally& tally,
+                            bool states_held, std::int64_t bound_since) {
+  // Only at the end of a tick that did everything it set out to: a backup an
+  // operation that failed half way wrote is the one most likely to be wanted,
+  // and the retention rule is not the place to second-guess that tick.
+  if (tick.outcome != sync::TickOutcome::kCompleted || tick.held || states_held ||
+      states.failed > 0 || states.canceled) {
+    return;
+  }
+  std::int64_t backed_up = tally.backed_up;
+  for (const sync::StateOperationResult& operation : states.operations) {
+    if (!operation.backup_sd_path.empty()) ++backed_up;
+  }
+  // Once after boot, and then when a tick wrote a backup: a prune over an
+  // unchanged directory finds what the last one found, and hashing the backups
+  // it kept every half hour would be card time spent on nothing.
+  if (backed_up == 0 && backups_pruned_) {
+    return;
+  }
+
+  backup::PruneOptions options;
+  options.backup_dir = sync::kBackupDir;
+  options.retention = backup::RetentionFor(inputs.config->backup);
+  http::HttpClient* client = inputs.client;
+  const auth::StoredToken* token = &inputs.token;
+  sync::CallPolicy policy;
+  policy.cancel = inputs.cancel.get();
+  options.server_digests = [client, token, policy](std::int64_t rom_id) {
+    return backup::ListServerSaveDigests(*client, *token, rom_id, policy);
+  };
+  // A backup from before this console synced with this server names another
+  // server's rom id, so this one's digests are not its proof (#294).
+  options.server_since = bound_since;
+  const backup::PruneReport report = backup::Prune(*inputs.files, options);
+  // A prune that could not read or remove something is asked again next tick,
+  // rather than waiting for the next backup to be written.
+  backups_pruned_ = report.warnings.empty();
+  log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
+  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap) {
+    log::Info(log::Event::kBackupPruned, backup::Describe(report));
+  }
 }
 
 bool SdEngine::StartTick(TickInputs* inputs) {
@@ -2174,6 +2404,7 @@ bool SdEngine::StartTick(TickInputs* inputs) {
     inputs->client = server_;
     inputs->files = card_;
     inputs->token = token_;
+    inputs->switches = server_switches_;
     blocked = gate_.blocked();
   }
   const config::Config& config = *inputs->config;
@@ -2272,7 +2503,8 @@ bool SdEngine::ReadServerForTick(TickInputs* inputs) {
       } else if (probe.transient()) {
         outcome = sync::TickOutcome::kOffline;
         if (probe.transport != http::Error::kNone) {
-          LogTransportFailure(probe.transport, "GET /api/heartbeat", probe.message);
+          LogTransportFailure(probe.transport, "GET /api/heartbeat", probe.message,
+                              LocalClock());
         } else {
           log::Warn(log::Event::kNetOffline, "GET /api/heartbeat: " + probe.message);
         }
@@ -2360,7 +2592,7 @@ roms::FetchResult SdEngine::FetchLibraryForTick(const TickInputs& inputs) {
                  "GET /api/roms answered " + std::to_string(library.status) + "; " +
                      library.message);
     } else if (library.transport != http::Error::kNone) {
-      LogTransportFailure(library.transport, "GET /api/roms", library.message);
+      LogTransportFailure(library.transport, "GET /api/roms", library.message, LocalClock());
     } else {
       // A status this client cannot proceed from, or a 200 that was not a rom
       // page. Retrying does not change either, which is what `sync.refused`
@@ -2392,6 +2624,7 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   TickScan found;
   found.baseline_path = files.Resolve(sync::kStateSdPath);
   found.loaded = LoadBaselineFor(found.baseline_path, config);
+  found.bound_since = found.loaded.value.bound_since();
   {
     std::lock_guard<std::mutex> lock(mutex_);
     found.fresh = fresh_roms_;
@@ -2510,7 +2743,11 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
   // restore taken while this tick runs arms a choice the next tick sends.
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    options.execute.keep_local = keep_local_;
+    if (server_switches_ == inputs.switches) {
+      options.execute.keep_local = keep_local_;
+    }
+    // The network clock is one of the two a tick holds the console's to (#295).
+    options.network_clock = network_clock_;
   }
   options.finish.state_sd_path = sync::kStateSdPath;
   options.cancel = inputs.cancel.get();
@@ -2688,6 +2925,9 @@ void SdEngine::TallyPlan(const sync::SyncPlan& plan, const sync::ExecutionReport
       ++tally->uploaded;
     } else if (operation.outcome == sync::OperationOutcome::kDownloaded) {
       ++tally->downloaded;
+    }
+    if (!operation.backup_sd_path.empty()) {
+      ++tally->backed_up;
     }
     // A removal (#233) leaves a backup too, and is not an arbitration.
     if (!operation.backup_sd_path.empty() &&
@@ -3364,6 +3604,8 @@ void SdEngine::BuildConflictPage(const ipc::ConflictQuery& query, ipc::ConflictP
   for (; at < entries.size() && page->entries.size() < wanted; ++at) {
     ipc::ConflictRow row;
     row.entry = entries[at];
+    // The screen has no use for it, and every byte counts against the page.
+    row.entry.server = 0;
     row.backup_present = BackupPresent(entries[at]);
     // A choice is its save's, and drawn on the entry it was made on: the
     // save's newest, which is the only one Keep local takes. A candidate for
@@ -3475,9 +3717,13 @@ conflicts::RestoreReport SdEngine::OnCard(Act&& act) {
 void SdEngine::RunRestore(std::int64_t entry_id) {
   bool keep_local = false;
   std::vector<state::Baseline::Key> armed;
+  std::uint64_t switches = 0;
+  std::uint64_t server_tag = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     keep_local = restore_keeps_local_;
+    switches = server_switches_;
+    server_tag = server_tag_;
     if (keep_local) {
       // For `conflicts::KeepLocal`'s bound, which the held choices count
       // towards as well as the armed ones (#275): each is a key waiting for
@@ -3513,6 +3759,7 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
   // card holds.
   conflicts::RestoreOptions restore_options;
   restore_options.game_running = keep_local && application_running();
+  restore_options.server = server_tag;
   conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
     return keep_local
                ? conflicts::KeepLocal(card, history_, entry_id, armed, &kept, restore_options)
@@ -3521,7 +3768,8 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
 
   bool woken = false;
   bool unarmed = false;
-  const bool held = keep_local && report.outcome == conflicts::RestoreOutcome::kHeld;
+  bool switched = false;
+  bool held = keep_local && report.outcome == conflicts::RestoreOutcome::kHeld;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (restore_.entry_id != entry_id) {
@@ -3529,7 +3777,14 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
       // refuse rather than write one restore's outcome under another's id.
       return;
     }
-    if (held) {
+    // `server.url` moved while this ran (#317): the choice was made against
+    // the server that is gone, so it is neither held nor armed. Restored bytes
+    // stay on the card -- a copy, backed up first -- and meet the new server's
+    // slot guard like any other upload.
+    switched = keep_local && switches != server_switches_;
+    if (switched) {
+      held = false;
+    } else if (held) {
       // Held, not armed: nothing is on the card yet. The worker is woken so
       // its next wait is bounded by the poll that lands it (`RunWorker`), and
       // that poll is one `foreground_poll_` off -- the probe was just asked.
@@ -3563,6 +3818,12 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
     restore_.phase = ipc::RestorePhase::kDone;
     restore_kept_.reset();
     restore_.report = std::move(report);
+  }
+  if (switched) {
+    log::Warn(log::Event::kSyncRefused,
+              "rom " + std::to_string(kept.first) +
+                  ": the server changed while Keep local ran, so nothing is armed for the new "
+                  "one");
   }
   if (unarmed) {
     log::Warn(log::Event::kSyncRefused,
@@ -3606,7 +3867,9 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
   // and each save's line written before the next is copied.
   bool asked = false;
   for (const state::Baseline::Key& key : held) {
+    conflicts::RestoreOptions options;
     std::vector<state::Baseline::Key> armed;
+    std::uint64_t switches = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // **Claimed before the card is touched** (#279). A cancel since the
@@ -3618,6 +3881,8 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
       landing_ = key;
       UnholdLocked(key);
       armed = keep_local_;
+      switches = server_switches_;
+      options.server = server_tag_;
     }
     // The same restore as `RunRestore`'s, run later.
     const conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
@@ -3629,7 +3894,7 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
       const conflicts::Entry* entry = conflicts::NewestSaveEntry(history_, key);
       state::Baseline::Key landed{0, std::nullopt};
       return conflicts::KeepLocal(card, history_, entry != nullptr ? entry->id : 0, armed,
-                                  &landed);
+                                  &landed, options);
     });
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -3639,7 +3904,8 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
       landing_.reset();
       // Armed only once the bytes are on the card, as `RunRestore` arms. The
       // bound counted this key while it was held, so there is room.
-      if (report.ok() && sync::ArmKeepLocal(&keep_local_, key)) {
+      // Not after a server change (#317), which dropped every choice.
+      if (report.ok() && switches == server_switches_ && sync::ArmKeepLocal(&keep_local_, key)) {
         asked = true;
       }
     }

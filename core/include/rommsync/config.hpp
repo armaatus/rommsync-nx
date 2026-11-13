@@ -150,6 +150,33 @@ enum class OnServerDelete {
 /// `remove` or `keep`: the word `config.ini` spells it with. Never null.
 const char* ToString(OnServerDelete on_server_delete);
 
+/// `[backup]`: how much of `.backup/` is kept (M11-8, #292, backup_prune.hpp).
+///
+/// Ten is more history than the Conflicts screen lists for one save; thirty
+/// days is a month of "I want last week's"; 512 MiB is a few percent of the
+/// smallest card a Switch homebrew setup runs on. None of the three ever
+/// removes the only copy of a backup's bytes -- that is the prune's own rule,
+/// and no setting turns it off.
+inline constexpr int kDefaultBackupKeep = 10;
+inline constexpr int kDefaultBackupKeepDays = 30;
+inline constexpr int kDefaultBackupMaxMib = 512;
+
+/// The largest values a key takes; past them a value is clamped, for
+/// `interval_min`'s reason -- falling back to the default would keep *less*
+/// than a user asking for a lot.
+inline constexpr int kMaxBackupKeep = 1000;
+inline constexpr int kMaxBackupKeepDays = 3650;
+inline constexpr int kMaxBackupMaxMib = 1024 * 1024;
+
+struct BackupConfig {
+  /// The newest this many of each save or state are kept. At least 1.
+  int keep = kDefaultBackupKeep;
+  /// Anything younger than this many days is kept. 0 keeps nothing by age.
+  int keep_days = kDefaultBackupKeepDays;
+  /// The directory's target size in MiB. 0 is no cap.
+  int max_mib = kDefaultBackupMaxMib;
+};
+
 /// `[sync]`.
 
 struct SyncConfig {
@@ -348,6 +375,7 @@ struct Config {
   DownloadsConfig downloads;
   SourcesConfig sources;
   TicoConfig tico;
+  BackupConfig backup;
 
   /// Keyed by RomM `platform_fs_slug` -- the on-disk folder name under RomM's
   /// `library/roms/`, so it is case-sensitive and not lowercased on the way in.

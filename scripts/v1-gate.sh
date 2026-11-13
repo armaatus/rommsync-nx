@@ -257,6 +257,7 @@ core/src/conflict_record.cpp|1|0|0|io::CommitStaged|SAVE (M7-1 restore): putting
 core/src/device_identity.cpp|0|0|2||not a save: device.dat
 core/src/download.cpp|1|0|1||not a save: rom bytes, and the queue record
 core/src/play_sessions.cpp|0|0|1||not a save: the play-session buffer M7-4 writes
+core/src/server_binding.cpp|0|0|1||not a save: server.id, which server the queue and play sessions belong to (#294); records it sets aside are renamed, never written over
 core/src/state_db.cpp|0|0|1||not a save: the sync baseline
 core/src/state_sync.cpp|1|0|0|io::CommitStaged|SAVE STATE: sync::BackUpFirst runs first
 core/src/sync_execute.cpp|1|1|0|io::CommitStaged|SAVE: sync::BackUpFirst runs first, and IS the CopyAtomically here; a server delete removes only after it too (#233)

@@ -128,7 +128,8 @@ RecoveryReport RecoverStaging(fs::FileSystem& files,
         // and deleting that would be this code destroying a file it did not
         // write. `io::CommitStaged` removes its own on success, so reaching here
         // means even that failed -- one stale file, rarely, against the chance
-        // of taking someone's manual backup.
+        // of taking someone's manual backup. The next commit is as careful: it
+        // sets this one aside as `.old.<n>`, a name this sweep never matches.
         ++report.previous_left;
         continue;
       }

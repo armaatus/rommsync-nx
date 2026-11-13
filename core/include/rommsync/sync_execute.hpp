@@ -72,6 +72,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/clock_check.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
@@ -341,9 +342,9 @@ enum class OperationError {
   kForbidden,
 
   /// The bytes are not the save the plan described: a download that is not the
-  /// server's copy, or a save a `delete` names that changed after the scan
-  /// reported it. Either way they were discarded and the local file was not
-  /// touched.
+  /// server's copy, or a save a `delete`, `download` or `conflict` names that
+  /// changed after the scan reported it (#286). Either way they were discarded
+  /// and the local file was not touched.
   ///
   /// Also a save written *after its backup* (#263, `UnchangedSinceBackup`): the
   /// replacement or removal stood down, and the save and its backup are both
@@ -374,6 +375,13 @@ enum class OperationError {
 
   /// The caller's `http::CancelToken` fired. Nothing after this operation ran.
   kCanceled,
+
+  /// An upload the server decided on the console's timestamp alone
+  /// (`DecidedByClock`), on a console whose clock failed `CheckClock` (#295).
+  /// **Nothing was sent and nothing local was touched.** A failure rather than
+  /// a decline: it is planned again every tick until the clock is right, and
+  /// that is a fault the user has to fix -- the message says how.
+  kClockUntrusted,
 };
 
 /// Stable, log-friendly name. Never null.
@@ -441,6 +449,31 @@ OperationError BackUpFirst(fs::FileSystem& files, const std::string& backup_dir,
 /// docs/SYNC_PROTOCOL.md#backups states.
 OperationError UnchangedSinceBackup(fs::FileSystem& files, const std::string& sd_path,
                                     const std::string& backup_sd_path, std::string* message);
+
+/// Whether the backup `BackUpFirst` just took of `sd_path` holds `expected`, the
+/// digest this tick reported for it (#286) -- asked right after the backup, and
+/// before `UnchangedSinceBackup`.
+///
+/// The server's ruling -- `download`, `conflict`, `delete`, a state's download --
+/// is about the bytes the scan reported. A save the game wrote between the scan
+/// and the backup is progress the ruling never saw: overwritten, it would live
+/// only in `.backup/`, and the next tick, finding the server's copy on the card,
+/// would never offer it. So anything but a match is `kUnverified`, and the
+/// operation stands down with the save left as it is; the next tick negotiates
+/// it as it now is.
+///
+/// On a mismatch the backup is dropped -- `*backup_sd_path` cleared -- **only
+/// when the save still holds its bytes**: then it duplicates a file nothing
+/// replaced, `BackUpFirst`'s reasoning for an unconfirmed copy. A save written
+/// again since the backup leaves the backup the only copy of the write before,
+/// and it stays, as the newest backup of that save, which `PruneBackups` never
+/// removes.
+///
+///   - `backup_sd_path` empty is nothing found to back up, and nothing to check.
+///   - A backup that cannot be read back is `kUnreadableCard`, and it stays.
+OperationError BackupIsReported(fs::FileSystem& files, const std::string& sd_path,
+                                const std::string& expected, std::string* backup_sd_path,
+                                std::string* message);
 
 /// Whether a conflict's losing local copy is on the server too (#240).
 ///
@@ -765,6 +798,12 @@ struct ExecuteOptions {
   /// reported with no digest, is nothing to check against, and the delete is
   /// refused before anything is copied.
   ///
+  /// A matched `download` or `conflict` is held to the same digest (#286): its
+  /// backup must be the bytes reported, or the save is progress the ruling
+  /// never saw and stays, failed `kUnverified`. A save reported with no digest
+  /// is refused before anything is fetched. Null skips the check -- a caller
+  /// that reported nothing has nothing to hold it to; `RunTick` always sets it.
+  ///
   /// It is also the emulator a matched download is held to (#238): a save
   /// reported under one id takes no copy whose format is another's
   /// (`scan::Interchangeable`). Null, a `tico-*` copy is written over nothing.
@@ -775,6 +814,15 @@ struct ExecuteOptions {
   /// when `Declines::Note` says it is news, and one that did what the plan asked
   /// is forgotten. Null says every decline, every time.
   Declines* declines = nullptr;
+
+  /// What `CheckClock` made of the console's clock against this plan's
+  /// references (#295). Not trusted, an upload `DecidedByClock` is failed
+  /// `OperationError::kClockUntrusted` before anything is read or sent -- unless
+  /// it is a player's Keep local (`keep_local`), which is their choice and not
+  /// the clock's. Every other operation runs: a download backs the local save
+  /// up first. `RunTick` sets it per plan; the default is trusted, which is
+  /// what a caller with no reference to check against has.
+  ClockCheck clock;
 
   /// Optional, not owned; must outlive the call. Checked between operations and
   /// passed to every request, so a shutdown ends the tick at an operation

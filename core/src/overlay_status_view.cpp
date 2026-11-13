@@ -329,6 +329,30 @@ std::string FormatRelativeTime(std::int64_t then_unix, std::int64_t now_unix) {
   return std::to_string(count) + " " + (count == 1 ? chosen->singular : chosen->plural) + " ago";
 }
 
+namespace {
+
+/// "3 days ahead; uploads held": an untrusted clock's row. Zero skew is a clock
+/// before the floor with nothing to measure it against -- an RTC that reset.
+std::string ClockText(std::int64_t skew_seconds) {
+  if (skew_seconds == 0) {
+    return "Not set; uploads held";
+  }
+  const std::int64_t magnitude = skew_seconds < 0 ? -skew_seconds : skew_seconds;
+  std::int64_t count = magnitude / 60;
+  const char* unit = "minute";
+  if (magnitude >= 86400) {
+    count = magnitude / 86400;
+    unit = "day";
+  } else if (magnitude >= 3600) {
+    count = magnitude / 3600;
+    unit = "hour";
+  }
+  return std::to_string(count) + " " + unit + (count == 1 ? "" : "s") +
+         (skew_seconds > 0 ? " ahead" : " behind") + "; uploads held";
+}
+
+}  // namespace
+
 StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
   StatusView view;
   view.link = Link::kOk;
@@ -381,6 +405,16 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
         std::to_string(status.config_error_count) +
             (status.config_error_count == 1 ? " problem" : " problems"),
         Tone::kBad);
+  }
+  // Only when it is not believed (#295): the uploads RomM chose on its
+  // timestamps are being held, and without this row a save that never goes up
+  // looks like a sync that is working. The remedy is the console's own setting,
+  // so it is the hint unless a worse problem already holds it.
+  if (!status.clock_trusted) {
+    Add(&view.lines, "Clock", ClockText(status.clock_skew_seconds), Tone::kWarn);
+    if (view.hint.empty()) {
+      view.hint = "Set the console's date and time";
+    }
   }
   AddDownload(&view, status.download);
   // Last, because it is the line a user reads once and a support thread reads

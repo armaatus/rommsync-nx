@@ -106,6 +106,7 @@ std::size_t RecordSaves(History* history, const sync::SyncPlan& plan,
     if (options.rom_name) {
       entry.rom_name = options.rom_name(result.rom_id);
     }
+    entry.server = options.server;
     if (history->Append(std::move(entry)).id != 0) {
       ++recorded;
     }
@@ -168,6 +169,7 @@ std::size_t RecordStates(History* history, const sync::StateSyncReport& report,
     if (options.rom_name) {
       entry.rom_name = options.rom_name(result.rom_id);
     }
+    entry.server = options.server;
     if (history->Append(std::move(entry)).id != 0) {
       ++recorded;
     }
@@ -322,6 +324,14 @@ RestoreReport KeepLocal(fs::FileSystem& files, const History& history, std::int6
   if (entry != nullptr && !entry->save_conflict()) {
     return refuse(RestoreOutcome::kNotAConflict,
                   "not a save conflict, so there is no server copy to keep this console's over");
+  }
+  if (entry != nullptr && entry->server != options.server) {
+    // Ahead of everything that could hold or write: the override would go to
+    // whichever save the current server calls this rom id (#317).
+    return refuse(RestoreOutcome::kNotAConflict,
+                  "recorded against another server than the one this console syncs with now, so "
+                  "Keep local cannot send these bytes over its copy; Restore still puts them back "
+                  "on the card");
   }
   if (entry != nullptr) {
     const state::Baseline::Key wanted{entry->rom_id, entry->slot};

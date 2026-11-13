@@ -191,6 +191,13 @@ enum class Event {
   /// leaving the card, so it is written for every one.
   kSaveDeleted,
 
+  /// `.backup/` was pruned to its retention rule at the end of a tick (M11-8,
+  /// #292): how many went, the bytes freed and left, and how many were kept
+  /// past the rule because no other copy of their bytes could be found. Only
+  /// written when something was pruned or something was kept, so a card under
+  /// its limits says nothing.
+  kBackupPruned,
+
   /// A rom queued for this console in RomM's web UI (M10-19, #245): taken into
   /// the download queue, reported back, or -- as a warning -- an exchange with
   /// the install endpoints that did not work. **Never a reason to fail a
@@ -211,6 +218,19 @@ enum class Event {
   /// read. Written by `WriteLast`, which allocates nothing, because the usual
   /// cause is that there is nothing left to allocate.
   kTerminated,
+
+  /// The console's clock is not believed (M11-11, #295): before 2026, or more
+  /// than a day from the network clock or the server's. Uploads RomM decided on
+  /// timestamps are held until it is set. Written when the finding changes --
+  /// it turns wrong, moves the other way, or comes right again -- not every
+  /// tick, because the held saves already say so as `save.failed` lines.
+  kClockSkew,
+
+  /// A TLS failure the clock is the likely cause of (#295): a certificate is
+  /// valid between two dates, and a console outside them refuses every one.
+  /// Kept apart from `kNetTls` because the remedy is the console's date, not
+  /// the certificate, the scheme or the proxy.
+  kNetTlsClock,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -223,8 +243,8 @@ inline constexpr std::array kAllEvents = {
     Event::kSyncRefused, Event::kSyncTick,    Event::kSaveFailed,
     Event::kDownload,    Event::kPlayFailed,  Event::kPower,
     Event::kServerVersion, Event::kServerUnsupported,
-    Event::kSyncHeld,    Event::kSaveDeleted, Event::kRemoteInstall,
-    Event::kPlayRecorded, Event::kTerminated,
+    Event::kSyncHeld,    Event::kSaveDeleted, Event::kBackupPruned, Event::kRemoteInstall,
+    Event::kPlayRecorded, Event::kTerminated, Event::kClockSkew, Event::kNetTlsClock,
 };
 
 /// Stable tag -- `net.offline`. Never null.

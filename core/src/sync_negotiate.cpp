@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "rommsync/auth.hpp"
+#include "rommsync/clock_check.hpp"
 #include "rommsync/http.hpp"
 #include "rommsync/json.hpp"
 #include "rommsync/sync.hpp"
@@ -555,6 +556,9 @@ Negotiation NegotiateWith(http::HttpClient& client, const auth::StoredToken& tok
           ParseNegotiateResponse(result.response.body, &too_large, options.keep);
       if (parsed.ok()) {
         outcome.plan = std::move(parsed.value);
+        // The clock the plan was decided against, for the uploads it decided on
+        // timestamps (#295, clock_check.hpp).
+        outcome.server_date = ServerDate(result.response.headers);
       } else if (too_large) {
         outcome = Refuse(NegotiateError::kPlanTooLarge,
                          "the plan holds more than the " + std::to_string(kMaxPlanOperations) +

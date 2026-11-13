@@ -72,7 +72,7 @@ source/
   status_screen.*     # the status screen's drawing; its decisions are in core/
   pairing_screen.*    # the pairing screen's drawing; likewise
   sync_screen.*       # the switch and "Sync now"; likewise
-  library_screen.*    # platforms -> roms -> the queue; likewise
+  library_screen.*    # platforms -> roms -> the queue; likewise. Its IPC frame is library_pump.*
   settings_screen.*   # the configuration, the root menu and "Re-pair"; likewise
   conflicts_screen.*  # what a sync overwrote, and the restore; its IPC frame is conflicts_pump.*
   log_screen.*        # the end of the log; its layout is log_paint.*
@@ -214,6 +214,33 @@ production RomM or a real library.
     have its controller back every time the overlay is closed. *"Crashes 100% on
     the sixth attempt"* (Ultrahand#278) is a counted resource running out;
     `overlay.cycles` is the host half of this step.
+
+15. **Exit with Library open.** Open Settings → **Library**, then leave the
+    overlay with Ultrahand's combo while the library is still on screen. Do it
+    four times, then open the overlay again. Expect the status screen to show
+    the sysmodule's state (*"Up to date"*, *"Ready"* or whatever applies), not
+    *"sys-rommsync is not running"*. Before M11-1 (#285) each
+    such exit left one session open on a sysmodule that allows three, so the
+    fourth open found none left until reboot.
+16. **A busy sysmodule does not slow the panel.** Queue a large rom from the
+    library, and while it downloads open the status screen, then the sync
+    screen, then pairing, scrolling and pressing B between them. Expect each to
+    move as smoothly as with nothing downloading, and the download's progress
+    to advance a few times a second. On the sync screen flip the switch with X:
+    expect it to move within a second, or *"Still applying..."* first and then
+    the switch -- never *"not responding"*. Before M11-15 (#299) these screens
+    waited for every answer on the draw thread.
+17. **A long platform, held.** Open the library on the platform with the most
+    roms (ideally well over 512). Hold Down: expect one row, a pause of about a
+    third of a second, then a steady repeat that speeds up the longer it is
+    held. Hold R: expect it to move a panel at a time, and to reach the end of
+    the list in seconds, riding *"Loading..."* while pages arrive. Tap Up and
+    Down: one row each, never two. Then hold L back to the top, and expect a
+    *"Loading..."* above the first row now and then while rows the browser
+    dropped are read again -- slower than going down, never a wrong rom under
+    the selection. Do the same with L/R and Down on the conflicts screen. Before
+    M11-14 (#298) every press was one row and nothing past row 512 of a
+    platform could be reached.
 
 Record what each step actually drew in #44, including the layout constants that
 had to move — every screen file keeps them in one block at the top for exactly

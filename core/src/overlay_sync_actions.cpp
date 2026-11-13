@@ -151,6 +151,13 @@ void SetNotice(SyncActionsView* view, const ipc::Status& status, const LastComma
       view->notice = SyncOutcomeText(last.sync);
       view->notice_tone = SyncOutcomeTone(last.sync);
       return;
+    case LastCommand::Kind::kApplying:
+      // Neutral, not bad: the sysmodule is busy -- a download has the card --
+      // and the press will land. "Not responding" here would send a user to
+      // press again, or to restart something that is working (#299).
+      view->notice = "Still applying...";
+      view->notice_tone = Tone::kNeutral;
+      return;
   }
 }
 
@@ -168,6 +175,12 @@ LastCommand LastCommand::SetEnabled(ipc::WriteOutcome outcome, bool enabled_now)
   last.kind = Kind::kSetEnabled;
   last.write = outcome;
   last.enabled_then = enabled_now;
+  return last;
+}
+
+LastCommand LastCommand::Applying() {
+  LastCommand last;
+  last.kind = Kind::kApplying;
   return last;
 }
 

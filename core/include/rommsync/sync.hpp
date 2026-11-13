@@ -734,6 +734,12 @@ struct Negotiation {
   /// carries the same field for the same reason.
   http::Error transport = http::Error::kNone;
 
+  /// The server's clock, off the `Date` header of the answer that carried the
+  /// plan (`ServerDate`, clock_check.hpp), or empty when it sent none that
+  /// reads. The reference a console clock is held to before an upload the
+  /// server decided on timestamps is sent (#295).
+  std::optional<Timestamp> server_date;
+
   bool ok() const { return error == NegotiateError::kNone; }
 };
 
