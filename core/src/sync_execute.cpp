@@ -7,7 +7,9 @@
 //
 //   1. fetch to `io::TempPathFor(<save>)`, never to `<save>`
 //   2. verify those bytes against the digest the server reported
-//   3. copy the save's current bytes into `.backup/`
+//   3. copy the save's current bytes into `.backup/`, and hold that copy to
+//      the digest this tick reported (`BackupIsReported`, #286): the ruling is
+//      about those bytes, and a save written since the scan is not them
 //   4. `io::CommitStaged` the verified bytes onto the save
 //
 // A conflict puts one more step between 3 and 4: the bytes step 3 preserved go
@@ -718,6 +720,42 @@ OperationError UnchangedSinceBackup(fs::FileSystem& files, const std::string& sd
   return OperationError::kNone;
 }
 
+OperationError BackupIsReported(fs::FileSystem& files, const std::string& sd_path,
+                                const std::string& expected, std::string* backup_sd_path,
+                                std::string* message) {
+  if (backup_sd_path->empty()) {
+    return OperationError::kNone;
+  }
+  const std::string backup = files.Resolve(*backup_sd_path);
+  const state::HashOutcome kept =
+      backup.empty() ? state::HashOutcome{} : state::HashFile(backup);
+  if (backup.empty() || !kept.ok()) {
+    *message = "the backup at " + *backup_sd_path +
+               " could not be read back to compare with what this tick reported, so " + sd_path +
+               " was left as it is" + (kept.message.empty() ? "" : ": " + kept.message);
+    return OperationError::kUnreadableCard;
+  }
+  if (kept.content_hash == expected) {
+    return OperationError::kNone;
+  }
+  // Dropped only while the save still holds these bytes. One written again
+  // since leaves this the sole copy of the write before -- kept, and named.
+  *message = sd_path +
+             " is not the bytes this tick reported, so the server's ruling is not about it; it "
+             "was left as it is";
+  const std::string source = files.Resolve(sd_path);
+  const state::HashOutcome now =
+      source.empty() ? state::HashOutcome{} : state::HashFile(source);
+  if (!now.ok() || now.content_hash != kept.content_hash) {
+    *message += ", and the backup at " + *backup_sd_path +
+                " is kept: the save was written again after it, so it is the only copy of the "
+                "bytes before";
+  } else if (io::Remove(backup) == 0) {
+    backup_sd_path->clear();
+  }
+  return OperationError::kUnverified;
+}
+
 namespace {
 
 /// `BackUpFirst` with a save's discriminator and this execution's clock filled
@@ -1250,6 +1288,26 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                 "the save path " + target->sd_path + " is not a path on this card");
   }
 
+  // The bytes the ruling is about (#286): what this tick reported for the save
+  // it replaces. Asked before anything is fetched, as `Remove` asks it -- with
+  // no digest to hold the backup to, nothing says the save is the copy the
+  // server ruled on. A placement replaces nothing, and a caller that passed no
+  // `reported` has said nothing to hold it to.
+  std::string ruled_on;
+  if (matched && options.reported != nullptr) {
+    const ClientSaveState* reported = ReportedFor(options, *target);
+    ruled_on = reported != nullptr ? reported->content_hash.value_or(std::string())
+                                   : std::string();
+    if (ruled_on.empty()) {
+      OperationResult failed =
+          Fail(operation, OperationError::kUnverified,
+               "this tick reported no digest for the save, so nothing says it is the copy the "
+               "server ruled on; it was left on the card");
+      failed.sd_path = target->sd_path;
+      return failed;
+    }
+  }
+
   const ServerSave described =
       DescribeServerSave(client, token, save_id, options, warnings, Describe(operation));
 
@@ -1332,6 +1390,20 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     OperationResult failed = Fail(operation, backed_up, std::move(message));
     failed.sd_path = target->sd_path;
     return failed;
+  }
+
+  // The save the game wrote between the scan and the backup is not the one the
+  // ruling was about (#286). Before the archival upload, which would otherwise
+  // keep it on the server as the losing side of a ruling that never saw it.
+  if (!ruled_on.empty()) {
+    if (const OperationError held = BackupIsReported(files, target->sd_path, ruled_on,
+                                                     &result.backup_sd_path, &message);
+        held != OperationError::kNone) {
+      OperationResult failed = Fail(operation, held, std::move(message));
+      failed.sd_path = target->sd_path;
+      failed.backup_sd_path = result.backup_sd_path;
+      return failed;
+    }
   }
 
   // The losing side of a conflict, kept where another device can reach it
@@ -1505,18 +1577,14 @@ OperationResult Remove(fs::FileSystem& files, const SyncOperation& operation,
 
   // The backup, not the save, is what is hashed: it is the copy that has to be
   // right for the removal to be safe, and it is the bytes the removal takes.
-  const state::HashOutcome digest = state::HashFile(files.Resolve(result.backup_sd_path));
-  if (!digest.ok() || digest.content_hash != expected) {
-    // The server ruled on the bytes this tick reported, and these are not
-    // them: progress the ruling never saw. The save stays, and the copy goes
-    // with it -- it duplicates a file nothing replaced, so it backs up
-    // nothing, which is `BackUpFirst`'s own reasoning for an unconfirmed one.
-    io::Remove(files.Resolve(result.backup_sd_path));
-    OperationResult failed =
-        Fail(operation, OperationError::kUnverified,
-             "the save is not the bytes this tick reported, so the server's ruling is not "
-             "about it; it was left on the card");
+  // Bytes the ruling never saw stay on the card, and the copy goes with them
+  // unless it is the only one (`BackupIsReported`).
+  if (const OperationError held = BackupIsReported(files, target->sd_path, expected,
+                                                   &result.backup_sd_path, &message);
+      held != OperationError::kNone) {
+    OperationResult failed = Fail(operation, held, std::move(message));
     failed.sd_path = target->sd_path;
+    failed.backup_sd_path = result.backup_sd_path;
     return failed;
   }
 

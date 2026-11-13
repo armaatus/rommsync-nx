@@ -786,6 +786,32 @@ over an unchanged local file — rare, and nobody waits on it.
 `conflicts.late_write` (a save, a Keep local and a state) and `states.late_write`
 force each with the same `io::Disk` (`faulty::LateWrite`, `tests/faulty_disk.hpp`).
 
+#### A write before the backup (#286)
+
+The comparison above starts at the backup, and the ruling starts earlier: the
+server decided `download`, `conflict` or `delete` about the bytes the scan
+reported, and a state's download was decided against the scanned digest. A
+game that writes between the scan and the backup — across a negotiate and a
+download, tens of megabytes for a state — leaves a save the backup copies and
+the save still equals. Committed over, that progress is in `.backup/` alone,
+and the next tick, finding the server's copy on the card, plans nothing.
+
+So right after the backup, `sync::BackupIsReported` holds it to the reported
+digest, in all four places: a `delete`, a `download`, a `conflict` (before its
+archival upload, which would otherwise keep the new bytes on the server as the
+losing side of a ruling that never saw them), and a state's download. A
+mismatch fails the operation — `kUnverified`, `changed_since_backup` for a
+state — and leaves the save; the next tick negotiates it as it now is. A matched
+`download` or `conflict` reported with no digest is refused before anything is
+fetched, as a `delete` is.
+
+The backup goes too, **but only while the save still holds its bytes** — then it
+duplicates a file nothing replaced. A save written again after the backup
+leaves the backup the only copy of the write before, and it stays, as that
+save's newest backup, which [pruning](#backups) never removes.
+`execute.stale_fetch` and `states.stale_write` write the save before the backup
+and, in a second case each, again after it.
+
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
 corrupt a file nothing opened, and A/B copies with a generation counter and a
