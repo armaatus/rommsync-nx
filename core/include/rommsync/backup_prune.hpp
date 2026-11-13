@@ -129,6 +129,15 @@ struct PruneOptions {
   /// Asked once per rom that has a candidate, and only then. Null knows
   /// nothing: only duplicates go.
   ServerDigests server_digests;
+
+  /// The Unix second the console began syncing with the server
+  /// `server_digests` asks (`state::Baseline::bound_since`, #294). A backup
+  /// named before it was taken against another server -- or one nothing on the
+  /// card can name -- under rom ids that mean nothing to this one, so this
+  /// server's digests are never its proof: it goes only as a duplicate, and
+  /// never asks the server about its rom. Zero trusts the server with every
+  /// backup.
+  std::int64_t server_since = 0;
 };
 
 struct PruneReport {

@@ -28,6 +28,7 @@
 #include "rommsync/config.hpp"
 #include "rommsync/md5.hpp"
 #include "rommsync/save_scan.hpp"
+#include "rommsync/server_binding.hpp"
 #include "rommsync/state_db.hpp"
 #include "rommsync/sync.hpp"
 
@@ -38,6 +39,7 @@ namespace {
 // host whose standard headers pull that in. Which ones do is not stable -- it
 // moved when `sync.hpp` grew an include in M2-4 -- so a green local run and a red
 // CI is the failure mode, and the anonymous namespace is what removes it.
+namespace binding = rommsync::binding;
 namespace crypto = rommsync::crypto;
 namespace io = rommsync::io;
 namespace scan = rommsync::scan;
@@ -1146,6 +1148,114 @@ void UnchangedIsSkippedChangedIsNot(checks::Checks& c) {
 
 /// A baseline that could not be read is a slow tick, not a wrong one: every
 /// save is hashed, and every one still gets a digest into the payload.
+// --- #294: a baseline belongs to the server it was synced against ------------
+
+/// The server a baseline was synced against is part of the file, beside the
+/// moment it was first bound, and comes back out of it.
+void ABaselineCarriesItsServer(checks::Checks& c) {
+  c.ExpectEq(binding::IdentityOf("HTTPS://RomM.Lan:8443/Romm/"),
+             std::string("https://romm.lan:8443/Romm"),
+             "a server is its URL, scheme and host lower-cased, the path as it is");
+  c.ExpectEq(binding::IdentityOf(""), std::string(), "and no URL is no server");
+  c.ExpectEq(binding::ArchiveSuffix("http://192.168.1.5:8080/romm"),
+             std::string("http-192.168.1.5-8080-romm"), "set aside under a name a person can read");
+
+  state::Baseline baseline;
+  baseline.Set(Full());
+  baseline.BindTo("http://romm.lan:8080", 1760000000);
+  const std::string text = state::SerializeBaseline(baseline);
+  c.ExpectEq(text.substr(0, text.find('\n')),
+             std::string("rommsync-state 4 1760000000 http://romm.lan:8080"),
+             "the header names the version, the second it was bound, and the server");
+  const state::LoadedBaseline back = state::ParseBaseline(text);
+  c.Expect(back.diagnostics.empty(), "it reads back cleanly -- " + back.DescribeDiagnostics());
+  c.ExpectEq(back.value.server(), std::string("http://romm.lan:8080"), "with its server");
+  c.ExpectEq(back.value.bound_since(), std::int64_t{1760000000}, "and since when");
+  c.ExpectEq(back.value.size(), std::size_t{1}, "and its row");
+}
+
+/// The acceptance: a baseline synced against one RomM is never read against
+/// another. Its rows -- here a `deleted_on_server` mark, which would keep the
+/// save from ever reaching the new server -- are set aside whole under the old
+/// server's name, and the new one starts from nothing.
+void AnotherServersBaselineIsSetAside(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("rebound.db");
+  const std::string aside = path.string() + ".http-a.example-8080";
+  std::error_code ignored;
+  std::filesystem::remove(aside, ignored);
+
+  state::Baseline baseline;
+  state::SaveRecord kept = Full();
+  kept.deleted_on_server = true;
+  kept.server_updated_at.reset();
+  kept.server_content_hash.reset();
+  baseline.Set(kept);
+  baseline.BindTo("http://a.example:8080", 1750000000);
+  c.Expect(state::SaveBaseline(path.string(), baseline).ok(), "server A's baseline is written");
+  const std::string written = ReadWhole(path.string());
+
+  state::LoadedBaseline same = state::LoadBaseline(path.string());
+  c.ExpectEq(state::BindToServer(&same, path.string(), "http://a.example:8080", 1760000000),
+             std::string(), "against the same server there is nothing to say");
+  c.Expect(same.value.Find(12, std::optional<std::string>("autosave")) != nullptr &&
+               same.value.bound_since() == 1750000000,
+           "and its rows and its binding stand");
+
+  state::LoadedBaseline other = state::LoadBaseline(path.string());
+  const std::string line =
+      state::BindToServer(&other, path.string(), "https://b.example", 1760000000);
+  c.Expect(other.value.empty(), "against another server, none of its rows is read");
+  c.ExpectEq(other.value.server(), std::string("https://b.example"), "it is the new server's");
+  c.ExpectEq(other.value.bound_since(), std::int64_t{1760000000}, "from now");
+  c.Expect(!std::filesystem::exists(path), "the old file is no longer where a tick reads it");
+  c.ExpectEq(ReadWhole(aside), written, "it is set aside whole, under the old server's name");
+  c.Expect(line.find(aside) != std::string::npos, "and the log line says where -- " + line);
+
+  // The new server's first write, then a boot that still has the old URL: the
+  // same rule the other way round, and the earlier archive is not overwritten.
+  state::Baseline fresh = other.value;
+  c.Expect(state::SaveBaseline(path.string(), fresh).ok(), "the new server's baseline is written");
+  state::LoadedBaseline back = state::LoadBaseline(path.string());
+  state::BindToServer(&back, path.string(), "http://a.example:8080", 1770000000);
+  c.ExpectEq(ReadWhole(aside), written, "the first archive is untouched");
+  c.Expect(std::filesystem::exists(path.string() + ".https-b.example"),
+           "and the second has its own name");
+}
+
+/// A commit window leaves the old server's rows under `.old`, which is where
+/// the next load looks for them. Setting aside only `state.db` would have them
+/// recovered on the tick after.
+void AnInterruptedCommitIsSetAsideToo(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("rebound-window.db");
+  const std::string aside = path.string() + ".http-a.example";
+  std::error_code ignored;
+  std::filesystem::remove(aside, ignored);
+
+  state::Baseline baseline;
+  baseline.Set(Full());
+  baseline.BindTo("http://a.example", 1750000000);
+  WriteWhole(io::PreviousPathFor(path.string()), state::SerializeBaseline(baseline));
+
+  state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  state::BindToServer(&loaded, path.string(), "http://b.example", 1760000000);
+  c.Expect(loaded.value.empty(), "the recovered rows are another server's, so none is kept");
+  c.Expect(!std::filesystem::exists(io::PreviousPathFor(path.string())) &&
+               std::filesystem::exists(aside),
+           "and the .old they came from is set aside");
+  const state::LoadedBaseline again = state::LoadBaseline(path.string());
+  c.Expect(again.value.empty(), "so the next load has nothing of server A's to recover");
+}
+
+/// No rows at all says nothing about which server any backup on the card was
+/// taken against, so the binding starts now rather than at the epoch.
+void NoBaselineIsBoundFromNow(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("rebound-none.db");
+  state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  state::BindToServer(&loaded, path.string(), "http://b.example", 1760000000);
+  c.ExpectEq(loaded.value.server(), std::string("http://b.example"), "a missing file is bound");
+  c.ExpectEq(loaded.value.bound_since(), std::int64_t{1760000000}, "from now");
+}
+
 void ALostBaselineCostsTimeNotCorrectness(checks::Checks& c) {
   const std::filesystem::path path = FreshPath("garbage.db");
   WriteWhole(path.string(), "\x01\x02 not a state.db at all\n");
@@ -1195,5 +1305,9 @@ int main() {
   HashesAFileTheWayTheServerWill(c);
   UnchangedIsSkippedChangedIsNot(c);
   ALostBaselineCostsTimeNotCorrectness(c);
+  ABaselineCarriesItsServer(c);
+  AnotherServersBaselineIsSetAside(c);
+  AnInterruptedCommitIsSetAsideToo(c);
+  NoBaselineIsBoundFromNow(c);
   return c.failures() == 0 ? 0 : 1;
 }

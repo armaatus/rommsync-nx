@@ -875,6 +875,10 @@ std::size_t AdoptLegacySaves(
   return adopted;
 }
 
+std::string BindToServer(LoadedBaseline*, const std::string&, std::string_view, std::int64_t) {
+  return {};
+}
+
 LoadedBaseline LoadBaseline(const std::string& path) {
   LoadedBaseline loaded;
   const io::BoundedRead outcome = Load(path, &loaded);

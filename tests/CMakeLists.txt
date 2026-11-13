@@ -1298,6 +1298,7 @@ set(PRUNE_UNIT_SCENARIOS
   duplicate  # an older identical copy goes when a newer one stays
   truncated  # past one listing, the rom it cuts sits the prune out, all its groups
   crash      # a power cut at every call of a prune loses no backup's bytes
+  other_server  # #294: a backup from before a server switch is never pruned on the new one's word
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})
@@ -2384,6 +2385,7 @@ target_link_libraries(test_engine PRIVATE Threads::Threads)
 set(ENGINE_SCENARIOS
   queue     # enqueue, dequeue, and the depth the status screen reads
   persists  # every change reaches queue.json, and a fresh engine reads it back
+  rebinds   # #294: another server's queue.json and play.db are set aside at boot, not read
   rollback  # a write that cannot happen changes neither the file nor memory
   corrupt   # a queue.json a yanked card left behind never blocks the boot
   config    # M5-3: an edit lands on the card and on the running engine
@@ -2455,6 +2457,7 @@ set(ENGINE_RIG_SCENARIOS
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
   backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
+  server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
   placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save

@@ -163,6 +163,51 @@ void Count(checks::Checks& c) {
   c.Expect(!backup::Describe(report).empty(), "the log line says something");
 }
 
+/// #294: after the console moved to another RomM, a backup taken under the old
+/// one names a rom id the new one may give to another game. Even when the new
+/// server happens to hold the same digest under that id, it is not the copy the
+/// backup is a backup of -- and a server the user only tried is not one they
+/// will go back to for it.
+void OtherServer(checks::Checks& c) {
+  Sandbox sandbox(c, "prune-other-server");
+  FakeServer server;
+  const std::int64_t switched = kNow - 30 * kDay;
+  std::vector<Seeded> before;
+  for (int i = 0; i < 4; ++i) {
+    before.push_back(Seed(sandbox, 4, "autosave", switched - 100 * kDay + i, Bytes(i)));
+    server.Holds(4, Bytes(i));
+  }
+  // Two identical copies from before: the older is a duplicate of the newer,
+  // which stays, so it still goes -- that proof is the card's, not a server's.
+  const Seeded twin_old = Seed(sandbox, 4, "autosave", switched - 200 * kDay, Bytes(3));
+  // And after the switch, the new server's own backups, which it does prove.
+  std::vector<Seeded> after;
+  for (int i = 10; i < 14; ++i) {
+    after.push_back(Seed(sandbox, 6, "autosave", switched + 1 + i, Bytes(i)));
+    server.Holds(6, Bytes(i));
+  }
+
+  backup::PruneOptions options = Options(&server, 1, 0, 0);
+  options.server_since = switched;
+  const std::unique_ptr<fs::FileSystem> files =
+      host::MakeNativeFileSystem(sandbox.root().string());
+  const backup::PruneReport report = backup::Prune(*files, options);
+
+  for (const Seeded& kept : before) {
+    c.Expect(sandbox.Exists(kept.sd_path),
+             "a backup from before the switch is not pruned on the new server's word: " +
+                 kept.sd_path);
+  }
+  c.Expect(!sandbox.Exists(twin_old.sd_path), "but an older duplicate of one that stays goes");
+  c.Expect(server.asked.count(4) == 0, "and the new server is never asked about the old rom id");
+  for (std::size_t i = 0; i + 1 < after.size(); ++i) {
+    c.Expect(!sandbox.Exists(after[i].sd_path),
+             "a backup taken since is pruned as before: " + after[i].sd_path);
+  }
+  c.Expect(sandbox.Exists(after.back().sd_path), "the newest of its group stays");
+  c.ExpectEq(report.pruned, std::size_t{4}, "four went: the duplicate and three of the new");
+}
+
 void Age(checks::Checks& c) {
   Sandbox sandbox(c, "prune-age");
   FakeServer server;
@@ -411,6 +456,8 @@ int main(int argc, char** argv) {
       Truncated(checks);
     } else if (scenario == "crash") {
       Crash(checks);
+    } else if (scenario == "other_server") {
+      OtherServer(checks);
     } else {
       std::cerr << "unknown scenario " << scenario << "\n";
       return 2;

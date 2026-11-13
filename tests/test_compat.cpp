@@ -30,6 +30,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #include "checks.hpp"
 #include "scratch.hpp"
@@ -312,6 +313,48 @@ void StateDb(checks::Checks& c) {
                newer.DescribeDiagnostics());
 }
 
+// --- state.db: rc2's, adopted by the server it was synced against (#294) -------------
+
+/// rc2 wrote version 3, which names no server. Upgrading is not a switch: the
+/// file is every row this console has, the configured server is the only one
+/// anything on the card can show it synced with, so the rows are kept -- the
+/// `deleted_on_server` mark among them, or a save the player kept off RomM on
+/// purpose would be offered back to it -- and the file is bound to that server
+/// from the epoch, so the prune still trusts the server with rc2's backups.
+void StateDbRc2(checks::Checks& c) {
+  const std::string rc2 = Slurp(fsys::path(ROMMSYNC_FIXTURES) / "v1.0.0-rc2" / "state_db");
+  c.ExpectEq(rc2.substr(0, rc2.find('\n')), std::string("rommsync-state 3"),
+             "state.db rc2: the fixture is rc2's version 3");
+  rs::state::LoadedBaseline read = rs::state::ParseBaseline(rc2);
+  c.Expect(read.diagnostics.empty(), "state.db rc2: no complaints -- " + read.DescribeDiagnostics());
+  c.ExpectEq(read.version, rs::state::kUnboundVersion, "state.db rc2: read as the unbound version");
+  c.ExpectEq(read.value.server(), std::string(), "state.db rc2: no server named");
+
+  const std::string path = (fsys::path(scratch::Dir()) / "compat-rc2-state.db").string();
+  std::error_code ignored;
+  fsys::remove(path, ignored);
+  const std::string line =
+      rs::state::BindToServer(&read, path, "https://romm.lan:8443/romm", 1770000000);
+  c.ExpectEq(read.value.server(), std::string("https://romm.lan:8443/romm"),
+             "state.db rc2: adopted by the configured server");
+  c.ExpectEq(read.value.bound_since(), std::int64_t{0}, "state.db rc2: from the epoch");
+  c.ExpectEq(read.value.size(), std::size_t{4}, "state.db rc2: every row kept");
+  const rs::state::SaveRecord* kept = read.value.Find(303, std::string("autosave"));
+  c.Expect(kept != nullptr && kept->deleted_on_server,
+           "state.db rc2: a save RomM deleted and the card kept keeps its mark");
+  const rs::state::StateRecord* state = read.value.FindState(101, "Super Game.state1");
+  c.Expect(state != nullptr && state->server_state_id == 77, "state.db rc2: the state row");
+  c.Expect(line.empty(), "state.db rc2: an upgrade is not a switch, and says nothing -- " + line);
+
+  const std::string written = rs::state::SerializeBaseline(read.value);
+  c.ExpectEq(written.substr(0, written.find('\n')),
+             std::string("rommsync-state 4 0 https://romm.lan:8443/romm"),
+             "state.db rc2: written back bound");
+  const rs::state::LoadedBaseline again = rs::state::ParseBaseline(written);
+  c.Expect(again.value.size() == 4 && again.value.server() == "https://romm.lan:8443/romm",
+           "state.db rc2: and read back as it");
+}
+
 // --- queue.json: discard, both ways ---------------------------------------------------
 
 void QueueJson(checks::Checks& c) {
@@ -523,6 +566,7 @@ int main() {
   checks::Checks c;
   ConfigIni(c);
   StateDb(c);
+  StateDbRc2(c);
   QueueJson(c);
   ConflictsDb(c);
   PlayDb(c);
