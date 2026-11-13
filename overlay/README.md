@@ -72,7 +72,7 @@ source/
   status_screen.*     # the status screen's drawing; its decisions are in core/
   pairing_screen.*    # the pairing screen's drawing; likewise
   sync_screen.*       # the switch and "Sync now"; likewise
-  library_screen.*    # platforms -> roms -> the queue; likewise
+  library_screen.*    # platforms -> roms -> the queue; likewise. Its IPC frame is library_pump.*
   settings_screen.*   # the configuration, the root menu and "Re-pair"; likewise
   conflicts_screen.*  # what a sync overwrote, and the restore; its IPC frame is conflicts_pump.*
   log_screen.*        # the end of the log; its layout is log_paint.*

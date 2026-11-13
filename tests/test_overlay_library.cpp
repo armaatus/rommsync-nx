@@ -1378,9 +1378,11 @@ void CheckLibraryScreenCallsNoEngine(Checks& checks) {
       "http::",      "sync::",  "auth::Gate", "state_db",
   };
 
-  ScanForbidden(checks, std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / "library_screen.cpp",
-                kForbidden,
-                "the overlay renders what the sysmodule reports and calls no engine");
+  // `library_pump.cpp` too: the screen's IPC moved there in #285.
+  for (const char* file : {"library_screen.cpp", "library_pump.cpp"}) {
+    ScanForbidden(checks, std::filesystem::path(ROMMSYNC_OVERLAY_SOURCE_DIR) / file, kForbidden,
+                  "the overlay renders what the sysmodule reports and calls no engine");
+  }
 }
 
 /// The model names no libnx and no libultrahand type (hard rule 4).

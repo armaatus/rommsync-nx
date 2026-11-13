@@ -22,6 +22,8 @@
 //   `lifecycle.cpp`    start, show, and the one teardown every exit path ends
 //                      in; and `Cadence`, the clock a screen polls by (#209).
 //   `log_paint.cpp`    the log screen's layout (#209).
+//   `library_pump.cpp` the library browser's IPC frame, and the teardown its
+//                      destructor runs (#285).
 //
 // The far side of the wire is the *real* dispatch table -- `ipc::Dispatch` over
 // an `ipc::ServiceCore` -- and the real `Error` -> `Result` mapping the
@@ -69,6 +71,7 @@
 #include "conflicts_pump.hpp"
 #include "draw_list.hpp"
 #include "ipc_client.hpp"
+#include "library_pump.hpp"
 #include "lifecycle.hpp"
 #include "log_paint.hpp"
 #include "prompts.hpp"
@@ -1387,6 +1390,7 @@ constexpr const char* kPortableFiles[] = {
     "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",   "screen_frame.cpp",
     "status_paint.hpp", "status_paint.cpp", "conflicts_pump.hpp", "conflicts_pump.cpp",
     "lifecycle.hpp",    "lifecycle.cpp",    "log_paint.hpp",      "log_paint.cpp",
+    "library_pump.hpp", "library_pump.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately

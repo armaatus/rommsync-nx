@@ -833,7 +833,8 @@ ctest --test-dir build --output-on-failure
   *unreachable*), and `status_paint.cpp` (the status screen's layout, behind the
   `DrawList` seam). M9-6 (#209) added three more: `conflicts_pump.cpp` (the
   conflicts screen's IPC frame), `lifecycle.cpp` (start, show and the one
-  teardown) and `log_paint.cpp` (the log screen's layout). What those make
+  teardown) and `log_paint.cpp` (the log screen's layout); M11-1 (#285) added
+  `library_pump.cpp` (the library browser's IPC frame and teardown). What those make
   assertable: `overlay.timeout` holds the far side's answer and asserts the draw
   thread gets `NotResponding` at the client's budget and is never held again
   while the call is out; `overlay.restore` times every frame of the conflicts
@@ -850,7 +851,7 @@ ctest --test-dir build --output-on-failure
   surprise. `overlay.portable` is the odd one out and is a grep: it holds the
   portable half of `overlay/source/` -- `draw_list.hpp`, `prompts.hpp`,
   `screen_frame.*`, `status_paint.*`, `conflicts_pump.*`, `lifecycle.*`,
-  `log_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
+  `log_paint.*`, `library_pump.*` -- to naming no `tesla.hpp`, `tsl::`,
   `libultrahand` or `arm_neon`, transitively through the headers they include,
   because the compile only covers the files this target happens to build and the
   *next* screen's painter is the one that would quietly leave the reach of every

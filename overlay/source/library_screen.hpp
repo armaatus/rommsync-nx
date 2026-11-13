@@ -67,14 +67,9 @@ class LibraryScreen : public tsl::Gui {
                    HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
 
  private:
-  /// Send at most one command, and tell the model what came back.
+  /// Send at most one command, and tell the model what came back
+  /// (`library_pump.hpp`).
   void Pump();
-
-  /// Send `command`, and report its answer to the model. Split out from `Pump`
-  /// because every arm ends the same way -- a `Result` that failed is either a
-  /// refusal the sysmodule named or the transport, and only `DecodeError` can
-  /// tell those apart.
-  void Send(const LibraryBrowserModel::Command& command);
 
   /// How many prompt rows this view will draw.
   ///

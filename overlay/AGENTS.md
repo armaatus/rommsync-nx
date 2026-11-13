@@ -60,7 +60,8 @@ Ultrahand overlay list.
   directly has left the reach of every test.
 - **The parts of this directory that need no renderer are compiled and run on a
   host.** `source/card_probe.cpp`, `source/conflicts_pump.cpp`,
-  `source/ipc_client.cpp`, `source/lifecycle.cpp`, `source/log_paint.cpp`,
+  `source/ipc_client.cpp`, `source/library_pump.cpp`, `source/lifecycle.cpp`,
+  `source/log_paint.cpp`,
   `source/screen_frame.cpp` and `source/status_paint.cpp` are built into
   `test_overlay_native` and driven against the real `ipc::Dispatch` and the real
   `sysmodule::ToResult` — so a payload the two halves disagree about is a red
