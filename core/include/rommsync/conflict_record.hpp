@@ -60,8 +60,8 @@ struct RecordOptions {
   std::function<sync::Timestamp()> now;
 
   /// Stamped on every entry as `Entry::server` (#317): the tag of the server
-  /// the tick ran against. Empty records entries with none.
-  std::string server;
+  /// the tick ran against. Zero records entries with none.
+  std::uint64_t server = 0;
 };
 
 /// Record every overwrite in `report`, and answer how many entries that was.
@@ -108,7 +108,7 @@ struct RestoreOptions {
 
   /// `KeepLocal` only: the tag of the server the console syncs with now
   /// (`Entry::server`, #317). An entry stamped otherwise is refused.
-  std::string server;
+  std::uint64_t server = 0;
 };
 
 /// Put the bytes `entry_id` names back on the card.

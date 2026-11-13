@@ -1,11 +1,14 @@
 #include "rommsync/server_binding.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/md5.hpp"
 
 namespace rommsync::binding {
 
@@ -127,9 +130,17 @@ Archived Archive(const std::string& path, std::string_view identity) {
   return archived;
 }
 
-std::string TagOf(std::string_view identity) {
-  static_cast<void>(identity);
-  return {};
+std::uint64_t TagOf(std::string_view identity) {
+  if (identity.empty()) {
+    return 0;
+  }
+  const std::string digest = crypto::Md5(identity);
+  std::uint64_t tag = 0;
+  for (std::size_t at = 0; at < 8 && at < digest.size(); ++at) {
+    tag = (tag << 8) | static_cast<unsigned char>(digest[at]);
+  }
+  // Zero is "no server"; one identity in 2^64 gives it up for one.
+  return tag == 0 ? 1 : tag;
 }
 
 Rebound BindRecords(const std::string& marker, const std::vector<std::string>& records,
@@ -159,6 +170,7 @@ Rebound BindRecords(const std::string& marker, const std::vector<std::string>& r
     // against something that is not this server.
     const std::string old(Trimmed(read == io::BoundedRead::kOk ? text : std::string()));
     rebound.rebound = true;
+    rebound.previous = old;
     bool all_aside = true;
     for (const std::string& record : records) {
       const Archived archived = Archive(record, old);

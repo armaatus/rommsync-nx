@@ -139,6 +139,42 @@ bool ReadEvent(std::string_view text, Event* out) {
   return false;
 }
 
+/// `Entry::server` as the file spells it: 16 lowercase hex digits. A string
+/// rather than a JSON number, which a reader may hold as a double.
+std::string ServerText(std::uint64_t server) {
+  static constexpr char kDigits[] = "0123456789abcdef";
+  std::string text(16, '0');
+  for (int at = 15; at >= 0; --at) {
+    text[static_cast<std::size_t>(at)] = kDigits[server & 0xF];
+    server >>= 4;
+  }
+  return text;
+}
+
+/// The other way. Exactly 16 hex digits and not zero, or it is not a tag.
+bool ReadServer(const std::string& text, std::uint64_t* server) {
+  if (text.size() != 16) {
+    return false;
+  }
+  std::uint64_t value = 0;
+  for (const char digit : text) {
+    std::uint64_t nibble = 0;
+    if (digit >= '0' && digit <= '9') {
+      nibble = static_cast<std::uint64_t>(digit - '0');
+    } else if (digit >= 'a' && digit <= 'f') {
+      nibble = static_cast<std::uint64_t>(digit - 'a' + 10);
+    } else {
+      return false;
+    }
+    value = (value << 4) | nibble;
+  }
+  if (value == 0) {
+    return false;
+  }
+  *server = value;
+  return true;
+}
+
 }  // namespace
 
 std::string SerializeEntry(const Entry& entry) {
@@ -170,6 +206,10 @@ std::string SerializeEntry(const Entry& entry) {
   }
   if (entry.archive_save_id > 0) {
     AppendInteger(&out, "archive_save_id", entry.archive_save_id);
+  }
+  // #317's, on the same terms: absent is a row from before it.
+  if (entry.server != 0) {
+    AppendText(&out, "server", ServerText(entry.server));
   }
   out += "}";
   return out;
@@ -261,6 +301,12 @@ bool ParseEntry(const json::Value& object, Entry* out, std::string* why) {
       return false;
     }
     entry.archive_save_id = id->integer();
+  }
+  if (const json::Value* server = object.Find("server"); server != nullptr && !server->is_null()) {
+    if (!server->is_string() || !ReadServer(server->string(), &entry.server)) {
+      *why = "field server: not a server this build records";
+      return false;
+    }
   }
 
   *out = std::move(entry);
@@ -611,9 +657,17 @@ StoreResult History::Append(Entry entry) {
   return result;
 }
 
-StoreResult History::Claim(const std::string& server) {
-  static_cast<void>(server);
-  return {};
+StoreResult History::Claim(std::uint64_t server) {
+  bool stamped = false;
+  if (server != 0) {
+    for (Entry& entry : entries_) {
+      if (entry.server == 0) {
+        entry.server = server;
+        stamped = true;
+      }
+    }
+  }
+  return stamped ? Persist() : StoreResult{};
 }
 
 }  // namespace rommsync::conflicts

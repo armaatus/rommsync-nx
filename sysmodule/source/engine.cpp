@@ -298,6 +298,14 @@ void SdEngine::ForgetServerLocked(bool different_server) {
     server_too_old_ = false;
     // Another server's rom ids.
     fresh_roms_.clear();
+    // ...and so are the Keep local choices (#317): an armed key would send
+    // `overwrite=true` for whatever the new server calls that rom id, and a
+    // held one would land bytes the new server never weighed, then arm. A
+    // choice already on its way to the card checks `server_switches_` before
+    // it arms.
+    std::vector<state::Baseline::Key>().swap(keep_local_);
+    std::vector<state::Baseline::Key>().swap(keep_local_held_);
+    ++server_switches_;
   }
 }
 
@@ -542,6 +550,7 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
     previous_config_ = config_;
     config_ = std::make_shared<const config::Config>(std::move(loaded.value));
   }
+  server_tag_ = binding::TagOf(binding::IdentityOf(ConfigSnapshot()->server.url));
   // In the same breath, so a changed interval takes effect with no reboot and a
   // changed `server.url` lifts a TLS park (`sync::Scheduler::Reconfigure`).
   scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
@@ -573,6 +582,29 @@ void SdEngine::BindResidentRecords(const std::string& server) {
   }
   if (rebound.bound) {
     records_server_ = server;
+  }
+  // conflicts.db stays where it is -- its backups are this card's, and a plain
+  // restore of one is local -- but a row from before #317 names no server, and
+  // Keep local must know which it was recorded on. The marker says: the server
+  // it named before this call, or this one when it already named this one or
+  // nothing (an upgrade, which `BindRecords` adopts the same way). A marker
+  // naming nothing usable stands for a server no configured URL is.
+  //
+  // At boot this writes the card under `mutex_`, as `BindRecords` above does:
+  // `Load`'s one exception, and only once, when an old row is first claimed.
+  if (rebound.rebound || rebound.bound) {
+    std::string_view owner = server;
+    if (rebound.rebound) {
+      owner = rebound.previous.empty() ? std::string_view("unknown:") : rebound.previous;
+    }
+    std::lock_guard<std::mutex> history(history_mutex_);
+    const conflicts::StoreResult claimed = history_.Claim(binding::TagOf(owner));
+    if (!claimed.ok()) {
+      log::Warn(log::Event::kServerVersion,
+                "the conflict history could not be marked with its server (" + claimed.message +
+                    "); this boot holds the marks, and a boot that reads them unmarked gives "
+                    "them to the server it is configured for");
+    }
   }
 }
 
@@ -835,8 +867,10 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
     // server that has just been replaced. Its grant would be a token issued by
     // one RomM committed under a `config.ini` naming another -- the same
     // confusion the discard above exists to prevent, arriving a minute later.
+    std::size_t choices_dropped = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      choices_dropped = keep_local_.size() + keep_local_held_.size();
       AbandonPairingLocked();
       // ...and so is the drain, which since M9-5 (#197) copied `base_url` and
       // the token at its start and would carry on fetching rom bodies from the
@@ -860,6 +894,15 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
       // about its version is not drawn beside the new one, and the next tick
       // asks.
       ForgetServerLocked(/*different_server=*/true);
+      // The new server's, from here: a Keep local between this slice and the
+      // adoption below is weighed against it, not against the one just left.
+      server_tag_ = binding::TagOf(binding::IdentityOf(parsed.value.server.url));
+    }
+    if (choices_dropped > 0) {
+      log::Info(log::Event::kSyncRefused,
+                std::to_string(choices_dropped) +
+                    " Keep local choice(s) made against the previous server are dropped with it; "
+                    "nothing goes up with overwrite=true to the new one");
     }
     // Every other write to `attempt_` notifies, and this one has the longest
     // wait to cut short: the thread is parked in `AwaitNextPoll` until the
@@ -2090,6 +2133,10 @@ struct SdEngine::TickInputs {
   // landing while the heartbeat is in flight bumps it, and the old server's
   // answer must not overwrite the "ask again" that stands for the new one.
   std::uint64_t generation = 0;
+  // `server_switches_` when this tick took its token (#317). A Keep local
+  // armed after a switch is the next server's, and a tick still running
+  // against the last one sends none of them.
+  std::uint64_t switches = 0;
 };
 
 /// What the card held this tick, and what the saves half is handed of it.
@@ -2259,6 +2306,9 @@ SdEngine::TickRun SdEngine::RunOneTick() {
     // failure: the screen falls back to the file name.
     return rom == nullptr ? std::string() : rom->fs_name_no_ext;
   };
+  // The server this tick runs against, which is the one its rom ids are of
+  // (#317), even if `server.url` moves before it ends.
+  record.server = binding::TagOf(binding::IdentityOf(inputs.config->server.url));
 
   SavesTally tally;
   const sync::TickResult tick = RunSavesHalf(inputs, library, &options, &found, record, &tally);
@@ -2354,6 +2404,7 @@ bool SdEngine::StartTick(TickInputs* inputs) {
     inputs->client = server_;
     inputs->files = card_;
     inputs->token = token_;
+    inputs->switches = server_switches_;
     blocked = gate_.blocked();
   }
   const config::Config& config = *inputs->config;
@@ -2692,7 +2743,9 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
   // restore taken while this tick runs arms a choice the next tick sends.
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    options.execute.keep_local = keep_local_;
+    if (server_switches_ == inputs.switches) {
+      options.execute.keep_local = keep_local_;
+    }
     // The network clock is one of the two a tick holds the console's to (#295).
     options.network_clock = network_clock_;
   }
@@ -3551,6 +3604,8 @@ void SdEngine::BuildConflictPage(const ipc::ConflictQuery& query, ipc::ConflictP
   for (; at < entries.size() && page->entries.size() < wanted; ++at) {
     ipc::ConflictRow row;
     row.entry = entries[at];
+    // The screen has no use for it, and every byte counts against the page.
+    row.entry.server = 0;
     row.backup_present = BackupPresent(entries[at]);
     // A choice is its save's, and drawn on the entry it was made on: the
     // save's newest, which is the only one Keep local takes. A candidate for
@@ -3662,9 +3717,13 @@ conflicts::RestoreReport SdEngine::OnCard(Act&& act) {
 void SdEngine::RunRestore(std::int64_t entry_id) {
   bool keep_local = false;
   std::vector<state::Baseline::Key> armed;
+  std::uint64_t switches = 0;
+  std::uint64_t server_tag = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     keep_local = restore_keeps_local_;
+    switches = server_switches_;
+    server_tag = server_tag_;
     if (keep_local) {
       // For `conflicts::KeepLocal`'s bound, which the held choices count
       // towards as well as the armed ones (#275): each is a key waiting for
@@ -3700,6 +3759,7 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
   // card holds.
   conflicts::RestoreOptions restore_options;
   restore_options.game_running = keep_local && application_running();
+  restore_options.server = server_tag;
   conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
     return keep_local
                ? conflicts::KeepLocal(card, history_, entry_id, armed, &kept, restore_options)
@@ -3708,7 +3768,8 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
 
   bool woken = false;
   bool unarmed = false;
-  const bool held = keep_local && report.outcome == conflicts::RestoreOutcome::kHeld;
+  bool switched = false;
+  bool held = keep_local && report.outcome == conflicts::RestoreOutcome::kHeld;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (restore_.entry_id != entry_id) {
@@ -3716,7 +3777,14 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
       // refuse rather than write one restore's outcome under another's id.
       return;
     }
-    if (held) {
+    // `server.url` moved while this ran (#317): the choice was made against
+    // the server that is gone, so it is neither held nor armed. Restored bytes
+    // stay on the card -- a copy, backed up first -- and meet the new server's
+    // slot guard like any other upload.
+    switched = keep_local && switches != server_switches_;
+    if (switched) {
+      held = false;
+    } else if (held) {
       // Held, not armed: nothing is on the card yet. The worker is woken so
       // its next wait is bounded by the poll that lands it (`RunWorker`), and
       // that poll is one `foreground_poll_` off -- the probe was just asked.
@@ -3750,6 +3818,12 @@ void SdEngine::RunRestore(std::int64_t entry_id) {
     restore_.phase = ipc::RestorePhase::kDone;
     restore_kept_.reset();
     restore_.report = std::move(report);
+  }
+  if (switched) {
+    log::Warn(log::Event::kSyncRefused,
+              "rom " + std::to_string(kept.first) +
+                  ": the server changed while Keep local ran, so nothing is armed for the new "
+                  "one");
   }
   if (unarmed) {
     log::Warn(log::Event::kSyncRefused,
@@ -3793,7 +3867,9 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
   // and each save's line written before the next is copied.
   bool asked = false;
   for (const state::Baseline::Key& key : held) {
+    conflicts::RestoreOptions options;
     std::vector<state::Baseline::Key> armed;
+    std::uint64_t switches = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // **Claimed before the card is touched** (#279). A cancel since the
@@ -3805,6 +3881,8 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
       landing_ = key;
       UnholdLocked(key);
       armed = keep_local_;
+      switches = server_switches_;
+      options.server = server_tag_;
     }
     // The same restore as `RunRestore`'s, run later.
     const conflicts::RestoreReport report = OnCard([&](fs::FileSystem& card) {
@@ -3816,7 +3894,7 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
       const conflicts::Entry* entry = conflicts::NewestSaveEntry(history_, key);
       state::Baseline::Key landed{0, std::nullopt};
       return conflicts::KeepLocal(card, history_, entry != nullptr ? entry->id : 0, armed,
-                                  &landed);
+                                  &landed, options);
     });
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -3826,7 +3904,8 @@ void SdEngine::LandHeldKeepLocal(bool ask_tick) {
       landing_.reset();
       // Armed only once the bytes are on the card, as `RunRestore` arms. The
       // bound counted this key while it was held, so there is room.
-      if (report.ok() && sync::ArmKeepLocal(&keep_local_, key)) {
+      // Not after a server change (#317), which dropped every choice.
+      if (report.ok() && switches == server_switches_ && sync::ArmKeepLocal(&keep_local_, key)) {
         asked = true;
       }
     }

@@ -203,6 +203,15 @@ and two RomMs behind one URL are not told apart. The backup prune
 (`backup::PruneOptions::server_since`) never removes a backup older than the
 binding on the new server's word.
 
+`conflicts.db` is not set aside: its entries point at backups on this card, and
+a plain restore of one is a local copy whichever server is configured. Instead
+each entry names the server its tick ran against (`Entry::server`, a digest of
+the identity, #317), and Keep local — which asks that server to take the
+bytes with `overwrite=true` — is refused on an entry from another. Rows written
+before #317 are claimed at boot for the server `server.id` named. A
+`server.url` change also drops every armed or held Keep local, which are
+in-memory keys of the old server's rom ids.
+
 **The two halves on one card.** The IPC contract has its own version
 (`ipc::kVersion`): when it differs the overlay draws "sysmodule unreachable" and
 names the half to update, whichever is behind. When it matches but the builds

@@ -1263,8 +1263,8 @@ void KeepLocal(checks::Checks& c) {
 void ServerTagged(checks::Checks& c) {
   const std::string kept = "the bytes this console had, and chose to keep\n";
   const std::string theirs = "the server's copy, which the conflict put here\n";
-  const std::string a = "5f0c2bd0a1d5d6cbb9cbd1c1c9e1b6a0";
-  const std::string b = "0e9e1f6c0b1f3a7c2d6c5b4a39281706";
+  const std::uint64_t a = 0x5f0c2bd0a1d5d6cbULL;
+  const std::uint64_t b = 0x0e9e1f6c0b1f3a7cULL;
 
   // The recorder stamps what the tick ran against, and the file keeps it.
   {
@@ -1299,7 +1299,7 @@ void ServerTagged(checks::Checks& c) {
              "an entry with no server is the row rc2 wrote: " + row);
     const conflicts::LoadedHistory read =
         conflicts::ParseHistory(conflicts::SerializeHistory({untagged}, 2));
-    c.Expect(read.entries.size() == 1 && read.entries[0].server.empty(),
+    c.Expect(read.entries.size() == 1 && read.entries[0].server == 0,
              "and reads back with none");
     conflicts::Entry tagged = untagged;
     tagged.server = b;

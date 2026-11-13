@@ -1504,6 +1504,19 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// held choice waits for one that does; a console always starts it.
   std::vector<state::Baseline::Key> keep_local_held_;
 
+  /// Bumped by every `server.url` change (`ForgetServerLocked`), which drops
+  /// both lists above (#317). A Keep local that read it before its copy and
+  /// finds it moved after arms nothing: the choice was the old server's.
+  /// Guarded by `mutex_`.
+  std::uint64_t server_switches_ = 0;
+
+  /// `binding::TagOf` the server `config.ini` names: what a conflict entry's
+  /// `server` is compared with before Keep local (#317). Set with the bump
+  /// above, in the same slice, so a Keep local reading both never pairs the
+  /// new count with the old server; and again whenever a configuration is
+  /// adopted. Guarded by `mutex_`.
+  std::uint64_t server_tag_ = 0;
+
   /// The held key `LandHeldKeepLocal` is writing now, taken out of
   /// `keep_local_held_` under `mutex_` before the card is touched (#279).
   /// That claim is what a cancel is decided against: before it, the key is

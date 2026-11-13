@@ -943,7 +943,8 @@ static_assert(sizeof(rommsync::download::QueueEntry) == 208,
               "download::QueueEntry changed size; re-measure kQueuedRomTextBytes");
 static_assert(kHeapDownloadQueue == 0x5400,
               "download::kMaxQueueEntries moved; retotal the table");
-static_assert(sizeof(rommsync::conflicts::Entry) == 408,
+// 416 since #317's `Entry::server`: eight bytes and no text, inside the row.
+static_assert(sizeof(rommsync::conflicts::Entry) == 416,
               "conflicts::Entry changed size; re-measure kHistoryEntryTextBytes");
 static_assert(kHeapConflictHistory == 0x8C00,
               "conflicts::kMaxEntries moved; retotal the table");

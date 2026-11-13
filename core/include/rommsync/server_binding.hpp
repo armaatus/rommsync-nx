@@ -33,6 +33,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -59,10 +60,10 @@ std::string IdentityOf(std::string_view server_url);
 /// (`http-192.168.1.5-8080`). `unknown` for an identity that leaves nothing.
 std::string ArchiveSuffix(std::string_view identity);
 
-/// A short, fixed-length name for `identity`, for a record that carries its
-/// server on every row (`conflicts::Entry::server`, #317): the identity's MD5
-/// in hex. Empty for an empty identity.
-std::string TagOf(std::string_view identity);
+/// A number for `identity`, for a record that carries its server on every row
+/// (`conflicts::Entry::server`, #317): the first eight bytes of the identity's
+/// MD5, never zero. Zero for an empty identity -- no server.
+std::uint64_t TagOf(std::string_view identity);
 
 /// What `Archive` did.
 struct Archived {

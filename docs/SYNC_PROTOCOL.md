@@ -514,7 +514,10 @@ and it is the only thing that ever sends `overwrite=true`:
    (#273), in this order -- and only then held for a running game (step 1a),
    so a choice that can never be taken says why rather than waiting for a game
    to close first:
-   - `not_a_conflict`: the entry is not a save conflict with a slot;
+   - `not_a_conflict`: the entry is not a save conflict with a slot, or it
+     was recorded against another server than the configured one (#317) --
+     its rom id is that server's, so the override could land on another game.
+     A plain restore of it still runs;
    - `superseded`: a newer entry of the same `(rom_id, slot)` -- another
      conflict, a download over it, a deletion -- has moved the card on since.
      Only a save's newest entry is Keep local's;
@@ -586,7 +589,10 @@ and it is the only thing that ever sends `overwrite=true`:
    -- a row never chosen, or a choice spent or dropped -- with its state.
 2. Once the bytes are on the card -- never before -- the sysmodule arms the
    conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
-   `sync::kMaxKeepLocal`) and asks for a tick.
+   `sync::kMaxKeepLocal`) and asks for a tick. A `server.url` change drops
+   every armed and held choice (#317), and one whose copy was running when the
+   URL moved arms nothing: the bytes it restored stay, backed up first, and
+   meet the new server's guard like any upload.
 3. That tick's upload of the save goes with `overwrite=true`. The plan that
    answers the key **spends** it (`sync::SpendKeepLocal`): an upload that went or
    was refused, or any other action -- the server asking for no upload. Only an
