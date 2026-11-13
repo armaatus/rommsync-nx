@@ -31,6 +31,10 @@ Five phases, one CTest entry each so a red run names what broke:
   structure the ten sections #35 specifies, in order; the hardware note with
             M8-2 named as what removes it; and a link to the guide from
             README.md.
+  loaders   the Ultrahand Overlay and nx-ovlloader the guide states as the
+            minimum are the ones .gitmodules records beside the libultrahand
+            pin, and the stock Tesla menu is called unverified until M12,
+            never claimed -- in the guide and in the zip's README (#297).
 
 docs/INTEROP.md (#243) is the install guide's second half -- what to set on the
 *other* devices -- and is held here for the same reason and in the same way:
@@ -436,6 +440,61 @@ def phase_structure(args) -> int:
     return 0
 
 
+# --- loaders: which overlay menu and loader the .ovl is stated for (#297) ------
+
+def pinned_loaders(repo: str):
+    """The libultrahand tag and the nx-ovlloader version Ultrahand ships it with,
+    both read off .gitmodules -- the one place the pin is recorded."""
+    text = read(os.path.join(repo, ".gitmodules"))
+    tag = re.search(r"^# Pinned at tag (v[0-9][0-9.]*) = [0-9a-f]{40}", text, re.MULTILINE)
+    loader = re.search(r"nx-ovlloader (v[0-9][0-9.]*[0-9])", text)
+    return (tag.group(1) if tag else None, loader.group(1) if loader else None)
+
+
+def phase_loaders(args) -> int:
+    repo = args.repo
+    tag, loader = pinned_loaders(repo)
+    if not tag:
+        return fail(".gitmodules records no '# Pinned at tag vX.Y.Z = <sha>' line")
+    if not loader:
+        return fail(".gitmodules does not say which nx-ovlloader Ultrahand ships "
+                    f"libultrahand {tag} with")
+
+    before = section(read(guide_path(repo)), "Before you start")
+    # Ultrahand-Overlay's releases carry libultrahand's version number, so the
+    # menu the .ovl is stated for is the one built from the same tag. A bump
+    # that leaves this sentence behind is the drift #297 found.
+    if not re.search(r"Ultrahand Overlay\*{0,2} " + re.escape(tag) + r"\*{0,2} or newer", before):
+        return fail(f"'Before you start' does not state Ultrahand Overlay {tag} or newer, "
+                    f"the menu built from the libultrahand tag .gitmodules pins")
+    if not re.search(r"nx-ovlloader\*{0,2} " + re.escape(loader) + r"\*{0,2} or newer", before):
+        return fail(f"'Before you start' does not state nx-ovlloader {loader} or newer, "
+                    "the loader that Ultrahand release ships with")
+
+    # The stock Tesla menu has never loaded this .ovl, and nothing before M12's
+    # compatibility matrix (#310) will: it may be named, but only as unverified.
+    sources = {"docs/INSTALL.md": read(guide_path(repo)),
+               "packaging/README.txt.in": read(os.path.join(repo, "packaging",
+                                                            "README.txt.in"))}
+    for name, text in sources.items():
+        flat = re.sub(r"\s+", " ", text)
+        if re.search(r"\bor Tesla\b|\(or Tesla\)|Tesla (?:also )?works", flat):
+            return fail(f"{name} claims the Tesla menu loads the overlay; until M12 "
+                        "(#310) that is unverified")
+        mentions = [m.start() for m in re.finditer(r"\bTesla menu\b", flat)]
+        if not mentions:
+            return fail(f"{name} does not say whether the stock Tesla menu loads the overlay")
+        for at in mentions:
+            window = flat[max(0, at - 200): at + 200]
+            if "unverified" not in window or "M12" not in window:
+                return fail(f"{name} names the Tesla menu without calling it unverified "
+                            "until M12")
+
+    print(f"Ultrahand Overlay {tag}+ and nx-ovlloader {loader}+ stated; "
+          "the Tesla menu is unverified until M12")
+    return 0
+
+
 # --- interop: docs/INTEROP.md (#243) -------------------------------------------
 
 def interop_path(repo: str) -> str:
@@ -722,6 +781,7 @@ PHASES = {
     "safety": phase_safety,
     "pairing": phase_pairing,
     "structure": phase_structure,
+    "loaders": phase_loaders,
     "interop": phase_interop,
     "interop_facts": phase_interop_facts,
     "interop_table": phase_interop_table,

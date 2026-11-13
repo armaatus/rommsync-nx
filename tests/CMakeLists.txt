@@ -2067,6 +2067,7 @@ foreach(scenario
         safety      # no account secret on the console, no weakened TLS
         pairing     # the state table is exactly what PairingState exposes
         structure   # #35's ten sections, the hardware note, the README link
+        loaders     # the Ultrahand / nx-ovlloader minimums match the pin (#297)
         # docs/INTEROP.md (#243): the other devices' half of the install guide.
         interop          # its sections, the links to it, the two config pages
         interop_facts    # versions, limits, keys and names read off the code
