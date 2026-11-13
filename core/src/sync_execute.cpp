@@ -1658,6 +1658,20 @@ ExecutionReport ExecutePlan(http::HttpClient& client, fs::FileSystem& files,
       const SaveTarget* target = MatchTarget(targets, operation);
       switch (operation.action) {
         case Action::kUpload:
+          if (!options.clock.trusted() && DecidedByClock(operation) &&
+              !KeepsLocal(options, operation)) {
+            // The server ruled on this console's timestamp, and the clock that
+            // stamped it is not believed (#295): sent, it could replace a newer
+            // save on the server that nothing here backed up.
+            result = Fail(operation, OperationError::kClockUntrusted,
+                          "held, not uploaded: " + options.clock.Describe() +
+                              ", and the server chose this upload by comparing timestamps; "
+                              "set the console's date and time, and it goes next sync");
+            if (target != nullptr) {
+              result.sd_path = target->sd_path;
+            }
+            break;
+          }
           result = Upload(client, files, token, plan, operation, target, options, &report.warnings);
           break;
         case Action::kDownload:
