@@ -97,7 +97,20 @@ are the part that says the move is safe. Put the new libnx version
 and update the `# Pinned at tag` line. Then read upstream's changes for
 signatures that still compile but mean something else -- v2.0.0 changed four
 (`drawString`, `CategoryHeader`, `OverlayFrame`, `ListItem`; #199 has the
-table) -- before trusting a green `switch.builds`.
+table) -- before trusting a green `switch.builds`. The tag also names the
+loaders the install guide states as the minimum (Ultrahand-Overlay's releases
+carry the library's version, and the `.gitmodules` comment names the
+nx-ovlloader that release bundles), so update that comment and
+[INSTALL.md](INSTALL.md#before-you-start) with it; `ctest -R
+docs.install_loaders` is red until both agree.
+
+**Knowing when to move it.** Nothing upstream announces a tag to us, so
+`scripts/toolchain.sh upstream` asks: it prints a `::warning::` when upstream
+has tagged past the pin, and exits 0 whatever it finds, offline included. The
+`switch-build-canary` job runs it on every push, where the warning is an
+annotation, and `ctest -R toolchain.upstream` runs it locally, passing when the
+pin is behind and skipping when GitHub cannot be reached. Warn-only on purpose:
+a new tag is news, and the move above is a reviewed change of its own (#297).
 
 ### The toolchain's ctest entries
 

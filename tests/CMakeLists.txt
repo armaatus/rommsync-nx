@@ -1931,8 +1931,7 @@ foreach(scenario
         pins        # every file naming the image names the pin; :latest only in the canary
         submodule   # the libultrahand gitlink is the tag .gitmodules records
         floor       # the libnx comparison orders 4.9 below 4.10
-        check       # ...and the check CI runs says why it refused, against a stub pacman
-        upstream_check) # the behind-upstream check, against a scratch repo (#297)
+        check)      # ...and the check CI runs says why it refused, against a stub pacman
   add_test(NAME toolchain.${scenario}
            COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" ${scenario})
   set_tests_properties(toolchain.${scenario} PROPERTIES TIMEOUT 60)
@@ -1940,11 +1939,17 @@ endforeach()
 
 # Is the libultrahand pin behind upstream's newest tag? Asked of GitHub, so it
 # warns and never fails: upstream tagging a release is news, not a break, and
-# moving the pin is a reviewed change of its own (#297). Offline it skips. Not
-# in the `toolchain` label: that suite fails on a skip, and this entry needs a
-# network rather than the image.
+# moving the pin is a reviewed change of its own (#297). `upstream_check` is the
+# logic against a scratch repo and never skips; `upstream` asks GitHub and skips
+# offline. Not in the `toolchain` label, whose suite fails on a skip: this needs
+# a network rather than the image -- which is also why it has a script of its
+# own (test_toolchain_upstream.sh says how switch.toolchain_suite tells).
+set(TOOLCHAIN_UPSTREAM_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_toolchain_upstream.sh")
+add_test(NAME toolchain.upstream_check
+         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_UPSTREAM_TEST}" upstream_check)
+set_tests_properties(toolchain.upstream_check PROPERTIES TIMEOUT 60)
 add_test(NAME toolchain.upstream
-         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_TEST}" upstream)
+         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_UPSTREAM_TEST}" upstream)
 set_tests_properties(toolchain.upstream PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 
 # The pinned image's libnx is >= 4.10.0 -- asked of the image, not assumed.

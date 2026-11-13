@@ -77,6 +77,78 @@ toolchain_check_libnx() {
   esac
 }
 
+# --- is the libultrahand pin behind upstream? (#297) -----------------------------
+#
+# Upstream tags a release every few weeks and nothing tells us: v2.5.3 was
+# pinned and "the newest tag" for days after v2.5.4 carried a sleep/wake fix.
+# This says so -- as a warning, never a failure, because a new upstream tag is
+# news rather than a break, and moving the pin is a reviewed change of its own
+# (docs/DEVELOPMENT.md#the-toolchain-pin). It needs the network, so not reaching
+# upstream is an answer of its own rather than a red build.
+
+# toolchain_libultrahand_pin -- prints "<tag> <url>": the tag .gitmodules records
+# and where upstream is. LIBULTRAHAND_UPSTREAM overrides the url, for a test.
+toolchain_libultrahand_pin() {
+  local modules tag url
+  modules="$(dirname "${BASH_SOURCE[0]}")/../.gitmodules"
+  tag="$(sed -nE 's/^# Pinned at tag (v[0-9][0-9A-Za-z.-]*) = [0-9a-f]{40}.*/\1/p' "$modules")"
+  url="$(sed -nE 's#^[[:space:]]*url = (.*libultrahand.*)$#\1#p' "$modules")"
+  [ -n "$tag" ] && [ -n "$url" ] || return 1
+  echo "$tag ${LIBULTRAHAND_UPSTREAM:-$url}"
+}
+
+# toolchain_check_upstream PINNED URL
+#   0  PINNED is upstream's newest release tag, or newer
+#   1  upstream has tagged a newer release (a ::warning:: says which)
+#   3  unknown: upstream unreachable, or it has no release tags
+#
+# A release tag is vX.Y.Z and nothing else: upstream's tags are its releases,
+# and a suffixed one would not be. Ordered by version_at_least, because the
+# string order puts v2.5.4 above v2.10.0.
+toolchain_check_upstream() {
+  local pinned="$1" url="$2" refs pid watcher rc=0 tag newest=""
+  refs="$(mktemp)"
+  # A deadline of our own: git has no connect timeout, and a stalled network
+  # must not hold a ctest entry or a CI step for minutes. The watcher's output
+  # goes nowhere, so the sleep it leaves behind holds no pipe open.
+  GIT_TERMINAL_PROMPT=0 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=15 \
+    ls-remote --tags --refs "$url" >"$refs" 2>/dev/null &
+  pid=$!
+  ( sleep 20 && kill "$pid" ) </dev/null >/dev/null 2>&1 &
+  watcher=$!
+  wait "$pid" || rc=$?
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$refs"
+    echo "note: cannot reach $url; whether $pinned is behind upstream is unknown"
+    return 3
+  fi
+  while read -r _ tag; do
+    tag="${tag#refs/tags/}"
+    [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]] || continue
+    if [ -z "$newest" ] || ! version_at_least "${newest#v}" "${tag#v}"; then
+      newest="$tag"
+    fi
+  done <"$refs"
+  rm -f "$refs"
+  if [ -z "$newest" ]; then
+    echo "note: $url has no vX.Y.Z tags; whether $pinned is behind upstream is unknown"
+    return 3
+  fi
+  if version_at_least "${pinned#v}" "${newest#v}"; then
+    if [ "$pinned" = "$newest" ]; then
+      echo "ok: libultrahand $pinned is upstream's newest tag"
+    else
+      echo "ok: libultrahand $pinned is not behind upstream's newest tag, $newest"
+    fi
+    return 0
+  fi
+  echo "::warning::libultrahand is pinned at $pinned; upstream has tagged $newest." \
+       "Read its changes and move the pin: docs/DEVELOPMENT.md#the-toolchain-pin"
+  return 1
+}
+
 # --- running something in it ----------------------------------------------------
 #
 # The ctest entries that need the toolchain (`ctest -L toolchain`) reach it one
@@ -128,6 +200,12 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     image) echo "$DEVKITPRO_IMAGE" ;;
     libnx) toolchain_check_libnx ;;
-    *)     echo "usage: $0 {image|libnx}" >&2; exit 2 ;;
+    # Warn-only on every answer, so a CI step running it is never red for it.
+    upstream)
+      pin="$(toolchain_libultrahand_pin)" || {
+        echo "::warning::cannot read the libultrahand pin out of .gitmodules"; exit 0; }
+      read -r tag url <<<"$pin"
+      toolchain_check_upstream "$tag" "$url" || true ;;
+    *)     echo "usage: $0 {image|libnx|upstream}" >&2; exit 2 ;;
   esac
 fi

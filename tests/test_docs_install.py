@@ -446,7 +446,7 @@ def pinned_loaders(repo: str):
     """The libultrahand tag and the nx-ovlloader version Ultrahand ships it with,
     both read off .gitmodules -- the one place the pin is recorded."""
     text = read(os.path.join(repo, ".gitmodules"))
-    tag = re.search(r"^# Pinned at tag (v[0-9][0-9.]*) = [0-9a-f]{40}", text, re.MULTILINE)
+    tag = re.search(r"^# Pinned at tag (v[0-9][0-9A-Za-z.-]*) = [0-9a-f]{40}", text, re.MULTILINE)
     loader = re.search(r"nx-ovlloader (v[0-9][0-9.]*[0-9])", text)
     return (tag.group(1) if tag else None, loader.group(1) if loader else None)
 
@@ -460,7 +460,10 @@ def phase_loaders(args) -> int:
         return fail(".gitmodules does not say which nx-ovlloader Ultrahand ships "
                     f"libultrahand {tag} with")
 
+    # As read rather than as typed: a link and a line wrap are not a change of
+    # version.
     before = section(read(guide_path(repo)), "Before you start")
+    before = re.sub(r"\s+", " ", re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", before))
     # Ultrahand-Overlay's releases carry libultrahand's version number, so the
     # menu the .ovl is stated for is the one built from the same tag. A bump
     # that leaves this sentence behind is the drift #297 found.
@@ -476,19 +479,16 @@ def phase_loaders(args) -> int:
     sources = {"docs/INSTALL.md": read(guide_path(repo)),
                "packaging/README.txt.in": read(os.path.join(repo, "packaging",
                                                             "README.txt.in"))}
+    # Sentence by sentence rather than by banned phrase: "Ultrahand or Tesla"
+    # was one spelling of the claim, and the next one would be another.
     for name, text in sources.items():
-        flat = re.sub(r"\s+", " ", text)
-        if re.search(r"\bor Tesla\b|\(or Tesla\)|Tesla (?:also )?works", flat):
-            return fail(f"{name} claims the Tesla menu loads the overlay; until M12 "
-                        "(#310) that is unverified")
-        mentions = [m.start() for m in re.finditer(r"\bTesla menu\b", flat)]
-        if not mentions:
+        tesla = [s for s in sentences(text) if re.search(r"\bTesla\b", s)]
+        if not any(re.search(r"\bTesla menu\b", s) for s in tesla):
             return fail(f"{name} does not say whether the stock Tesla menu loads the overlay")
-        for at in mentions:
-            window = flat[max(0, at - 200): at + 200]
-            if "unverified" not in window or "M12" not in window:
-                return fail(f"{name} names the Tesla menu without calling it unverified "
-                            "until M12")
+        for s in tesla:
+            if "unverified" not in s or "M12" not in s:
+                return fail(f"{name} names Tesla without calling it unverified until M12 "
+                            f"(#310): {s!r}")
 
     print(f"Ultrahand Overlay {tag}+ and nx-ovlloader {loader}+ stated; "
           "the Tesla menu is unverified until M12")
