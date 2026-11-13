@@ -2043,6 +2043,196 @@ void LateWriteFetch(rig::Checks& checks, http::HttpClient& client, const std::st
   }
 }
 
+// --- stale_fetch --------------------------------------------------------------
+//
+// #286: a `download` or a `conflict` whose save the game wrote between the scan
+// and the backup. The server ruled on the bytes the tick reported, and the card
+// holds bytes it never saw; replacing them leaves that progress in `.backup/`
+// alone, where the next tick -- seeing the server's copy, which the server has --
+// never offers it again. `Remove`'s check, held to the two overwrites.
+
+/// A download plan for a save reported as `reported`, with the server holding a
+/// copy no device has synced. False, with the reason in `checks`, on a rig
+/// that would not set it up.
+bool DownloadPlanFor(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                     const Fixture& fixture, const harness::Rom& rom, Sandbox& sandbox,
+                     const std::string& slot, const std::string& name,
+                     const std::string& reported, sync::SyncNegotiatePayload* payload,
+                     sync::SyncPlan* plan, harness::Save* server) {
+  const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+  rig::WriteFile(staged, "the server's newer copy, ruled on against the reported bytes\n");
+  if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m11-2", staged, name,
+                           /*with_device=*/false, server)) {
+    checks.Expect(false, "the server copy was stored");
+    return false;
+  }
+  payload->device_id = fixture.device_id;
+  payload->saves.push_back(harness::LocalSave(
+      rom.id, name, slot, "m11-2", crypto::Md5Hex(reported),
+      std::chrono::system_clock::now() - std::chrono::hours{1},
+      static_cast<std::int64_t>(reported.size())));
+  if (!PlanFor(checks, client, base, fixture, *payload, {slot}, plan)) {
+    return false;
+  }
+  checks.Expect(plan->operations[0].action == sync::Action::kDownload,
+                std::string("the plan is a download: ") +
+                    sync::ToString(plan->operations[0].action));
+  return true;
+}
+
+/// What every stale overwrite must leave: the progress still the save, nothing
+/// staged beside it, and the operation failed as unverified. Returns the
+/// operation's result, if there was one.
+std::optional<sync::OperationResult> ExpectStoodDown(rig::Checks& checks, Sandbox& sandbox,
+                                                     const sync::ExecutionReport& report,
+                                                     const std::string& save,
+                                                     const std::string& progress,
+                                                     const std::string& what) {
+  checks.ExpectEq(sandbox.Read(save), progress,
+                  what + ": the progress the ruling never saw is still the save");
+  checks.ExpectEq(report.failed, 1, what + ": counted failed, so the next tick negotiates it");
+  checks.Expect(!sandbox.Exists(io::TempPathFor(save)),
+                what + ": and the server's copy is not left staged beside it");
+  if (report.operations.size() != 1) {
+    checks.Expect(false, what + ": the plan's one operation has a result");
+    return std::nullopt;
+  }
+  const sync::OperationResult& done = report.operations[0];
+  checks.Expect(done.error == sync::OperationError::kUnverified,
+                what + ": named as bytes the ruling was not about: " +
+                    sync::ToString(done.error) + " -- " + done.message);
+  return done;
+}
+
+void StaleFetch(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                const Fixture& fixture, const harness::Rom& rom) {
+  const std::string reported = "the local copy the scan reported\n";
+  const std::string progress = "progress the game wrote after the scan\n";
+
+  // 1. download.
+  {
+    Sandbox sandbox(checks, "execute-stale-download");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string slot = harness::UniqueSlot("m11-2-download");
+    const std::string name = "stale-download.srm";
+    sync::SyncNegotiatePayload payload;
+    sync::SyncPlan plan;
+    harness::Save server;
+    if (DownloadPlanFor(checks, client, base, fixture, rom, sandbox, slot, name, reported,
+                        &payload, &plan, &server)) {
+      sandbox.SeedSave(SavePath(name), progress);
+      sync::ExecuteOptions options = OptionsAt(1'757'000'720);
+      options.reported = &payload.saves;
+      const sync::ExecutionReport report = sync::ExecutePlan(
+          client, *files, TokenFor(base, fixture), plan, {{rom.id, slot, SavePath(name), name}},
+          options);
+      if (const auto done =
+              ExpectStoodDown(checks, sandbox, report, SavePath(name), progress, "download")) {
+        checks.Expect(done->backup_sd_path.empty(),
+                      "download: no backup is claimed -- the save it copied is still there: " +
+                          done->backup_sd_path);
+      }
+      checks.Expect(!sandbox.HasBackupOf(progress),
+                    "download: and no copy of the save is left in .backup/ as a backup of "
+                    "something nothing replaced");
+    }
+    harness::DeleteSave(client, base, fixture, server.id);
+  }
+
+  // 2. conflict, keep both: refused before the archival upload, which would
+  // otherwise keep the progress on the server as the losing side of a ruling
+  // that was never about it.
+  {
+    Sandbox sandbox(checks, "execute-stale-conflict");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string slot = harness::UniqueSlot("m11-2-conflict");
+    const std::string name = "stale-conflict.srm";
+    const std::string staged = sandbox.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "server v1\n");
+    harness::Save server;
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m11-2", staged, name,
+                             /*with_device=*/true, &server)) {
+      checks.Expect(false, "the first server copy was stored");
+      return;
+    }
+    PassASecond();
+    rig::WriteFile(staged, "server v2, longer\n");
+    harness::Save moved;
+    if (!harness::ReplaceSave(client, base, fixture, server.id, staged, name, &moved)) {
+      checks.Expect(false, "the server copy moved forward in place");
+      harness::DeleteSave(client, base, fixture, server.id);
+      return;
+    }
+    sync::SyncNegotiatePayload payload;
+    payload.device_id = fixture.device_id;
+    payload.saves.push_back(harness::LocalSave(
+        rom.id, name, slot, "m11-2", crypto::Md5Hex(reported),
+        std::chrono::system_clock::now() + std::chrono::seconds{300},
+        static_cast<std::int64_t>(reported.size())));
+    sync::SyncPlan plan;
+    if (PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+      checks.Expect(plan.operations[0].action == sync::Action::kConflict,
+                    std::string("the plan is a conflict: ") +
+                        sync::ToString(plan.operations[0].action));
+      sandbox.SeedSave(SavePath(name), progress);
+      sync::ExecuteOptions options = OptionsAt(1'757'000'721);
+      options.reported = &payload.saves;
+      const sync::ExecutionReport report = sync::ExecutePlan(
+          client, *files, TokenFor(base, fixture), plan, {{rom.id, slot, SavePath(name), name}},
+          options);
+      if (const auto done =
+              ExpectStoodDown(checks, sandbox, report, SavePath(name), progress, "conflict")) {
+        checks.Expect(done->archive == sync::ArchiveOutcome::kNone,
+                      std::string("conflict: nothing was archived on the server: ") +
+                          sync::ToString(done->archive));
+      }
+      checks.Expect(!sandbox.HasBackupOf(progress),
+                    "conflict: and no copy of the save is left in .backup/");
+    }
+    harness::DeleteSave(client, base, fixture, server.id);
+  }
+
+  // 3. The game writes again between the backup and its check. The backup is
+  // then the only copy of the progress the scan missed, so it stays -- dropping
+  // it is only ever dropping a duplicate of the save.
+  {
+    Sandbox sandbox(checks, "execute-stale-only-copy");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string slot = harness::UniqueSlot("m11-2-only-copy");
+    const std::string name = "stale-only-copy.srm";
+    const std::string later = "and more progress, written after the backup\n";
+    sync::SyncNegotiatePayload payload;
+    sync::SyncPlan plan;
+    harness::Save server;
+    if (DownloadPlanFor(checks, client, base, fixture, rom, sandbox, slot, name, reported,
+                        &payload, &plan, &server)) {
+      sandbox.SeedSave(SavePath(name), progress);
+      sync::ExecuteOptions options = OptionsAt(1'757'000'722);
+      options.reported = &payload.saves;
+      sync::ExecutionReport report;
+      {
+        faulty::LateWrite game([&] { sandbox.Reseed(SavePath(name), later); });
+        report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan,
+                                   {{rom.id, slot, SavePath(name), name}}, options);
+        checks.Expect(game.fired(), "only copy: the game wrote after the backup");
+      }
+      if (const auto done =
+              ExpectStoodDown(checks, sandbox, report, SavePath(name), later, "only copy")) {
+        checks.Expect(!done->backup_sd_path.empty() &&
+                          sandbox.Read(done->backup_sd_path) == progress,
+                      "only copy: the backup is kept and named, holding the progress the scan "
+                      "missed: " + done->backup_sd_path);
+      }
+      checks.Expect(sandbox.HasBackupOf(progress),
+                    "only copy: the progress the scan missed is still under .backup/");
+    }
+    harness::DeleteSave(client, base, fixture, server.id);
+  }
+}
+
 // --- crash --------------------------------------------------------------------
 //
 // M9-14 (#203): `download`, with a power cut at every call it makes. The
@@ -3403,6 +3593,8 @@ int main(int argc, char** argv) {
     Collision(checks, *client, base, fixture, rom);
   } else if (scenario == "late_fetch") {
     LateWriteFetch(checks, *client, base, fixture, rom);
+  } else if (scenario == "stale_fetch") {
+    StaleFetch(checks, *client, base, fixture, rom);
   } else if (scenario == "revoked") {
     Revoked(checks, *client, base, fixture, rom);
   } else {
