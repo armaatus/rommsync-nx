@@ -1274,6 +1274,7 @@ set(CONFLICT_UNIT_SCENARIOS
   crash        # M9-14: a power cut at every call of a restore, and one the card would not confirm
   keep_local   # #249: Keep local restores a save conflict's bytes and arms its key; the plan spends it
   late_write   # #270: a write between a restore's backup and its copy stays on the card
+  server       # #317: an entry carries its server; Keep local refused for another server's
   service      # both commands through ipc::Dispatch over a real SdEngine
   overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
 )
@@ -2427,6 +2428,7 @@ set(ENGINE_SCENARIOS
   restore_polled  # M9-6: a restore on a slow card holds no IPC call while it copies
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
   keep_local_guards  # #273/#275: Keep local held under a game, refused past four waiting
+  keep_local_server  # #317: Keep local is refused on another server's conflict, and dropped by a switch
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
@@ -2496,6 +2498,7 @@ set(ENGINE_RIG_SCENARIOS
   declined           # #257: a save the placer will not place costs one line, never a failed save
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
   keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
+  keep_local_switched  # #317: a Keep local armed against one server sends no overwrite=true to the next
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

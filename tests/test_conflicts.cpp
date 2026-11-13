@@ -24,6 +24,8 @@
 //                   plan that answered the key spends it -- one that did not
 //                   upload it reported as overtaken (#273); a superseded
 //                   conflict and a fifth choice are refused (#273)
+//   server       -- #317: an entry carries its server, and Keep local is
+//                   refused for another server's; a plain restore is not
 //   late_write   -- #270: a write landing between a restore's backup and its
 //                   copy stays on the card, and the restore stands down
 //   interrupted  -- a restore killed mid-write leaves the old bytes, never a
@@ -1251,6 +1253,134 @@ void KeepLocal(checks::Checks& c) {
 // that, is killed by `SIGXFSZ` *inside* the write, at an offset the kernel
 // picks -- no sleeping, no racing, and no cleanup on the way out. A timing-based
 // kill would pass on a fast machine by never landing in the window.
+
+// --- server -------------------------------------------------------------------
+//
+// #317: a conflict's rom id is one server's. An entry carries which, and Keep
+// local -- the one route to `overwrite=true` -- is refused for an entry from
+// another server, while a plain restore, which only copies on the card, is not.
+
+void ServerTagged(checks::Checks& c) {
+  const std::string kept = "the bytes this console had, and chose to keep\n";
+  const std::string theirs = "the server's copy, which the conflict put here\n";
+  const std::string a = "5f0c2bd0a1d5d6cbb9cbd1c1c9e1b6a0";
+  const std::string b = "0e9e1f6c0b1f3a7c2d6c5b4a39281706";
+
+  // The recorder stamps what the tick ran against, and the file keeps it.
+  {
+    Sandbox sandbox(c, "conflicts-server-record");
+    const std::string path = sandbox.Host(std::string(conflicts::kHistorySdPath));
+    conflicts::History history(path);
+    history.Load();
+    sync::SyncPlan plan;
+    sync::ExecutionReport report;
+    AddConflict(&plan, &report, 4, "retroarch-srm", "Both sides changed since last sync",
+                sync::Reason::kBothChanged, std::string(harness::kBackupDir) + "/4-a.srm");
+    conflicts::RecordOptions options = At(kWhen);
+    options.server = a;
+    c.ExpectEq(conflicts::RecordSaves(&history, plan, report,
+                                      {Reported(4, "retroarch-srm", "game.srm", kept)}, options),
+               std::size_t{1}, "the conflict is recorded");
+    c.Expect(history.size() == 1 && history.entries()[0].server == a,
+             "stamped with the server the tick ran against");
+    conflicts::History reread(path);
+    reread.Load();
+    c.Expect(reread.size() == 1 && reread.entries()[0].server == a,
+             "and the stamp survives a reboot");
+  }
+
+  // A row from before #317 has no key and reads as unclaimed, and an unclaimed
+  // entry is written exactly as before: the format keeps its version.
+  {
+    conflicts::Entry untagged = SaveEntry(4, "game.srm");
+    untagged.id = 1;
+    const std::string row = conflicts::SerializeEntry(untagged);
+    c.Expect(row.find("\"server\"") == std::string::npos,
+             "an entry with no server is the row rc2 wrote: " + row);
+    const conflicts::LoadedHistory read =
+        conflicts::ParseHistory(conflicts::SerializeHistory({untagged}, 2));
+    c.Expect(read.entries.size() == 1 && read.entries[0].server.empty(),
+             "and reads back with none");
+    conflicts::Entry tagged = untagged;
+    tagged.server = b;
+    const conflicts::LoadedHistory both =
+        conflicts::ParseHistory(conflicts::SerializeHistory({tagged}, 2));
+    c.Expect(both.entries.size() == 1 && both.entries[0].server == b,
+             "a tagged one round-trips its tag");
+  }
+
+  // Claimed: the unclaimed rows become the named server's, a stamped one keeps
+  // its own, and the file says so.
+  {
+    Sandbox sandbox(c, "conflicts-server-claim");
+    const std::string path = sandbox.Host(std::string(conflicts::kHistorySdPath));
+    conflicts::History history(path);
+    history.Load();
+    conflicts::Entry other = SaveEntry(5, "other.srm");
+    other.server = b;
+    const std::int64_t old_id = history.Append(SaveEntry(4, "game.srm")).id;
+    const std::int64_t other_id = history.Append(other).id;
+    c.Expect(history.Claim(a).ok(), "the claim is written");
+    conflicts::History reread(path);
+    reread.Load();
+    const conflicts::Entry* claimed = reread.Find(old_id);
+    const conflicts::Entry* own = reread.Find(other_id);
+    c.Expect(claimed != nullptr && claimed->server == a,
+             "an entry from before #317 is the claiming server's");
+    c.Expect(own != nullptr && own->server == b, "and a stamped one keeps its server");
+  }
+
+  // Keep local against the server it was recorded on works; against another it
+  // is refused before a byte is written. A plain restore still works.
+  {
+    Sandbox sandbox(c, "conflicts-server-keep-local");
+    const std::unique_ptr<fs::FileSystem> files =
+        rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    sandbox.SeedSave(SavePath("game.srm"), theirs);
+    const std::string backup =
+        std::string(harness::kBackupDir) + "/4-retroarch-srm-1757000000.srm";
+    c.Expect(sandbox.Write(backup, kept), "the conflict's backup is on the card");
+    conflicts::History history(sandbox.Host(std::string(conflicts::kHistorySdPath)));
+    history.Load();
+    conflicts::Entry entry = SaveEntry(4, "game.srm");
+    entry.backup_sd_path = backup;
+    entry.server = a;
+    const std::int64_t id = history.Append(entry).id;
+
+    conflicts::RestoreOptions options;
+    options.backup_dir = harness::kBackupDir;
+    options.now = []() { return Moment(kWhen + 500); };
+    options.server = b;
+    state::Baseline::Key key{0, std::nullopt};
+    const conflicts::RestoreReport refused =
+        conflicts::KeepLocal(*files, history, id, {}, &key, options);
+    c.Expect(refused.outcome == conflicts::RestoreOutcome::kNotAConflict,
+             std::string("Keep local on another server's conflict is refused: ") +
+                 conflicts::ToString(refused.outcome) + " -- " + refused.message);
+    c.Expect(key.first == 0, "and arms nothing");
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), theirs, "and writes nothing");
+    options.game_running = true;
+    const conflicts::RestoreReport not_held =
+        conflicts::KeepLocal(*files, history, id, {}, &key, options);
+    c.Expect(not_held.outcome == conflicts::RestoreOutcome::kNotAConflict && key.first == 0,
+             std::string("nor is it held under a game: ") + conflicts::ToString(not_held.outcome));
+    options.game_running = false;
+
+    const conflicts::RestoreReport restored = conflicts::Restore(*files, history, id, options);
+    c.Expect(restored.ok(), std::string("a plain restore of it is local, and runs: ") +
+                                conflicts::ToString(restored.outcome) + " -- " +
+                                restored.message);
+    c.ExpectEq(sandbox.Read(SavePath("game.srm")), kept, "with the backup's bytes on the card");
+
+    sandbox.Reseed(SavePath("game.srm"), theirs);
+    options.server = a;
+    const conflicts::RestoreReport same =
+        conflicts::KeepLocal(*files, history, id, {}, &key, options);
+    c.Expect(same.ok() && key == state::Baseline::Key{4, std::string("retroarch-srm")},
+             std::string("on the server it was recorded on, Keep local is taken: ") +
+                 conflicts::ToString(same.outcome) + " -- " + same.message);
+  }
+}
 
 void Interrupted(checks::Checks& c) {
 #ifdef ROMMSYNC_CAN_FORK
@@ -2683,7 +2813,8 @@ int main(int argc, char** argv) {
 
   if (scenario == "store" || scenario == "record" || scenario == "restore" ||
       scenario == "interrupted" || scenario == "service" || scenario == "overlay" ||
-      scenario == "crash" || scenario == "keep_local" || scenario == "late_write") {
+      scenario == "crash" || scenario == "keep_local" || scenario == "late_write" ||
+      scenario == "server") {
     checks::Checks checks;
     if (scenario == "store") {
       Store(checks);
@@ -2699,6 +2830,8 @@ int main(int argc, char** argv) {
       LateWrite(checks);
     } else if (scenario == "keep_local") {
       KeepLocal(checks);
+    } else if (scenario == "server") {
+      ServerTagged(checks);
     } else if (scenario == "service") {
       Service(checks);
     } else {

@@ -611,4 +611,9 @@ StoreResult History::Append(Entry entry) {
   return result;
 }
 
+StoreResult History::Claim(const std::string& server) {
+  static_cast<void>(server);
+  return {};
+}
+
 }  // namespace rommsync::conflicts

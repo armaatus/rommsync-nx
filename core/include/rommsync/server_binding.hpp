@@ -59,6 +59,11 @@ std::string IdentityOf(std::string_view server_url);
 /// (`http-192.168.1.5-8080`). `unknown` for an identity that leaves nothing.
 std::string ArchiveSuffix(std::string_view identity);
 
+/// A short, fixed-length name for `identity`, for a record that carries its
+/// server on every row (`conflicts::Entry::server`, #317): the identity's MD5
+/// in hex. Empty for an empty identity.
+std::string TagOf(std::string_view identity);
+
 /// What `Archive` did.
 struct Archived {
   /// The file was moved. False when there was nothing to move, too.
@@ -93,6 +98,10 @@ struct Rebound {
   /// The marker names `identity` now. False when it could not be read or
   /// written, or a record could not be set aside -- the next call tries again.
   bool bound = false;
+
+  /// With `rebound`: the identity the marker named, which the records were
+  /// written against. Empty when it named none.
+  std::string previous;
 
   /// One line per thing worth a log: what was set aside and where, and any
   /// file that could not be.

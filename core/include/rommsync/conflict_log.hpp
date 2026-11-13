@@ -253,6 +253,17 @@ struct Entry {
   /// zero otherwise.
   std::int64_t archive_save_id = 0;
 
+  /// Which RomM `rom_id` is one of (#317): `binding::TagOf` its identity, or
+  /// empty for a row written before #317 that nothing has claimed yet
+  /// (`History::Claim`). Keep local asks the server this tag names to take the
+  /// bytes, so an entry from another server never arms it (`KeepLocal`); a
+  /// plain restore is local and does not look.
+  ///
+  /// Optional in the file, as `local_copy` is, and a digest rather than the URL
+  /// so thirty-two of them stay inside `kMaxHistoryBytes` whatever the URL. An
+  /// older build ignores the key, and drops it when it next writes the file.
+  std::string server;
+
   /// True when this entry could be restored if the backup is still there.
   bool restorable() const { return Overwrote(event) && !backup_sd_path.empty(); }
 
@@ -404,6 +415,13 @@ class History {
   /// The entry lives in memory for this boot, and its backup is on the card
   /// whatever happens to the index.
   StoreResult Append(Entry entry);
+
+  /// Stamp every entry with no `server` as `server`'s, and write the file when
+  /// one was (#317). For the rows written before entries carried a server: the
+  /// engine claims them for the server its records were bound to when it first
+  /// reads them. Nothing to stamp writes nothing; an empty `server` stamps
+  /// nothing. As with `Append`, the stamps stand in memory if the write fails.
+  StoreResult Claim(const std::string& server);
 
 
  private:

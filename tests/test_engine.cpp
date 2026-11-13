@@ -2177,6 +2177,134 @@ void KeepLocalGuards(checks::Checks& c) {
                                   again.report.message);
 }
 
+/// #317, with no server: a Keep local is a choice made against one RomM, and is
+/// never armed against another. Two save conflicts on a card configured for
+/// server B, with sync switched off so no tick spends a choice:
+///
+///   1. the card's records are bound to server A (`server.id`) and its
+///      conflicts.db is from before entries carried a server: they are A's, so
+///      Keep local on one is refused and a plain restore still runs;
+///   2. a card from before #294, with no marker: its conflicts are the
+///      configured server's, and Keep local is taken. One is armed and one held
+///      under a game; `server.url` then moves to C, and neither survives it --
+///      the armed one is not drawn as waiting, the held one never lands, and a
+///      second press on B's conflict is refused.
+void KeepLocalServer(checks::Checks& c) {
+  const std::string a = "http://a.example:8080";
+  const std::string b = "https://b.example";
+  const auto file = [](int n) { return "game" + std::to_string(n) + ".srm"; };
+  const auto kept = [](int n) { return "the bytes kept for save " + std::to_string(n); };
+  const auto server = [](int n) { return "the server's copy of " + std::to_string(n); };
+  // Two untagged save conflicts, as a build before #317 recorded them.
+  const auto seed = [&](Console& console, bool bound_to_a) {
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + b + "\n\n[sync]\nenabled = false\n"),
+             "a card configured for server B, with sync switched off");
+    if (bound_to_a) {
+      c.Expect(console.sandbox.Write("/config/rommsync/server.id", binding::IdentityOf(a) + "\n"),
+               "whose records were written against server A");
+    }
+    std::vector<std::int64_t> ids;
+    conflicts::History history(console.directory + conflicts::kHistoryFileName);
+    history.Load();
+    for (int n = 1; n <= 2; ++n) {
+      const std::string backup = std::string(harness::kBackupDir) + "/" + std::to_string(n) +
+                                 "-retroarch-srm-1757000000.srm";
+      c.Expect(console.sandbox.SeedSave(harness::SavePath(file(n)), server(n)) &&
+                   console.sandbox.Write(backup, kept(n)),
+               "a save conflict's two sides are on the card");
+      conflicts::Entry entry;
+      entry.kind = conflicts::EntryKind::kSave;
+      entry.event = conflicts::Event::kConflict;
+      entry.rom_id = n;
+      entry.file_name = file(n);
+      entry.slot = "retroarch-srm";
+      entry.when = 1'757'000'000;
+      entry.sd_path = harness::SavePath(file(n));
+      entry.backup_sd_path = backup;
+      ids.push_back(history.Append(entry).id);
+    }
+    return ids;
+  };
+  const auto press = [](Console& console, ipc::Command command, std::int64_t id) {
+    std::string response;
+    console.Call(command, ipc::EncodeEntryId(id), &response);
+    return console.AwaitRestore(id);
+  };
+
+  {
+    Console console(c, "engine-keep-local-server-a");
+    const std::vector<std::int64_t> ids = seed(console, /*bound_to_a=*/true);
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+
+    const ipc::RestoreState refused = press(console, ipc::Command::kKeepLocal, ids[0]);
+    c.Expect(refused.report.outcome == conflicts::RestoreOutcome::kNotAConflict,
+             std::string("Keep local on server A's conflict is refused on server B: ") +
+                 conflicts::ToString(refused.report.outcome) + " -- " + refused.report.message);
+    c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), server(1), "nothing was written");
+    c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kOpen, "and nothing is armed");
+    const ipc::RestoreState restored = press(console, ipc::Command::kRestoreBackup, ids[0]);
+    c.Expect(restored.report.ok(), std::string("a plain restore of it is local, and runs: ") +
+                                       conflicts::ToString(restored.report.outcome) + " -- " +
+                                       restored.report.message);
+    c.ExpectEq(console.sandbox.Read(harness::SavePath(file(1))), kept(1),
+               "with the backup's bytes on the card");
+  }
+
+  {
+    Console console(c, "engine-keep-local-server-upgraded");
+    const std::vector<std::int64_t> ids = seed(console, /*bound_to_a=*/false);
+    std::atomic<bool> running{false};
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    console.engine.UseCard(card.get());
+    console.engine.UseForegroundProbe(
+        [&running] {
+          play::Foreground foreground;
+          foreground.running = running.load();
+          return foreground;
+        },
+        std::chrono::milliseconds{50});
+    console.engine.StartWorker();
+
+    const ipc::RestoreState armed = press(console, ipc::Command::kKeepLocal, ids[0]);
+    c.Expect(armed.report.ok(), std::string("a card with no marker: its conflicts are server "
+                                            "B's, and Keep local is taken: ") +
+                                    conflicts::ToString(armed.report.outcome) + " -- " +
+                                    armed.report.message);
+    c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kWaiting,
+             "and waits for its upload");
+    running = true;
+    const ipc::RestoreState held = press(console, ipc::Command::kKeepLocal, ids[1]);
+    c.Expect(held.report.outcome == conflicts::RestoreOutcome::kHeld,
+             std::string("the second is held under a game: ") +
+                 conflicts::ToString(held.report.outcome));
+
+    c.Expect(console.Set(Edit("server", "url", "https://c.example")).outcome ==
+                 ipc::WriteOutcome::kApplied,
+             "server.url moves to C");
+    c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kOpen,
+             std::string("server B's armed choice is not carried to C: ") +
+                 ipc::ToString(console.KeepLocalOf(ids[0])));
+    c.Expect(console.KeepLocalOf(ids[1]) == ipc::KeepLocalState::kOpen,
+             std::string("nor is the held one: ") + ipc::ToString(console.KeepLocalOf(ids[1])));
+    running = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    c.ExpectEq(console.sandbox.Read(harness::SavePath(file(2))), server(2),
+               "the game closes, and the dropped hold lands nothing");
+    const ipc::RestoreState again = press(console, ipc::Command::kKeepLocal, ids[0]);
+    c.Expect(again.report.outcome == conflicts::RestoreOutcome::kNotAConflict,
+             std::string("and Keep local on B's conflict is refused on C: ") +
+                 conflicts::ToString(again.report.outcome) + " -- " + again.report.message);
+    c.Expect(console.KeepLocalOf(ids[0]) == ipc::KeepLocalState::kOpen, "arming nothing");
+  }
+}
+
 /// #279, through the engine and over the wire: a Keep local held under a
 /// running game is withdrawn before the game closes. Nothing was written while
 /// it was held, so nothing is written by the cancel, and once the hold
@@ -6862,6 +6990,125 @@ int KeepLocalChoice(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #317's acceptance, through the real engine against RomM 5.4.0: a Keep local
+/// armed against one server is never spent against the next.
+///
+/// A conflict as `keep_local` makes one, and Keep local on it with sync
+/// switched off, so the choice waits armed. `server.url` then moves to the same
+/// RomM under another spelling (`localhost`), which is another server to this
+/// client (server_binding.hpp) and keeps the old rom id meaning the same game
+/// -- the worst case, where an override carried across would land. The console
+/// pairs with the new server and syncs: no upload goes with `overwrite=true`.
+int KeepLocalSwitched(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  const std::string::size_type loopback = base.find("127.0.0.1");
+  if (loopback == std::string::npos) {
+    c.Expect(false, "the rig is on 127.0.0.1, so localhost is another spelling of it: " + base);
+    return c.failures();
+  }
+  const std::string other = base.substr(0, loopback) + "localhost" + base.substr(loopback + 9);
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee_mb.gba", &rom),
+           "the fixture library has 240pee_mb.gba");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-keep-local-switched");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::string stamp = harness::UniqueSlot("keep-local-switched");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Intercepting wire(client);
+  Console console(c, "engine-keep-local-switched");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::string save = "/tico/saves/gba/240pee_mb.srm";
+  console.sandbox.MakeDirs("/tico/saves/gba");
+  console.sandbox.SeedSave(save, "the switch's save, first synced " + stamp + "\n");
+
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UsePairingBackend(Backend(client));
+  console.Boot();
+  console.engine.UseServer(&wire, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  const auto overrides = [&wire] { return wire.Asked(http::Method::kPost, "overwrite=true"); };
+
+  TickOnce(console, ticks, c, "the first tick");
+  harness::PassASecond();
+  {
+    const std::string staged = console.sandbox.Host("/config/rommsync/other.srm");
+    rig::WriteFile(staged, "the other device's progress, under gpsp " + stamp + "\n");
+    harness::Save written;
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "gpsp", staged,
+                                 "240pee_mb.srm", /*with_device=*/false, &written),
+             "another device writes the slot under gpsp");
+  }
+  harness::PassASecond();
+  const std::string mine = "the switch played on: the copy the player keeps " + stamp + "\n";
+  console.sandbox.Reseed(save, mine);
+  TickOnce(console, ticks, c, "the conflict's tick");
+  c.Expect(console.sandbox.HasBackupOf(mine), "the console's bytes are under .backup/");
+
+  std::string response;
+  console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
+               &response);
+  std::int64_t entry_id = 0;
+  for (const ipc::ConflictRow& row : ipc::DecodeConflictPage(response).value.entries) {
+    if (row.entry.rom_id == rom.id && row.entry.event == conflicts::Event::kConflict) {
+      entry_id = row.entry.id;
+    }
+  }
+  c.Expect(entry_id != 0, "the conflict is on the conflicts screen");
+
+  c.Expect(console.SetEnabled(false).enabled == false, "sync is switched off");
+  c.Expect(console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(entry_id), &response) ==
+               ipc::Error::kOk,
+           "KeepLocal is answered");
+  const ipc::RestoreState kept = console.AwaitRestore(entry_id);
+  c.Expect(kept.report.ok(), std::string("Keep local put the console's bytes back: ") +
+                                 conflicts::ToString(kept.report.outcome) + " -- " +
+                                 kept.report.message);
+  c.Expect(console.KeepLocalOf(entry_id) == ipc::KeepLocalState::kWaiting,
+           "and the choice waits, armed, for a tick");
+
+  // The overlay's edit, which discards the pairing; the console pairs again
+  // with the new server, as a player would.
+  c.Expect(console.Set(Edit("server", "url", other)).outcome == ipc::WriteOutcome::kApplied,
+           "server.url moves to " + other);
+  const auth::PairingStatus showing = BeginAndShow(console, c);
+  const http::Result approved = rig::ApproveDeviceCode(client, other, showing.user_code, Scopes());
+  c.Expect(approved.successful(),
+           "the new server approves the pairing -- HTTP " +
+               std::to_string(approved.response.status));
+  const auth::PairingStatus granted = Terminal(console, c);
+  c.Expect(granted.state == auth::PairingState::kApproved,
+           std::string("and the console is paired with it: ") + auth::ToString(granted.state));
+  c.Expect(console.SetEnabled(true).enabled, "sync is switched back on");
+  TickOnce(console, ticks, c, "the new server's first tick");
+  c.Expect(overrides().empty(),
+           "no upload to the new server goes with overwrite=true -- the choice was the old "
+           "server's" +
+               Rendered(console.Log()));
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// #273, through the real engine against RomM 5.4.0: the ways a Keep local is
 /// spent without the override going up.
 ///
@@ -7228,6 +7475,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"install_wake", InstallWake},
       {"keep_local", KeepLocalChoice},
       {"keep_local_overtaken", KeepLocalOvertaken},
+      {"keep_local_switched", KeepLocalSwitched},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -7281,6 +7529,8 @@ int main(int argc, char** argv) {
     RestoreDuringBootWait(checks);
   } else if (scenario == "keep_local_guards") {
     KeepLocalGuards(checks);
+  } else if (scenario == "keep_local_server") {
+    KeepLocalServer(checks);
   } else if (scenario == "keep_local_cancel") {
     KeepLocalCancel(checks);
   } else if (scenario == "keep_local_cancel_race") {

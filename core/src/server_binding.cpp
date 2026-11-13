@@ -127,6 +127,11 @@ Archived Archive(const std::string& path, std::string_view identity) {
   return archived;
 }
 
+std::string TagOf(std::string_view identity) {
+  static_cast<void>(identity);
+  return {};
+}
+
 Rebound BindRecords(const std::string& marker, const std::vector<std::string>& records,
                     std::string_view identity) {
   Rebound rebound;

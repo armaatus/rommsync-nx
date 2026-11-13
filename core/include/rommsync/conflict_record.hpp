@@ -58,6 +58,10 @@ struct RecordOptions {
   /// stamp, which cannot be written against a clock that moves. Null means
   /// `std::chrono::system_clock::now`.
   std::function<sync::Timestamp()> now;
+
+  /// Stamped on every entry as `Entry::server` (#317): the tag of the server
+  /// the tick ran against. Empty records entries with none.
+  std::string server;
 };
 
 /// Record every overwrite in `report`, and answer how many entries that was.
@@ -101,6 +105,10 @@ struct RestoreOptions {
   /// than written (#275), and only after the entry's own refusals, so a choice
   /// that could never be taken says why rather than being held first (#273).
   bool game_running = false;
+
+  /// `KeepLocal` only: the tag of the server the console syncs with now
+  /// (`Entry::server`, #317). An entry stamped otherwise is refused.
+  std::string server;
 };
 
 /// Put the bytes `entry_id` names back on the card.
@@ -159,6 +167,10 @@ bool CarriesChoice(const History& history, const Entry& entry);
 ///         a slot. A download that replaced a save had no local side the server
 ///         weighed, a state has no slot an upload could go over, and a deletion
 ///         was RomM's own -- plain `Restore` is what those have;
+///       - with `kNotAConflict` too for a conflict recorded against another
+///         server than `options.server` (#317). Its rom id names a game on
+///         that server only, so the override would go to whatever the current
+///         one calls that id. A plain `Restore` of it is still the player's;
 ///       - with `kSuperseded` for a conflict that is not the newest entry of its
 ///         `(rom_id, slot)` (#273). A later conflict, download or deletion of
 ///         the save has put other bytes on the card since, and the server a
