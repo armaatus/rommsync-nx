@@ -135,6 +135,14 @@ target_compile_definitions(test_sync_plan PRIVATE
   ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0")
 add_test(NAME sync.plan COMMAND test_sync_plan)
 
+# M11-11 (#295): whether the console's clock is believed, against a fake one --
+# a console in the past, one in the future, one within the threshold -- and the
+# `Date` header the server's reference is read from. No network.
+add_executable(test_clock_check test_clock_check.cpp)
+target_link_libraries(test_clock_check PRIVATE rommsync::core)
+target_include_directories(test_clock_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME sync.clock COMMAND test_clock_check)
+
 # token.dat. Pure filesystem and parsing, so this never skips either -- and the
 # guarantee it exists for (a failed write costs the new token, never the working
 # one) is checkable with no server at all.
