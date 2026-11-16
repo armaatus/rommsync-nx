@@ -2435,6 +2435,7 @@ set(ENGINE_SCENARIOS
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
+  nifm_verdict   # #289: a nifm probe that fails is the console offline, not online
   boots_offline  # #289: a boot with no Wi-Fi holds its tick for the network, past the boot wait
   wakes_offline  # #289: a tick due at a wake waits for Wi-Fi to reassociate, and earns no backoff
   romm_forgotten  # M10-2: a heartbeat answered after the engine forgot the server is not recorded

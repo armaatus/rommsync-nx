@@ -135,6 +135,8 @@ in RomM and never come back from it. Nothing changes on the card.
 3 warn net.offline GET /api/roms: body ended early; the rom index could not be fetched: body ended early (transfer closed with 14822 bytes remaining to read)
 3 warn net.offline negotiate: connection failed; the negotiation did not complete: connection failed
 2 warn net.offline tick skipped: this build has no transport
+2 warn net.offline the console has no internet connection; the interval tick waits for the network
+2 warn net.offline nifm answered 0x123456; read as no internet connection
 ```
 
 The part before the `;` is where it failed and how — `GET /api/roms` is the
@@ -159,6 +161,19 @@ harmless; the next one picks up where this one would have.
    needs the port written out.
 4. If the detail says **host could not be resolved**, it is DNS: try the
    server's IP address in `[server] url` to confirm, then fix the name.
+
+`the console has no internet connection; the … tick waits for the network`
+is the console itself saying it is offline — airplane mode, Wi-Fi off, no
+known network in range, or a wake before Wi-Fi has reassociated. Nothing was
+sent and nothing failed: the tick (`boot`, `interval` or `on_demand`) is held,
+the console asks again every two seconds for two minutes and every thirty seconds
+after that, and the tick runs the moment Wi-Fi is
+back, with no backoff to wait out. It is written once per hold, so a console
+that sat in a bag all afternoon shows one line. If it keeps appearing while the
+console's own settings show a working connection, run the connection test under
+System Settings → Internet and include what it says in a bug report.
+`nifm answered 0x…` is the same verdict reached from an answer this client did
+not expect, and worth including in a bug report too.
 
 `tick skipped: this build has no transport` is a different sentence and is not
 a network problem — it is a build with no HTTP client wired in, which is not

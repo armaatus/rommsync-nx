@@ -102,6 +102,7 @@
 #include "engine.hpp"
 #include "faulty_disk.hpp"
 #include "harness.hpp"
+#include "http/nifm_verdict.hpp"
 #include "power.hpp"
 #include "power_fake.hpp"
 #include "rig.hpp"
@@ -2895,6 +2896,21 @@ bool AwaitRequests(const Unanswered& server, int above, std::chrono::millisecond
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
   }
   return server.requests() > above;
+}
+
+/// M11-5 (#289): what `ConsoleIsOnline` makes of nifm's answer. The probe
+/// failing is the console being offline -- libnx documents 0xd46ed for airplane
+/// mode and no network in range -- where it used to be read as online.
+void NifmVerdicts(checks::Checks& c) {
+  using rommsync::sysmodule::ClassifyNifm;
+  using rommsync::sysmodule::NifmVerdict;
+  c.Expect(ClassifyNifm(0, true) == NifmVerdict::kOnline, "connected is online");
+  c.Expect(ClassifyNifm(0, false) == NifmVerdict::kOffline,
+           "answered but not connected -- still associating -- is offline");
+  c.Expect(ClassifyNifm(0xd46ed, true) == NifmVerdict::kOffline,
+           "airplane mode or no network in range is offline, whatever the status left behind");
+  c.Expect(ClassifyNifm(0x2a2, true) == NifmVerdict::kOfflineUnexpected,
+           "any other failure is offline too, and the one worth a log line");
 }
 
 /// M11-5 (#289): a console that boots with no Wi-Fi does not spend its boot
@@ -7681,6 +7697,8 @@ int main(int argc, char** argv) {
     Reenable(checks);
   } else if (scenario == "sleeps") {
     Sleeps(checks);
+  } else if (scenario == "nifm_verdict") {
+    NifmVerdicts(checks);
   } else if (scenario == "boots_offline") {
     BootsOffline(checks);
   } else if (scenario == "wakes_offline") {

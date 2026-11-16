@@ -1083,6 +1083,15 @@ void SdEngine::ObserveAnswer(auth::Answer answer) {
   auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
 }
 
+bool SdEngine::NetworkUp() const {
+  NetworkProbe probe;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    probe = network_probe_;
+  }
+  return !probe || probe();
+}
+
 bool SdEngine::AwaitNetwork() {
   // The wait for the network happens **here**, on this thread, and never in
   // `main`: a console that comes up with no Wi-Fi must not hold boot
@@ -1141,6 +1150,13 @@ bool SdEngine::AwaitNetwork() {
 
 void SdEngine::RunWorker() {
   bool network_seen = AwaitNetwork();
+  if (!network_seen) {
+    // The boot wait already spent the quick pace's budget, so a boot tick held
+    // after it goes straight to the slow one rather than polling two more
+    // minutes. A wait cut short by a sleep is reset at the wake below.
+    std::lock_guard<std::mutex> lock(mutex_);
+    offline_since_ = clock_->Steady() - network_budget_;
+  }
 
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stopping_) {
@@ -1154,6 +1170,11 @@ void SdEngine::RunWorker() {
       quiesced_.notify_all();
       wake_.wait(lock, [this] { return stopping_ || !suspended_; });
       worker_parked_ = false;
+      // A tick held for the network before the sleep is held afresh after it,
+      // on the quick pace: Wi-Fi reassociating at a wake is the case that pace
+      // is for, and the hold says so again rather than going quiet (#289).
+      offline_since_.reset();
+      offline_said_ = false;
       if (!stopping_ && !network_seen) {
         // The boot wait was cut short by the sleep rather than satisfied
         // (`AwaitNetwork` returns which). A console that came up with Wi-Fi not
@@ -1225,6 +1246,44 @@ void SdEngine::RunWorker() {
     // lands while the lock is released below cannot be missed. See `wakes_`.
     const std::uint64_t decided_at = wakes_;
     sync::Decision decision = scheduler_.Poll();
+    if (decision.run()) {
+      // **Every tick waits for the network, not only the boot one** (M11-5,
+      // #289). The boot wait gives up after its budget, and after a wake from a
+      // console that had seen the network it is not given at all -- so a tick
+      // falling due then raced nifm, failed offline, and put the schedule on
+      // its backoff for being in a bag. Held instead, like a tick under a game:
+      // handed back, nothing sent, nothing recorded, and asked again every
+      // `network_poll_` for a budget and every `network_idle_poll_` after it,
+      // so the tick runs within seconds of Wi-Fi coming back. Ahead of the
+      // game check, which is a `pm` call a held tick need not spend.
+      lock.unlock();
+      const bool network_up = NetworkUp();
+      lock.lock();
+      if (!network_up) {
+        scheduler_.Defer(decision.trigger);
+        const std::chrono::steady_clock::time_point now = clock_->Steady();
+        if (!offline_since_) {
+          offline_since_ = now;
+        }
+        const std::chrono::milliseconds pace =
+            now - *offline_since_ < network_budget_ ? network_poll_ : network_idle_poll_;
+        if (!offline_said_) {
+          offline_said_ = true;
+          // Once per hold, as `sync.held` is: a console in a bag all day is one
+          // line, not one per re-check. Outside the lock: it is a card write.
+          lock.unlock();
+          log::Warn(log::Event::kNetOffline,
+                    std::string("the console has no internet connection; the ") +
+                        sync::ToString(decision.trigger) + " tick waits for the network");
+          lock.lock();
+        }
+        decision = sync::Decision{};
+        decision.sleep_for = pace;
+      } else {
+        offline_since_.reset();
+        offline_said_ = false;
+      }
+    }
     if (decision.run()) {
       // Asked only now, when a tick is actually due: a console with nothing to
       // run never asks `pm` anything (#242). And asked **first**, ahead of

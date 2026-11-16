@@ -103,10 +103,16 @@ bool NetworkReady();
 ///
 /// This is what "offline-safe" costs on a console (CLAUDE.md): a sync tick on a
 /// Switch in a bag would otherwise spend `connect_timeout` per request finding
-/// out what nifm can answer in one IPC call. **A nifm that will not answer is
+/// out what nifm can answer in one IPC call. **A nifm that was never opened is
 /// not treated as offline** -- the transport is bsd and ssl, and refusing to try
-/// because a diagnostic service was busy would be the worse mistake. That is
-/// also why it is safe to call when `NetworkInitialize` was skipped entirely:
+/// because a diagnostic service is missing would be the worse mistake. **A nifm
+/// that answers with a failure is** (M11-5, #289): libnx documents the call
+/// failing with 0xd46ed in airplane mode and with no known network in range, so
+/// a failure is the offline answer rather than a busy service; any other code
+/// is read the same way and logged as `net.offline` (`nifm_verdict.hpp`).
+///
+/// The never-opened guard is also why it is safe to call when
+/// `NetworkInitialize` was skipped entirely:
 /// since M9-1 (#195) it can be, and an unguarded `nifmGetInternetConnectionStatus`
 /// on a session that was never opened is one wasted `svcSendSyncRequest` per
 /// probe rather than an answer.

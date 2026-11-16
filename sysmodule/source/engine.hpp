@@ -931,9 +931,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   ///
   /// Bounded rather than indefinite: a console that lives on a coffee table with
   /// no Wi-Fi would otherwise park this thread until it is next carried into
-  /// range. Giving up costs one tick, which fails `TickOutcome::kOffline` and is
-  /// rescheduled on the same backoff every other offline console is on. It also
-  /// gives up at once when the process is going away.
+  /// range. Giving up costs nothing since M11-5 (#289): the boot tick is then
+  /// held for the network in `RunWorker`, as every later tick is, rather than
+  /// run to fail offline and earn a backoff. It also gives up at once when the
+  /// process is going away.
   ///
   /// **True when the probe said yes, or when there is no probe.** False is the
   /// budget running out, a shutdown, or a sleep -- and the last of those is why
@@ -942,6 +943,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `RunWorker` gives it again on the wake rather than running the boot tick
   /// against a `nifm` that has not reassociated.
   bool AwaitNetwork();
+
+  /// One answer from `network_probe_`, asked outside `mutex_`. True when there
+  /// is no probe. Takes `mutex_` for the copy, so never called holding it.
+  bool NetworkUp() const;
 
   /// Tell the worker there is something to do. Safe from any thread; takes
   /// `mutex_` for the counter and notifies outside it.
@@ -1657,6 +1662,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// A tick is being held for a running game. Only the worker touches it; it
   /// is what makes `sync.held` one line per game rather than one per re-check.
   bool holding_ = false;
+
+  /// When the tick now held for the network was first found offline, or empty
+  /// when none is, and whether the hold has said so (#289). Worker-only, like
+  /// `holding_`: the first picks the re-check pace, the second makes the
+  /// `net.offline` line one per hold.
+  std::optional<std::chrono::steady_clock::time_point> offline_since_;
+  bool offline_said_ = false;
 
   /// Bumped by every command that gives the worker something to do, under
   /// `mutex_`, and read by the worker as part of its wait predicate.

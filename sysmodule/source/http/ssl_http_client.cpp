@@ -17,8 +17,11 @@
 
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -26,7 +29,9 @@
 #include <string>
 
 #include "http_wire.hpp"
+#include "nifm_verdict.hpp"
 #include "posix_connection.hpp"
+#include "rommsync/log.hpp"
 
 namespace rommsync::sysmodule {
 namespace {
@@ -425,10 +430,32 @@ bool ConsoleIsOnline() {
   NifmInternetConnectionType type{};
   u32 strength = 0;
   NifmInternetConnectionStatus status{};
-  if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) {
-    return true;
+  const Result rc = nifmGetInternetConnectionStatus(&type, &strength, &status);
+  // **A failure is offline** (M11-5, #289): libnx documents this call failing
+  // in airplane mode and with no known network in range, so reading a failure
+  // as "nifm was busy" skipped the boot wait and the connector's pre-check on
+  // exactly the consoles they exist for (`nifm_verdict.hpp`).
+  switch (ClassifyNifm(R_FAILED(rc) ? rc : 0, status == NifmInternetConnectionStatus_Connected)) {
+    case NifmVerdict::kOnline:
+      return true;
+    case NifmVerdict::kOffline:
+      return false;
+    case NifmVerdict::kOfflineUnexpected:
+      break;
   }
-  return status == NifmInternetConnectionStatus_Connected;
+  // Said once per change of code rather than once per two-second probe: the
+  // worker asks every poll while a tick is held.
+  static std::atomic<Result> last_said{0};
+  if (last_said.exchange(rc) != rc) {
+    // `std::to_chars` rather than `snprintf`, which would link newlib's whole
+    // `_svfprintf_r` into the sysmodule (`switch.builds`).
+    char hex[16];
+    const std::to_chars_result end =
+        std::to_chars(hex, hex + sizeof(hex), static_cast<std::uint32_t>(rc), 16);
+    log::Warn(log::Event::kNetOffline, "nifm answered 0x" + std::string(hex, end.ptr) +
+                                           "; read as no internet connection");
+  }
+  return false;
 }
 
 std::unique_ptr<http::HttpClient> MakeHorizonHttpClient(const http::ClientOptions& options) {
