@@ -2121,6 +2121,24 @@ foreach(scenario
   set_tests_properties(docs.troubleshooting_${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# --- the front door: SECURITY.md, SUPPORT.md, CONTRIBUTING.md, issue forms ---
+# Written before there was a client, and still saying so long after (#302):
+# nothing broke when the client landed, so nothing told them. The bug form is
+# held to the fields triage asks for first, and parsed against GitHub's form
+# schema so it renders rather than degrading to a blank issue. Reads files only.
+set(DOCS_COMMUNITY_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_docs_community.py")
+
+foreach(scenario
+        stale        # no user-facing page says the client does not exist
+        forms        # every issue form parses and keeps to the form schema
+        bug_fields   # the bug form requires #302's triage fields; the log paths are log.hpp's
+        versions)    # SECURITY.md's supported table names VERSION's series
+  add_test(NAME docs.community_${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${DOCS_COMMUNITY_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(docs.community_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M6-3: turning a tag into a release --------------------------------------
 # Three files decide whether a `v*` tag publishes something a user can install:
 # VERSION, the release job in .github/workflows/ci.yml, and the notes generator.
