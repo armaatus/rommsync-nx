@@ -193,6 +193,7 @@ struct PlanRun {
   TickCompletion finished;
   TickOutcome outcome = TickOutcome::kCompleted;
   auth::Answer answer = auth::Answer::kSilent;
+  ClockCheck clock;
 };
 
 /// Execute, resolve and finish one plan, starting from `*baseline` and leaving
@@ -211,6 +212,17 @@ PlanRun CarryOut(http::HttpClient& client, fs::FileSystem& files, const auth::St
   // one, and only on the bytes this tick reported: the server ruled on those.
   execute.delete_action = options.server.delete_action;
   execute.reported = &offered;
+  // The console's clock against this plan's references, read now: the plan was
+  // decided against the server's clock a moment ago (#295, clock_check.hpp).
+  ClockReading reading;
+  reading.local = options.console_clock ? options.console_clock()
+                                        : std::chrono::system_clock::now();
+  if (options.network_clock) {
+    reading.network = options.network_clock();
+  }
+  reading.server = negotiated->server_date;
+  execute.clock = CheckClock(reading);
+  run.clock = execute.clock;
   run.executed = ExecutePlan(client, files, token, negotiated->plan, targets, execute);
 
   // Before the baseline is written, because the baseline is written from the
@@ -536,6 +548,10 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
     result.negotiated = std::move(one);
     result.executed = std::move(run.executed);
     Accumulate(&result.resolved, std::move(run.resolved));
+    // An untrusted check is kept over a later trusted one: it held something.
+    if (!result.clock.has_value() || result.clock->trusted()) {
+      result.clock = run.clock;
+    }
 
     if (run.outcome == TickOutcome::kUnauthorized || run.outcome == TickOutcome::kCanceled) {
       // The next chunk would meet the same refusal, or the same shutdown.

@@ -36,9 +36,21 @@ you have installed homebrew on a Switch before and have never seen RomM.
   gates of its own, up to `[21.0.0+]`, and they are guarded for the same reason.
   Nothing has been booted on any firmware, so treat both numbers as what the
   build aims at rather than a compatibility list.
-- **Ultrahand or Tesla already installed and working.** The control UI is an
-  overlay; if your overlay menu does not open today, fix that first — none of
-  what follows is visible without it.
+- **[Ultrahand Overlay](https://github.com/ppkantorski/Ultrahand-Overlay)
+  v2.5.4 or newer, with [nx-ovlloader](https://github.com/ppkantorski/nx-ovlloader)
+  v2.0.3 or newer, installed and working.** The control UI is an overlay; if
+  your overlay menu does not open today, fix that first — none of what follows
+  is visible without it. Those are the versions the overlay is built against:
+  it is compiled from libultrahand v2.5.4, and Ultrahand Overlay v2.5.4 is the
+  release that bundles that library and nx-ovlloader v2.0.3 together. Older
+  ones are untested rather than refused. On Atmosphère 1.10.0 or newer,
+  Ultrahand hides an overlay that lacks libnx's `LNY2` stamp; every build of
+  this one is checked for it before it can be released.
+
+  Whether the stock Tesla menu loads it is **unverified until M12**: the
+  overlay carries Ultrahand's signature and has been checked against nothing
+  else, and the compatibility matrix that will settle it is
+  [#310](https://github.com/armaatus/rommsync-nx/issues/310). Use Ultrahand.
 - **[ovl-sysmodules](https://github.com/ppkantorski/ovl-sysmodules) installed.**
   That is the overlay that starts, stops and boot-toggles sysmodules, and it is
   the only supported way to turn `sys-rommsync` on. rommsync-nx does not ship

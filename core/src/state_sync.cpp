@@ -29,6 +29,7 @@
 //   2. check those bytes against the length the server reported -- which is all
 //      there is; see the header
 //   3. `sync::BackUpFirst` the state's current bytes into `.backup/`
+//      ...`sync::BackupIsReported` that they are the bytes the scan hashed (#286)
 //      ...and `sync::UnchangedSinceBackup` that nothing wrote the state since (#270)
 //   4. `io::CommitStaged` the bytes onto the state
 #include "rommsync/state_sync.hpp"
@@ -549,10 +550,16 @@ StateOperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
 /// `sd_path` is where the bytes go and `previous` is the backup discriminator's
 /// name; for a placement there is nothing at `sd_path`, so `BackUpFirst` finds
 /// no source and there is nothing to protect.
+///
+/// `scanned` is the digest the scan took of the state being replaced, which the
+/// decision to download was made against (#286) -- `Decide` downloads only over
+/// a state its row still describes, digest included. Empty for a placement,
+/// which replaces nothing the scan saw.
 StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                            const auth::StoredToken& token, const ServerState& server,
-                           const std::string& sd_path, StateAction action,
-                           const StateSyncOptions& options, std::vector<std::string>* warnings) {
+                           const std::string& sd_path, const std::string& scanned,
+                           StateAction action, const StateSyncOptions& options,
+                           std::vector<std::string>* warnings) {
   const std::string destination = files.Resolve(sd_path);
   if (destination.empty()) {
     return Fail(server.rom_id, server.file_name, action, StateError::kUnreadableCard,
@@ -627,6 +634,24 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
         Fail(server.rom_id, server.file_name, action, error, std::move(message));
     failed.sd_path = sd_path;
     return failed;
+  }
+
+  // **The backup is the state the download was decided against** (#286): one
+  // saved on a hotkey while the download ran is a state nothing ruled on, and
+  // replaced, it would be in `.backup/` alone with the next run seeing it synced.
+  if (!scanned.empty()) {
+    const OperationError held =
+        BackupIsReported(files, sd_path, scanned, &result.backup_sd_path, &message);
+    if (held != OperationError::kNone) {
+      const StateError error = held == OperationError::kUnverified
+                                   ? StateError::kChangedSinceBackup
+                                   : StateError::kUnreadableCard;
+      StateOperationResult failed =
+          Fail(server.rom_id, server.file_name, action, error, std::move(message));
+      failed.sd_path = sd_path;
+      failed.backup_sd_path = result.backup_sd_path;
+      return failed;
+    }
   }
 
   // **And the state is still what the backup copied** (#270, #263's check):
@@ -1000,7 +1025,8 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       }
       case StateAction::kDownload: {
         StateOperationResult result =
-            Fetch(client, files, token, *server, file.sd_path, action, options, &report.warnings);
+            Fetch(client, files, token, *server, file.sd_path, file.content_hash, action,
+                  options, &report.warnings);
         if (result.outcome == StateOutcome::kDownloaded) {
           AdvanceWritten(files, &file, *server, file.sd_path, baseline, &report.warnings);
         }
@@ -1076,8 +1102,8 @@ StateSyncReport SyncStates(http::HttpClient& client, fs::FileSystem& files,
       }
     }
     StateOperationResult result =
-        Fetch(client, files, token, server, sd_path, StateAction::kPlace, options,
-              &report.warnings);
+        Fetch(client, files, token, server, sd_path, /*scanned=*/std::string(),
+              StateAction::kPlace, options, &report.warnings);
     if (result.outcome == StateOutcome::kDownloaded) {
       folders.Keep();
       AdvanceWritten(files, nullptr, server, sd_path, baseline, &report.warnings);

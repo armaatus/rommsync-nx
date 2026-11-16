@@ -50,6 +50,10 @@ SECTIONS = [
     "The token expired or was revoked",
     "The server URL is wrong or missing",
     "TLS fails",
+    # M11-11 (#295). `clock.skew` and `net.tls_clock` are tags the code writes,
+    # and the remedy -- the console's date -- is next to TLS, where a clock
+    # outside a certificate's dates is first met.
+    "The console's clock is wrong",
     "Saves are skipped: nothing matches",
     "The folder map switched saves off",
     "The SD card is full",

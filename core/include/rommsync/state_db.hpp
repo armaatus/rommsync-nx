@@ -78,6 +78,19 @@
 // row let go costs its save one re-hash, and is said; a row repeating one let
 // go is a second row, and discards the file as any second row does.
 //
+// ## Version 4: the server (#294)
+//
+// A rom id means something only on the RomM that issued it, so the rows are
+// held to that server: the header names it, `rommsync-state 4 <bound since>
+// <server>` (`binding::IdentityOf`), and `BindToServer` sets aside a file that
+// names another rather than read its rows -- a `deleted_on_server` mark from
+// the old server would otherwise keep a save from ever reaching the new one.
+// rc2's version 3 is the same rows with no server named; it is read, and
+// adopted by the server the console is configured for. A bare
+// `rommsync-state 4` is a baseline nobody bound -- one a test or a tool built
+// -- and is read as rc2's is. rc2 itself reads version 4 as a newer release's
+// file and rebuilds its baseline from the card, which is #255's rule.
+//
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two
 // ways -- which the string can: this client writes `Z` and RomM writes `+00:00`
@@ -108,9 +121,15 @@ namespace rommsync::state {
 /// The file the baseline lives in, relative to `sdmc:/config/rommsync/`.
 inline constexpr const char* kStateFileName = "state.db";
 
-/// The first line of a well-formed file, `<magic> <version>`.
+/// The first line of a well-formed file, `<magic> <version>`, and since #294
+/// `<magic> <version> <bound since> <server>` -- see "Version 4" above.
 inline constexpr const char* kFormatMagic = "rommsync-state";
-inline constexpr int kFormatVersion = 3;
+inline constexpr int kFormatVersion = 4;
+
+/// The version before #294 bound the file to a server: rc2's, the same rows
+/// with no server in the header. Read, and adopted as the configured server's
+/// by `BindToServer`.
+inline constexpr int kUnboundVersion = 3;
 
 /// The version before #236 moved every save to the shared slot: the same rows,
 /// with slots derived as `<source>-<extension>`. Read, and migrated by
@@ -339,9 +358,28 @@ class Baseline {
   std::size_t size() const { return rows_.size() + states_.size(); }
   bool empty() const { return rows_.empty() && states_.empty(); }
 
+  /// The server these rows were synced against (`binding::IdentityOf`), or
+  /// empty for a baseline nothing has bound -- an rc2 file, or one a caller
+  /// built by hand. Written into the header, so it travels with the rows.
+  const std::string& server() const { return server_; }
+
+  /// The Unix second this file was first bound to `server()`: zero for rc2's
+  /// rows, which were adopted, and the moment of the rebinding for a file that
+  /// began again after another server's (`BindToServer`). A backup named before
+  /// it was taken against some other server, so this one's digests prove
+  /// nothing about it (`backup::PruneOptions::server_since`).
+  std::int64_t bound_since() const { return bound_since_; }
+
+  void BindTo(std::string server, std::int64_t since) {
+    server_ = std::move(server);
+    bound_since_ = since;
+  }
+
  private:
   std::map<Key, SaveRecord> rows_;
   std::map<StateKey, StateRecord> states_;
+  std::string server_;
+  std::int64_t bound_since_ = 0;
 };
 
 /// A baseline and everything wrong with the file it came from.
@@ -447,6 +485,30 @@ std::size_t AdoptLegacySaves(
 /// failure was then read as an unreadable file rather than the commit window
 /// `.old` exists for.
 LoadedBaseline LoadBaseline(const std::string& path);
+
+/// Hold what `LoadBaseline(path)` read to the server `server` names
+/// (`binding::IdentityOf`), at `now_unix` (#294). Returns a line for the log,
+/// empty when there is nothing to say.
+///
+///   - **The same server**: nothing.
+///   - **A file nobody bound** -- rc2's version 3, or rc1's version 2 -- is
+///     adopted as this server's from the epoch: it is every row this console
+///     has, and as far as the card can show, the server it was configured for
+///     is the one those rows came from.
+///   - **No rows at all** -- no file, a discarded one, a newer release's -- is
+///     bound from `now_unix`. Nothing says which server any backup on the card
+///     was taken against, so none is taken to be this one's.
+///   - **Another server's file** is set aside as `<path>.<its server>`
+///     (`binding::Archive`) and the baseline begins again, empty, bound from
+///     `now_unix` -- a first sync, which backs up before it overwrites. Its rows
+///     are never read against this server: a `deleted_on_server` mark would keep
+///     a save from ever reaching it, and a rom id may name another game here.
+///     If the file cannot be set aside the rows are dropped all the same, and the
+///     next write replaces it.
+///
+/// `server` empty -- no server configured -- binds nothing.
+std::string BindToServer(LoadedBaseline* loaded, const std::string& path, std::string_view server,
+                         std::int64_t now_unix);
 
 namespace testing {
 

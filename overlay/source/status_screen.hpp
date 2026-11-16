@@ -21,9 +21,8 @@
 #include <tesla.hpp>
 
 #include "ipc_client.hpp"
-#include "lifecycle.hpp"
 #include "rommsync/overlay_status_view.hpp"
-#include "screen_frame.hpp"
+#include "status_pump.hpp"
 
 namespace rommsync::overlay {
 
@@ -37,10 +36,8 @@ class StatusScreen : public tsl::Gui {
 
   tsl::elm::Element* createUI() override;
 
-  /// Called once per frame by Tesla. One `GetStatus` per frame is the rate this
-  /// contract was shaped for -- `ipc::Status` carries the current download so
-  /// the screen is one round trip rather than two, and the sysmodule answers it
-  /// off a snapshot it already holds (`ipc::Engine::Snapshot`).
+  /// Called once per frame by Tesla. The IPC is `StatusPump`'s
+  /// (`status_pump.hpp`), where a host test can reach it.
   void update() override;
 
   /// Y opens the settings screen, which is this overlay's root menu.
@@ -55,45 +52,13 @@ class StatusScreen : public tsl::Gui {
                    HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
 
  private:
-  /// Ask, and turn whatever came back -- including nothing -- into `view_`.
-  void Poll();
-
-  /// What the card says about the two switches, re-reading it if this poll is
-  /// the one due to.
-  ///
-  /// Not an accessor: it is the poll's own step, and it stats three files on the
-  /// polls where `probe_cadence_` is due. Named for that -- `card()` beside
-  /// `card_` would read as free.
-  ///
-  /// `link` is what decides whether to look at all. Only `Link::kNotRunning`
-  /// uses the answer: `RenderUnreachable` discards the card for `kUnreadable`
-  /// and `kIncompatible`, where a session that opened has already proved the
-  /// module installed and running.
-  ///
-  /// Only ever consulted when the sysmodule did not answer: a session that
-  /// opened proves the module is installed and running, and reading it off the
-  /// card as well would be two sources for one fact (`card_probe.hpp`).
-  const CardState& CardThisPoll(Link link);
-
-  /// Draw `view_` into the bounds `CustomDrawer` hands us.
+  /// Draw the pump's view into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
   IpcClient& client_;
 
-  /// The session handshake, and which of the two unreachable sentences a failed
-  /// call means. Shared with every other screen (`screen_frame.hpp`).
-  ScreenFrame frame_{client_};
-
-  /// What the last poll produced. Starts as "not running" rather than as an
-  /// empty screen: the first frame is drawn before the first poll returns, and
-  /// a blank one there is indistinguishable from a broken overlay.
-  StatusView view_ = RenderUnreachable(Link::kNotRunning);
-
-  /// The last look at the card, and when the next one is due. Due on the first
-  /// poll that needs it, so that poll reads the card rather than drawing a
-  /// default -- and on the first of every showing (`lifecycle.hpp`).
-  CardState card_;
-  Cadence probe_cadence_;
+  /// The handshake, the poll, and the view they produce (`status_pump.hpp`).
+  StatusPump pump_{client_};
 };
 
 }  // namespace rommsync::overlay

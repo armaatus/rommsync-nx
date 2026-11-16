@@ -135,6 +135,14 @@ target_compile_definitions(test_sync_plan PRIVATE
   ROMMSYNC_CAPTURES_DIR="${CMAKE_SOURCE_DIR}/server/contract/captures/5.4.0")
 add_test(NAME sync.plan COMMAND test_sync_plan)
 
+# M11-11 (#295): whether the console's clock is believed, against a fake one --
+# a console in the past, one in the future, one within the threshold -- and the
+# `Date` header the server's reference is read from. No network.
+add_executable(test_clock_check test_clock_check.cpp)
+target_link_libraries(test_clock_check PRIVATE rommsync::core)
+target_include_directories(test_clock_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME sync.clock COMMAND test_clock_check)
+
 # token.dat. Pure filesystem and parsing, so this never skips either -- and the
 # guarantee it exists for (a failed write costs the new token, never the working
 # one) is checkable with no server at all.
@@ -502,7 +510,11 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # `DrawList` instead of a `tsl::gfx::Renderer` -- and two reach libnx and get
 # `tests/hostswitch/switch.h` instead, which stubs only what those two files
 # name. M9-6 (#209) added `conflicts_pump.cpp`, `lifecycle.cpp` and
-# `log_paint.cpp`, each split out of a screen so the claim about it runs.
+# `log_paint.cpp`, each split out of a screen so the claim about it runs;
+# M11-1 (#285) `library_pump.cpp`, the library browser's IPC and teardown;
+# M11-15 (#299) `status_pump.cpp`, `sync_pump.cpp` and `pairing_pump.cpp`, the
+# three screens that poll, so a frame against a slow sysmodule can be timed,
+# and `poller.cpp`, the line they poll through without waiting.
 # `sysmodule/source/ipc/result.cpp` is the far side's `Error` -> `Result`
 # mapping, compiled in so the overlay's inverse is tested against the real
 # one rather than against a copy of it.
@@ -522,10 +534,15 @@ add_executable(test_overlay_native
   "${CMAKE_SOURCE_DIR}/overlay/source/card_probe.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/conflicts_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/ipc_client.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/library_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/log_paint.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/pairing_pump.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/poller.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/status_pump.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/sync_pump.cpp"
   "${CMAKE_SOURCE_DIR}/sysmodule/source/ipc/result.cpp")
 target_link_libraries(test_overlay_native PRIVATE rommsync::core Threads::Threads)
 target_include_directories(test_overlay_native PRIVATE
@@ -555,8 +572,10 @@ foreach(scenario
         errors     # a refusal is not a transport failure, and neither is a bad payload
         timeout    # a sysmodule that does not answer holds no frame past one budget
         restore    # a restore that is still copying holds no frame at all
+        frames     # a sysmodule that answers in 300 ms holds no frame past 2 ms
         cycles     # every exit path gives back everything, the same way, every time
         hidden     # polling is by showing, because update() stops while hidden
+        scroll     # row 2000 of a platform, by a held R, with the heap flat
         log        # the log the sysmodule serves, readable without an SD reader
         portable   # the half of a screen that must keep compiling on a host
         draw)      # what the status screen actually asks to be drawn
@@ -953,6 +972,7 @@ target_compile_definitions(test_sync_execute PRIVATE
 set(EXECUTE_UNIT_SCENARIOS
   naming   # the backup path carries the slot, so one rom's two saves are two files
   staging  # the streamed copy and the two-rename commit an overwrite goes through
+  foreign_old # #293: a <save>.old the commit did not write survives it
   counting # no-op, a downgraded action, and the two refusals that need no server
   crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
   overwrite # #232: overwrite=false unless Keep local, and a 409 named as a newer save in the slot
@@ -985,6 +1005,7 @@ set(EXECUTE_RIG_SCENARIOS
   collision       # two saves of one rom, one second, two backups
   revoked         # M1-4: a 401 stops the plan where it stands, and touches no save
   late_fetch      # #263: a write between the backup and a download's or conflict's commit stays
+  stale_fetch     # #286: ...and one between the scan and the backup, which the ruling never saw
 )
 foreach(scenario IN LISTS EXECUTE_RIG_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -1253,6 +1274,7 @@ set(CONFLICT_UNIT_SCENARIOS
   crash        # M9-14: a power cut at every call of a restore, and one the card would not confirm
   keep_local   # #249: Keep local restores a save conflict's bytes and arms its key; the plan spends it
   late_write   # #270: a write between a restore's backup and its copy stays on the card
+  server       # #317: an entry carries its server; Keep local refused for another server's
   service      # both commands through ipc::Dispatch over a real SdEngine
   overlay      # the screen's decisions, and the greps overlay/AGENTS.md owes
 )
@@ -1268,6 +1290,36 @@ endif()
 # RUN_SERIAL for the reason every rig test needs it (see the top of this file):
 # this uploads and deletes saves on the shared fixture device.
 set_tests_properties(conflicts.recorded PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
+# --- M11-8 (#292): `.backup/` bounded, and nothing pruned is the only copy ----
+add_executable(test_backup_prune test_backup_prune.cpp)
+target_link_libraries(test_backup_prune PRIVATE rommsync::host)
+target_include_directories(test_backup_prune PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_backup_prune PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+set(PRUNE_UNIT_SCENARIOS
+  names      # a backup name reads back; anything else is not a backup
+  count      # the newest `keep` of a group stay; older copies the server holds go
+  age        # younger than `keep_days` stays whatever the count says
+  cap        # over `max_bytes`, oldest first across the tree, never a group's newest
+  unique     # bytes on neither the server nor a newer backup are never pruned
+  duplicate  # an older identical copy goes when a newer one stays
+  truncated  # past one listing, the rom it cuts sits the prune out, all its groups
+  crash      # a power cut at every call of a prune loses no backup's bytes
+  other_server  # #294: a backup from before a server switch is never pruned on the new one's word
+)
+foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
+  add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})
+  set_tests_properties(prune.${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
+add_test(NAME prune.server COMMAND test_backup_prune server)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(prune.server PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# RUN_SERIAL: it arms the fault proxy, which every rig test shares.
+set_tests_properties(prune.server PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
 # --- the host harness, and the edge cases only the fault proxy can force -----
 # M0-5. One CTest entry per scenario, same shape as the rest of this file, so a
@@ -1390,6 +1442,7 @@ set(STATES_RIG_SCENARIOS
   overwrite  # the server's copy moved: back up first, then replace
   crash      # M9-14: ...and a power cut at every call of it loses nothing
   late_write # #270: ...and a write between its backup and its commit stays on the card
+  stale_write # #286: ...and one between the scan and the backup, which nothing ruled on
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
   mapped     # #239: Tico's Auto up as .state.auto with its screenshot, down as Tico's and RetroArch's
@@ -1569,6 +1622,7 @@ set(TICK_UNIT_SCENARIOS
   newer_bounds # #232: ...held while a game runs (#242), and never placed where step 0 found nothing
   migrated_kept  # #236: a delete #233 kept stays withheld when rc1's row moves to the shared slot
   too_large    # #248: a plan past the transport ceiling is a plan too large, which a scoped tick splits
+  clock        # #295: an untrusted console clock holds the uploads decided on its timestamp
 )
 
 # M6-2 (#33). These are the same executables, registered under `toggle.` because
@@ -1884,6 +1938,21 @@ foreach(scenario
   set_tests_properties(toolchain.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# Is the libultrahand pin behind upstream's newest tag? Asked of GitHub, so it
+# warns and never fails: upstream tagging a release is news, not a break, and
+# moving the pin is a reviewed change of its own (#297). `upstream_check` is the
+# logic against a scratch repo and never skips; `upstream` asks GitHub and skips
+# offline. Not in the `toolchain` label, whose suite fails on a skip: this needs
+# a network rather than the image -- which is also why it has a script of its
+# own (test_toolchain_upstream.sh says how switch.toolchain_suite tells).
+set(TOOLCHAIN_UPSTREAM_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_toolchain_upstream.sh")
+add_test(NAME toolchain.upstream_check
+         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_UPSTREAM_TEST}" upstream_check)
+set_tests_properties(toolchain.upstream_check PROPERTIES TIMEOUT 60)
+add_test(NAME toolchain.upstream
+         COMMAND "${BASH_PROGRAM}" "${TOOLCHAIN_UPSTREAM_TEST}" upstream)
+set_tests_properties(toolchain.upstream PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
 # The pinned image's libnx is >= 4.10.0 -- asked of the image, not assumed.
 # Its SKIP_RETURN_CODE is unwrapped for switch.builds' reason, given at length
 # above: the host runner has no devkitpro image. The `switch-build` job runs the
@@ -2014,6 +2083,7 @@ foreach(scenario
         safety      # no account secret on the console, no weakened TLS
         pairing     # the state table is exactly what PairingState exposes
         structure   # #35's ten sections, the hardware note, the README link
+        loaders     # the Ultrahand / nx-ovlloader minimums match the pin (#297)
         # docs/INTEROP.md (#243): the other devices' half of the install guide.
         interop          # its sections, the links to it, the two config pages
         interop_facts    # versions, limits, keys and names read off the code
@@ -2342,6 +2412,7 @@ target_link_libraries(test_engine PRIVATE Threads::Threads)
 set(ENGINE_SCENARIOS
   queue     # enqueue, dequeue, and the depth the status screen reads
   persists  # every change reaches queue.json, and a fresh engine reads it back
+  rebinds   # #294: another server's queue.json and play.db are set aside at boot, not read
   rollback  # a write that cannot happen changes neither the file nor memory
   corrupt   # a queue.json a yanked card left behind never blocks the boot
   config    # M5-3: an edit lands on the card and on the running engine
@@ -2357,6 +2428,7 @@ set(ENGINE_SCENARIOS
   restore_polled  # M9-6: a restore on a slow card holds no IPC call while it copies
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
   keep_local_guards  # #273/#275: Keep local held under a game, refused past four waiting
+  keep_local_server  # #317: Keep local is refused on another server's conflict, and dropped by a switch
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
@@ -2409,9 +2481,12 @@ set(ENGINE_RIG_SCENARIOS
   server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
   drains       # M9-5: a rom queued over IPC becomes a file on the card
   romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
+  clock        # #295: a console clock a month off the network clock is logged and drawn, then trusted again
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
+  backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
+  server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
   placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save
@@ -2423,6 +2498,7 @@ set(ENGINE_RIG_SCENARIOS
   declined           # #257: a save the placer will not place costs one line, never a failed save
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
   keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
+  keep_local_switched  # #317: a Keep local armed against one server sends no overwrite=true to the next
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

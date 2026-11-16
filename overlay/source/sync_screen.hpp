@@ -29,9 +29,8 @@
 #include <tesla.hpp>
 
 #include "ipc_client.hpp"
-#include "rommsync/ipc.hpp"
 #include "rommsync/overlay_sync_actions.hpp"
-#include "screen_frame.hpp"
+#include "sync_pump.hpp"
 
 namespace rommsync::overlay {
 
@@ -45,9 +44,8 @@ class SyncScreen : public tsl::Gui {
 
   tsl::elm::Element* createUI() override;
 
-  /// Called once per frame by Tesla. One `GetStatus` per frame is the rate the
-  /// contract was shaped for: the sysmodule answers it off a snapshot it
-  /// already holds (`ipc::Engine::Snapshot`).
+  /// Called once per frame by Tesla. The IPC is `SyncPump`'s
+  /// (`sync_pump.hpp`), where a host test can reach it.
   void update() override;
 
   /// A sends `SyncNow`; X flips `[sync] enabled`.
@@ -62,46 +60,13 @@ class SyncScreen : public tsl::Gui {
                    HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
 
  private:
-  /// Ask, and turn whatever came back -- including nothing -- into `view_`.
-  void Poll();
-
-  /// Send `SyncNow`, or draw the refusal this screen already knows is coming.
-  void PressSyncNow();
-
-  /// Send `SetEnabled` for the opposite of what the sysmodule currently
-  /// reports, and redraw the switch as whatever came back.
-  void PressToggle();
-
-  /// `view_` from `status_` and `last_`. Every path that changes either of them
-  /// ends here, so the screen is one function of the two rather than a set of
-  /// places that each write a view.
-  void Refresh();
-
-  /// Draw `view_` into the bounds `CustomDrawer` hands us.
+  /// Draw the pump's view into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
   IpcClient& client_;
 
-  /// The session handshake, and which of the two unreachable sentences a failed
-  /// call means. Shared with every other screen (`screen_frame.hpp`).
-  ScreenFrame frame_{client_};
-
-  /// The last status the sysmodule answered with.
-  ///
-  /// Kept rather than rendered and dropped, because a press has to be decided
-  /// against it: which refusal a blocked "Sync now" draws is a function of the
-  /// console's state, and re-asking for it on the button press would be a round
-  /// trip inside an input handler.
-  ipc::Status status_;
-
-  /// What the last press produced. Cleared to `kNone` only by a `SetEnabled`
-  /// that took -- see `LastCommand`.
-  LastCommand last_;
-
-  /// What the last poll produced. Starts as "not running" rather than as an
-  /// empty screen: the first frame is drawn before the first poll returns, and
-  /// a blank one there is indistinguishable from a broken overlay.
-  SyncActionsView view_ = RenderSyncActionsUnreachable(Link::kNotRunning);
+  /// The poll, the two presses, and the view they produce (`sync_pump.hpp`).
+  SyncPump pump_{client_};
 };
 
 }  // namespace rommsync::overlay

@@ -107,9 +107,9 @@ bool DecodeError(Result rc, ipc::Error* out);
 /// fighting its host for the session.
 ///
 /// Called from one thread -- the draw thread -- and only from it. One session
-/// answers one request at a time, so there is never more than one call out, and
-/// the worker that carries it is this class's own business (see the header
-/// note).
+/// answers one request at a time, so there is never more than one call out --
+/// waited for, or posted (#299) -- and the worker that carries it is this
+/// class's own business (see the header note).
 class IpcClient {
  public:
   /// How long the draw thread waits for one answer.
@@ -253,6 +253,54 @@ class IpcClient {
   /// the sysmodule dispatched with nothing here to send it.
   Result GetLog(std::int32_t lines, ipc::LogTail* tail);
 
+  // --- the half that never waits (M11-15, #299) ------------------------------
+  //
+  // Every method above waits for its answer, for up to the budget -- which a
+  // screen that sends one every frame pays every frame: an answer in 300 ms is
+  // an overlay at three frames a second. `Post` hands the call to the worker
+  // and returns, and `Collect` asks whether it is back; neither waits on the
+  // sysmodule. `Poller` (`poller.hpp`) is what the polling screens drive it
+  // through.
+  //
+  // It is the same one call slot: a posted call is out exactly as a waited-for
+  // one is, and a waiting call that finds one out waits for it within its own
+  // budget and then drops its answer -- which its poster learns as `kLost`.
+  //
+  // One exception, `Call`'s own: when the worker could not be started, a post
+  // is dispatched on the caller's thread, unbounded, as every call was before
+  // #209 -- an overlay that cannot start a thread is better slow than mute.
+
+  /// Which posted call, so an answer is only ever handed to the poster.
+  using Ticket = std::uint64_t;
+
+  enum class Arrival {
+    kPending,  ///< still out
+    kArrived,  ///< back: the `Result` is filled in, and on success `Decode` reads it
+    kLost,     ///< not this ticket's any more: a waiting call, `Close` or `Shutdown` took it
+  };
+
+  /// Send `command` without waiting for it. 0 and a ticket when the worker has
+  /// it; `NotResponding()` while another call is still out, which is not sent;
+  /// and `Call`'s own refusals (no session, a request too large) otherwise.
+  Result Post(ipc::Command command, std::string_view request, Ticket* ticket);
+
+  /// Whether `ticket`'s call is back. Never waits.
+  Arrival Collect(Ticket ticket, Result* rc);
+
+  /// The answer `Collect` just reported, decoded -- valid until the next call
+  /// or post. `MalformedResponse()` for a payload this build cannot read.
+  template <typename T, typename DecodeFn>
+  Result Decode(DecodeFn decode, T* out) {
+    const auto decoded = decode(std::string_view(response_));
+    if (!decoded.ok()) {
+      return MalformedResponse();
+    }
+    *out = decoded.value;
+    return 0;
+  }
+
+  std::chrono::milliseconds budget() const { return budget_; }
+
  private:
   /// Where the one call is. `kDone` with `abandoned_` set is a late answer
   /// nobody is waiting for, which the next `Call` drops.
@@ -263,7 +311,7 @@ class IpcClient {
   ///
   /// The buffers are members rather than locals, and are reused across calls:
   /// `kMaxPayloadBytes` is 8 KiB, an overlay's draw thread does not have that to
-  /// spare on the stack, and the status screen polls every frame -- so an
+  /// spare on the stack, and a screen may send a command every frame -- so an
   /// allocation per call would be an allocation per frame. They are also what
   /// the worker reads and writes, which is the other reason they cannot be the
   /// caller's: a call the caller gave up on is still using them.
@@ -287,8 +335,8 @@ class IpcClient {
   /// half-filled struct. Written once because there are thirteen of them, and
   /// because a fix applied to twelve is the bug this whole header exists to
   /// prevent.
-  template <typename T, typename Decode>
-  Result CallAndDecode(ipc::Command command, std::string_view request, Decode decode, T* out);
+  template <typename T, typename DecodeFn>
+  Result CallAndDecode(ipc::Command command, std::string_view request, DecodeFn decode, T* out);
 
   Service service_{};
   std::string request_;
@@ -308,6 +356,9 @@ class IpcClient {
   Result result_ = 0;
   /// The caller stopped waiting for the call in `slot_`.
   bool abandoned_ = false;
+  /// The call in `slot_` was posted, and this ticket will collect it. 0: none.
+  Ticket posted_ = 0;
+  Ticket last_ticket_ = 0;
   bool stopping_ = false;
 
   ::pthread_t thread_{};

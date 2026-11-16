@@ -34,7 +34,9 @@ struct Entry {
   /// Zero for a directory, and for a file whose size could not be read.
   std::int64_t size_bytes = 0;
 
-  /// Last modification, in whole seconds since the Unix epoch, UTC.
+  /// Last modification, in whole seconds since the Unix epoch, UTC. On Horizon
+  /// that is assumed of `st_mtime` and not yet measured -- FAT stores local
+  /// time -- which is an M12 step (docs/SYNC_PROTOCOL.md#the-consoles-clock-295).
   ///
   /// `0` means the backend could not read one. That is deliberately the same
   /// value `sync::Validate` refuses as "an unset clock rather than an mtime",

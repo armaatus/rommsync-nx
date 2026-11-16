@@ -338,6 +338,12 @@ jobs:
       - name: libnx is new enough for HOS 21.0.0
         run: bash scripts/toolchain.sh libnx
 
+      # The other upstream that moves without telling us (#297): a ::warning::
+      # annotation when libultrahand has tagged past the pin. Exits 0 on every
+      # answer, offline included, so it never turns this job red by itself.
+      - name: libultrahand pin against upstream's newest tag (warns only)
+        run: bash scripts/toolchain.sh upstream
+
       - name: Build sysmodule
         run: make -C sysmodule -j"$(nproc)"
 

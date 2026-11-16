@@ -84,9 +84,11 @@ void IpcClient::Close() {
   if (slot_ == Slot::kQueued || slot_ == Slot::kRunning) {
     return;
   }
-  // A late answer nobody wanted goes with the session it arrived on.
+  // A late answer nobody wanted goes with the session it arrived on, and so
+  // does one a poster has not collected yet: it learns that as `kLost`.
   slot_ = Slot::kIdle;
   abandoned_ = false;
+  posted_ = 0;
   serviceClose(&service_);
 }
 
@@ -109,6 +111,7 @@ void IpcClient::Shutdown() {
   stopping_ = false;
   slot_ = Slot::kIdle;
   abandoned_ = false;
+  posted_ = 0;
   serviceClose(&service_);
 }
 
@@ -173,6 +176,20 @@ void IpcClient::Run() {
 
 Result IpcClient::Call(ipc::Command command, std::string_view request) {
   std::unique_lock<std::mutex> lock(mutex_);
+  // One deadline for the whole call, so a call that first waits out somebody
+  // else's still answers within one budget (#209).
+  const auto deadline = std::chrono::steady_clock::now() + budget_;
+  if (posted_ != 0) {
+    // A posted call its poster has not collected: a screen's poll, out when a
+    // screen above it sends (#299). Waited for as though it were this call's,
+    // then dropped -- the poster learns it as `kLost` and asks again.
+    posted_ = 0;
+    if (!done_.wait_until(lock, deadline, [this] { return slot_ == Slot::kDone; })) {
+      abandoned_ = true;
+      return NotResponding();
+    }
+    slot_ = Slot::kIdle;
+  }
   if (abandoned_) {
     if (slot_ != Slot::kDone) {
       // The last call is still out. Not sent: one session answers one request
@@ -214,7 +231,7 @@ Result IpcClient::Call(ipc::Command command, std::string_view request) {
 
   slot_ = Slot::kQueued;
   work_.notify_one();
-  if (!done_.wait_for(lock, budget_, [this] { return slot_ == Slot::kDone; })) {
+  if (!done_.wait_until(lock, deadline, [this] { return slot_ == Slot::kDone; })) {
     // The bound. The call stays out and the worker stays on it; `response_` is
     // the worker's until it comes back, so nothing here reads it.
     abandoned_ = true;
@@ -259,19 +276,71 @@ Result IpcClient::Dispatch(ipc::Command command) {
   return 0;
 }
 
-template <typename T, typename Decode>
-Result IpcClient::CallAndDecode(ipc::Command command, std::string_view request, Decode decode,
+Result IpcClient::Post(ipc::Command command, std::string_view request, Ticket* ticket) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (abandoned_ || posted_ != 0) {
+    if (slot_ != Slot::kDone) {
+      // Out, and not ours to wait for: `Post` never waits. Not sent, for
+      // `Call`'s reason -- one session answers one request at a time.
+      return NotResponding();
+    }
+    // Back, and nobody is collecting it: a waited-for call's late answer, or a
+    // poster that went away. Dropped, never handed on.
+    abandoned_ = false;
+    posted_ = 0;
+    slot_ = Slot::kIdle;
+  }
+  if (!serviceIsActive(&service_)) {
+    response_.clear();
+    return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+  }
+  if (!ipc::Fits(request)) {
+    response_.clear();
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  }
+
+  request_.assign(request.data(), request.size());
+  command_ = command;
+  *ticket = ++last_ticket_;
+  posted_ = *ticket;
+
+  if (!StartWorkerLocked()) {
+    // No thread to carry it: sent here, unbounded, for `Call`'s reason. The
+    // answer is ready for the first `Collect`.
+    lock.unlock();
+    const Result result = Dispatch(command);
+    lock.lock();
+    result_ = result;
+    slot_ = Slot::kDone;
+    return 0;
+  }
+  slot_ = Slot::kQueued;
+  work_.notify_one();
+  return 0;
+}
+
+IpcClient::Arrival IpcClient::Collect(Ticket ticket, Result* rc) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (ticket == 0 || posted_ != ticket) {
+    return Arrival::kLost;
+  }
+  if (slot_ != Slot::kDone) {
+    return Arrival::kPending;
+  }
+  *rc = result_;
+  posted_ = 0;
+  slot_ = Slot::kIdle;
+  return Arrival::kArrived;
+}
+
+template <typename T, typename DecodeFn>
+Result IpcClient::CallAndDecode(ipc::Command command, std::string_view request, DecodeFn decode,
                                T* out) {
   const Result result = Call(command, request);
   if (R_FAILED(result)) {
     return result;
   }
-  const auto decoded = decode(std::string_view(response_));
-  if (!decoded.ok()) {
-    return MalformedResponse();
-  }
-  *out = decoded.value;
-  return 0;
+  return Decode(decode, out);
 }
 
 Result IpcClient::GetInterfaceVersion(std::uint32_t* out) {

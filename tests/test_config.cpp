@@ -259,6 +259,37 @@ void OnServerDeleteIsReadAndChecked(checks::Checks& c) {
   }
 }
 
+/// `[backup]` (#292): how much of `.backup/` the prune keeps. Whole numbers with
+/// a floor; past the ceiling a value is clamped rather than refused.
+void BackupRetentionIsReadAndChecked(checks::Checks& c) {
+  const config::BackupConfig defaults = config::Defaults().backup;
+  c.ExpectEq(defaults.keep, 10, "ten backups of each save are kept by default");
+  c.ExpectEq(defaults.keep_days, 30, "and anything younger than thirty days");
+  c.ExpectEq(defaults.max_mib, 512, "toward a 512 MiB directory");
+
+  const auto parse = [](const std::string& lines) {
+    return config::ParseConfig(WithServer("[backup]\n" + lines + "\n"));
+  };
+  const config::LoadResult set = parse("keep = 3\nkeep_days = 0\nmax_mib = 0");
+  c.Expect(set.value.backup.keep == 3 && set.value.backup.keep_days == 0 &&
+               set.value.backup.max_mib == 0 && set.diagnostics.empty(),
+           "all three are read, zero included: " + set.DescribeDiagnostics());
+
+  const config::LoadResult none = parse("keep = 0");
+  c.ExpectEq(none.value.backup.keep, 10, "keep = 0 leaves the default: the newest always stays");
+  c.Expect(Complaint(none, "backup", "keep") != nullptr, "and says so: " + none.DescribeDiagnostics());
+
+  const config::LoadResult words = parse("max_mib = lots");
+  c.ExpectEq(words.value.backup.max_mib, 512, "a word leaves the default");
+  c.Expect(Complaint(words, "backup", "max_mib") != nullptr, "and says so");
+
+  const config::LoadResult huge = parse("keep_days = 99999");
+  c.ExpectEq(huge.value.backup.keep_days, config::kMaxBackupKeepDays, "past the ceiling clamps");
+
+  const config::LoadResult stranger = parse("prune = never");
+  c.Expect(Complaint(stranger, "backup", "prune") != nullptr, "an unknown key is named");
+}
+
 // --- the happy path ----------------------------------------------------------
 
 void AWholeFileParses(checks::Checks& c) {
@@ -1025,6 +1056,7 @@ int main() {
   DownloadsLandInTicosFolderNames(c);
   TicoAccountIsReadAndChecked(c);
   OnServerDeleteIsReadAndChecked(c);
+  BackupRetentionIsReadAndChecked(c);
   AWholeFileParses(c);
   ItSurvivesHowPeopleActuallyWriteFiles(c);
   ABadFileStillBoots(c);

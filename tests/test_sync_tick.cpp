@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -40,6 +41,7 @@
 #include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "rommsync/atomic_file.hpp"
+#include "rommsync/clock_check.hpp"
 #include "rommsync/conflict_record.hpp"
 #include "rommsync/host/curl_http_client.hpp"
 #include "rommsync/host/file_sync.hpp"
@@ -1040,6 +1042,203 @@ void MigratedKept(rig::Checks& checks) {
     checks.Expect(client.negotiated.size() == 1 &&
                       client.negotiated[0].find("\"rom_id\":4") != std::string::npos,
                   "while new progress is");
+  }
+}
+
+// --- clock ----------------------------------------------------------------------
+//
+// A console whose clock cannot be believed does not upload over a server save on
+// the strength of its timestamp (#295). No server: a client that plans two
+// uploads -- one decided on the timestamp, with no sync history, and one into an
+// empty slot -- under a `Date` header that is now, and records which uploads it
+// was sent. The console's clock is faked through `TickOptions::console_clock`;
+// what `CheckClock` decides on is sync.clock's.
+
+class ClockClient final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request& request) override {
+    http::Result result;
+    result.response.status = 200;
+    if (request.url.find("/api/sync/negotiate") != std::string::npos) {
+      if (date.has_value()) {
+        result.response.headers.push_back({"date", *date});
+      }
+      result.response.body =
+          R"j({"session_id":9,"operations":[)j"
+          R"j({"action":"upload","rom_id":4,"save_id":20,"file_name":"Game.srm",)j"
+          R"j("slot":"autosave","emulator":"snes9x",)j"
+          R"j("reason":"Client save is newer (no sync history)",)j"
+          R"j("server_updated_at":"2026-10-21T09:02:14+00:00",)j"
+          R"j("server_content_hash":"00112233445566778899aabbccddeeff"},)j"
+          R"j({"action":"upload","rom_id":5,"save_id":null,"file_name":"Other.srm",)j"
+          R"j("slot":"autosave","emulator":"snes9x",)j"
+          R"j("reason":"Save exists on client but not on server",)j"
+          R"j("server_updated_at":null,"server_content_hash":null}],)j"
+          R"j("total_upload":2,"total_download":0,"total_conflict":0,"total_no_op":0})j";
+    } else if (request.method == http::Method::kPost &&
+               request.url.find("/api/saves?") != std::string::npos) {
+      uploads.push_back(request.url);
+      // Refused, so nothing past the request matters: what is checked is
+      // whether it was sent.
+      result.response.status = 500;
+      result.response.body = "{}";
+    } else {
+      result.response.body = "{}";
+    }
+    return result;
+  }
+  http::Result Download(const http::Request&, const http::DownloadTarget&) override {
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    return result;
+  }
+
+  std::optional<std::string> date;
+  std::vector<std::string> uploads;
+};
+
+/// `when` in the shape a `Date` header carries it.
+std::string HttpDate(std::chrono::system_clock::time_point when) {
+  const std::time_t seconds = std::chrono::system_clock::to_time_t(when);
+  std::tm utc{};
+  gmtime_r(&seconds, &utc);
+  char text[40];
+  std::strftime(text, sizeof text, "%a, %d %b %Y %H:%M:%S GMT", &utc);
+  return text;
+}
+
+void Clock(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-clock");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  auth::StoredToken token;
+  token.server_url = kNowhere;
+  token.access_token = "not-a-token";
+  token.device_id = "fixture-clock";
+
+  const auto now = std::chrono::system_clock::now();
+  std::vector<sync::ClientSaveState> reported;
+  std::vector<sync::SaveTarget> targets;
+  for (const std::int64_t rom_id : {std::int64_t{4}, std::int64_t{5}}) {
+    const std::string name = rom_id == 4 ? "Game.srm" : "Other.srm";
+    const std::string bytes = "the save of rom " + std::to_string(rom_id) + "\n";
+    sandbox.SeedSave(SavePath(name), bytes);
+    sync::ClientSaveState save;
+    save.rom_id = rom_id;
+    save.file_name = name;
+    save.slot = "autosave";
+    save.emulator = "snes9x";
+    save.content_hash = crypto::Md5Hex(bytes);
+    save.updated_at = now;
+    save.file_size_bytes = static_cast<std::int64_t>(bytes.size());
+    reported.push_back(save);
+    targets.push_back({rom_id, std::string("autosave"), SavePath(name), name});
+  }
+
+  struct Ran {
+    std::vector<std::string> uploads;
+    sync::TickResult result;
+    bool Uploaded(std::int64_t rom_id) const {
+      const std::string needle = "rom_id=" + std::to_string(rom_id) + "&";
+      return std::any_of(uploads.begin(), uploads.end(), [&needle](const std::string& url) {
+        return url.find(needle) != std::string::npos;
+      });
+    }
+  };
+  const auto run = [&](std::chrono::system_clock::time_point console, bool with_date,
+                       std::vector<state::Baseline::Key> keep_local = {}) {
+    ClockClient client;
+    if (with_date) {
+      client.date = HttpDate(now);
+    }
+    sync::TickOptions options = OptionsAt(1'757'000'900);
+    options.recover_dirs.clear();
+    options.console_clock = [console]() { return console; };
+    options.execute.keep_local = std::move(keep_local);
+    Ran ran;
+    ran.result = sync::RunTick(client, *files, token, reported, targets, state::Baseline{}, options);
+    ran.uploads = client.uploads;
+    return ran;
+  };
+  const auto error_of = [](const sync::TickResult& result, std::int64_t rom_id) {
+    for (const sync::OperationResult& operation : result.executed.operations) {
+      if (operation.rom_id == rom_id) {
+        return operation.error;
+      }
+    }
+    return sync::OperationError::kNone;
+  };
+
+  // A console a week ahead of the server: the timestamp-decided upload is held,
+  // the one into an empty slot is not.
+  {
+    const Ran ran = run(now + std::chrono::hours{24 * 7}, true);
+    const Ran& client = ran;
+    const sync::TickResult& result = ran.result;
+    checks.Expect(result.clock.has_value() && !result.clock->trusted(),
+                  "a week ahead of the server's Date is an untrusted clock");
+    if (result.clock.has_value()) {
+      checks.Expect(result.clock->verdict == sync::ClockVerdict::kAhead &&
+                        result.clock->reference == sync::ClockReference::kServer,
+                    "ahead of the server: " + result.clock->Describe());
+    }
+    checks.Expect(!client.Uploaded(4), "the upload decided on the timestamp is not sent");
+    checks.Expect(error_of(result, 4) == sync::OperationError::kClockUntrusted,
+                  std::string("...and is held for the clock: ") +
+                      sync::ToString(error_of(result, 4)));
+    checks.Expect(client.Uploaded(5), "the upload into an empty slot still goes");
+    checks.Expect(result.outcome != sync::TickOutcome::kCompleted,
+                  "and a tick that held a save does not call itself complete");
+    checks.ExpectEq(sandbox.Read(SavePath("Game.srm")), std::string("the save of rom 4\n"),
+                    "the held save is untouched on the card");
+  }
+
+  // A console reset to 2000, with or without the server's word for it.
+  {
+    const auto reset = sync::Timestamp{} + std::chrono::seconds{946'684'800};
+    const Ran ran = run(reset, false);
+    const Ran& client = ran;
+    const sync::TickResult& result = ran.result;
+    checks.Expect(result.clock.has_value() &&
+                      result.clock->verdict == sync::ClockVerdict::kBeforeFloor,
+                  "a clock in 2000 is before the floor, with no Date header to compare");
+    checks.Expect(!client.Uploaded(4), "and holds the timestamp-decided upload");
+  }
+
+  // Within the threshold: everything goes, as before #295.
+  {
+    const Ran ran = run(now + std::chrono::hours{3}, true);
+    const Ran& client = ran;
+    const sync::TickResult& result = ran.result;
+    checks.Expect(result.clock.has_value() && result.clock->trusted(),
+                  "three hours ahead of the server is trusted");
+    checks.Expect(client.Uploaded(4) && client.Uploaded(5), "and both uploads are sent");
+  }
+
+  // The player's Keep local is theirs, not the clock's.
+  {
+    const Ran ran = run(now + std::chrono::hours{24 * 7}, true, {{4, std::string("autosave")}});
+    checks.Expect(ran.Uploaded(4), "a Keep local is sent on an untrusted clock");
+  }
+
+  // The network clock is a reference too, when the console has one.
+  {
+    ClockClient client;
+    sync::TickOptions options = OptionsAt(1'757'000'900);
+    options.recover_dirs.clear();
+    options.console_clock = [now]() { return now; };
+    options.network_clock = [now]() -> std::optional<sync::Timestamp> {
+      return now - std::chrono::hours{24 * 30};
+    };
+    const sync::TickResult result =
+        sync::RunTick(client, *files, token, reported, targets, state::Baseline{}, options);
+    checks.Expect(result.clock.has_value() &&
+                      result.clock->reference == sync::ClockReference::kNetwork &&
+                      result.clock->verdict == sync::ClockVerdict::kAhead,
+                  "a month ahead of the network clock is ahead of it");
+    Ran seen;
+    seen.uploads = client.uploads;
+    checks.Expect(!seen.Uploaded(4), "and holds the timestamp-decided upload");
   }
 }
 
@@ -4295,7 +4494,8 @@ int main(int argc, char** argv) {
   if (scenario == "recovery" || scenario == "durable" || scenario == "backupdir" ||
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
       scenario == "disabled" || scenario == "unsupported" || scenario == "newer_rule" ||
-      scenario == "newer_bounds" || scenario == "migrated_kept" || scenario == "too_large") {
+      scenario == "newer_bounds" || scenario == "migrated_kept" || scenario == "too_large" ||
+      scenario == "clock") {
     if (scenario == "recovery") {
       Recovery(checks);
     } else if (scenario == "durable") {
@@ -4318,6 +4518,8 @@ int main(int argc, char** argv) {
       NewerBounds(checks);
     } else if (scenario == "too_large") {
       TooLarge(checks);
+    } else if (scenario == "clock") {
+      Clock(checks);
     } else {
       Canceled(checks);
     }

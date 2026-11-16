@@ -317,6 +317,15 @@ int Negotiates(http::HttpClient& client, const std::string& base, const Fixture&
                 "a session was opened, and its id is what `complete` is posted to");
   checks.Expect(negotiated.plan.warnings.empty(),
                 "nothing in a healthy 5.2.0's plan is unrecognised");
+  // The server's clock, off its `Date` header: the reference an untrusted
+  // console clock is caught against (#295). Docker shares the host's clock, so
+  // a real RomM's is within seconds of this one.
+  checks.Expect(negotiated.server_date.has_value(), "the server's Date header is read");
+  if (negotiated.server_date.has_value()) {
+    const auto apart = std::chrono::abs(*negotiated.server_date - std::chrono::system_clock::now());
+    checks.Expect(apart < std::chrono::minutes{2},
+                  "and it is the server's clock, which the host shares");
+  }
 
   const sync::SyncOperation* operation = PlannedFor(negotiated.plan, slot);
   if (operation == nullptr) {

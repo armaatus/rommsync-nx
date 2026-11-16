@@ -181,6 +181,7 @@ enum class SectionKind {
   kDownloads,
   kSources,
   kTico,
+  kBackup,
   kPlatform,
   kUnknown,
 };
@@ -432,6 +433,48 @@ void ApplyTico(const ParseState& state, int line, std::string_view key, std::str
     return;
   }
   config->tico = std::move(*tico);
+}
+
+/// `[backup]` (#292): three whole numbers, each with a floor and a ceiling.
+void ApplyBackup(const ParseState& state, int line, std::string_view key, std::string_view value,
+                 Config* config, Diagnostics* diags) {
+  int* target = nullptr;
+  int floor = 0;
+  int ceiling = 0;
+  if (key == "keep") {
+    // One, not zero: the newest backup of a save is the one a restore is
+    // likeliest to want, and "keep none" is not a retention rule.
+    target = &config->backup.keep;
+    floor = 1;
+    ceiling = kMaxBackupKeep;
+  } else if (key == "keep_days") {
+    target = &config->backup.keep_days;
+    ceiling = kMaxBackupKeepDays;
+  } else if (key == "max_mib") {
+    target = &config->backup.max_mib;
+    ceiling = kMaxBackupMaxMib;
+  } else {
+    diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
+    return;
+  }
+  int number = 0;
+  if (!ParseInt(value, &number)) {
+    diags->Add(Severity::kWarning, line, state.section, key,
+               "expected a whole number, got '" + std::string(value) + "'; keeping " +
+                   std::to_string(*target));
+    return;
+  }
+  if (number < floor) {
+    diags->Add(Severity::kWarning, line, state.section, key,
+               "cannot be below " + std::to_string(floor) + "; keeping " + std::to_string(*target));
+    return;
+  }
+  if (number > ceiling) {
+    diags->Add(Severity::kWarning, line, state.section, key,
+               "larger than the " + std::to_string(ceiling) + " maximum; using that instead");
+    number = ceiling;
+  }
+  *target = number;
 }
 
 /// `rejected` collects slugs whose section had a line the parser could not use,
@@ -1136,6 +1179,8 @@ LoadResult ParseConfig(std::string_view text) {
         state.kind = SectionKind::kSources;
       } else if (lowered == "tico") {
         state.kind = SectionKind::kTico;
+      } else if (lowered == "backup") {
+        state.kind = SectionKind::kBackup;
       } else if (lowered.rfind("platform.", 0) == 0) {
         // The slug keeps its case: it is RomM's `platform_fs_slug`, which is a
         // directory name on the server's filesystem, and lowercasing it would
@@ -1277,6 +1322,9 @@ LoadResult ParseConfig(std::string_view text) {
         break;
       case SectionKind::kTico:
         ApplyTico(state, line_number, key, value, &result.value, &diags);
+        break;
+      case SectionKind::kBackup:
+        ApplyBackup(state, line_number, key, value, &result.value, &diags);
         break;
       case SectionKind::kPlatform:
         if (key == "emulator" || key == "play_with") {

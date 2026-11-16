@@ -226,6 +226,13 @@ WriteResult WriteAtomically(const std::string& path,
 /// an existing destination, so a file already at `path` is moved to
 /// `PreviousPathFor(path)` first and put back if the second rename fails.
 ///
+/// A file already at `PreviousPathFor(path)` when the commit starts is not this
+/// commit's, and is never removed (#293): it is renamed to the first free
+/// `<path>.old.<n>` (n from 1 to `kMaxAside`, 16, in the .cpp) before the save moves aside. It is either
+/// an earlier commit's whose tidy-up failed or one a human made by hand, and
+/// nothing can tell the two apart. With all sixteen names taken -- or the rename
+/// refused -- the commit fails as `kCommitFailed` and `path` is untouched.
+///
 /// On success the destination's *directory* is handed to `FileSync` as well, so
 /// the published name is as durable as the bytes behind it. The rename has
 /// happened either way, so a refusal there is not a failed commit: it is
@@ -400,7 +407,8 @@ BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string*
                         const std::function<BoundedRead(std::FILE* file)>& past_limit);
 
 /// Remove `path` and the `.tmp`/`.old` an interrupted commit can leave beside
-/// it, overwriting each with zeroes first.
+/// it -- and any `.old.<n>` `CommitStaged` set aside -- overwriting each with
+/// zeroes first.
 ///
 /// The overwrite is worth exactly what it is worth: it removes the bytes any
 /// reader of the file system can see, and on a wear-levelling SD card it does
@@ -408,8 +416,8 @@ BoundedRead ReadBounded(const std::string& path, std::size_t limit, std::string*
 /// "Re-pair" has to genuinely discard the old token, and unlinking `token.dat`
 /// while `token.dat.old` still holds the same bearer token would not.
 ///
-/// True when nothing of the three is left, including when there was nothing to
-/// begin with.
+/// True when none of them is left, including when there was nothing to begin
+/// with.
 bool Shred(const std::string& path);
 
 }  // namespace rommsync::io

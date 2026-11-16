@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "boot_wait.hpp"
@@ -942,7 +943,8 @@ static_assert(sizeof(rommsync::download::QueueEntry) == 208,
               "download::QueueEntry changed size; re-measure kQueuedRomTextBytes");
 static_assert(kHeapDownloadQueue == 0x5400,
               "download::kMaxQueueEntries moved; retotal the table");
-static_assert(sizeof(rommsync::conflicts::Entry) == 408,
+// 416 since #317's `Entry::server`: eight bytes and no text, inside the row.
+static_assert(sizeof(rommsync::conflicts::Entry) == 416,
               "conflicts::Entry changed size; re-measure kHistoryEntryTextBytes");
 static_assert(kHeapConflictHistory == 0x8C00,
               "conflicts::kMaxEntries moved; retotal the table");
@@ -1297,6 +1299,19 @@ bool g_psc_up = false;
 /// opened would answer "no game" on every call, which is the old behaviour
 /// with nothing saying so.
 bool g_pm_up = false;
+
+/// The network system clock (M11-11, #295), or empty when the console has none
+/// synchronised -- `timeGetCurrentTime` fails until nifm has reached Nintendo's
+/// time service once. `time:s` is the service `__appInit` opened, and the one
+/// that exposes this clock.
+std::optional<std::chrono::system_clock::time_point> NetworkClock() {
+  u64 seconds = 0;
+  if (R_FAILED(timeGetCurrentTime(TimeType_NetworkSystemClock, &seconds)) || seconds == 0) {
+    return std::nullopt;
+  }
+  return std::chrono::system_clock::time_point{} +
+         std::chrono::seconds{static_cast<std::int64_t>(seconds)};
+}
 
 /// Whether an application is in the foreground (M10-16, #242): a retail game,
 /// Tico, or RetroArch launched over a title -- anything pm launched as *the*
@@ -1828,6 +1843,12 @@ int main(int, char**) {
   engine.UseServer(g_http.get(), "");
   engine.UseCard(g_card.get());
   engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleIsOnline);
+  // The reference a wrong console clock is caught against before it decides a
+  // first sync (#295). With no clock service there is no reference to read;
+  // the server's `Date` header and the floor still hold.
+  if (g_time_up) {
+    engine.UseNetworkClock(&NetworkClock);
+  }
   // Before the worker, so the boot tick is already held if the console came up
   // straight into a game (#242).
   if (g_pm_up) {

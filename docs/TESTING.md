@@ -818,8 +818,8 @@ ctest --test-dir build --output-on-failure
   process is told about a sleep early enough to matter. None of the
   eight needs Docker, a rig, or a resolver, so none of them ever skips.
 - The `overlay.card`, `overlay.wire`, `overlay.roundtrip`, `overlay.version`,
-  `overlay.errors`, `overlay.timeout`, `overlay.restore`, `overlay.cycles`,
-  `overlay.hidden`, `overlay.log`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
+  `overlay.errors`, `overlay.timeout`, `overlay.restore`, `overlay.frames`, `overlay.cycles`,
+  `overlay.hidden`, `overlay.scroll`, `overlay.log`, `overlay.portable` and `overlay.draw` scenarios are **`overlay/source/` itself,
   compiled by a host compiler and run** (M9-7, #198). Everything else in the
   `overlay.*` group tests the view models in `core/` -- what a screen *says* --
   and greps the directory for what it must not contain; until #198 not one of
@@ -833,16 +833,26 @@ ctest --test-dir build --output-on-failure
   *unreachable*), and `status_paint.cpp` (the status screen's layout, behind the
   `DrawList` seam). M9-6 (#209) added three more: `conflicts_pump.cpp` (the
   conflicts screen's IPC frame), `lifecycle.cpp` (start, show and the one
-  teardown) and `log_paint.cpp` (the log screen's layout). What those make
+  teardown) and `log_paint.cpp` (the log screen's layout); M11-1 (#285) added
+  `library_pump.cpp` (the library browser's IPC frame and teardown); M11-15 (#299)
+  added `status_pump.cpp`, `sync_pump.cpp` and `pairing_pump.cpp` (the three
+  polling screens' IPC frames) and `poller.cpp` (the line they poll through
+  without waiting). What those make
   assertable: `overlay.timeout` holds the far side's answer and asserts the draw
   thread gets `NotResponding` at the client's budget and is never held again
   while the call is out; `overlay.restore` times every frame of the conflicts
-  screen while a restore is still copying; `overlay.cycles` drives every way the
+  screen while a restore is still copying; `overlay.frames` times every frame
+  and press of the status, sync and pairing screens against a sysmodule that
+  answers in 300 ms, at the device's budget, and a write that lands past it;
+  `overlay.cycles` drives every way the
   pinned `tsl::loop` ends, eight times over, and balances sessions, worker
   threads and -- through `count_new.hpp` -- the heap, after grepping
   `tesla.hpp` for the loop's one tail; `overlay.hidden` pins that a poll is due
   on the first frame of every showing, because `update()` does not run while
-  the overlay is hidden. The far side is the **real** `ipc::Dispatch` over a real
+  the overlay is hidden; `overlay.scroll` (M11-14, #298) holds R at 60 Hz on a
+  2500-rom platform until row 2000, asserts the heap stays flat past the
+  library's 512-row window and that a still frame allocates nothing, then holds
+  L back to row 1 through the re-reads. The far side is the **real** `ipc::Dispatch` over a real
   `ipc::ServiceCore`, answering through the **real** `sysmodule::ToResult` --
   split into `sysmodule/source/ipc/result.cpp` so the overlay's `DecodeError` is
   held against the mapping that ships rather than against a copy of it. So an
@@ -850,7 +860,8 @@ ctest --test-dir build --output-on-failure
   surprise. `overlay.portable` is the odd one out and is a grep: it holds the
   portable half of `overlay/source/` -- `draw_list.hpp`, `prompts.hpp`,
   `screen_frame.*`, `status_paint.*`, `conflicts_pump.*`, `lifecycle.*`,
-  `log_paint.*` -- to naming no `tesla.hpp`, `tsl::`,
+  `log_paint.*`, `library_pump.*`, `status_pump.*`, `sync_pump.*`,
+  `pairing_pump.*`, `poller.*` -- to naming no `tesla.hpp`, `tsl::`,
   `libultrahand` or `arm_neon`, transitively through the headers they include,
   because the compile only covers the files this target happens to build and the
   *next* screen's painter is the one that would quietly leave the reach of every

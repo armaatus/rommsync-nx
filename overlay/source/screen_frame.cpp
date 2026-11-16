@@ -11,7 +11,20 @@
 namespace rommsync::overlay {
 
 Link ScreenFrame::Ready() {
+  const Link connected = Connect();
+  if (connected != Link::kOk || version_checked_) {
+    return connected;
+  }
+  std::uint32_t interface = 0;
+  const Result rc = client_.GetInterfaceVersion(&interface);
+  return Admit(rc, interface);
+}
+
+Link ScreenFrame::Connect() {
   if (!client_.open()) {
+    if (retired_) {
+      return Link::kNotRunning;
+    }
     if (R_FAILED(client_.Open())) {
       // No `rommsync` port. Not installed, not enabled, or it aborted at boot --
       // and it is the state a user who forgot to switch it on is in, so it is
@@ -20,12 +33,11 @@ Link ScreenFrame::Ready() {
     }
     version_checked_ = false;
   }
-  if (version_checked_) {
-    return Link::kOk;
-  }
+  return Link::kOk;
+}
 
-  sysmodule_interface_ = 0;
-  const Result rc = client_.GetInterfaceVersion(&sysmodule_interface_);
+Link ScreenFrame::Admit(Result rc, std::uint32_t sysmodule_interface) {
+  sysmodule_interface_ = R_SUCCEEDED(rc) ? sysmodule_interface : 0;
   if (rc == NotResponding()) {
     // Nothing came back in time. The session is the worker's until it does, so
     // it is neither reopened nor judged: the next frame asks again (#209).
@@ -70,6 +82,11 @@ Link ScreenFrame::Reopen() {
   // re-opened here rather than on the next frame. See the note on `Diagnose`.
   client_.Close();
   version_checked_ = false;
+  if (retired_) {
+    // Nobody draws a retired frame, so which sentence applies does not matter
+    // -- only that it is not `kOk` and that no session was opened to find out.
+    return Link::kNotRunning;
+  }
   return R_SUCCEEDED(client_.Open()) ? Link::kUnreadable : Link::kNotRunning;
 }
 

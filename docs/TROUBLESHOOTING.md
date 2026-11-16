@@ -109,9 +109,12 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
+| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists | [The SD card is full](#the-sd-card-is-full) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
+| `clock.skew` | the console's clock is not believed — unset, or a day or more off the network clock or the server's — so saves the server would choose by timestamp are held; or it agrees again | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
+| `net.tls_clock` | a TLS failure the console's clock is the likely cause of | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -283,6 +286,56 @@ measured the 1.2 ceiling.
 
 ---
 
+## The console's clock is wrong
+
+**Symptom.** The status screen has a **Clock** row — *3 days ahead; uploads
+held*, or *Not set; uploads held* — and a save you played on this console never
+reaches RomM, while saves from RomM still arrive. Or every request fails at the
+TLS handshake on a console whose battery ran flat.
+
+**Log line.**
+
+```
+14 warn clock.skew the console clock is 3 days ahead of the server's clock; saves the server would choose by comparing timestamps are not uploaded until the console's date and time are set
+15 warn save.failed upload rom 12, slot autosave: held, not uploaded: the console clock is 3 days ahead of the server's clock, and the server chose this upload by comparing timestamps; set the console's date and time, and it goes next sync
+```
+
+or, over `https://`:
+
+```
+2 error net.tls_clock GET /api/heartbeat: TLS failure; the server's certificate was refused; the console clock is not set: it reads a date before 2026 -- set the console's date and time, or let it synchronise over the internet
+```
+
+**What is happening.** The first time this console syncs a save RomM already
+holds, RomM decides which copy wins by comparing the two timestamps — and this
+console's timestamp is its clock. A clock set days ahead would upload over a
+newer save on the server, which nothing on the console backed up. So while the
+clock disagrees by more than a day with the network clock or with the server's
+own clock — or reads a date before 2026, which is what a reset clock does —
+those uploads are held. Everything else carries on: a save RomM sends is still
+backed up under `.backup/` before it is written, and an upload RomM decided by
+the save's contents rather than its time still goes. A **Keep local** you chose
+on the Conflicts screen goes too: that is your decision, not the clock's.
+
+A TLS certificate is valid between two dates, so a console whose clock is
+outside them refuses every certificate; that is `net.tls_clock` rather than
+`net.tls`, because the fix is the date and not the certificate.
+
+**The fix.** System Settings → System → Date and Time: turn on
+**Synchronise Clock via Internet**, or set the date and time by hand. The next
+sync checks again, and the log says so:
+
+```
+16 info clock.skew the console clock agrees with the server's clock; held uploads go again
+```
+
+*Not verified until M12:* whether the file times the card reports are UTC or the
+console's local time ([SYNC_PROTOCOL.md](SYNC_PROTOCOL.md#the-consoles-clock-295)).
+A console in a time zone far from UTC is inside the day this check allows
+either way.
+
+---
+
 ## Saves are skipped: nothing matches
 
 **Symptom.** Some games sync and others never do. The ones that do not have
@@ -444,10 +497,22 @@ keep syncing throughout.
 **The fix.** Free space on the card. Then look for leftovers:
 
 - `<save>.part` and `<save>.tmp` next to your saves are swept on the next sync.
-- `sdmc:/config/rommsync/.backup/` holds every save this client has ever
-  overwritten. It is not swept, deliberately — it is what the overlay's
-  **Conflicts** screen restores from. Deleting old backups by hand is safe and
-  is the fastest space you will find.
+- `sdmc:/config/rommsync/.backup/` holds the saves this client has
+  overwritten — what the overlay's **Conflicts** screen restores from. After
+  every sync that completed it is pruned to `[backup]`'s limits
+  ([CONFIG.md](CONFIG.md#backup-how-much-of-backup-is-kept)): the newest ten of
+  each save, everything from the last thirty days, toward 512 MiB in all.
+
+```
+31 info backup.pruned 14 of 52 backups pruned, 9437184 bytes freed; 402653184 bytes in 38 left; 6 kept past the retention rule because no other copy of their bytes could be found
+```
+
+**A backup whose bytes exist nowhere else is never pruned**, which is what the
+last clause counts — save states mostly, since RomM keeps one copy of a state
+and no digest to compare. If the card is still full, those are what is left:
+copy any you want to keep to a computer, then delete them by hand; that is safe
+and is the fastest space you will find. Lowering `max_mib` does not remove them,
+by design.
 
 ---
 
@@ -994,6 +1059,37 @@ with the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug
 the lines before this one say what it was doing. If it happens on every boot,
 move `config/rommsync/queue.json` out of the way first — a queue is the one
 thing a boot reads that grows with what you asked for.
+
+### Running, but "not responding" or "still applying"
+
+No log line marks this one, which is why it lives here rather than in a
+section of its own: the overlay says it, not the log.
+
+**Symptom.** A screen says `sys-rommsync is not responding`, or a press on the
+sync screen says `Still applying...`.
+
+**What it means.** The sysmodule is running and has not answered within half a
+second. Usually it is busy: a download writing to the card holds the same lock a
+settings change needs, and an answer can take a few hundred milliseconds. The
+overlay never waits for it — the status, sync and pairing screens ask about
+four times a second and draw the last answer they have — so the panel stays
+responsive and B still leaves. A press that is out says *still applying* rather
+than failing: the change is the sysmodule's to make, and it lands when the card
+lets it; the screen redraws from the next answer. A press still out after ten
+seconds is no longer called busy: the screen says *not responding*, and moves
+the switch anyway if the answer comes later.
+
+**One case that is not.** If the sysmodule stops answering altogether — its IPC
+thread is stuck rather than busy — the overlay cannot unload while one of its
+calls is still out: the call cannot be cancelled, and the overlay's code cannot
+be unloaded underneath it. Closing it then waits, holding neither the panel nor
+your input, and **every Tesla/Ultrahand overlay is unavailable until the console
+reboots**. This is a deliberate trade (the alternative is a crash), and it has
+not been seen on a console.
+
+**What to do.** Wait for *still applying* to clear; it does by itself. For
+*not responding* that does not clear within a minute, reboot, and report it with
+the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug-report)).
 
 ---
 

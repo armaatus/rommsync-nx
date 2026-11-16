@@ -267,7 +267,8 @@ dropped *downwards* — rounding 11:36:27.9 up to :28 would claim a file is newe
 than it is and win an arbitration it should have lost. A timestamp at or before
 the epoch is refused rather than sent: that is a console whose clock never got
 set, and the server would read it as "very old" and plan a `download` over what
-may be the only copy of the save.
+may be the only copy of the save. A clock that is set, and wrong, is the next
+section's.
 
 `POST /api/sync/negotiate` → `SyncNegotiateResponse { session_id, operations[],
 total_upload, total_download, total_conflict, total_no_op, total_delete }` —
@@ -316,6 +317,67 @@ A server save the device *has* synced and that has not changed since is read as
 save the client loses locally is not silently restored. Untracked saves
 (`is_untracked` on the device's sync row) come back as `no_op` /
 `Save is untracked on this device`.
+
+### The console's clock (#295)
+
+A save with no sync history is arbitrated on timestamps alone (`Client save is
+newer (no sync history)` / `Server save is newer (no sync history)`), and the
+client's timestamp is the console's clock at the moment the save was written.
+An RTC that reset — a drained battery, a NAND restore — or a clock set by hand
+to the wrong day decides that arbitration. In the past it loses: the server's
+copy is downloaded over the local save, which is backed up first, so it costs a
+restore from `.backup/`. In the future it wins: the local save is uploaded over
+a newer one on the server, and nothing on the console backed that up.
+
+So before each plan runs, `sync::CheckClock`
+([`clock_check.hpp`](../core/include/rommsync/clock_check.hpp)) holds the
+console's clock to:
+
+- **a floor**, `2026-01-01T00:00:00Z` — no correct clock running this build is
+  before it, and a reset one is decades before it. Needs no reference, so it
+  catches the commonest case: a console offline since its battery ran out.
+- **the network clock** — Horizon's `time:s` network system clock, which nifm
+  keeps in step with Nintendo's time service. Absent until the console has
+  synchronised it (and on the host).
+- **the server's `Date` header**, off the negotiation that produced the plan.
+  The one the arbitration actually compares against: RomM sets its own
+  timestamps.
+
+More than `kMaxClockSkew` — a day — from either reference, either way, or before
+the floor, and the clock is not trusted. A day is wider than any time zone
+mistaken for UTC, and narrower than a clock set to the wrong date.
+
+**What an untrusted clock holds: the upload RomM decided on the timestamp** —
+`Reason::kClientNewerNoHistory`, and nothing else. It is failed
+`OperationError::kClockUntrusted` before a byte is read or sent, so the tick is
+`partial` and the save is planned again next tick. Every other operation runs:
+
+- a download, `Server save is newer (no sync history)` included, backs the local
+  save up before it writes, as every overwrite does (hard rule 2);
+- an upload into an empty slot (`Save exists on client but not on server`) has
+  nothing to overwrite;
+- an upload past a sync record (`Client save is newer than last sync`) is
+  decided by the digest baseline as well as the time (#234);
+- a player's **Keep local** is their choice, not the clock's.
+
+The engine writes `clock.skew` when the finding changes — wrong, wrong the other
+way, right again — and `Status` carries `clock_trusted` and `clock_skew_seconds`
+to the overlay's **Clock** row. A TLS failure while the clock is not trusted
+against the floor or the network clock, or one whose message says a certificate
+is expired or not yet valid, is `net.tls_clock` rather than `net.tls`: a
+certificate is valid between two dates, and Horizon's `SslVerifyOption_DateCheck`
+refuses the handshake outside them. `tick.clock`, `sync.clock` and
+`engine.clock` hold this.
+
+**Open until M12: is `st_mtime` UTC?** `sysmodule/source/card.cpp` takes a
+save's `st_mtime` as it is, and `updated_at` above assumes it is UTC. FAT stores
+a file's time as local time with no zone, and whether libnx's fsdev converts it
+is unverified. If it does not, a console at UTC+X reports every save X hours
+newer than it is — inside the day this check allows, so a first sync's
+arbitration would lean that way unseen. The measurement — write a save at a
+known UTC instant on a console set to a non-UTC zone, read its `st_mtime` back —
+needs hardware, and is a step of the M12 hardware test plan (#307). Its answer
+belongs here.
 
 ## Step 2 — execute the plan
 
@@ -452,7 +514,10 @@ and it is the only thing that ever sends `overwrite=true`:
    (#273), in this order -- and only then held for a running game (step 1a),
    so a choice that can never be taken says why rather than waiting for a game
    to close first:
-   - `not_a_conflict`: the entry is not a save conflict with a slot;
+   - `not_a_conflict`: the entry is not a save conflict with a slot, or it
+     was recorded against another server than the configured one (#317) --
+     its rom id is that server's, so the override could land on another game.
+     A plain restore of it still runs;
    - `superseded`: a newer entry of the same `(rom_id, slot)` -- another
      conflict, a download over it, a deletion -- has moved the card on since.
      Only a save's newest entry is Keep local's;
@@ -524,7 +589,10 @@ and it is the only thing that ever sends `overwrite=true`:
    -- a row never chosen, or a choice spent or dropped -- with its state.
 2. Once the bytes are on the card -- never before -- the sysmodule arms the
    conflict's `(rom_id, slot)` (`sync::ArmKeepLocal`, at most
-   `sync::kMaxKeepLocal`) and asks for a tick.
+   `sync::kMaxKeepLocal`) and asks for a tick. A `server.url` change drops
+   every armed and held choice (#317), and one whose copy was running when the
+   URL moved arms nothing: the bytes it restored stay, backed up first, and
+   meet the new server's guard like any upload.
 3. That tick's upload of the save goes with `overwrite=true`. The plan that
    answers the key **spends** it (`sync::SpendKeepLocal`): an upload that went or
    was refused, or any other action -- the server asking for no upload. Only an
@@ -674,7 +742,9 @@ durable before the next one can be:
 3. The new bytes are staged beside the save and **synced** — by
    `io::CopyStaged` for a restore, by the HTTP backend before it renames its
    `.part` for a download.
-4. `io::CommitStaged`: the save to `<save>.old`, the staged file onto the save,
+4. `io::CommitStaged`: any `<save>.old` already there set aside to the first free
+   `<save>.old.<n>` (#293: the commit did not write it, so it never removes it),
+   the save to `<save>.old`, the staged file onto the save,
    `<save>.old` removed, and the save's directory synced. A cut between the two
    renames leaves `.old` and no save, which the boot sweep renames back.
 
@@ -711,6 +781,21 @@ A process that **runs out of memory** mid-overwrite is the same question asked
 of a death rather than a power cut, and `oom.tick` asks it at every allocation a
 tick makes (#250, docs/TESTING.md): the save is old or new, new only beside a
 backup of the old, and the log's last line says the sysmodule stopped.
+
+#### How long a backup stays (#292)
+
+`.backup/` is pruned at the end of a tick that completed — never during an
+operation, and under the same lock a restore takes — to `[backup]`'s limits
+([CONFIG.md](CONFIG.md#backup-how-much-of-backup-is-kept),
+[`backup_prune.hpp`](../core/include/rommsync/backup_prune.hpp)). Count and age
+decide which backups *may* go; whether one *does* is a digest check, and the
+answer is keep unless its MD5 is a `content_hash` RomM holds for that rom
+(`GET /api/saves?rom_id=`, asked only for roms that have a candidate) or a newer
+backup of the same save holds the same bytes. That is hard rule 3 applied to
+retention: the server is what makes deleting a local copy safe. The live save is
+not a second copy, and a state, with no server digest, goes only as a duplicate.
+Each removal is one `remove()` of bytes already proven elsewhere, so a power cut
+leaves a subset of the removals and nothing else; `prune.crash` replays it.
 
 #### A write after the backup (#263)
 
@@ -768,6 +853,32 @@ what proves it is on the card as copied. A state download is a moved server row
 over an unchanged local file — rare, and nobody waits on it.
 `conflicts.late_write` (a save, a Keep local and a state) and `states.late_write`
 force each with the same `io::Disk` (`faulty::LateWrite`, `tests/faulty_disk.hpp`).
+
+#### A write before the backup (#286)
+
+The comparison above starts at the backup, and the ruling starts earlier: the
+server decided `download`, `conflict` or `delete` about the bytes the scan
+reported, and a state's download was decided against the scanned digest. A
+game that writes between the scan and the backup — across a negotiate and a
+download, tens of megabytes for a state — leaves a save the backup copies and
+the save still equals. Committed over, that progress is in `.backup/` alone,
+and the next tick, finding the server's copy on the card, plans nothing.
+
+So right after the backup, `sync::BackupIsReported` holds it to the reported
+digest, in all four places: a `delete`, a `download`, a `conflict` (before its
+archival upload, which would otherwise keep the new bytes on the server as the
+losing side of a ruling that never saw them), and a state's download. A
+mismatch fails the operation — `kUnverified`, `changed_since_backup` for a
+state — and leaves the save; the next tick negotiates it as it now is. A matched
+`download` or `conflict` reported with no digest is refused before anything is
+fetched, as a `delete` is.
+
+The backup goes too, **but only while the save still holds its bytes** — then it
+duplicates a file nothing replaced. A save written again after the backup
+leaves the backup the only copy of the write before, and it stays, as that
+save's newest backup, which [pruning](#backups) never removes.
+`execute.stale_fetch` and `states.stale_write` write the save before the backup
+and, in a second case each, again after it.
 
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
@@ -1305,7 +1416,7 @@ no cleanup got to run — `sync::RecoverStaging`, over the save folders and
 |---|---|---|
 | `<save>.tmp.part` | a download the process died during | removed. `DownloadTarget::resume` is false for a save, so nothing in it is worth keeping and the next tick refetches |
 | `<save>.tmp` | a download whose body ended and whose commit did not | **removed, not committed.** See below |
-| `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save. When `<save>` *is* there the commit finished, and the file is counted and **left alone**: a `Game.srm.old` a human made by hand has exactly that shape, and this sweep does not delete files it did not write |
+| `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save. When `<save>` *is* there the commit finished, and the file is counted and **left alone**: a `Game.srm.old` a human made by hand has exactly that shape, and this sweep does not delete files it did not write. The next commit into `<save>` does not either: it renames it to `<save>.old.<n>`, which this sweep never matches (#293) |
 | `.backup/<rom_id>-<slot>-<ts>.<ext>` | any overwrite | never touched. A backup is never garbage: it is the copy M7-1 restores from, including one written for an overwrite that then failed |
 
 **A `<save>.tmp` is discarded rather than finished, and an earlier revision of

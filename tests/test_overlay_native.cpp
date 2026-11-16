@@ -22,6 +22,11 @@
 //   `lifecycle.cpp`    start, show, and the one teardown every exit path ends
 //                      in; and `Cadence`, the clock a screen polls by (#209).
 //   `log_paint.cpp`    the log screen's layout (#209).
+//   `library_pump.cpp` the library browser's IPC frame, and the teardown its
+//                      destructor runs (#285).
+//   `status_pump.cpp`, `sync_pump.cpp`, `pairing_pump.cpp`
+//                      the three polling screens' IPC frames (#299).
+//   `poller.cpp`       the line those three poll through without waiting (#299).
 //
 // The far side of the wire is the *real* dispatch table -- `ipc::Dispatch` over
 // an `ipc::ServiceCore` -- and the real `Error` -> `Result` mapping the
@@ -43,6 +48,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -60,7 +67,9 @@
 #include "rommsync/ipc.hpp"
 #include "rommsync/log.hpp"
 #include "rommsync/overlay_conflicts_view.hpp"
+#include "rommsync/overlay_library_model.hpp"
 #include "rommsync/overlay_log_view.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "rommsync/overlay_status_view.hpp"
 
 // The overlay's own headers, and the sysmodule's half of the error mapping.
@@ -69,12 +78,16 @@
 #include "conflicts_pump.hpp"
 #include "draw_list.hpp"
 #include "ipc_client.hpp"
+#include "library_pump.hpp"
 #include "lifecycle.hpp"
 #include "log_paint.hpp"
+#include "pairing_pump.hpp"
 #include "prompts.hpp"
 #include "result.hpp"
 #include "screen_frame.hpp"
 #include "status_paint.hpp"
+#include "status_pump.hpp"
+#include "sync_pump.hpp"
 
 namespace {
 
@@ -155,6 +168,12 @@ class HostSysmodule : public hostswitch::Server {
   /// Armed, every call blocks before it is dispatched. See `Hold`.
   Hold hold;
 
+  /// How long every call takes to answer -- or, with `slow_command` set, only
+  /// that one (#299). A sysmodule that is busy rather than stuck: `SetConfig`
+  /// under the card mutex while a download writes is a few hundred ms.
+  std::atomic<int> delay_ms{0};
+  std::atomic<int> slow_command{-1};
+
   /// Atomic because a call the overlay gave up on is still running on the
   /// client's worker while the test reads this.
   std::atomic<int> calls{0};
@@ -165,6 +184,10 @@ class HostSysmodule : public hostswitch::Server {
                 std::size_t capacity, u64* length) override {
     ++calls;
     hold.Pass();
+    const int slow = slow_command.load();
+    if (slow < 0 || static_cast<u32>(slow) == command_id) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms.load()});
+    }
     last_command = command_id;
     last_request.assign(static_cast<const char*>(request), request_size);
     *length = 0;
@@ -1049,6 +1072,241 @@ int RunRestore(Checks& checks) {
   return checks.failures();
 }
 
+// --- overlay.frames -----------------------------------------------------------
+
+/// The longest a frame callback may take while the sysmodule is slow (#299):
+/// the issue's bound. A frame at 60 Hz is 16.7 ms, and these are a few
+/// microseconds of work when nothing is waited for.
+constexpr std::chrono::milliseconds kFrameBound{2};
+
+/// A frame at 60 Hz, between two `update()`s.
+constexpr std::chrono::milliseconds kFramePeriod{16};
+
+/// No card: the sysmodule answers in every frame these drive, so a probe that
+/// ran would be a probe the status pump should not have made.
+overlay::CardState NoCard() { return overlay::CardState{}; }
+
+/// Run `frame` at 60 Hz until `done` holds or `kPatience` runs out, timing every
+/// call. Answers whether `done` held.
+template <typename Frame, typename Done>
+bool RunFramesUntil(Frame frame, Done done, std::chrono::milliseconds* slowest) {
+  const Clock::time_point start = Clock::now();
+  while (Since(start) < kPatience) {
+    const Clock::time_point began = Clock::now();
+    frame();
+    *slowest = std::max(*slowest, Since(began));
+    if (done()) {
+      return true;
+    }
+    std::this_thread::sleep_for(kFramePeriod);
+  }
+  return false;
+}
+
+/// The screen is drawing an answer: linked, and saying something. A view is
+/// blank until its first answer arrives, and blank is `Link::kOk` by default.
+template <typename View>
+bool Drawn(const View& view) {
+  return view.link == overlay::Link::kOk && !view.headline.empty();
+}
+
+std::string Took(std::chrono::milliseconds slowest) {
+  return " (the slowest frame took " + std::to_string(slowest.count()) + "ms)";
+}
+
+/// M11-15 (#299): a sysmodule that takes 300 ms to answer does not slow the
+/// overlay down.
+///
+/// Before this, the status, sync and pairing screens each sent a command from
+/// every `update()` and waited for it, up to the 500 ms budget (#209): an
+/// answer anywhere between a frame and the budget held the draw thread for
+/// that long, every frame -- a few frames a second while a download had the
+/// card. Every frame below is timed against the issue's 2 ms, with the client
+/// at the device's own budget so that 300 ms is an answer, not a timeout.
+int RunFrames(Checks& checks) {
+  Console console;
+  console.engine().settings.server.url = "http://romm.test";
+  console.engine().settings.sync.enabled = true;
+  console.engine().snapshot.auth = ipc::AuthState::kPaired;
+  console.engine().start_pairing_starts = true;
+  console.Start();
+  console.sysmodule().delay_ms = 300;
+  overlay::IpcClient client;
+
+  {
+    overlay::StatusPump pump(client, &NoCard);
+    std::chrono::milliseconds slowest{0};
+    const bool answered = RunFramesUntil(
+        [&] { pump.Frame(); }, [&] { return Drawn(pump.view()); }, &slowest);
+    checks.Expect(answered, "the status screen draws the sysmodule's answer" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no status frame waited for a 300 ms answer" + Took(slowest));
+  }
+
+  {
+    overlay::SyncPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return Drawn(pump.view()); }, &slowest),
+                  "the sync screen draws the sysmodule's answer" + Took(slowest));
+    // Sync now first: the toggle below turns sync off, which blocks it.
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressSyncNow();
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return !pump.view().notice.empty(); }, &slowest),
+                  "Sync now's answer is drawn" + Took(slowest));
+    checks.ExpectEq(console.engine().sync_requests, 1, "and it was sent once");
+    const bool was = pump.view().enabled;
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressToggle();
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().enabled != was; }, &slowest),
+                  "the switch moves once the write is answered" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no sync frame or press waited for a 300 ms answer" + Took(slowest));
+  }
+
+  {
+    overlay::PairingPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().start; }, &slowest),
+                  "the pairing screen offers Pair" + Took(slowest));
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressStart();
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] {
+                                   return pump.view().state ==
+                                          rommsync::auth::PairingState::kStarting;
+                                 },
+                                 &slowest),
+                  "the press arrives, and the screen says it is starting" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no pairing frame or press waited for a 300 ms answer" + Took(slowest));
+  }
+
+  // A write past the budget is still applying, not "not responding" (#299):
+  // the edit lands, late, and the screen says so rather than calling it a
+  // failure and dropping the answer.
+  {
+    console.sysmodule().slow_command = static_cast<int>(ipc::Command::kSetEnabled);
+    console.sysmodule().delay_ms = static_cast<int>(overlay::IpcClient::kCallBudget.count()) + 300;
+    overlay::SyncPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return Drawn(pump.view()); }, &slowest),
+                  "the sync screen is up" + Took(slowest));
+    const bool was = pump.view().enabled;
+    pump.PressToggle();
+    bool applying = false;
+    bool unreachable = false;
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        pump.Frame();
+                        applying = applying ||
+                                   pump.view().notice.find("applying") != std::string::npos;
+                        unreachable = unreachable || pump.view().link != overlay::Link::kOk;
+                      },
+                      [&] { return pump.view().enabled != was; }, &slowest),
+                  "the late write is not lost: the switch moves when it lands" + Took(slowest));
+    checks.Expect(applying, "while it was out past the budget, the screen said still applying");
+    checks.Expect(!unreachable, "and never that the sysmodule was not responding");
+    checks.Expect(pump.view().notice.find("applying") == std::string::npos,
+                  "the notice goes once the answer is in: " + pump.view().notice);
+    checks.Expect(slowest < kFrameBound, "and no frame waited for it" + Took(slowest));
+  }
+
+  // A write that does not come back at all is not "still applying" forever:
+  // past `kBudgetsBeforeStuck` budgets it is a sysmodule that is stuck, and
+  // its answer is still used when it does come.
+  {
+    console.sysmodule().slow_command = -1;
+    console.sysmodule().delay_ms = 0;
+    overlay::IpcClient quick(kTestBudget);
+    overlay::SyncPump pump(quick);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); }, [&] { return Drawn(pump.view()); },
+                                 &slowest),
+                  "the sync screen is up" + Took(slowest));
+    const bool was = pump.view().enabled;
+    console.sysmodule().hold.Arm();
+    pump.PressToggle();
+    bool applying = false;
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        pump.Frame();
+                        applying = applying ||
+                                   pump.view().notice.find("applying") != std::string::npos;
+                      },
+                      [&] { return pump.view().link == overlay::Link::kNotResponding; },
+                      &slowest),
+                  "a write stuck for twenty budgets is reported as not responding" +
+                      Took(slowest));
+    checks.Expect(applying, "after it said still applying");
+    console.sysmodule().hold.Release();
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return Drawn(pump.view()) && pump.view().enabled != was; },
+                                 &slowest),
+                  "and when it lands at last, the switch moves and the screen is back" +
+                      Took(slowest));
+    checks.Expect(slowest < kFrameBound, "and no frame waited for any of it" + Took(slowest));
+    quick.Shutdown();
+  }
+
+  // The rate. A screen that is answered at once asks about four times a
+  // second, not once a frame: a busy sysmodule is asked a quarter as often.
+  {
+    overlay::StatusPump pump(client, &NoCard);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); }, [&] { return Drawn(pump.view()); },
+                                 &slowest),
+                  "the status screen is up" + Took(slowest));
+    const int before = console.sysmodule().calls.load();
+    for (int frame = 0; frame < 60; ++frame) {
+      pump.Frame();
+      std::this_thread::sleep_for(kFramePeriod);
+    }
+    const int reads = console.sysmodule().calls.load() - before;
+    checks.Expect(reads >= 2 && reads <= 6,
+                  "sixty frames ask 60 / Poller::kFramesBetweenReads times, give or take one: "
+                  "asked " + std::to_string(reads));
+  }
+
+  // A posted call and a waited-for one share the slot. A screen above a poller
+  // that left a call out waits for it within its own budget and drops it; the
+  // poster learns it was lost rather than being handed somebody else's answer.
+  {
+    overlay::ScreenFrame frame(client);
+    checks.Expect(frame.Ready() == overlay::Link::kOk, "the handshake passes");
+    console.sysmodule().delay_ms = 100;
+    overlay::IpcClient::Ticket ticket = 0;
+    checks.ExpectEq(client.Post(ipc::Command::kGetStatus, ipc::EncodeEmpty(), &ticket), Result{0},
+                    "a post is taken at once");
+    Result rc = 0;
+    checks.Expect(client.Collect(ticket, &rc) == overlay::IpcClient::Arrival::kPending,
+                  "and is pending while the far side works");
+    ipc::ConfigView view;
+    checks.ExpectEq(client.GetConfig(&view), Result{0},
+                    "a waited-for call behind it is answered, within its budget");
+    checks.Expect(client.Collect(ticket, &rc) == overlay::IpcClient::Arrival::kLost,
+                  "and the posted answer it waited out is lost to its poster, not handed on");
+    console.sysmodule().delay_ms = 0;
+  }
+
+  client.Shutdown();
+  checks.ExpectEq(hostswitch::OpenSessions(), 0, "every session this scenario opened is closed");
+  return checks.failures();
+}
+
 // --- overlay.cycles -----------------------------------------------------------
 
 std::string WithoutComment(const std::string& line);  // overlay.portable's, below
@@ -1062,12 +1320,46 @@ std::vector<bool>& ForegroundCalls() {
 }
 void RecordForeground(bool enabled) { ForegroundCalls().push_back(enabled); }
 
-/// `RommsyncOverlay`, minus `tsl::Overlay`: the client and the lifecycle it
-/// owns, declared in the same order `main.cpp` declares them.
-struct OverlayUnderTest {
+/// `LibraryScreen` on the gui stack, minus the `tsl::Gui`: its IPC frame, and
+/// the destructor `~LibraryScreen` runs (`library_pump.hpp`). The library is
+/// the screen this is about because it is the one whose destructor talks to
+/// the sysmodule -- it closes the cursors it holds (#285).
+struct LibraryUnderTest {
+  explicit LibraryUnderTest(overlay::IpcClient& borrowed) : client(borrowed) {}
+  ~LibraryUnderTest() { overlay::CloseLibrary(frame, client, model); }
+
+  LibraryUnderTest(const LibraryUnderTest&) = delete;
+  LibraryUnderTest& operator=(const LibraryUnderTest&) = delete;
+
+  /// `update()`.
+  void Frame() { overlay::PumpLibrary(frame, client, model, link); }
+
+  overlay::IpcClient& client;
+  overlay::ScreenFrame frame{client};
+  overlay::LibraryBrowserModel model;
+  overlay::Link link = overlay::Link::kOk;
+};
+
+/// `tsl::Overlay`'s part: the gui stack. A private member of the **base**
+/// class, so `~Overlay` destroys it after everything `RommsyncOverlay` owns,
+/// and nothing in the pinned `tsl::loop` empties it before `delete overlay`
+/// (#285). Whatever screen is open when the overlay exits is destroyed here.
+struct TeslaOverlayPart {
+  virtual ~TeslaOverlayPart() = default;
+  std::list<std::unique_ptr<LibraryUnderTest>> gui_stack;
+};
+
+/// `RommsyncOverlay`'s own part: the client and the lifecycle it owns, in the
+/// order `main.cpp`'s `OverlayServices` declares them.
+struct OverlayServicesPart {
   overlay::IpcClient client{kTestBudget};
   overlay::Lifecycle lifecycle{client, &RecordForeground};
 };
+
+/// `RommsyncOverlay`, laid out as `main.cpp` lays it out: services first, so
+/// they are destroyed *after* the gui stack and a screen's destructor never
+/// finds the client gone. `RunCycles` greps `main.cpp` for that base list.
+struct OverlayUnderTest : OverlayServicesPart, TeslaOverlayPart {};
 
 /// One way libtesla's loop ends, as our overlay's hooks see it.
 ///
@@ -1199,6 +1491,82 @@ int RunCycles(Checks& checks) {
     }
     checks.Expect(main.find("client_.Close()") == std::string::npos,
                   "and none of them closes the session around the lifecycle");
+    // The layout `OverlayUnderTest` copies (#285). `tsl::Overlay`'s gui stack is
+    // destroyed by its own destructor, so whatever owns the client has to be a
+    // base declared before it to outlive the screens on that stack.
+    checks.Expect(main.find("class RommsyncOverlay : private OverlayServices, public tsl::Overlay") !=
+                      std::string::npos,
+                  "main.cpp's client and lifecycle are a base declared before tsl::Overlay, so "
+                  "they outlive the gui stack");
+  }
+
+  // No screen's destructor can open a session (#285). It runs whenever the
+  // stack is emptied -- after `exitServices` on every exit libtesla's loop
+  // has -- so a destructor that reached `Ready()` or `Diagnose()` would
+  // `smGetService` on a client that had already stopped, and nothing after it
+  // closes what it opens. The library's teardown is `CloseLibrary`, which is
+  // held to retiring its frame first; any other screen may not touch the wire.
+  {
+    const std::filesystem::path dir(ROMMSYNC_OVERLAY_SOURCE_DIR);
+    int destructors = 0;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(dir)) {
+      // Headers too: a destructor defined inline in `<thing>_screen.hpp` is as
+      // much a screen's destructor as one in the `.cpp`.
+      const std::string name = entry.path().filename().string();
+      const std::string stem = entry.path().stem().string();
+      constexpr std::string_view kScreenSuffix = "_screen";
+      if (stem.size() < kScreenSuffix.size() ||
+          stem.compare(stem.size() - kScreenSuffix.size(), kScreenSuffix.size(), kScreenSuffix) !=
+              0) {
+        continue;
+      }
+      const std::string code = CodeOnly(ReadWhole(entry.path()));
+      for (std::size_t at = code.find('~'); at != std::string::npos; at = code.find('~', at + 1)) {
+        // `~SomethingScreen(`, and not a bitwise not.
+        std::size_t after = at + 1;
+        while (after < code.size() && IsIdentifier(code[after])) {
+          ++after;
+        }
+        const std::string_view identifier(code.data() + at + 1, after - at - 1);
+        if (after >= code.size() || code[after] != '(' || identifier.size() < 6 ||
+            identifier.substr(identifier.size() - 6) != "Screen") {
+          continue;
+        }
+        // Only a definition has a body: `{` before the next `;`. A declaration
+        // (`~LibraryScreen() override;`) is checked where it is defined.
+        const std::size_t open = code.find('{', at);
+        const std::size_t semicolon = code.find(';', at);
+        if (open == std::string::npos || (semicolon != std::string::npos && semicolon < open)) {
+          continue;
+        }
+        int depth = 0;
+        std::size_t close = open;
+        for (; close < code.size(); ++close) {
+          depth += code[close] == '{' ? 1 : code[close] == '}' ? -1 : 0;
+          if (depth == 0) {
+            break;
+          }
+        }
+        const std::string body = code.substr(open, close - open);
+        ++destructors;
+        for (const char* banned : {"Ready(", "Open(", "Diagnose(", "Pump", "client_."}) {
+          checks.Expect(body.find(banned) == std::string::npos,
+                        name + "'s destructor names " + banned +
+                            ": a screen destroyed after the overlay stopped would open a session "
+                            "nothing closes");
+        }
+      }
+    }
+    checks.Expect(destructors > 0, "the screen destructor grep found ~LibraryScreen to check");
+
+    const std::string pump = CodeOnly(ReadWhole(dir / "library_pump.cpp"));
+    const std::size_t teardown = pump.find("void CloseLibrary(");
+    const std::size_t retired = pump.find("frame.Retire();", teardown);
+    const std::size_t ready = pump.find("frame.Ready()", teardown);
+    checks.Expect(teardown != std::string::npos && retired != std::string::npos &&
+                      retired < ready,
+                  "CloseLibrary retires its frame before asking it anything, so the teardown "
+                  "only ever uses a session that is already open");
   }
 
   Console console;
@@ -1211,6 +1579,7 @@ int RunCycles(Checks& checks) {
       const std::string where = std::string(path.name) + ", cycle " + std::to_string(cycle);
       ForegroundCalls().clear();
       const int teardowns = overlay::Lifecycle::Teardowns();
+      int opened_before_teardown = 0;
       {
         auto under_test = std::make_unique<OverlayUnderTest>();
         under_test->lifecycle.Start();  // initServices
@@ -1220,6 +1589,11 @@ int RunCycles(Checks& checks) {
         checks.Expect(ForegroundCalls() == std::vector<bool>{false},
                       "the overlay gives input back the moment it starts: " + where);
 
+        // The library is the screen left open: pushed, and never popped, so
+        // `~Overlay` is what destroys it (#285).
+        under_test->gui_stack.push_back(std::make_unique<LibraryUnderTest>(under_test->client));
+        LibraryUnderTest& library = *under_test->gui_stack.back();
+
         overlay::ScreenFrame frame(under_test->client);
         for (int show = 0; show < path.shows; ++show) {
           under_test->lifecycle.Shown();
@@ -1227,7 +1601,16 @@ int RunCycles(Checks& checks) {
           ipc::Status status;
           checks.Expect(R_SUCCEEDED(under_test->client.GetStatus(&status)),
                         "and polls: " + where);
+          for (int tick = 0; tick < 4; ++tick) {
+            library.Frame();
+          }
+          checks.Expect(library.model.open_cursors() > 0,
+                        "the library holds a cursor its destructor has to close: " + where);
         }
+        // Every session the teardown below opens is one opened after the
+        // overlay's own part stopped, and on a console nothing closes it: one
+        // of `kMaxSessions` gone until reboot, per exit (#285).
+        opened_before_teardown = hostswitch::SessionsOpened();
         // One call that ran out of budget and is still out when the overlay
         // closes -- the worst case for a teardown, released a moment later.
         if (path.shows > 0) {
@@ -1251,6 +1634,10 @@ int RunCycles(Checks& checks) {
           under_test.reset();
         }
       }
+      checks.ExpectEq(hostswitch::SessionsOpened(), opened_before_teardown,
+                      "a screen destroyed with the overlay opens no session -- with Library "
+                      "open and no pop, every exit would otherwise take one of kMaxSessions: " +
+                          where);
       checks.ExpectEq(overlay::Lifecycle::Teardowns(), teardowns + 1,
                       "the one teardown ran exactly once: " + where);
       checks.ExpectEq(hostswitch::OpenSessions(), 0, "no session is left open: " + where);
@@ -1274,6 +1661,147 @@ int RunCycles(Checks& checks) {
       }
     }
   }
+  return checks.failures();
+}
+
+// --- overlay.scroll -----------------------------------------------------------
+
+/// `LibraryScreen` minus the `tsl::Gui`, as #298 left it: the held key turned
+/// into rows by `ScrollRepeat`, the IPC frame, and the view re-rendered only
+/// when the model changed -- `update()` and `handleInput()` in one call.
+struct LibraryOnScreen {
+  explicit LibraryOnScreen(overlay::IpcClient& borrowed) : client(borrowed) {}
+  ~LibraryOnScreen() { overlay::CloseLibrary(frame, client, model); }
+
+  LibraryOnScreen(const LibraryOnScreen&) = delete;
+  LibraryOnScreen& operator=(const LibraryOnScreen&) = delete;
+
+  void Frame(overlay::ScrollKey held, overlay::ScrollRepeat::Clock::time_point now) {
+    const int rows = repeat.Update(held, now);
+    if (rows != 0) {
+      model.MoveSelection(rows);
+    }
+    overlay::PumpLibrary(frame, client, model, link);
+    overlay::RenderLibrary(model, &view, &seen);
+  }
+
+  std::int64_t SelectedRom() const {
+    if (view.selected < 0) {
+      return 0;
+    }
+    return view.rows[static_cast<std::size_t>(view.selected)].rom_id;
+  }
+
+  overlay::IpcClient& client;
+  overlay::ScreenFrame frame{client};
+  overlay::LibraryBrowserModel model;
+  overlay::Link link = overlay::Link::kOk;
+  overlay::LibraryView view;
+  std::uint64_t seen = ~std::uint64_t{0};
+  overlay::ScrollRepeat repeat;
+};
+
+/// Row 2000 of a 2500-rom platform, reached with a held R through the real
+/// dispatch, and the heap flat all the way down (#298).
+///
+/// Before #298 the level stopped at row 512 with "Too many to list here", a
+/// held key moved one row per press, and every frame copied every loaded row
+/// into the view.
+int RunScroll(Checks& checks) {
+  using ScrollClock = overlay::ScrollRepeat::Clock;
+  Console console;
+  console.engine().library_roms = 2500;
+  console.Start();
+  // A generous budget: this is about rows, not time, and a loaded host must not
+  // turn a page into "not responding".
+  overlay::IpcClient client(std::chrono::milliseconds{2000});
+  LibraryOnScreen library(client);
+
+  int frame = 0;
+  const auto at = [&frame] {
+    return ScrollClock::time_point{} + std::chrono::microseconds(std::int64_t{frame} * 16'667);
+  };
+  for (; frame < 20 && library.model.selected_position() < 0; ++frame) {
+    library.Frame(overlay::ScrollKey::kNone, at());
+  }
+  checks.ExpectEq(library.model.selected_position(), 0, "the platform list loaded");
+  library.model.Activate();
+
+  // R held, at 60 Hz, until the selection is past row 1990.
+  const int held_from = frame;
+  std::optional<count_new::Snapshot> baseline;
+  for (; frame < held_from + 600 && library.model.selected_position() < 1990; ++frame) {
+    library.Frame(overlay::ScrollKey::kPageDown, at());
+    if (!baseline.has_value() &&
+        library.model.loaded_rows() >= static_cast<std::size_t>(overlay::kMaxLoadedRows)) {
+      // The window has filled: from here on the rows held should not grow.
+      // (Not the selection's place: a held R outruns the pages, and rides the
+      // "Loading..." row, which is no place in the list.)
+      baseline = count_new::Now();
+      count_new::ResetPeak();
+    }
+  }
+  const int held_frames = frame - held_from;
+  checks.Expect(library.model.selected_position() >= 1990,
+                "a held R gets past row 1990: at " +
+                    std::to_string(library.model.selected_position()));
+  checks.Expect(held_frames <= 6 * 60,
+                "within six seconds at 60 Hz: " + std::to_string(held_frames) + " frames");
+
+  // Released past it, then taps onto row 2000 exactly: a page at a time while
+  // a page away, a row at a time after.
+  for (int press = 0; press < 128 && library.model.selected_position() != 1999; ++press) {
+    library.Frame(overlay::ScrollKey::kNone, at());
+    ++frame;
+    const int away = 1999 - library.model.selected_position();
+    overlay::ScrollKey key = away > 0 ? overlay::ScrollKey::kDown : overlay::ScrollKey::kUp;
+    if (away >= overlay::kPageRows) {
+      key = overlay::ScrollKey::kPageDown;
+    } else if (away <= -overlay::kPageRows) {
+      key = overlay::ScrollKey::kPageUp;
+    }
+    library.Frame(key, at());
+    ++frame;
+  }
+  checks.ExpectEq(library.SelectedRom(), std::int64_t{2000}, "row 2000 is the 2000th rom");
+
+  checks.Expect(baseline.has_value(), "the window filled on the way down");
+  if (count_new::kActive && baseline.has_value()) {
+    const count_new::Snapshot now = count_new::Now();
+    const std::int64_t grew = now.outstanding_bytes - baseline->outstanding_bytes;
+    // A row is ~200 bytes here, so a heap that kept one per row scrolled past
+    // would have grown ~300 KiB over these ~1500 rows.
+    checks.Expect(grew < 16 * 1024,
+                  "the heap does not grow with the rows scrolled past: " + std::to_string(grew) +
+                      " bytes over ~1500 rows");
+    const std::int64_t peak = now.peak_bytes - baseline->outstanding_bytes;
+    checks.Expect(peak < 256 * 1024, "nor peak far above it: " + std::to_string(peak) + " bytes");
+
+    // Still, with nothing to fetch: a frame allocates nothing at all.
+    for (int settle = 0; settle < 8; ++settle, ++frame) {
+      library.Frame(overlay::ScrollKey::kNone, at());
+    }
+    const count_new::Window idle;
+    for (int still = 0; still < 30; ++still, ++frame) {
+      library.Frame(overlay::ScrollKey::kNone, at());
+    }
+    checks.ExpectEq(idle.allocations(), std::int64_t{0},
+                    "thirty frames with nothing to do allocate nothing");
+  }
+
+  // And L back to the top: the rows dropped above the window are read again.
+  for (int release = 0; release < 2; ++release, ++frame) {
+    library.Frame(overlay::ScrollKey::kNone, at());
+  }
+  const int up_from = frame;
+  for (; frame < up_from + 1800 && library.model.selected_position() != 0; ++frame) {
+    library.Frame(overlay::ScrollKey::kPageUp, at());
+  }
+  checks.ExpectEq(library.model.selected_position(), 0, "a held L gets back to row 1");
+  checks.ExpectEq(library.SelectedRom(), std::int64_t{1}, "which is the first rom");
+  checks.Expect(console.engine().library_cursors.size() <= 2,
+                "every cursor a rewind replaced was ended: " +
+                    std::to_string(console.engine().library_cursors.size()) + " open");
   return checks.failures();
 }
 
@@ -1387,6 +1915,9 @@ constexpr const char* kPortableFiles[] = {
     "draw_list.hpp",    "prompts.hpp",      "screen_frame.hpp",   "screen_frame.cpp",
     "status_paint.hpp", "status_paint.cpp", "conflicts_pump.hpp", "conflicts_pump.cpp",
     "lifecycle.hpp",    "lifecycle.cpp",    "log_paint.hpp",      "log_paint.cpp",
+    "library_pump.hpp", "library_pump.cpp", "status_pump.hpp",    "status_pump.cpp",
+    "sync_pump.hpp",    "sync_pump.cpp",    "pairing_pump.hpp",   "pairing_pump.cpp",
+    "poller.hpp",       "poller.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately
@@ -1850,8 +2381,14 @@ int main(int argc, char** argv) {
   if (scenario == "hidden") {
     return RunHidden(checks);
   }
+  if (scenario == "scroll") {
+    return RunScroll(checks);
+  }
   if (scenario == "restore") {
     return RunRestore(checks);
+  }
+  if (scenario == "frames") {
+    return RunFrames(checks);
   }
   if (scenario == "timeout") {
     return RunTimeout(checks);
@@ -1863,6 +2400,7 @@ int main(int argc, char** argv) {
     return RunDraw(checks);
   }
   std::cerr << "usage: test_overlay_native "
-               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|log|portable|draw>\n";
+               "<card|wire|roundtrip|version|errors|timeout|restore|cycles|hidden|scroll|log|"
+               "portable|draw>\n";
   return 2;
 }

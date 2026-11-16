@@ -109,6 +109,8 @@ Status ServiceCore::GetStatus() const {
   status.server_version = snapshot.server_version;
   Shorten(&status.server_version, server::kMaxVersionBytes);
   status.server_supported = snapshot.server_supported;
+  status.clock_trusted = snapshot.clock_trusted;
+  status.clock_skew_seconds = snapshot.clock_skew_seconds;
   status.download = snapshot.download;
   // A `fs_name` comes off a RomM library, so its length is not ours to assume,
   // and `GetStatus` is documented never to fail. A truncated label costs a few

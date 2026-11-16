@@ -1,15 +1,12 @@
 #include "pairing_screen.hpp"
 
-#include <cstdint>
 #include <string>
 
 #include "ipc_client.hpp"
+#include "pairing_pump.hpp"
 #include "palette.hpp"
 #include "rommsync/core.hpp"
-#include "rommsync/ipc.hpp"
 #include "rommsync/overlay_pairing_view.hpp"
-#include "rommsync/pairing.hpp"
-#include "screen_frame.hpp"
 
 namespace rommsync::overlay {
 namespace {
@@ -48,98 +45,21 @@ tsl::elm::Element* PairingScreen::createUI() {
   return frame;
 }
 
-void PairingScreen::update() { Poll(); }
+void PairingScreen::update() { pump_.Frame(); }
 
 bool PairingScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAnalogStickState,
                                 HidAnalogStickState) {
   if ((keys_down & HidNpadButton_A) == 0) {
     return false;
   }
-  if (!view_.start && !view_.start_over) {
+  if (!pump_.view().start && !pump_.view().start_over) {
     // Nothing is offered: an attempt is in flight, or there is no sysmodule to
     // ask. Not handled, so B still leaves the screen and Tesla keeps its own
     // bindings.
     return false;
   }
-  Start();
+  pump_.PressStart();
   return true;
-}
-
-bool PairingScreen::Ready() {
-  // The port and the version handshake, both of which every screen needs and
-  // none of which is this screen's own (`screen_frame.hpp`).
-  const Link link = frame_.Ready();
-  if (link == Link::kOk) {
-    return true;
-  }
-  view_ = RenderPairingUnreachable(link, frame_.sysmodule_interface());
-  return false;
-}
-
-void PairingScreen::Poll() {
-  if (!Ready()) {
-    blocked_ = false;
-    return;
-  }
-
-  auth::PairingStatus status;
-  const Result rc = client_.GetPairState(&status);
-  if (R_FAILED(rc)) {
-    blocked_ = false;
-    // A payload this build cannot read is distinct from a sysmodule that is
-    // gone, and distinct from a half-parsed status: the screen says so instead
-    // of drawing defaulted fields as though they were an answer. Which of the
-    // two it is is `Diagnose`'s to say.
-    view_ = RenderPairingUnreachable(frame_.Diagnose(rc), frame_.sysmodule_interface());
-    return;
-  }
-
-  if (blocked_) {
-    // The refusal stands until the user presses the button again. `StartPair`
-    // refuses *before* `PairingSession::Begin()` runs (`ipc::ServiceCore`), so
-    // the session still reports whatever the last attempt left behind --
-    // `kIdle` on a first Pair, `kExpired` or `kDenied` on a Start over -- and
-    // every one of those would redraw over the reason one frame after the
-    // press. Nothing is polling behind a refusal to keep saying it, and a
-    // button that visibly does nothing is what this whole screen exists to
-    // avoid. `GetPairState` is still called every frame above, so a sysmodule
-    // that goes away while the refusal is up is still reported.
-    return;
-  }
-  view_ = RenderPairing(status);
-}
-
-void PairingScreen::Start() {
-  blocked_ = false;
-  if (!Ready()) {
-    return;
-  }
-
-  auth::PairingStatus status;
-  const Result rc = client_.StartPair(&status);
-  if (R_SUCCEEDED(rc)) {
-    // `kStarting`, almost always: the sysmodule hands the init to its own
-    // thread and answers without waiting for it (`ipc::Engine::StartPairing`).
-    view_ = RenderPairing(status);
-    return;
-  }
-  if (rc == MalformedResponse()) {
-    view_ = RenderPairingUnreachable(Link::kUnreadable);
-    return;
-  }
-
-  // It refused, or the session died. `GetStatus` never fails, so one that does
-  // is the transport -- and one that does not already says whether there is a
-  // server to pair with. See the note on `Start` in the header for why the
-  // `Result` itself is not decoded here.
-  ipc::Status console;
-  const Result status_rc = client_.GetStatus(&console);
-  if (R_FAILED(status_rc)) {
-    view_ = RenderPairingUnreachable(frame_.Diagnose(status_rc), frame_.sysmodule_interface());
-    return;
-  }
-  view_ = RenderPairingBlocked(console.configured ? PairBlock::kRefused : PairBlock::kNoServer);
-  blocked_ = true;
 }
 
 void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
@@ -154,6 +74,7 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   const s32 bottom = y + height;
   const s32 line_width = width > kInset ? width - kInset : 0;
   const tsl::Color muted = MutedColor();
+  const PairingView& view = pump_.view();
 
   s32 row = y;
   // Once one element has been dropped for want of room, nothing below it is
@@ -174,30 +95,30 @@ void PairingScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     row += advance;
   };
 
-  line(view_.headline, kHeadlineFont, ColorFor(view_.tone), kHeadlineHeight);
-  line(view_.hint, kBodyFont, muted, kHintHeight);
+  line(view.headline, kHeadlineFont, ColorFor(view.tone), kHeadlineHeight);
+  line(view.hint, kBodyFont, muted, kHintHeight);
 
-  if (!view_.code.empty()) {
+  if (!view.code.empty()) {
     row += kRowHeight / 2;
     // The address above the code: a user reads the two in that order, and the
     // address is the half they need before the code means anything.
-    line(view_.url, kBodyFont, tsl::gfx::Renderer::a(tsl::defaultTextColor), kRowHeight);
+    line(view.url, kBodyFont, tsl::gfx::Renderer::a(tsl::defaultTextColor), kRowHeight);
     // Verbatim, and never re-grouped -- RomM's alphabet already excludes the
     // confusable characters, so there is nothing here to help with
     // (docs/AUTH.md).
-    line(view_.code, kCodeFont, tsl::gfx::Renderer::a(tsl::defaultTextColor), kCodeHeight);
-    line(view_.countdown, kBodyFont, muted, kRowHeight);
+    line(view.code, kCodeFont, tsl::gfx::Renderer::a(tsl::defaultTextColor), kCodeHeight);
+    line(view.countdown, kBodyFont, muted, kRowHeight);
   }
 
-  if (!view_.detail.empty()) {
+  if (!view.detail.empty()) {
     row += kRowHeight / 2;
-    line(view_.detail, kBodyFont, muted, kRowHeight);
+    line(view.detail, kBodyFont, muted, kRowHeight);
   }
 
   // Last, and only when there is something the button does. A prompt for an
   // action the screen would decline is worse than no prompt at all.
-  const std::string action = view_.start ? Prompt(kGlyphA, "Pair")
-                             : view_.start_over ? Prompt(kGlyphA, "Start over")
+  const std::string action = view.start ? Prompt(kGlyphA, "Pair")
+                             : view.start_over ? Prompt(kGlyphA, "Start over")
                                                 : std::string();
   if (!action.empty() && fits(kRowHeight * 2)) {
     row += kRowHeight / 2;

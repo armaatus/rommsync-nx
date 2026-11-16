@@ -54,6 +54,14 @@ retroarch             = auto
 ; folders hold roms, so they are read only when this is true.
 retroarch_content_dir = false
 
+[backup]
+; Every save this client overwrites is copied under /config/rommsync/.backup/
+; first. After each sync the oldest are pruned to these limits -- but a backup is
+; only ever deleted when RomM, or a newer backup, holds the same bytes.
+keep      = 10                     ; the newest backups of each save kept, at least 1
+keep_days = 30                     ; and every one younger than this; 0 = none by age
+max_mib   = 512                    ; the size .backup/ is held to; 0 = no cap
+
 [tico]
 ; Tico 0.8 keeps saves per Switch account, under /tico/saves/users/<account>/.
 ; auto reads the one account there is, and asks (on the settings screen) when

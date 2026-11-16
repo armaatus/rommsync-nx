@@ -234,6 +234,11 @@ enum class StateError {
   ///
   /// Not `kUnverified`, which names *downloaded* bytes that failed their length:
   /// here the download was fine and it is the local file that moved.
+  ///
+  /// Also a state written after the *scan* and before the backup (#286,
+  /// `sync::BackupIsReported`): the download was decided against the scanned
+  /// digest, and this is not that state. The same stand-down, with the backup
+  /// dropped when the state still holds its bytes and kept when it does not.
   kChangedSinceBackup,
 
   /// The verified bytes could not be moved onto the state.
