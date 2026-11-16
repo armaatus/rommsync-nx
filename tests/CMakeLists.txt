@@ -2594,6 +2594,31 @@ foreach(scenario states once)
   set_tests_properties(power.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# M11-6 (#290): a sleep that lands while a request is still opening its
+# connection. The quiesce waits a budget and then acknowledges anyway, so what
+# has to be true is that the lookup, the connect and the handshake each end at
+# the cancel -- otherwise the acknowledgement goes out on time with a bsd,
+# sfdnsres or ssl call still running. Through the shipping wire client and
+# plain connector; the handshake phase stands the `ssl` service's call in with
+# a server that never answers, waited on the way `SslConnector` waits.
+add_executable(test_sleep_connect test_sleep_connect.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/http_wire.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/posix_connection.cpp")
+target_link_libraries(test_sleep_connect PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_sleep_connect PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_sleep_connect PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-sleep"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+foreach(scenario dns connect handshake)
+  add_test(NAME sleep.${scenario} COMMAND test_sleep_connect ${scenario})
+  set_tests_properties(sleep.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M9-1: what `__appInit` does, and what it cannot be asked ----------------
 # Nothing in `sysmodule/source/main.cpp` runs off a console, which is how three
 # boot bugs sat in twenty lines through every green `ctest` (#195): a `smExit()`

@@ -80,8 +80,24 @@ class PlainConnection final : public Connection {
 
 }  // namespace
 
+bool ResolveBlocking(const std::string& host, std::uint32_t* address,
+                     const http::CancelToken* cancel) {
+  if (cancel != nullptr && cancel->canceled()) return false;
+  addrinfo hints{};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* resolved = nullptr;
+  if (getaddrinfo(host.c_str(), nullptr, &hints, &resolved) != 0 || resolved == nullptr) {
+    return false;
+  }
+  *address = reinterpret_cast<sockaddr_in*>(resolved->ai_addr)->sin_addr.s_addr;
+  freeaddrinfo(resolved);
+  return cancel == nullptr || !cancel->canceled();
+}
+
 int ConnectTo(const Origin& origin, std::chrono::milliseconds connect_timeout,
-              std::chrono::milliseconds io_timeout, http::Error* error, std::string* message) {
+              std::chrono::milliseconds io_timeout, http::Error* error, std::string* message,
+              const http::CancelToken* cancel, Resolve resolve) {
   sockaddr_in address{};
   std::memset(&address, 0, sizeof(address));
   address.sin_family = AF_INET;
@@ -90,18 +106,14 @@ int ConnectTo(const Origin& origin, std::chrono::milliseconds connect_timeout,
   // An address first, because on the test rig and on a LAN RomM it usually is
   // one -- and because that path needs no name service at all.
   if (inet_pton(AF_INET, origin.host.c_str(), &address.sin_addr) != 1) {
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    addrinfo* resolved = nullptr;
-    if (getaddrinfo(origin.host.c_str(), nullptr, &hints, &resolved) != 0 ||
-        resolved == nullptr) {
+    std::uint32_t resolved = 0;
+    const Resolve lookup = resolve != nullptr ? resolve : ResolveBlocking;
+    if (!lookup(origin.host, &resolved, cancel)) {
       *error = http::Error::kUnresolvedHost;
       *message = "could not resolve " + origin.host;
       return -1;
     }
-    address.sin_addr = reinterpret_cast<sockaddr_in*>(resolved->ai_addr)->sin_addr;
-    freeaddrinfo(resolved);
+    address.sin_addr.s_addr = resolved;
   }
 
   const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -144,6 +156,7 @@ std::unique_ptr<Connection> MakePlainConnection(int fd) {
 std::unique_ptr<Connection> PlainConnector::Open(const Origin& origin,
                                                  std::chrono::milliseconds connect_timeout,
                                                  const http::ClientOptions&,
+                                                 const http::CancelToken*,
                                                  http::Error* error, std::string* message) {
   *error = http::Error::kNone;
   if (origin.tls) {
@@ -151,7 +164,8 @@ std::unique_ptr<Connection> PlainConnector::Open(const Origin& origin,
     *message = "this connector speaks no TLS";
     return nullptr;
   }
-  const int fd = ConnectTo(origin, connect_timeout, connect_timeout, error, message);
+  const int fd = ConnectTo(origin, connect_timeout, connect_timeout, error, message, nullptr,
+                           resolve_);
   if (fd < 0) return nullptr;
   std::unique_ptr<Connection> connection = MakePlainConnection(fd);
   if (connection == nullptr) {

@@ -14,12 +14,28 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 
 #include "http_wire.hpp"
 
 namespace rommsync::sysmodule {
+
+/// A name to an IPv4 address, in network byte order, or false.
+///
+/// A seam because the console's lookup is not `getaddrinfo` alone: it is one
+/// IPC to `sfdnsres` that nothing on the calling thread can interrupt, so the
+/// console's resolver arms a `CancelToken::Abort` that cancels it from the
+/// thread that fires `cancel` (`ssl_http_client.cpp`, M11-6, #290). Null means
+/// `ResolveBlocking`.
+using Resolve = bool (*)(const std::string& host, std::uint32_t* address,
+                         const http::CancelToken* cancel);
+
+/// `getaddrinfo`, with `cancel` read before and after it but not during: POSIX
+/// has no way to interrupt one. What the host build and the tests use.
+bool ResolveBlocking(const std::string& host, std::uint32_t* address,
+                     const http::CancelToken* cancel);
 
 /// Resolve `origin` and connect, or return -1 with `error` and `message` set.
 ///
@@ -33,8 +49,12 @@ namespace rommsync::sysmodule {
 /// is the only bound that reaches the service's own I/O, and whether the service
 /// honours a socket option set before it takes the descriptor is one of the
 /// things a run on hardware would tell us (docs/DEVELOPMENT.md).
+///
+/// `cancel` ends any phase of it within one slice -- `http::Error::kCanceled`
+/// -- and `resolve` is how the name, if it is one, becomes an address.
 int ConnectTo(const Origin& origin, std::chrono::milliseconds connect_timeout,
-              std::chrono::milliseconds io_timeout, http::Error* error, std::string* message);
+              std::chrono::milliseconds io_timeout, http::Error* error, std::string* message,
+              const http::CancelToken* cancel = nullptr, Resolve resolve = nullptr);
 
 /// Take ownership of `fd` and speak plain TCP over it. Null only when there was
 /// no room for the object, in which case `fd` is closed.
@@ -46,12 +66,21 @@ std::unique_ptr<Connection> MakePlainConnection(int fd);
 /// rather than carrying a second copy of them, and the host suite uses this
 /// class directly -- so what `wire.*` drives is the shipping code, minus the
 /// `ssl` layer it cannot reach.
+///
+/// `resolve` is for the tests that need a lookup to block (`sleep.*`); the
+/// default is `ResolveBlocking`.
 class PlainConnector final : public Connector {
  public:
+  explicit PlainConnector(Resolve resolve = nullptr) : resolve_(resolve) {}
+
   std::unique_ptr<Connection> Open(const Origin& origin,
                                    std::chrono::milliseconds connect_timeout,
-                                   const http::ClientOptions& options, http::Error* error,
+                                   const http::ClientOptions& options,
+                                   const http::CancelToken* cancel, http::Error* error,
                                    std::string* message) override;
+
+ private:
+  Resolve resolve_;
 };
 
 }  // namespace rommsync::sysmodule

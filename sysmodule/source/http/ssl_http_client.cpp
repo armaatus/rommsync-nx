@@ -119,7 +119,8 @@ class SslConnector final : public Connector {
 
   std::unique_ptr<Connection> Open(const Origin& origin,
                                    std::chrono::milliseconds connect_timeout,
-                                   const http::ClientOptions& options, http::Error* error,
+                                   const http::ClientOptions& options,
+                                   const http::CancelToken*, http::Error* error,
                                    std::string* message) override {
     *error = http::Error::kNone;
     if (!g_socket_up) {
