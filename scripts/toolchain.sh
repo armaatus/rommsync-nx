@@ -184,13 +184,17 @@ toolchain_missing() {
 # --user so a container build leaves files this user can delete: Docker Desktop
 # maps ownership back on macOS, but on Linux the default root would leave a
 # temp directory rm -rf cannot clear.
+#
+# DIR is mounted at $TOOLCHAIN_WORKDIR, /work unless set: `package.reproducible`
+# builds two copies at two different paths, and through docker every copy would
+# otherwise be built at the same one.
 toolchain_run() {
-  local dir="$1" script="$2"
+  local dir="$1" script="$2" workdir="${TOOLCHAIN_WORKDIR:-/work}"
   shift 2
   if toolchain_here; then
     ( cd "$dir" && bash -lc "$script" _ "$@" )
   else
-    docker run --rm --user "$(id -u):$(id -g)" -v "$dir:/work" -w /work \
+    docker run --rm --user "$(id -u):$(id -g)" -v "$dir:$workdir" -w "$workdir" \
       "$DEVKITPRO_IMAGE" bash -lc "$script" _ "$@"
   fi
 }

@@ -2042,7 +2042,8 @@ foreach(scenario
         refuses         # a wrong .nsp, an unsigned .ovl, a missing input
         deterministic   # the same inputs, the same bytes
         upgrade         # unzipping over an install keeps config.ini and the rest
-        notices)        # every linked library has a notice row, every row ships (#300)
+        notices         # every linked library has a notice row, every row ships (#300)
+        wording)        # PRE-RELEASE and "never run on a console" only when true (#303)
   add_test(NAME package.${scenario}
            COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" ${scenario})
   set_tests_properties(package.${scenario} PROPERTIES TIMEOUT 120)
@@ -2065,6 +2066,17 @@ add_test(NAME package.builds
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" builds)
 set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
                      RUN_SERIAL TRUE)
+
+# The same sources built twice, at two different paths, are the same bytes --
+# the three targets and the zip (#303). It is what lets the release job publish
+# switch-build's artifacts as "the build of this tag", and a rebuilder compare
+# against them. Two full cross-compiles, so it is the slowest entry here; same
+# image, label and skip as package.builds, and run in CI by the same
+# `tests/toolchain_suite.sh --here`.
+add_test(NAME package.reproducible
+         COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" reproducible)
+set_tests_properties(package.reproducible PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1500
+                     LABELS toolchain RUN_SERIAL TRUE)
 
 # --- the install guide: docs/INSTALL.md --------------------------------------
 # The one page in this repo nobody may verify by following it -- hard rule 1
@@ -2186,6 +2198,13 @@ set_tests_properties(release.prerelease PROPERTIES TIMEOUT 60)
 add_test(NAME release.history
          COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" history)
 set_tests_properties(release.history PROPERTIES TIMEOUT 120)
+
+# What a release says about itself (#303): "pre-release" only when VERSION is
+# one, and "not yet verified on hardware" -- pointing at #44 -- only while the
+# launch gate (#305) still holds a console row. Every release used to say both.
+add_test(NAME release.wording
+         COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" wording)
+set_tests_properties(release.wording PROPERTIES TIMEOUT 60)
 
 # The one compatibility statement a release makes, and the fact that there is
 # only one of it. `ATMOSPHERE_TARGET` is restated in docs/INSTALL.md's "Before

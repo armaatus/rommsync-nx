@@ -29,12 +29,21 @@
 #                                  rommsync.log
 #                                  and the flags/boot2.flag that says the
 #                                  sysmodule is enabled alone.
+#   test_package.sh wording        README.txt calls the build a PRE-RELEASE only
+#                                  when VERSION is one, and says it has not run
+#                                  on a console only while the launch gate (#305)
+#                                  holds a console row (#303).
+#   test_package.sh reproducible   the three Switch targets, built from the same
+#                                  sources at two different paths, are the same
+#                                  bytes, and so is the zip packaged from each --
+#                                  what lets the release job ship switch-build's
+#                                  artifacts and a rebuilder check them (#303).
 #   test_package.sh builds         ...and it packages a real devkitPro build,
 #                                  run inside the same container, so the script
 #                                  is exercised where #34's release job will run
 #                                  it and not only against stubs.
 #
-# Everything but `builds` uses stubbed artifacts -- four bytes of magic is all
+# Everything but `builds` and `reproducible` uses stubbed artifacts -- four bytes of magic is all
 # the script inspects -- so it needs no Docker and never skips. `builds` needs
 # the devkitpro/devkita64 image, exactly like `switch.builds`, and skips rather
 # than pulling 2.7GB unasked -- which means that on a machine without it,
@@ -572,7 +581,157 @@ phase_notices() {
   echo "ok: every linked library has a row, and every row reaches the notices"
 }
 
+# --- what the README says about the build -------------------------------------
+
+# A checkout holding only what package.sh reads, so VERSION and the launch gate
+# can be set per case without touching this one's.
+mini_repo() {
+  local dir="$1"
+  mkdir -p "$dir/scripts" "$dir/sysmodule"
+  cp "$REPO_ROOT/LICENSE" "$dir/"
+  cp "$REPO_ROOT/sysmodule/sys-rommsync.json" "$dir/sysmodule/"
+  cp -R "$REPO_ROOT/packaging" "$dir/"
+  cp "$PACKAGE" "$NOTICES" "$REPO_ROOT/scripts/release-notes.sh" "$dir/scripts/"
+}
+
+# The stand-in for scripts/launch-gate.sh (#305) that tests/test_release.sh's
+# `wording` uses too: `--rows` as `id|kind|claim`, and a held gate is one with a
+# `console` row left in it.
+fake_gate() {
+  local dir="$1" held="$2" kind=repo
+  [ "$held" = held ] && kind=console
+  printf '#!/usr/bin/env bash\necho "smoke|%s|#44 complete"\n' "$kind" \
+    > "$dir/scripts/launch-gate.sh"
+  chmod +x "$dir/scripts/launch-gate.sh"
+}
+
+phase_wording() {
+  SCRATCH="$(mktemp -d)"
+  stub_inputs
+  local repo="$SCRATCH/repo"
+  mini_repo "$repo"
+
+  local version gate readme tree="$SCRATCH/tree"
+  for version in 1.0.0 1.0.0-rc1; do
+    for gate in none held passed; do
+      echo "$version" > "$repo/VERSION"
+      rm -f "$repo/scripts/launch-gate.sh"
+      [ "$gate" = none ] || fake_gate "$repo" "$gate"
+      "$repo/scripts/package.sh" --nsp "$SCRATCH/sys-rommsync.nsp" \
+          --ovl "$SCRATCH/ovl-rommsync.ovl" --out "$SCRATCH/out" >/dev/null 2>&1 ||
+        fail "package.sh failed on $version, launch gate $gate"
+      rm -rf "$tree"
+      unzip -qq "$SCRATCH/out/rommsync-nx-$version.zip" -d "$tree" ||
+        fail "cannot unpack the $version archive"
+      readme="$tree/config/rommsync/README.txt"
+
+      # README.txt.in carries its conditional paragraphs as marker lines, and
+      # none of them may reach a user whatever the case.
+      grep -qE '^@|@[A-Z_]+@' "$readme" &&
+        fail "$version, gate $gate: README.txt still holds template markers"
+
+      case "$version" in
+        *-*) grep -q 'PRE-RELEASE' "$readme" ||
+               fail "$version: a prerelease's README does not say it is one" ;;
+        *)   grep -qi 'pre-release' "$readme" &&
+               fail "$version: a stable release's README calls it a PRE-RELEASE" ;;
+      esac
+
+      # No gate is not a passed gate: until #305 exists, nothing has said a
+      # console ran this.
+      if [ "$gate" = passed ]; then
+        grep -q 'not yet been run on a real console' "$readme" &&
+          fail "$version, gate passed: README.txt still says it never ran on a console"
+      else
+        grep -q 'not yet been run on a real console' "$readme" ||
+          fail "$version, gate $gate: README.txt does not say it never ran on a console"
+      fi
+    done
+  done
+
+  echo "ok: README.txt says PRE-RELEASE and 'not run on a console' only when each is true"
+}
+
 # --- the real thing ------------------------------------------------------------
+
+# copy_sources DEST -- what a devkitPro build and package.sh read, and nothing a
+# previous build left: the build directories and the targets' outputs are
+# removed, so what DEST holds afterwards is this build's.
+copy_sources() {
+  local dest="$1"
+  mkdir -p "$dest/scripts"
+  cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$REPO_ROOT/LICENSE" "$dest/"
+  cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$REPO_ROOT/overlay" \
+        "$REPO_ROOT/tlsprobe" "$REPO_ROOT/packaging" "$dest/"
+  cp "$PACKAGE" "$NOTICES" "$REPO_ROOT/scripts/release-notes.sh" "$dest/scripts/"
+  cp "$REPO_ROOT/.gitmodules" "$dest/"
+  # Removing the object directory is what actually forces the rebuild --
+  # `$(OUTPUT).elf: $(OFILES)` and the objects live in `build/`, so the whole
+  # link chain is already out of date once it is gone. Clearing the target's
+  # own outputs on top of that is defence in depth against a make rule that
+  # stops going through the objects.
+  #
+  # Named by extension rather than cleared with a `sys-rommsync.*` glob: that
+  # glob also matches sys-rommsync.json, the NPDM config without which npdmtool
+  # produces no .npdm and the .nsp does not link -- so a glob leaves a restoring
+  # `cp` behind it that is load-bearing and looks incidental. Nothing here
+  # deletes something it then has to put back.
+  local target ext
+  rm -rf "$dest/sysmodule/build" "$dest/overlay/build" "$dest/tlsprobe/build"
+  for target in sysmodule/sys-rommsync overlay/ovl-rommsync tlsprobe/rommsync-tlsprobe; do
+    for ext in nsp nso npdm ovl nro nacp elf map lst; do
+      rm -f "$dest/$target.$ext"
+    done
+  done
+}
+
+# The three targets and the zip, as `sha256sum` lines relative to DIR.
+built_digests() {
+  ( cd "$1" && sha256sum sysmodule/sys-rommsync.nsp overlay/ovl-rommsync.ovl \
+                          tlsprobe/rommsync-tlsprobe.nro "dist/rommsync-nx-$VERSION.zip" )
+}
+
+# Two builds of the same sources at two different absolute paths -- the
+# difference between a CI runner's checkout and anyone else's -- must be the
+# same bytes. Path is the input that varied in practice: `__FILE__` and the
+# DWARF a link writes carry it, and before switch.mk mapped it away the same
+# commit built in two directories gave three different binaries (#303). Built
+# in sequence and in separate containers, so nothing one build leaves is
+# visible to the other.
+phase_reproducible() {
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
+  [ -f "$REPO_ROOT/overlay/lib/libultrahand/ultrahand.mk" ] ||
+    skip "overlay/lib/libultrahand is empty (git submodule update --init --recursive)"
+  command -v sha256sum >/dev/null 2>&1 || skip "no sha256sum"
+
+  SCRATCH="$(mktemp -d)"
+  local one="$SCRATCH/one" two="$SCRATCH/elsewhere/at/another/depth/two"
+  copy_sources "$one"
+  copy_sources "$two"
+
+  local build='make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)" &&
+               make -C tlsprobe -j"$(nproc)" && scripts/package.sh'
+  # Through docker each copy is mounted where it is asked to be, so the two
+  # builds see two paths there too; in the image (--here) they already do.
+  TOOLCHAIN_WORKDIR=/work toolchain_run "$one" "$build" >"$SCRATCH/one.log" 2>&1 ||
+    { cat "$SCRATCH/one.log" >&2; fail "the first build failed"; }
+  TOOLCHAIN_WORKDIR=/elsewhere/at/another/depth/two toolchain_run "$two" "$build" \
+      >"$SCRATCH/two.log" 2>&1 ||
+    { cat "$SCRATCH/two.log" >&2; fail "the second build failed"; }
+
+  local a b
+  a="$(built_digests "$one")" || fail "the first build is missing an output"
+  b="$(built_digests "$two")" || fail "the second build is missing an output"
+  echo "$a"
+  [ "$a" = "$b" ] || {
+    diff <(echo "$a") <(echo "$b") >&2
+    fail "the same sources built at two paths are different bytes; a published checksum
+nobody else can reproduce is a statement about one runner, not about the tag"
+  }
+  echo "ok: the same sources at two paths build the same .nsp, .ovl, .nro and zip"
+}
+
 
 phase_builds() {
   local missing
@@ -582,32 +741,10 @@ phase_builds() {
 
   # A copy, not the worktree, for the reasons tests/test_switch_build.sh gives:
   # the container builds as root and three worktrees may be doing this at once.
-  SCRATCH="$(mktemp -d)"
-  cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$REPO_ROOT/LICENSE" "$SCRATCH/"
-  cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$REPO_ROOT/overlay" \
-        "$REPO_ROOT/packaging" "$SCRATCH/"
-  mkdir -p "$SCRATCH/scripts"
-  cp "$PACKAGE" "$NOTICES" "$SCRATCH/scripts/"
-  cp "$REPO_ROOT/.gitmodules" "$SCRATCH/"
   # Sources only, so the assertions below read this build's output and not a
-  # previous one's. Removing the object directory is what actually forces the
-  # rebuild -- `$(OUTPUT).elf: $(OFILES)` and the objects live in `build/`, so
-  # the whole link chain is already out of date once it is gone. Clearing the
-  # target's own outputs on top of that is defence in depth against a make rule
-  # that stops going through the objects.
-  #
-  # Named by extension rather than cleared with a `sys-rommsync.*` glob: that
-  # glob also matches sys-rommsync.json, the NPDM config without which npdmtool
-  # produces no .npdm and the .nsp does not link -- so a glob leaves a restoring
-  # `cp` behind it that is load-bearing and looks incidental. Nothing here
-  # deletes something it then has to put back.
-  local target ext
-  rm -rf "$SCRATCH/sysmodule/build" "$SCRATCH/overlay/build"
-  for target in sysmodule/sys-rommsync overlay/ovl-rommsync; do
-    for ext in nsp nso npdm ovl nro nacp elf map lst; do
-      rm -f "$SCRATCH/$target.$ext"
-    done
-  done
+  # previous one's.
+  SCRATCH="$(mktemp -d)"
+  copy_sources "$SCRATCH"
 
   local log="$SCRATCH/build.log"
   # Packaged inside the container, not on this host: #34's release job runs the
@@ -668,6 +805,8 @@ case "${1:-}" in
   deterministic) phase_deterministic ;;
   upgrade)       phase_upgrade ;;
   notices)       phase_notices ;;
+  wording)       phase_wording ;;
+  reproducible)  phase_reproducible ;;
   builds)        phase_builds ;;
-  *) echo "usage: $0 {layout|toolbox|refuses|deterministic|upgrade|notices|builds}" >&2; exit 2 ;;
+  *) echo "usage: $0 {layout|toolbox|refuses|deterministic|upgrade|notices|wording|reproducible|builds}" >&2; exit 2 ;;
 esac
