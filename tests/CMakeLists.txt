@@ -350,6 +350,23 @@ endif()
 # ten-inits-a-minute limit is per IP, which is the whole suite.
 set_tests_properties(ipc.engine PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# M11-7 (#291). The service loop's decision about each `svcReplyAndReceive`
+# return, driven with the result/index pairs the kernel produces. The loop itself
+# is libnx (`sysmodule/source/ipc/server.cpp`); `ipc/wait_outcome.hpp` names no
+# libnx type, which is what lets it be compiled here (sysmodule/AGENTS.md).
+add_executable(test_ipc_wait test_ipc_wait.cpp)
+target_include_directories(test_ipc_wait PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+set(IPC_WAIT_SCENARIOS
+  closed     # a hang-up drops exactly that session, whether or not a reply was pending
+  received   # the port and the sessions signalling, unchanged
+  error      # any other result is logged and survived, until a run of them
+)
+foreach(scenario IN LISTS IPC_WAIT_SCENARIOS)
+  add_test(NAME ipc.wait_${scenario} COMMAND test_ipc_wait ${scenario})
+  set_tests_properties(ipc.wait_${scenario} PROPERTIES TIMEOUT 30)
+endforeach()
+
 # --- the three lists the overlay browses -------------------------------------
 # M5-4. The producer behind `ipc::ListBegin`/`ListNext`/`ListEnd`, driven through
 # `ipc::Dispatch` over a real `SdEngine` -- so what these scenarios assert on is
