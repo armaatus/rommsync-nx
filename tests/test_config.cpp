@@ -847,6 +847,105 @@ void LoadingFromDisk(checks::Checks& c) {
   std::remove(path.c_str());
 }
 
+/// `[server] ca_file` (#288): the certificate a self-signed or private-CA RomM
+/// is verified against. Read as written, then checked on the card by
+/// `LoadConfig`, because the failure it exists to prevent -- every request
+/// failing `net.tls` with nothing on the settings screen saying why -- is a
+/// failure of the *file*, not of the line.
+void TheCaFileIsReadAndChecked(checks::Checks& c) {
+  c.Expect(config::Defaults().server.ca_file.empty(),
+           "no CA file by default: the console's own trust store");
+
+  const config::LoadResult parsed =
+      config::ParseConfig(WithServer("ca_file = sdmc:/config/rommsync/ca.pem\n"));
+  c.ExpectEq(parsed.value.server.ca_file, std::string("sdmc:/config/rommsync/ca.pem"),
+             "the path is taken as written");
+  c.Expect(parsed.diagnostics.empty(),
+           "and parsing alone does not go near the card: " + parsed.DescribeDiagnostics());
+
+  const config::LoadResult cleared =
+      config::ParseConfig(WithServer("ca_file = /a.pem\nca_file =\n"));
+  c.Expect(cleared.value.server.ca_file.empty() && cleared.diagnostics.empty(),
+           "an empty value is no CA file, the default: " + cleared.DescribeDiagnostics());
+
+  const config::LoadResult long_path = config::ParseConfig(
+      WithServer("ca_file = /" + std::string(config::kMaxPathLength, 'a') + "\n"));
+  c.Expect(long_path.value.server.ca_file.empty(), "a path past kMaxPathLength is not used");
+  const config::Diagnostic* too_long = Complaint(long_path, "server", "ca_file");
+  c.Expect(too_long != nullptr && too_long->severity == config::Severity::kWarning,
+           "and is a warning on its line: " + long_path.DescribeDiagnostics());
+
+  // Plain http has no handshake to verify, so a CA file there is unused. Said,
+  // because the user who set it believes it is doing something.
+  const config::LoadResult plain = config::ParseConfig(
+      "[server]\nurl = http://romm.lan:8080\nca_file = /config/rommsync/ca.pem\n");
+  const config::Diagnostic* unused = Complaint(plain, "server", "ca_file");
+  c.Expect(unused != nullptr && unused->severity == config::Severity::kNotice &&
+               unused->message.find("https") != std::string::npos,
+           "a CA file under plain http is a notice that it is unused: " +
+               plain.DescribeDiagnostics());
+
+  // --- on the card ------------------------------------------------------------
+  const std::filesystem::path dir = std::filesystem::path(scratch::Dir()) / "ca-file";
+  std::filesystem::create_directories(dir);
+  const std::string ini = (dir / "config.ini").string();
+  const std::string pem = (dir / "ca.pem").string();
+  const auto load_with = [&](const std::string& contents) {
+    std::filesystem::remove(pem);
+    if (!contents.empty()) {
+      std::ofstream out(pem, std::ios::binary);
+      out << contents;
+    }
+    {
+      std::ofstream out(ini, std::ios::binary);
+      out << "[server]\nurl = https://romm.example.com\nca_file = " << pem << "\n";
+    }
+    return config::LoadConfig(ini);
+  };
+  const std::string kPem =
+      "-----BEGIN CERTIFICATE-----\n"
+      "MIIBszCCAVmgAwIBAgIUQ2Ff\n"
+      "-----END CERTIFICATE-----\n";
+
+  const config::LoadResult good = load_with(kPem);
+  c.Expect(good.ok() && good.diagnostics.empty(),
+           "a PEM certificate on the card loads clean: " + good.DescribeDiagnostics());
+  c.ExpectEq(good.value.server.ca_file, pem, "and is the CA file in force");
+
+  const config::LoadResult bundle = load_with(kPem + kPem);
+  c.Expect(bundle.ok(), "a bundle of two is accepted: " + bundle.DescribeDiagnostics());
+
+  // Each refusal is an error rather than a warning: the client cannot verify
+  // the server it was pointed at, which is "cannot do its job as configured".
+  // The path stays in force, so every request still fails at the import and
+  // says so, rather than quietly trusting the console's store instead.
+  const struct {
+    const char* what;
+    std::string contents;
+    const char* says;
+  } kRefused[] = {
+      {"a missing file", "", "does not exist"},
+      {"a DER certificate", std::string("\x30\x82\x01\xb3\x30\x82", 6), "DER"},
+      {"a file with no certificate in it", "hello\n", "no PEM certificate"},
+      {"a private key", "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+       "no PEM certificate"},
+      {"a file past the size bound", std::string(config::kMaxCaFileBytes + 1, 'x'), "larger than"},
+  };
+  for (const auto& refused : kRefused) {
+    const config::LoadResult result = load_with(refused.contents);
+    const config::Diagnostic* complaint = Complaint(result, "server", "ca_file");
+    c.Expect(complaint != nullptr && complaint->severity == config::Severity::kError,
+             std::string(refused.what) + " is an error: " + result.DescribeDiagnostics());
+    c.Expect(complaint != nullptr && complaint->message.find(refused.says) != std::string::npos,
+             std::string(refused.what) + " says '" + refused.says +
+                 "': " + result.DescribeDiagnostics());
+    c.ExpectEq(result.value.server.ca_file, pem,
+               std::string(refused.what) + " keeps the path in force");
+    c.Expect(result.value.configured(), std::string(refused.what) + " still has a server");
+  }
+  std::filesystem::remove_all(dir);
+}
+
 void NothingCrashesOnAPartialFile(checks::Checks& c) {
   // Every prefix of a valid file, which is what an interrupted write leaves.
   // The assertion is deliberately weak -- a truncated file has no right answer
@@ -1041,6 +1140,12 @@ void TheShippedExampleParses(checks::Checks& c) {
            "so is [sync] on_server_delete");
   c.Expect(example.find("\non_server_delete") != std::string::npos,
            "which the shipped example spells out, so the choice is visible");
+  // `ca_file` is there to be found -- the self-signed answer docs/INSTALL.md
+  // gives (#288) -- and commented out, since a path to a file the user has not
+  // copied yet would be an error on the first boot.
+  c.Expect(example.find("ca_file = sdmc:/config/rommsync/ca.pem") != std::string::npos,
+           "the shipped example documents [server] ca_file");
+  c.Expect(result.value.server.ca_file.empty(), "commented out, so no CA file is in force");
   c.ExpectEq(result.value.downloads.enabled, defaults.downloads.enabled,
              "so is [downloads] enabled");
   c.ExpectEq(result.value.downloads.verify_hash, defaults.downloads.verify_hash,
@@ -1073,6 +1178,7 @@ int main() {
   EmulatorOverridesAreCheckedAndKeepTheFolders(c);
   TheServerUrlIsAnOriginOrNothing(c);
   LoadingFromDisk(c);
+  TheCaFileIsReadAndChecked(c);
   NothingCrashesOnAPartialFile(c);
   TheDocumentedExampleParses(c);
   TheShippedExampleParses(c);

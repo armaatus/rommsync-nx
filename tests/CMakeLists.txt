@@ -2121,7 +2121,9 @@ foreach(scenario
         interop_facts    # versions, limits, keys and names read off the code
         interop_table    # the per-system table both ways against save_source.cpp
         # docs/PRIVACY.md (#301): what leaves the console, read off the request bodies.
-        privacy)
+        privacy
+        ca_file     # #288: one "Self-signed or private CA" section, and every page links it
+        )
   add_test(NAME docs.install_${scenario}
            COMMAND ${Python3_EXECUTABLE} "${DOCS_INSTALL_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
@@ -2323,6 +2325,17 @@ endif()
 set_tests_properties(tls.isolated tls.cert tls.serves
                      PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 
+# #288's acceptance: a console pairs and syncs through the terminator only with
+# `[server] ca_file` naming its certificate. Through the engine, so it is the
+# real config -> transport path; skips with the rig, like `serves`. Serial with
+# the three above, since `cert` re-mints the certificate this one trusts.
+add_test(NAME tls.ca_file
+         COMMAND "${BASH_PROGRAM}" "${TLS_FIXTURE_TEST}" ca_file $<TARGET_FILE:test_engine>)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(tls.ca_file PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(tls.ca_file PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
+
 # --- the M0 exit gate's mechanical clauses -----------------------------------
 # "No test in the suite requires a console or a production server"
 # (docs/TESTING.md#the-m0-exit-gate) is a claim about every test, so it can only
@@ -2475,6 +2488,7 @@ set(ENGINE_SCENARIOS
   rollback  # a write that cannot happen changes neither the file nor memory
   corrupt   # a queue.json a yanked card left behind never blocks the boot
   config    # M5-3: an edit lands on the card and on the running engine
+  ca_trust  # #288: [server] ca_file reaches the transport at boot and on every adopted edit
   commit    # M5-3: a commit interrupted between the two renames loses nothing
   unpairs   # M5-3: a server change discards the pairing before it writes
   stale     # M5-3: "did the server change" is a question about the card

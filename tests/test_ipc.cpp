@@ -131,6 +131,8 @@ ipc::ConfigView LoadedConfigView() {
   view.config.play_with["snes"] = config::PlayWith::kRetroArch;
   // ...and #301's opt-out, off its default of on.
   view.config.sync.play_sessions = false;
+  // ...and #288's CA file, which a v16 decoder has no field for.
+  view.config.server.ca_file = "sdmc:/config/rommsync/ca.pem";
   config::Diagnostic note;
   note.severity = config::Severity::kWarning;
   note.line = 9;
@@ -223,9 +225,10 @@ int Version() {
   // `keep_local`. 14 since M10-35 (#279): `CancelKeepLocal`, whose answer an
   // older overlay has no decoder for. 15 since M11-11 (#295): `Status` gained
   // `clock_trusted` and `clock_skew_seconds`. 16 since M11-17 (#301):
-  // `ConfigView` gained `play_sessions`. What is frozen is command 0's
+  // `ConfigView` gained `play_sessions`. 17 since M11-4 (#288): and
+  // `server.ca_file`. What is frozen is command 0's
   // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{16},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{17},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -441,6 +444,8 @@ int RoundTrip() {
     const ipc::Decoded<ipc::ConfigView> back = ipc::DecodeConfigView(ipc::EncodeConfigView(sent));
     checks.Expect(back.ok(), "a config round trips: " + back.error.Describe());
     checks.ExpectEq(back.value.config.server.url, sent.config.server.url, "the url survives");
+    checks.ExpectEq(back.value.config.server.ca_file, sent.config.server.ca_file,
+                    "the CA file survives (#288)");
     checks.ExpectEq(back.value.config.sync.interval_min, sent.config.sync.interval_min,
                     "the interval survives");
     checks.ExpectEq(back.value.config.sync.states, sent.config.sync.states, "states survives");

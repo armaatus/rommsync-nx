@@ -199,6 +199,11 @@ void Rejects(checks::Checks& c) {
   cases.push_back({"a boolean that is not one", One("sync", "states", "maybe")});
   cases.push_back({"a section this build does not have", One("experimental", "future", "2")});
   cases.push_back({"a key this build does not have", One("sync", "nonsense", "4")});
+  // Read, never written (#288): the certificate itself has to reach the card
+  // from a PC, so the line naming it is written there too, and an overlay that
+  // could repoint the console's trust is one more way to aim it at the wrong
+  // server.
+  cases.push_back({"the CA file", One("server", "ca_file", "sdmc:/config/rommsync/ca.pem")});
   cases.push_back({"a folder whose name would read back as a comment",
                    One("platform.snes", "roms", "/tico/roms/great #2")});
   cases.push_back({"an empty entry in a folder list",

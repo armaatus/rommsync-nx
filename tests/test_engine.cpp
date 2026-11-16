@@ -86,6 +86,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -590,6 +591,59 @@ ipc::ConfigEdit Edit(std::string section, std::string key, std::string value) {
   ipc::ConfigEdit edit;
   edit.assignments.push_back({std::move(section), std::move(key), std::move(value), false});
   return edit;
+}
+
+/// #288: `[server] ca_file` reaches the transport. The engine hands the CA in
+/// force to `UseCaTrust` when it is installed, and again every time a
+/// configuration is adopted, so a hand edit picked up by the next `SetConfig`
+/// is trusted without a reboot -- and a file that is not a certificate is said
+/// on the settings screen the moment it is, not only at boot.
+void CaTrust(checks::Checks& c) {
+  Console console(c, "engine-ca-trust");
+  const std::string kPem =
+      "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ2Ff\n-----END CERTIFICATE-----\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/ca.pem", kPem), "a CA is on the card");
+  const std::string pem = console.sandbox.Host("/config/rommsync/ca.pem");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\nca_file = " + pem +
+                                     "\n"),
+           "and config.ini names it");
+  console.Boot();
+
+  std::vector<std::string> trusted;
+  console.engine.UseCaTrust([&trusted](const std::string& path) { trusted.push_back(path); });
+  c.Expect(!trusted.empty() && trusted.back() == pem,
+           "installing the hook hands it the CA file already in force");
+  bool complained = false;
+  for (const config::Diagnostic& note : console.Configured().diagnostics) {
+    complained = complained || note.key == "ca_file";
+  }
+  c.Expect(!complained, "and a real certificate draws no complaint");
+
+  // A hand edit, then any press that writes the file: the file is re-read
+  // whole, so the new CA is what is in force -- and it is checked on the card,
+  // as boot would have.
+  const std::string missing = console.sandbox.Host("/config/rommsync/other.pem");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\nca_file = " +
+                                     missing + "\n"),
+           "config.ini is repointed by hand");
+  const ipc::ConfigResult applied = console.Set(Edit("sync", "interval_min", "45"));
+  c.Expect(applied.outcome == ipc::WriteOutcome::kApplied, "an unrelated edit is applied");
+  c.Expect(!trusted.empty() && trusted.back() == missing,
+           "and the transport is handed the CA the file now names");
+  complained = false;
+  for (const config::Diagnostic& note : console.Configured().diagnostics) {
+    complained = complained || (note.key == "ca_file" && note.severity == config::Severity::kError);
+  }
+  c.Expect(complained, "a CA file that is not there is an error on the settings screen");
+
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n"),
+           "and the line is removed by hand");
+  console.Set(Edit("sync", "interval_min", "30"));
+  c.Expect(!trusted.empty() && trusted.back().empty(),
+           "so the transport is told there is no CA file any more");
 }
 
 void ConfigWrites(checks::Checks& c) {
@@ -7748,6 +7802,124 @@ int PlaySessionsOff(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// A client whose trust can be repointed: the curl backend fixes its options
+/// at construction, so each `UseCaTrust` builds a fresh one with
+/// `ClientOptions::ca_bundle_path` set -- the field the sysmodule's own
+/// transport honours the same way (`ssl_http_client.cpp`).
+class Retrusting final : public http::HttpClient {
+ public:
+  Retrusting() : inner_(rig::MakeClient()) {}
+
+  void Trust(const std::string& path) {
+    http::ClientOptions options;
+    options.ca_bundle_path = path;
+    std::shared_ptr<http::HttpClient> next(rig::MakeClient(options));
+    std::lock_guard<std::mutex> lock(mutex_);
+    inner_ = std::move(next);
+  }
+
+  http::Result Send(const http::Request& request) override { return Current()->Send(request); }
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    return Current()->Download(request, target);
+  }
+
+ private:
+  std::shared_ptr<http::HttpClient> Current() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return inner_;
+  }
+
+  std::mutex mutex_;
+  std::shared_ptr<http::HttpClient> inner_;
+};
+
+/// #288's acceptance, through the TLS terminator in front of the fixture RomM
+/// (`scripts/orca/tls-fixture.sh`, started by `test_tls_fixture.sh ca_file`):
+/// a console pointed at its `https://` origin pairs and syncs only with
+/// `[server] ca_file` naming the fixture's certificate. No CA file and the
+/// wrong one both fail the handshake, and neither leaves a token behind.
+int CaFile(http::HttpClient& plain, const std::string& base) {
+  rig::Checks c;
+  const char* tls_base = std::getenv("TLS_BASE_URL");
+  const char* right = std::getenv("ROMMSYNC_TLS_CA");
+  const char* wrong = std::getenv("ROMMSYNC_TLS_WRONG_CA");
+  if (tls_base == nullptr || right == nullptr || wrong == nullptr) {
+    std::cerr << "run through tests/test_tls_fixture.sh ca_file, which starts the terminator\n";
+    return 1;
+  }
+  const std::string origin = tls_base;
+
+  const auto boot = [&](Console& console, Retrusting& client, const std::string& ca_line) {
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + origin + "\n" + ca_line +
+                                       "\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\nstates = false\n"),
+             "the console points at the TLS terminator" +
+                 (ca_line.empty() ? std::string() : " with " + ca_line));
+    console.engine.UsePairingBackend(Backend(client));
+    console.Boot();
+    console.engine.UseCaTrust([&client](const std::string& path) { client.Trust(path); });
+  };
+
+  // --- refused: no CA file, and somebody else's -----------------------------
+  for (const std::string& ca_line : {std::string(), "ca_file = " + std::string(wrong)}) {
+    const std::string what = ca_line.empty() ? "with no ca_file" : "with the wrong ca_file";
+    Retrusting client;
+    Console console(c, ca_line.empty() ? "engine-ca-none" : "engine-ca-wrong");
+    boot(console, client, ca_line);
+    auth::PairingStatus started;
+    c.Expect(console.StartPair(&started) == ipc::Error::kOk, what + ": StartPair is answered");
+    const auth::PairingStatus settled = Terminal(console, c);
+    c.Expect(settled.state == auth::PairingState::kFailed,
+             what + ": the attempt fails (" + auth::ToString(settled.state) + ": " +
+                 settled.message + ")");
+    c.Expect(settled.user_code.empty(), what + ": and never reaches a code");
+    c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+             what + ": and writes no token");
+  }
+
+  // --- accepted: the fixture's own certificate --------------------------------
+  Retrusting client;
+  Console console(c, "engine-ca-right");
+  boot(console, client, "ca_file = " + std::string(right));
+  const auth::PairingStatus showing = BeginAndShow(console, c);
+  c.Expect(showing.state == auth::PairingState::kPending,
+           std::string("with the fixture's ca_file the attempt reaches a code (") +
+               auth::ToString(showing.state) + ": " + showing.message + ")");
+  if (showing.user_code.empty()) {
+    return c.failures();
+  }
+  // The approval is the user's browser, so it goes the plain way in.
+  const http::Result approved = rig::ApproveDeviceCode(plain, base, showing.user_code, Scopes());
+  c.Expect(approved.successful(),
+           "approving the code -- HTTP " + std::to_string(approved.response.status));
+  const auth::PairingStatus granted = Terminal(console, c);
+  c.Expect(granted.state == auth::PairingState::kApproved,
+           std::string("and it pairs over verified TLS (") + auth::ToString(granted.state) +
+               ": " + granted.message + ")");
+  if (granted.state != auth::PairingState::kApproved) {
+    return c.failures();
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseServer(&client, "");
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  TickOnce(console, ticks, c, "a sync through the TLS terminator");
+
+  const auth::LoadedToken stored = auth::LoadToken(console.directory + auth::kTokenFileName);
+  if (stored.ok()) {
+    harness::Fixture fixture;
+    if (harness::LoadFixture(&fixture)) {
+      harness::DeleteDevice(plain, base, fixture, stored.value.device_id);
+    }
+  }
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -7791,6 +7963,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"keep_local_overtaken", KeepLocalOvertaken},
       {"keep_local_switched", KeepLocalSwitched},
       {"play_off", PlaySessionsOff},
+      {"ca_file", CaFile},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -7822,6 +7995,8 @@ int main(int argc, char** argv) {
     Corrupt(checks);
   } else if (scenario == "config") {
     ConfigWrites(checks);
+  } else if (scenario == "ca_trust") {
+    CaTrust(checks);
   } else if (scenario == "commit") {
     InterruptedCommit(checks);
   } else if (scenario == "unpairs") {

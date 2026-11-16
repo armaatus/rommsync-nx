@@ -905,7 +905,60 @@ def phase_privacy(args) -> int:
     return 0
 
 
+# --- the self-signed answer (#288) --------------------------------------------
+
+CA_HEADING = "Self-signed or private CA"
+CA_ANCHOR = "self-signed-or-private-ca"
+CA_EXAMPLE = "ca_file = sdmc:/config/rommsync/ca.pem"
+
+
+def phase_ca_file(args) -> int:
+    """Every page that says "import the certificate" now names the one way to:
+    `[server] ca_file`, in one INSTALL section the others link to. Read against
+    the parser, so a renamed key is red here rather than a line a user copies
+    that the console ignores with a warning."""
+    repo = args.repo
+    parser = read(os.path.join(repo, "core", "src", "config.cpp"))
+    if '"ca_file"' not in parser:
+        return fail("core/src/config.cpp no longer reads a \"ca_file\" key; "
+                    "the docs below describe one")
+
+    guide = read(guide_path(repo))
+    found = re.search(rf"^#+ {re.escape(CA_HEADING)}\s*$", guide, re.MULTILINE)
+    if not found:
+        return fail(f"docs/INSTALL.md has no '{CA_HEADING}' section")
+    rest = guide[found.end():]
+    end = re.search(r"^#+ ", rest, re.MULTILINE)
+    body = rest[: end.start()] if end else rest
+    for needle, why in (
+        (CA_EXAMPLE, "the exact line to put under [server]"),
+        ("[server]", "which section the key goes in"),
+        ("config/rommsync/ca.pem", "where the file goes on the card"),
+        ("PEM", "the one format it reads"),
+        ("openssl x509 -inform der", "how to convert a DER certificate"),
+        ("SECURITY.md", "the reasoning, rather than restating it"),
+    ):
+        if needle not in body:
+            return fail(f"docs/INSTALL.md's '{CA_HEADING}' does not give {why} ({needle!r})")
+
+    example = read(os.path.join(repo, "packaging", "config.ini.example"))
+    if CA_EXAMPLE not in example:
+        return fail(f"packaging/config.ini.example does not document {CA_EXAMPLE!r}")
+    if "ca_file" not in read(os.path.join(repo, "docs", "CONFIG.md")):
+        return fail("docs/CONFIG.md does not describe [server] ca_file")
+
+    for page in ("SECURITY.md", "TROUBLESHOOTING.md"):
+        text = read(os.path.join(repo, "docs", page))
+        if f"INSTALL.md#{CA_ANCHOR}" not in text:
+            return fail(f"docs/{page} tells the user to import a certificate and does not "
+                        f"link INSTALL.md#{CA_ANCHOR}, which says how")
+    print(f"INSTALL.md's '{CA_HEADING}' names {CA_EXAMPLE!r}; the example, CONFIG.md, "
+          "SECURITY.md and TROUBLESHOOTING.md agree")
+    return 0
+
+
 PHASES = {
+    "ca_file": phase_ca_file,
     "paths": phase_paths,
     "links": phase_links,
     "safety": phase_safety,
