@@ -73,11 +73,13 @@ Unzip the release onto the **root** of your SD card, keeping the folder
 structure. There is no wrapper directory: the archive merges into the
 `atmosphere/` and `switch/` folders your card already has.
 
-Six files and one empty folder land, and nothing else changes:
+Eight files and one empty folder land, and nothing else changes:
 
 ```
-README.txt
-LICENSE
+config/rommsync/README.txt
+config/rommsync/LICENSE
+config/rommsync/THIRD_PARTY_NOTICES.txt
+config/rommsync/COPYING.GPL-2.0
 atmosphere/contents/4200000000524D53/exefs.nsp
 atmosphere/contents/4200000000524D53/toolbox.json
 atmosphere/contents/4200000000524D53/flags/
@@ -101,8 +103,14 @@ switch/.overlays/ovl-rommsync.ovl
 - `config/rommsync/config.ini.example` is a starting configuration. It is an
   *example*: the file the client actually reads is `config/rommsync/config.ini`,
   which you make in step 3.
-- `README.txt` and `LICENSE` land at the **root** of the card under those names,
-  so an unrelated `README.txt` or `LICENSE` already sitting there is replaced.
+- `config/rommsync/README.txt` is the short version of this guide.
+  `config/rommsync/LICENSE`, `config/rommsync/COPYING.GPL-2.0` and
+  `config/rommsync/THIRD_PARTY_NOTICES.txt` are the licences: the sysmodule is
+  MIT, the overlay is GPL-2.0 because it links libultrahand, and the notices
+  cover every library either one links ([LICENSING.md](LICENSING.md)). Nothing
+  lands at the root of the card itself. Releases up to v1.0.0-rc2 put a
+  `README.txt` and a `LICENSE` there; if the ones at your root are rommsync-nx's,
+  they can go.
 
 The `flags/` folder arrives **empty**. Nothing in it means the sysmodule does
 not start at boot; ovl-sysmodules puts `boot2.flag` there the first time you
@@ -326,7 +334,7 @@ RetroArch's and the converters wait on real save files captured on hardware
 Download the newer release and unzip it over the top, onto the SD root, exactly
 as in step 1.
 
-The six files from step 1 are replaced. Nothing else is, because nothing else
+The eight files from step 1 are replaced. Nothing else is, because nothing else
 is in the archive:
 
 | File | What happens |

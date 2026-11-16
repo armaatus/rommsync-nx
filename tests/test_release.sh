@@ -322,6 +322,15 @@ phase_notes() {
   grep -q 'github.com/.*rommsync-nx' "$body" ||
     fail "the notes do not link the project"
 
+  # The source offer (#300): the overlay is GPL-2.0, and the release that ships
+  # it names where the corresponding source is -- the tree at this tag, which
+  # pins libultrahand as a submodule -- and where the notices are.
+  grep -q "rommsync-nx/tree/v$version" "$body" ||
+    fail "the notes do not link the source at tree/v$version"
+  grep -q 'THIRD_PARTY_NOTICES.txt' "$body" ||
+    fail "the notes do not say where the third-party notices are"
+  grep -q 'GPL' "$body" || fail "the notes do not say the overlay is GPL-2.0"
+
   # What it was built against, which is the one compatibility statement a
   # release makes -- and it is a statement about a target, not a verified claim:
   # nothing here has run on hardware before M8-1.

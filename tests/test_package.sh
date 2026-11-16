@@ -45,6 +45,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE="$REPO_ROOT/scripts/package.sh"
+NOTICES="$REPO_ROOT/scripts/notices.sh"
 # The pinned image (#199), named in one place.
 # shellcheck source=../scripts/toolchain.sh
 . "$REPO_ROOT/scripts/toolchain.sh"
@@ -100,8 +101,10 @@ run_package() {
 # boot2.flag inside it is what does that, and it is not shipped.
 expected_entries() {
   printf '%s\n' \
-    "README.txt" \
-    "LICENSE" \
+    "config/rommsync/README.txt" \
+    "config/rommsync/LICENSE" \
+    "config/rommsync/THIRD_PARTY_NOTICES.txt" \
+    "config/rommsync/COPYING.GPL-2.0" \
     "atmosphere/contents/$1/exefs.nsp" \
     "atmosphere/contents/$1/toolbox.json" \
     "atmosphere/contents/$1/flags/" \
@@ -229,18 +232,37 @@ phase_layout() {
   # The README a user reads is the one this build produced: an unsubstituted
   # placeholder is a file that tells them to install into a directory called
   # @TITLE_ID@.
-  grep -q "$VERSION" "$tree/README.txt" || fail "README.txt does not carry $VERSION"
-  grep -q "$tid" "$tree/README.txt" || fail "README.txt does not carry the title id"
+  local readme="$tree/config/rommsync/README.txt"
+  grep -q "$VERSION" "$readme" || fail "README.txt does not carry $VERSION"
+  grep -q "$tid" "$readme" || fail "README.txt does not carry the title id"
   # The placeholder shape, not every at-sign: a contact address or a GitHub
   # handle in the shipped README is not a bug, and banning them would fail here
   # with a message about something else entirely.
-  grep -qE '@[A-Z_]+@' "$tree/README.txt" &&
+  grep -qE '@[A-Z_]+@' "$readme" &&
     fail "README.txt still holds an unsubstituted @PLACEHOLDER@"
 
   cmp -s "$REPO_ROOT/packaging/config.ini.example" \
          "$tree/config/rommsync/config.ini.example" ||
     fail "the packaged config.ini.example is not packaging/config.ini.example"
-  cmp -s "$REPO_ROOT/LICENSE" "$tree/LICENSE" || fail "the packaged LICENSE differs"
+  cmp -s "$REPO_ROOT/LICENSE" "$tree/config/rommsync/LICENSE" ||
+    fail "the packaged LICENSE differs"
+
+  # Nothing lands at the SD root (#300). The root is shared by every piece of
+  # homebrew on the card, and a README.txt or LICENSE there is somebody else's
+  # file this archive would silently replace.
+  grep -qv '/' <<<"$entries" &&
+    fail "the archive puts a file at the SD root: $(grep -v '/' <<<"$entries" | head -n 1)"
+
+  # The overlay binary is GPL-2.0 (docs/LICENSING.md), so its licence text and
+  # the notices for everything linked into either binary travel with it. Both
+  # are compared against their sources, not merely found: a notices file from a
+  # stale manifest is the non-compliance this exists to prevent.
+  cmp -s "$REPO_ROOT/packaging/licenses/GPL-2.0.txt" \
+         "$tree/config/rommsync/COPYING.GPL-2.0" ||
+    fail "the packaged COPYING.GPL-2.0 is not packaging/licenses/GPL-2.0.txt"
+  "$NOTICES" > "$SCRATCH/notices.txt" || fail "scripts/notices.sh failed"
+  cmp -s "$SCRATCH/notices.txt" "$tree/config/rommsync/THIRD_PARTY_NOTICES.txt" ||
+    fail "the packaged THIRD_PARTY_NOTICES.txt is not what scripts/notices.sh generates"
 
   # The overlay names the same title id, because it looks for `exefs.nsp` and
   # `flags/boot2.flag` under it to tell "not installed" from "not set to boot"
@@ -431,10 +453,9 @@ phase_upgrade() {
   echo "someone else's overlay" > "$sd/switch/.overlays/ovl-sysmodules.ovl"
   mkdir -p "$sd/atmosphere/contents/0100000000000352"
   echo "someone else's sysmodule" > "$sd/atmosphere/contents/0100000000000352/exefs.nsp"
-  # ...and the two files at the SD root that this archive DOES take over. The
-  # layout #32 specifies puts README.txt and LICENSE there, so they are replaced
-  # like the artifacts are, and README.txt says so. Seeded here so the exemption
-  # below is a decision on the record rather than a case the test never met.
+  # ...and the two files at the SD root that releases before #300 took over.
+  # This archive keeps its README.txt and LICENSE under config/rommsync/, so
+  # somebody else's at the root must come through untouched.
   echo "someone else's README" > "$sd/README.txt"
   echo "someone else's LICENSE" > "$sd/LICENSE"
 
@@ -460,7 +481,7 @@ phase_upgrade() {
     path="${line#* * }"
     case "$path" in
       *"/atmosphere/contents/$tid/exefs.nsp"|*"/atmosphere/contents/$tid/toolbox.json"| \
-      *"/switch/.overlays/ovl-rommsync.ovl"|./README.txt|./LICENSE)
+      *"/switch/.overlays/ovl-rommsync.ovl")
         continue ;;  # the archive's own files, replaced on purpose
     esac
     grep -qxF "$line" <<<"$after" || fail "unpacking changed or removed $path"
@@ -471,15 +492,84 @@ phase_upgrade() {
     fail "the upgrade did not install exefs.nsp"
   [ "$(tail -c 4 "$sd/switch/.overlays/ovl-rommsync.ovl")" = "ULTR" ] ||
     fail "the upgrade did not install the overlay"
-  grep -q 'rommsync-nx' "$sd/README.txt" ||
-    fail "the upgrade did not replace README.txt at the SD root"
-  cmp -s "$REPO_ROOT/LICENSE" "$sd/LICENSE" ||
-    fail "the upgrade did not replace LICENSE at the SD root"
+  grep -q 'rommsync-nx' "$sd/config/rommsync/README.txt" ||
+    fail "the upgrade did not install config/rommsync/README.txt"
+  [ -s "$sd/config/rommsync/THIRD_PARTY_NOTICES.txt" ] ||
+    fail "the upgrade did not install config/rommsync/THIRD_PARTY_NOTICES.txt"
   python3 "$REPO_ROOT/tests/toolbox_check.py" \
       "$sd/atmosphere/contents/$tid/toolbox.json" "$tid" "$VERSION" ||
     fail "the upgrade did not replace the previous release's toolbox.json"
 
   echo "ok: unzipping twice over an install leaves config.ini, boot2.flag and the rest alone"
+}
+
+# --- the notices: nothing linked without its licence (#300) -------------------
+
+phase_notices() {
+  bash -n "$NOTICES" || fail "scripts/notices.sh does not parse"
+  SCRATCH="$(mktemp -d)"
+  local manifest="$REPO_ROOT/packaging/third_party.manifest"
+
+  # The real tree: every -l, every submodule, a row.
+  "$NOTICES" --check 2>"$SCRATCH/err" ||
+    { cat "$SCRATCH/err" >&2; fail "the manifest misses a linked library"; }
+
+  # ...and the check is not vacuous. Each case is the manifest minus one row,
+  # which must be refused by name: -lcurl is in switch.mk, libultrahand is in
+  # .gitmodules.
+  local name token
+  for name in curl libultrahand; do
+    grep -v "^$name |" "$manifest" > "$SCRATCH/short.manifest"
+    "$NOTICES" --check --manifest "$SCRATCH/short.manifest" 2>"$SCRATCH/err" &&
+      fail "a manifest without its $name row was accepted"
+    case "$name" in curl) token="-lcurl" ;; *) token="overlay/lib/libultrahand" ;; esac
+    grep -qF -- "$token" "$SCRATCH/err" ||
+      fail "the refusal for a missing $name row does not name $token: $(cat "$SCRATCH/err")"
+  done
+
+  # A link map is read the same way: an archive the linker pulled in with no
+  # row, and one in a binary its row does not list, are both refused. Map lines
+  # in the shape GNU ld writes them.
+  printf 'LOAD /opt/devkitpro/portlibs/switch/lib/libfoo.a\n' > "$SCRATCH/foo.map"
+  "$NOTICES" --check --map overlay="$SCRATCH/foo.map" 2>"$SCRATCH/err" &&
+    fail "a link map naming libfoo.a, which has no row, was accepted"
+  grep -q 'libfoo.a' "$SCRATCH/err" || fail "the refusal does not name libfoo.a"
+  printf 'LOAD /opt/devkitpro/portlibs/switch/lib/libcurl.a\n' > "$SCRATCH/curl.map"
+  "$NOTICES" --check --map sysmodule="$SCRATCH/curl.map" 2>/dev/null &&
+    fail "libcurl.a in the sysmodule was accepted though its row says overlay only"
+  "$NOTICES" --check --map overlay="$SCRATCH/curl.map" 2>/dev/null ||
+    fail "libcurl.a in the overlay was refused though its row says overlay"
+
+  # The libultrahand row names the commit the submodule pointer does: a bump
+  # that leaves the row behind is a notice pointing at somebody else's source.
+  local pinned
+  pinned="$(git -C "$REPO_ROOT" ls-files -s overlay/lib/libultrahand | awk '{print $2}')"
+  [ -n "$pinned" ] || fail "cannot read the libultrahand gitlink"
+  grep -E '^libultrahand \|' "$manifest" | grep -q "$pinned" ||
+    fail "the libultrahand row does not name the pinned commit $pinned"
+
+  # The GPL text shipped is the one libultrahand itself is licensed by.
+  if [ -f "$REPO_ROOT/overlay/lib/libultrahand/LICENSE" ]; then
+    cmp -s "$REPO_ROOT/overlay/lib/libultrahand/LICENSE" \
+           "$REPO_ROOT/packaging/licenses/GPL-2.0.txt" ||
+      fail "packaging/licenses/GPL-2.0.txt is not libultrahand's LICENSE"
+  fi
+
+  # Every row reaches the notices, with its licence text in full.
+  local out="$SCRATCH/notices.txt" text missing
+  "$NOTICES" > "$out" || fail "scripts/notices.sh failed"
+  while IFS='|' read -r name _ _ _ _ _ text; do
+    name="$(sed 's/[[:space:]]*$//' <<<"$name")"
+    text="$(tr -d '[:space:]' <<<"$text")"
+    grep -qF "$name" "$out" || fail "the notices do not name $name"
+    # Line by line rather than as one block: grep has no multi-line match, and
+    # every line of the text being present is what "carries it" means here.
+    missing="$(grep -vxF -f "$out" "$REPO_ROOT/packaging/licenses/$text" | grep -v '^$' | head -n 1)"
+    [ -z "$missing" ] || fail "the notices lack a line of packaging/licenses/$text: $missing"
+  done < <(grep -vE '^[[:space:]]*(#|$)' "$manifest")
+  grep -q "tree/v$VERSION" "$out" || fail "the notices do not link the source tag v$VERSION"
+
+  echo "ok: every linked library has a row, and every row reaches the notices"
 }
 
 # --- the real thing ------------------------------------------------------------
@@ -497,7 +587,8 @@ phase_builds() {
   cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$REPO_ROOT/overlay" \
         "$REPO_ROOT/packaging" "$SCRATCH/"
   mkdir -p "$SCRATCH/scripts"
-  cp "$PACKAGE" "$SCRATCH/scripts/"
+  cp "$PACKAGE" "$NOTICES" "$SCRATCH/scripts/"
+  cp "$REPO_ROOT/.gitmodules" "$SCRATCH/"
   # Sources only, so the assertions below read this build's output and not a
   # previous one's. Removing the object directory is what actually forces the
   # rebuild -- `$(OUTPUT).elf: $(OFILES)` and the objects live in `build/`, so
@@ -531,6 +622,13 @@ phase_builds() {
   local tid; tid="$(program_id)" || exit 1
   local zip="$SCRATCH/dist/rommsync-nx-$VERSION.zip"
   [ -s "$zip" ] || { cat "$log" >&2; fail "no $zip"; }
+
+  # What the linker really pulled into each binary, specs-file archives
+  # included, each with a manifest row that lists that binary (#300).
+  "$NOTICES" --check --manifest "$REPO_ROOT/packaging/third_party.manifest" \
+      --map sysmodule="$SCRATCH/sysmodule/build/sys-rommsync.map" \
+      --map overlay="$SCRATCH/overlay/build/ovl-rommsync.map" ||
+    fail "a library in a real link map has no row in packaging/third_party.manifest"
 
   assert_archive "$zip" "$tid"
 
@@ -569,6 +667,7 @@ case "${1:-}" in
   refuses)       phase_refuses ;;
   deterministic) phase_deterministic ;;
   upgrade)       phase_upgrade ;;
+  notices)       phase_notices ;;
   builds)        phase_builds ;;
-  *) echo "usage: $0 {layout|toolbox|refuses|deterministic|upgrade|builds}" >&2; exit 2 ;;
+  *) echo "usage: $0 {layout|toolbox|refuses|deterministic|upgrade|notices|builds}" >&2; exit 2 ;;
 esac

@@ -188,8 +188,8 @@ cat <<EOF
 
 Download **\`$ZIP\`** below and unzip it onto the **root** of your SD card.
 It merges with what is already there; it does not replace your
-\`config.ini\`, your pairing, your sync state or your save backups. It does
-replace a \`README.txt\` or \`LICENSE\` at the root of the card.
+\`config.ini\`, your pairing, your sync state or your save backups, and it
+puts nothing at the root of the card itself.
 
 You need Ultrahand (or Tesla), ovl-sysmodules, and a RomM 5.4.0 or later
 server. The sysmodule ships **disabled** — nothing runs until you enable it with
@@ -203,6 +203,15 @@ and when something does not sync, every log line and what to do about it:
   $URL/blob/$TAG/docs/TROUBLESHOOTING.md
 
 Built with $(toolchain), for $ATMOSPHERE_TARGET.
+
+**Licences and source.** The overlay statically links libultrahand and is
+distributed under the GPL, version 2; the sysmodule is MIT. The archive carries
+both texts and the notices for every library either binary links, under
+\`config/rommsync/\` (\`COPYING.GPL-2.0\`, \`LICENSE\`, \`THIRD_PARTY_NOTICES.txt\`).
+The complete corresponding source of this release, with the libultrahand
+commit it pins, is the tree at this tag:
+
+  $URL/tree/$TAG
 
 > Not yet verified on hardware. Every guarantee this build carries was proven
 > against a real RomM server and a cross-compile, never on a console — see the

@@ -2041,7 +2041,8 @@ foreach(scenario
         toolbox         # every toolbox.json ovl-sysmodules skips or aborts on is refused (#211)
         refuses         # a wrong .nsp, an unsigned .ovl, a missing input
         deterministic   # the same inputs, the same bytes
-        upgrade)        # unzipping over an install keeps config.ini and the rest
+        upgrade         # unzipping over an install keeps config.ini and the rest
+        notices)        # every linked library has a notice row, every row ships (#300)
   add_test(NAME package.${scenario}
            COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" ${scenario})
   set_tests_properties(package.${scenario} PROPERTIES TIMEOUT 120)
