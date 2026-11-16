@@ -569,8 +569,13 @@ Push the tag and the `release` job in
 for `static`, `host-tests` and `switch-build`, checks the tag and `VERSION` agree
 and that the tagged commit is an ancestor of `main` — the three jobs say the
 commit is *good*, nothing else says it was *reviewed*, and a tag can be pushed at
-any branch head — then builds the three Switch targets in `devkitpro/devkita64`,
-runs `scripts/package.sh`, and writes a `SHA256SUMS` beside the archive.
+any branch head — then takes the three artifacts `switch-build` built and
+checked in the same run, re-reads them with `scripts/artifact-check.py`, runs
+`scripts/package.sh` on them in `devkitpro/devkita64`, writes a `SHA256SUMS`
+beside the archive, and attests both with `actions/attest` (signed build
+provenance; `gh attestation verify <zip> --repo <owner>/<repo>` checks it). It
+builds nothing itself: what ships is the build `switch-build`'s checks read
+(#303).
 
 It publishes in that order too: the release is created as a **draft**, the two
 assets are uploaded, both are pulled back *out* of the release through the API
@@ -580,7 +585,7 @@ page advertising a truncated download whenever an upload failed. The body is
 `scripts/release-notes.sh`: the install lines, what the build targets, the
 commits since the previous tag, and those checksums.
 
-Eight things are worth knowing before you do it:
+Nine things are worth knowing before you do it:
 
 - **That pull request is an ordinary one.** It needs the required checks green
   and no review thread left open (`required_conversation_resolution` is on);
@@ -597,7 +602,17 @@ Eight things are worth knowing before you do it:
 - **The checksums are computed beside the build.** The archive is
   byte-deterministic for one `zip` build, which is what makes a published
   checksum a statement about these bytes — one recomputed on another host is a
-  checksum of something else.
+  checksum of something else. The binaries inside it are reproducible across
+  checkout paths: `switch.mk` maps the tree's absolute path out of `__FILE__`
+  and the debug info, and `ctest -R package.reproducible` (in `switch-build`,
+  through `tests/toolchain_suite.sh`) builds the tree at two paths and compares.
+- **What the release says about itself follows two facts.** "Pre-release", in
+  the notes and in the archive's `README.txt`, follows `VERSION`
+  (`release-notes.sh --prerelease`). "Not yet verified on hardware" follows the
+  launch gate (#305, `scripts/launch-gate.sh`): `release-notes.sh --verified`
+  is `true` only once that script exists and lists no `console` row, so every
+  release says it until a console has run the build and the gate records it.
+  `ctest -R 'release.wording|package.wording'` holds both.
 - **A stable release's notes start at the last stable release**, not at the last
   release candidate. `v0.2.0` cut after a `v0.2.0-rc1` lists everything since
   `v0.1.0`; `v0.2.0-rc2` lists everything since `rc1`. `ctest -R release.history`
@@ -613,7 +628,7 @@ Eight things are worth knowing before you do it:
   `ctest -R release.compatibility` holds those two together and refuses a third
   copy, so the fix is still that one constant and a guide edit in the same
   commit. Nothing here has run on a console — the notes say so in the release
-  itself. Confirming or correcting the numbers is part of the M8-1 gate (#43),
+  itself, until the launch gate says otherwise. Confirming or correcting the numbers is part of the M8-1 gate (#43),
   on the `media` row, which prints them beside the NAND backup because the same
   first boot settles both.
 - **Both halves of that line were corrected, not confirmed, by M6-4 (#142)** —

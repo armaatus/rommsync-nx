@@ -364,6 +364,14 @@ jobs:
   # proven, and static is where this very workflow is checked for validity. A
   # release that skipped any of them would be bytes nobody tested.
   #
+  # ...and it builds nothing itself (#303). It used to run its own three
+  # `make`s, and those bytes went through none of switch-build's checks --
+  # artifact-check, the image budget, the toolchain's ctest entries -- nor were
+  # they compared with the ones that did. What it packages now is switch-build's
+  # upload from this same run, so what a user downloads is the build those
+  # checks read. `package.reproducible`, run by switch-build, is what says
+  # anyone else building the tag in the pinned image gets the same bytes.
+  #
   # Those three say the tagged commit is GOOD. They do not say it was reviewed:
   # a tag can be pushed at any commit on any branch, and this job would publish
   # it. The `git merge-base` step below is what closes that, since every commit
@@ -388,9 +396,14 @@ jobs:
       run:
         shell: bash
     # The default token is read-only. Creating a release and attaching assets to
-    # it is the only write this workflow does, and it is scoped to this job.
+    # it is the only write this workflow does, and it is scoped to this job --
+    # with the three the attestation needs: an OIDC token for Sigstore to sign
+    # with, and the right to store the attestation and its artifact record.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -451,23 +464,39 @@ jobs:
             echo "PRERELEASE=$prerelease"
           } >> "$GITHUB_ENV"
 
-      # The same three builds switch-build runs, in the same image. tlsprobe is
-      # built but never packaged -- it is a spike, never installed
-      # (tlsprobe/README.md) -- and it is built here so a release cannot be cut
-      # from a tree where it stopped compiling.
-      - name: Build sysmodule
-        run: make -C sysmodule -j"$(nproc)"
+      # switch-build's three artifacts, from this run and so from this commit.
+      # tlsprobe's comes along and is never packaged -- it is a spike, never
+      # installed (tlsprobe/README.md) -- but switch-build had to build it for
+      # this job to start, so a release still cannot be cut from a tree where
+      # it stopped compiling.
+      - name: Take switch-build's artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: rommsync-nx
+          path: switch-build
 
-      - name: Build overlay
-        run: make -C overlay -j"$(nproc)"
-
-      - name: Build the TLS probe
-        run: make -C tlsprobe -j"$(nproc)"
+      # Read again on the way in, by the parser switch-build used: the artifact
+      # store is one more hop these bytes took since they were checked. The
+      # digests go in the log, where they can be compared with a rebuild.
+      - name: The artifacts are what they claim to be
+        run: |
+          set -euo pipefail
+          python3 scripts/artifact-check.py container \
+            switch-build/sysmodule/sys-rommsync.nsp \
+            switch-build/overlay/ovl-rommsync.ovl \
+            switch-build/tlsprobe/rommsync-tlsprobe.nro
+          sha256sum switch-build/sysmodule/sys-rommsync.nsp \
+            switch-build/overlay/ovl-rommsync.ovl
 
       # The zip is the only thing a user should ever download: a loose .nsp under
-      # its build name installs cleanly and does nothing at all (#32).
+      # its build name installs cleanly and does nothing at all (#32). Named
+      # inputs rather than package.sh's defaults, which are where a `make` in
+      # this job would have put a build of its own.
       - name: Package
-        run: scripts/package.sh
+        run: |
+          scripts/package.sh \
+            --nsp switch-build/sysmodule/sys-rommsync.nsp \
+            --ovl switch-build/overlay/ovl-rommsync.ovl
 
       # Computed beside the build, in the same job. The archive is
       # byte-deterministic for one `zip` build, which is what makes this a
@@ -482,6 +511,18 @@ jobs:
           cd dist
           sha256sum "rommsync-nx-$VERSION.zip" > SHA256SUMS
           cat SHA256SUMS
+
+      # Signed provenance for both assets: which workflow, commit and run made
+      # them, in a form `gh attestation verify` checks without trusting this
+      # repository's token. Before Publish, so no release -- draft or not --
+      # exists for bytes that have none. One of GitHub's own actions, not a
+      # third party's: the supply-chain worry below is about the latter.
+      - name: Attest the archive and the checksums
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/rommsync-nx-${{ env.VERSION }}.zip
+            dist/SHA256SUMS
 
       - name: Release notes
         run: |

@@ -256,9 +256,11 @@ phase_ci() {
 
   # What it packages is what it downloaded, named, rather than package.sh's
   # defaults -- which are where a `make` would have put a build.
-  local package_call
-  package_call="$(grep -E 'scripts/package\.sh' <<<"$code")"
-  grep -q -- '--nsp' <<<"$package_call" && grep -q -- '--ovl' <<<"$package_call" ||
+  local package_step
+  package_step="$(release_step Package | uncommented)"
+  grep -q 'scripts/package.sh' <<<"$package_step" ||
+    fail "the release job's Package step does not run scripts/package.sh"
+  grep -q -- '--nsp' <<<"$package_step" && grep -q -- '--ovl' <<<"$package_step" ||
     fail "the release job packages package.sh's default paths, not the downloaded artifacts"
   # ...and they are re-read as what they claim to be on the way in: an artifact
   # store is one more hop the bytes took since switch-build checked them.

@@ -185,9 +185,10 @@ toolchain_missing() {
 # maps ownership back on macOS, but on Linux the default root would leave a
 # temp directory rm -rf cannot clear.
 #
-# DIR is mounted at $TOOLCHAIN_WORKDIR, /work unless set: `package.reproducible`
-# builds two copies at two different paths, and through docker every copy would
-# otherwise be built at the same one.
+# Through docker, DIR is mounted at $TOOLCHAIN_WORKDIR, /work unless set:
+# `package.reproducible` builds two copies at two different paths, and every
+# copy would otherwise be built at the same one. In the image (--here) DIR is
+# built where it is, so the copies' own paths already differ.
 toolchain_run() {
   local dir="$1" script="$2" workdir="${TOOLCHAIN_WORKDIR:-/work}"
   shift 2

@@ -189,7 +189,17 @@ ROMMSYNC_VENDOR_DROPS := -Wextra -Wpedantic -Werror
 ROMMSYNC_CODEGEN := -Os -flto=auto -ffunction-sections -fdata-sections \
 			-fno-unwind-tables -fno-asynchronous-unwind-tables
 
-CFLAGS := -g $(ROMMSYNC_WARNINGS) $(ROMMSYNC_CODEGEN) $(ARCH) $(DEFINES)
+# The checkout's path, out of the bytes (#303). `__FILE__` in an assert and the
+# DWARF a link writes both carry the absolute path the tree was built in, so
+# the same commit built in /work and in /__w/rommsync-nx/rommsync-nx produced
+# three different .nsp/.ovl/.nro -- and a published checksum nobody rebuilding
+# the tag could reproduce. Mapped to the repo-relative path instead. On the
+# link as well as the compile: under LTO the link is where the code and its
+# debug info are generated. `package.reproducible` builds the tree at two paths
+# and holds this.
+ROMMSYNC_REPRO := -ffile-prefix-map=$(abspath $(ROMMSYNC_ROOT))/=
+
+CFLAGS := -g $(ROMMSYNC_WARNINGS) $(ROMMSYNC_CODEGEN) $(ROMMSYNC_REPRO) $(ARCH) $(DEFINES)
 
 CFLAGS += $(INCLUDE) -D__SWITCH__
 
@@ -217,7 +227,7 @@ ASFLAGS := -g $(ARCH)
 # flags (`stack.measured` adds -fstack-usage -fcallgraph-info=su), and under
 # LTO the compile that decides the frames is the link's. A -D in it is inert
 # here, since the link preprocesses nothing.
-LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) $(ROMMSYNC_CODEGEN) $(DEFINES) \
+LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) $(ROMMSYNC_CODEGEN) $(ROMMSYNC_REPRO) $(DEFINES) \
 			-Wl,--gc-sections -Wl,-Map,$(notdir $*.map)
 
 LIBS += -lnx

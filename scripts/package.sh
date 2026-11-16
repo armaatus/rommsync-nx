@@ -210,7 +210,9 @@ CONFIG_EXAMPLE="$REPO_ROOT/packaging/config.ini.example"
 LICENSE="$REPO_ROOT/LICENSE"
 GPL_TEXT="$REPO_ROOT/packaging/licenses/GPL-2.0.txt"
 NOTICES="$REPO_ROOT/scripts/notices.sh"
-for f in "$TEMPLATE" "$TOOLBOX_TEMPLATE" "$CONFIG_EXAMPLE" "$LICENSE" "$GPL_TEXT" "$NOTICES"; do
+RELEASE_NOTES="$REPO_ROOT/scripts/release-notes.sh"
+for f in "$TEMPLATE" "$TOOLBOX_TEMPLATE" "$CONFIG_EXAMPLE" "$LICENSE" "$GPL_TEXT" "$NOTICES" \
+         "$RELEASE_NOTES"; do
   [ -f "$f" ] || die "missing $f"
 done
 
@@ -235,10 +237,36 @@ cp "$LICENSE" "$STAGE/$LICENSE_ENTRY"
 cp "$GPL_TEXT" "$STAGE/$GPL_ENTRY"
 bash "$NOTICES" > "$STAGE/$NOTICES_ENTRY" || die "could not generate the notices"
 
-# The version and the title id a user reads are the ones the archive was built
-# with, substituted the way switch.mk substitutes version.hpp.in.
-sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
-  "$TEMPLATE" > "$STAGE/$README_ENTRY"
+# What the README says about the build is asked of release-notes.sh, which the
+# release page is written by, so the two cannot disagree (#303): PRE-RELEASE
+# only when VERSION is one, and "not yet run on a real console" only while the
+# launch gate still holds a console row. Every README used to say both.
+PRERELEASE="$(bash "$RELEASE_NOTES" --prerelease)" || die "release-notes.sh --prerelease failed"
+VERIFIED="$(bash "$RELEASE_NOTES" --verified)" || die "release-notes.sh --verified failed"
+
+# The template's paragraphs that hold only sometimes sit between an
+# `@IF <condition>@` line and an `@ENDIF@` line; the markers never ship, and a
+# condition this does not know is refused rather than read as false.
+# Then the version and the title id a user reads are the ones the archive was
+# built with, substituted the way switch.mk substitutes version.hpp.in.
+awk -v prerelease="$PRERELEASE" -v verified="$VERIFIED" '
+  /^@IF [a-z]+@$/ {
+    if (inblock) { print "nested @IF at line " NR > "/dev/stderr"; failed = 1; exit 1 }
+    cond = substr($2, 1, length($2) - 1)
+    if      (cond == "prerelease") keep = (prerelease == "true")
+    else if (cond == "unverified") keep = (verified == "false")
+    else { print "unknown condition @IF " cond "@ at line " NR > "/dev/stderr"; failed = 1; exit 1 }
+    inblock = 1; next
+  }
+  /^@ENDIF@$/ { inblock = 0; next }
+  !inblock || keep
+  END { if (inblock && !failed) { print "@IF without @ENDIF" > "/dev/stderr"; exit 1 } }
+' "$TEMPLATE" |
+  sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
+  > "$STAGE/$README_ENTRY" || die "could not render $TEMPLATE"
+if grep -qE '^@|@[A-Z_]+@' "$STAGE/$README_ENTRY"; then
+  die "README.txt still holds a template marker"
+fi
 
 # ovl-sysmodules parses this one, so a substitution that did not happen is not a
 # cosmetic bug: `@TITLE_ID@` is not hex, `strtoul` reads it as 0, and the module

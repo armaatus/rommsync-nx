@@ -8,9 +8,17 @@ Ultrahand overlay (ovl-rommsync) to drive it.
 
   https://github.com/armaatus/rommsync-nx
 
-This is a PRE-RELEASE that has not yet been run on a real console. Try it
-on a spare SD card or an emuMMC with a NAND backup, against a RomM you do
-not mind losing saves on.
+@IF prerelease@
+This is a PRE-RELEASE: a release candidate, which may still change before
+the release it leads to.
+
+@ENDIF@
+@IF unverified@
+This build has not yet been run on a real console. Try it on a spare SD
+card or an emuMMC with a NAND backup, against a RomM you do not mind
+losing saves on.
+
+@ENDIF@
 
 
 YOU NEED
