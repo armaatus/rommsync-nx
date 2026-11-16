@@ -1023,6 +1023,7 @@ set(EXECUTE_RIG_SCENARIOS
   revoked         # M1-4: a 401 stops the plan where it stands, and touches no save
   late_fetch      # #263: a write between the backup and a download's or conflict's commit stays
   stale_fetch     # #286: ...and one between the scan and the backup, which the ruling never saw
+  stale_place     # #318: ...and a placement's, onto a path the scan found empty
 )
 foreach(scenario IN LISTS EXECUTE_RIG_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -1460,6 +1461,7 @@ set(STATES_RIG_SCENARIOS
   crash      # M9-14: ...and a power cut at every call of it loses nothing
   late_write # #270: ...and a write between its backup and its commit stays on the card
   stale_write # #286: ...and one between the scan and the backup, which nothing ruled on
+  stale_place # #318: ...and a placement's, onto a path the scan found empty
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
   mapped     # #239: Tico's Auto up as .state.auto with its screenshot, down as Tico's and RetroArch's

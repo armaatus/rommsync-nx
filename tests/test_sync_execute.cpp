@@ -2233,6 +2233,89 @@ void StaleFetch(rig::Checks& checks, http::HttpClient& client, const std::string
   }
 }
 
+// --- stale_place --------------------------------------------------------------
+//
+// #318: `stale_fetch` for a placement. The scan found nothing at the path, so
+// nothing was ruled on there -- and a game writing its first save while the
+// download runs makes a save the server never saw. Committed over, it would live
+// in `.backup/` alone, with the next tick finding the server's copy on the card.
+
+void StalePlace(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                const Fixture& fixture, const harness::Rom& rom) {
+  const std::string slot = harness::UniqueSlot("m11-318-place");
+  const std::string name = "stale-place.srm";
+  const std::string first = "the game's first save, written while the download ran\n";
+  const std::string later = "and more progress, written after the backup\n";
+
+  harness::Save server;
+  {
+    Sandbox upload(checks, "execute-stale-place-upload");
+    const std::string staged = upload.Host("/config/rommsync/server-copy.srm");
+    rig::WriteFile(staged, "a save this console has never held\n");
+    if (!harness::UploadSave(client, base, fixture, rom.id, slot, "m11-318", staged, name,
+                             /*with_device=*/false, &server)) {
+      checks.Expect(false, "the server copy was stored");
+      return;
+    }
+  }
+  // Nothing reported for the slot: the server's copy is a placement.
+  sync::SyncNegotiatePayload payload;
+  payload.device_id = fixture.device_id;
+  sync::SyncPlan plan;
+  if (!PlanFor(checks, client, base, fixture, payload, {slot}, &plan)) {
+    harness::DeleteSave(client, base, fixture, server.id);
+    return;
+  }
+
+  for (const bool again : {false, true}) {
+    const std::string what = again ? "only copy" : "placement";
+    Sandbox sandbox(checks, again ? "execute-stale-place-only-copy" : "execute-stale-place");
+    const auto files = rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+    const std::string target = SavePath(name);
+    sync::ExecuteOptions options = OptionsAt(again ? 1'757'000'731 : 1'757'000'730);
+    options.reported = &payload.saves;
+    options.place = [&target](const sync::SyncOperation&) {
+      place::Placement placement;
+      placement.sd_path = target;
+      return placement;
+    };
+    sync::ExecutionReport report;
+    {
+      // The download's `.part` made durable: the scan found the path empty, and
+      // the backup has not begun.
+      const std::string part = http::PartialPathFor(io::TempPathFor(sandbox.Host(target)));
+      faulty::LateWrite during([&] { sandbox.Reseed(target, first); }, part);
+      std::optional<faulty::LateWrite> after;
+      if (again) {
+        after.emplace([&] { sandbox.Reseed(target, later); });
+      }
+      report = sync::ExecutePlan(client, *files, TokenFor(base, fixture), plan, /*targets=*/{},
+                                 options);
+      checks.Expect(during.fired(), what + ": the game wrote while the download ran");
+      checks.Expect(!after.has_value() || after->fired(),
+                    what + ": and again after the backup");
+    }
+    const std::string& now = again ? later : first;
+    if (const auto done = ExpectStoodDown(checks, sandbox, report, target, now, what)) {
+      if (again) {
+        checks.Expect(!done->backup_sd_path.empty() &&
+                          sandbox.Read(done->backup_sd_path) == first,
+                      what + ": the backup is kept and named, the only copy of the first save: " +
+                          done->backup_sd_path);
+      } else {
+        checks.Expect(done->backup_sd_path.empty(),
+                      what + ": no backup is claimed -- the save it copied is still there: " +
+                          done->backup_sd_path);
+      }
+    }
+    checks.Expect(sandbox.HasBackupOf(first) == again,
+                  what + (again ? ": the first save is still under .backup/"
+                                : ": no copy of the save is left in .backup/ as a backup of "
+                                  "something nothing replaced"));
+  }
+  harness::DeleteSave(client, base, fixture, server.id);
+}
+
 // --- crash --------------------------------------------------------------------
 //
 // M9-14 (#203): `download`, with a power cut at every call it makes. The
@@ -3595,6 +3678,8 @@ int main(int argc, char** argv) {
     LateWriteFetch(checks, *client, base, fixture, rom);
   } else if (scenario == "stale_fetch") {
     StaleFetch(checks, *client, base, fixture, rom);
+  } else if (scenario == "stale_place") {
+    StalePlace(checks, *client, base, fixture, rom);
   } else if (scenario == "revoked") {
     Revoked(checks, *client, base, fixture, rom);
   } else {
