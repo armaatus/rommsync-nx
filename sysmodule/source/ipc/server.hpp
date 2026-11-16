@@ -52,15 +52,17 @@ class ServiceServer {
   ServiceServer(const ServiceServer&) = delete;
   ServiceServer& operator=(const ServiceServer&) = delete;
 
-  /// Serve until `svcReplyAndReceive` fails in a way that is not a closed
-  /// session -- which, for a sysmodule, is never: this does not return in
-  /// normal operation.
+  /// Serve for the life of the process. A result the loop has no case for is
+  /// logged as `ipc.error`, the sessions are dropped and the loop carries on;
+  /// it returns only after `kMaxConsecutiveIpcErrors` of them in a row, with
+  /// nothing working in between (`wait_outcome.hpp`, #291).
   void Run();
 
   /// One pass: reply to whoever was last answered, wait, and handle whatever
-  /// arrives. Separated from `Run` because it is the unit a reader can check --
-  /// this is the code with no test that can reach it, so it is kept to a size a
-  /// person can hold in their head.
+  /// arrives. Fails only with a result `DecideWait` has no case for.
+  /// Separated from `Run` because it is the unit a reader can check -- this is
+  /// the code with no test that can reach it, so it is kept to a size a person
+  /// can hold in their head.
   ///
   /// Waits indefinitely. A timeout parameter would be one more branch nothing
   /// in this build takes; the process that wants one is the scheduler (M7-2),
@@ -72,6 +74,9 @@ class ServiceServer {
   /// so the last entry moves into the hole: nothing indexes a session by
   /// anything but its position in this array.
   void Drop(std::size_t index);
+
+  /// Drop every session and keep the port: what an unexpected result leaves.
+  void DropSessions();
 
   ipc::ServiceCore& core_;
 

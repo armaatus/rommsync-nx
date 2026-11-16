@@ -115,6 +115,7 @@ and a log is not worth it. A save is never in that position; see
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
 | `clock.skew` | the console's clock is not believed — unset, or a day or more off the network clock or the server's — so saves the server would choose by timestamp are held; or it agrees again | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 | `net.tls_clock` | a TLS failure the console's clock is the likely cause of | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
+| `ipc.error` | the service the overlay talks to met a kernel error, dropped the overlay's connections and carried on — or, after several in a row, stopped | [The overlay's connection failed](#the-overlays-connection-failed) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -1074,6 +1075,30 @@ with the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug
 the lines before this one say what it was doing. If it happens on every boot,
 move `config/rommsync/queue.json` out of the way first — a queue is the one
 thing a boot reads that grows with what you asked for.
+
+### The overlay's connection failed
+
+**Symptom.** The overlay says `sys-rommsync` is not running, or it said so
+once and came back on the next screen, and the log has lines like these:
+
+```
+640 error ipc.error svcReplyAndReceive failed: 2001-0114 (0xe401); dropped 1 session(s); 1 in a row -- the IPC service carries on
+648 error ipc.error svcReplyAndReceive failed: 2001-0114 (0xe401); dropped 0 session(s); 8 in a row -- the sysmodule is stopping, and the overlay will say it is not running until the console restarts
+```
+
+**What it means.** The console's kernel refused the call the sysmodule waits
+for the overlay in. The number after `failed:` is the kernel's own result code,
+the form Atmosphère's crash reports use. A single line that *carries on* is
+survived: the overlay's connection is dropped, it opens a new one on its next
+screen, and syncing never stopped. Eight in a row with nothing working between
+them stops the sysmodule: syncing stops with it until the console restarts.
+Every save is backed up before it is overwritten and every write is atomic, so
+a stop part way through a sync costs nothing that is not picked up again.
+
+**What to do.** One line that carries on needs nothing. A line that says *is
+stopping* is a bug in the client: restart the console to bring the sysmodule
+back, and report it with the log attached
+([What to attach to a bug report](#what-to-attach-to-a-bug-report)).
 
 ### Running, but "not responding" or "still applying"
 

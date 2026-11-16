@@ -371,6 +371,8 @@ const char* ToString(Event event) {
       return "clock.skew";
     case Event::kNetTlsClock:
       return "net.tls_clock";
+    case Event::kIpcError:
+      return "ipc.error";
   }
   return "unknown";
 }

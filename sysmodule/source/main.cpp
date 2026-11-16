@@ -1890,8 +1890,9 @@ int main(int, char**) {
 
   rommsync::ipc::ServiceCore core(engine);
   rommsync::sysmodule::ServiceServer server(core, g_service_port);
-  // Does not return. A sysmodule that fell out of its service loop would sit in
-  // the process list answering nothing.
+  // Returns only after a run of kernel results the loop has no case for, each
+  // one an `ipc.error` line (#291). Ending the process then, rather than sitting
+  // in the process list answering nothing, is what lets a restart recover it.
   server.Run();
   return 0;
 }
