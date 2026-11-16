@@ -55,6 +55,16 @@ you have installed homebrew on a Switch before and have never seen RomM.
   That is the overlay that starts, stops and boot-toggles sysmodules, and it is
   the only supported way to turn `sys-rommsync` on. rommsync-nx does not ship
   its own boot switch.
+- **Room for one more sysmodule.** `sys-rommsync` is built to a resident
+  footprint of at most 2,342,912 bytes (2.23 MiB) for as long as it runs, out of
+  the memory Atmosphère sets aside for every custom sysmodule together — 7 MB on
+  Horizon 21 and 22, an experimental 16 MB on 23.0.0 with Atmosphère 1.12.x —
+  shared with nx-ovlloader's overlay heap and anything else you run beside it
+  (sys-clk, MissionControl, ldn_mitm, emuiibo…). If you already run several,
+  turn one off before enabling this one: Atmosphère's boot aborts a sysmodule
+  launch that does not fit. How the number is made up is in
+  [DEVELOPMENT.md](DEVELOPMENT.md#what-the-process-costs-the-pool); it is
+  computed from the build and has not yet been read on a real console (M12).
 - **A RomM 5.4.0 or later server the console can reach over the network** — an
   older one is refused before any save is offered to it
   ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#romm-is-too-old)) — and an account

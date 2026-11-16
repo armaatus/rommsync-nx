@@ -317,6 +317,79 @@ newlib's `printf` formatter went with #252's `snprintf` cut, and libstdc++'s
 fast_float with #253's integer-only JSON numbers; `switch.builds` refuses either
 coming back.
 
+### What the process costs the pool
+
+The image is not the whole bill, and until M11-12 (#296) nothing put the two
+beside the pool they come out of. What `sys-rommsync` holds resident, for its
+whole life, measured off the linked image in `devkitpro/devkita64:20260219`:
+
+| term | bytes | where it comes from |
+|---|---:|---|
+| code: the text and rodata segments, paged | 663,552 | the link (`scripts/image-budget.sh`) |
+| data and `.bss`, paged | 1,617,920 | of it, the 1.5 MiB inner heap (`kInnerHeapSize`) |
+| ...inside the heap: three thread stacks | 319,488 | `kHeapThreadStacks` + `kHeapWatcherStack` (`main.cpp`) |
+| ...inside the heap: bsd transfer memory | 118,784 | `kHeapSocketMemory`, `SocketBudget` |
+| the main thread's stack | 32,768 | `main_thread_stack_size` in `sys-rommsync.json` |
+| the TLS page its four threads share | 4,096 | `TLS_BYTES` |
+| `ssl` | 0 | the `ssl` sysmodule's own process ([M0-1](#m0-1-the-measurement-and-the-decision)) |
+
+**The resident footprint is 2,342,912 bytes (2.23 MiB), recorded 24 KiB over
+what this build measures.** It is one number, and it is held: `switch.builds`
+fails when the linked image plus the stack and the TLS page is over it, or more
+than 64 KiB under it -- a number that stopped being a measurement -- and
+`heap.footprint` fails when this page or INSTALL quotes any other. Moving it is
+an edit to `RESIDENT_FOOTPRINT` in `scripts/image-budget.sh` and to both
+documents, in one change.
+
+Against the pool that number is about a third of the 7 MB Atmosphere adds on
+HOS 21 and 22, and about a seventh of the experimental 16 MB 1.12.x settled on
+for 23.0.0 ([above](#what-the-image-costs)). That pool is shared: nx-ovlloader's
+overlay heap alone defaults to 4 MB on HOS 21-22 and 6 MB on 23+, and sys-clk,
+MissionControl, ldn_mitm, emuiibo and SaltyNX are each a tenant beside it. What
+this does not count: the kernel's own objects for the process (page tables, the
+`KProcess` and its threads), which are not this build's to size. Whether the
+whole set fits is a reading of `svcGetResourceLimitCurrentValue` on the System
+limit with the set running, and that is the M12 co-resident run's
+([#309](https://github.com/armaatus/rommsync-nx/issues/309)).
+
+**Cuts looked for, and none taken.** The total is over the ~2 MiB #296 named as
+the line to look below. What was looked at: the inner heap leaves 4 KiB over
+its peak, and every term of it is a bound something else enforces; the main
+thread's stack is sized against the deepest JSON it parses (#216); `-Os`, LTO
+and the dropped formatter and float parser are already taken (#200, #252, #253);
+the prebuilt libraries' `.eh_frame` (~25 KiB) needs a fork of libnx's
+`switch.ld`, declined above. Anything further is a smaller bound -- fewer saves
+a tick, a shorter rom index -- and that is a product decision, not a build one.
+
+**Sockets stay up for the life of the process; they are not brought up per
+tick.** #296 asked whether to, and the answer is no, for now:
+
+- **It frees nothing from the pool.** The bsd transfer memory is allocated out
+  of `g_inner_heap`, a `.bss` array whose pages the loader maps and the pool
+  pays for at launch. `socketExit` hands those 116 KiB back to newlib, not to
+  the system. Shrinking `kInnerHeapSize` by them is the only way to cash the
+  saving, and then the next tick's `socketInitialize` needs 116 KiB of
+  page-aligned contiguous heap left free by everything that ran in between --
+  a new way to fail, on every tick instead of once at boot.
+- **What it would free is `bsd:u` sessions**, three of them
+  (`SocketBudget::num_bsd_sessions`' two and the monitor; `kBsd` in
+  `handle_budget.hpp` adds the transfer memory's handle), of the fifteen `bsd:u`
+  allows system-wide since 18.0.0. That is real, and it is why libultrahand
+  brings sockets up per download. But the worker, the pairing thread and the
+  overlay's list paging each reach the network at times of their own, so a
+  per-tick lifetime is a reference count under a lock across two threads, and
+  the boot-time failure the overlay can report becomes a mid-tick one.
+- **The re-init cost has no host prototype.** `socketInitialize` and
+  `sslInitialize` are IPC to `bsd:u`, `sfdnsres` and `ssl`, and the desktop
+  backend has nothing comparable to time. Its cost is a console measurement,
+  behind the M8-1 gate.
+
+The open risk this leaves is the session count: a co-resident set that already
+holds `bsd:u` full at boot leaves this process without a transport until the
+next boot, since `NetworkInitialize` is not retried (`main.cpp` records why).
+The M12 co-resident run is where that is seen; a lazy retry of the transport is
+the follow-up if it is.
+
 ## Repo build layout
 
 ```
