@@ -5378,6 +5378,17 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(console.sandbox.Read(backup(100)), newest, "and so did the newest");
   c.Expect(Logged(log, "backup.pruned"), "the log says what was pruned:" + Rendered(log));
 
+  // And the status screen says the same numbers (#316): what is left, and the
+  // one kept because no other copy of its bytes exists.
+  const ipc::EngineSnapshot status = console.engine.Snapshot();
+  c.Expect(status.backup.measured, "the prune's report reaches the status");
+  c.ExpectEq(status.backup.backups, std::int64_t{2}, "two backups are left");
+  c.ExpectEq(status.backup.bytes, static_cast<std::int64_t>(unique.size() + newest.size()),
+             "and their bytes");
+  c.ExpectEq(status.backup.kept_unique, std::int64_t{1},
+             "one of them kept only because it is the only copy");
+  c.Expect(!status.backup.over_cap, "and with no cap, nothing is over it");
+
   harness::DeleteSave(client, base, fixture, uploaded.id);
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();

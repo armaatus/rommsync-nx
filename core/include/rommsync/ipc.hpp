@@ -186,7 +186,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **17** since M11-4 (#288), which added `ca_file` to `ConfigView`'s
 /// `server` -- a required field, so a v17 overlay reading a v16 sysmodule's
 /// `GetConfig` fails to decode it.
-inline constexpr std::uint32_t kVersion = 17;
+///
+/// **18** since M11-21 (#316), which added `backup` to `Status` -- a required
+/// object, so a v17 overlay reading a v18 sysmodule's `Status` fails to decode
+/// it.
+inline constexpr std::uint32_t kVersion = 18;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -445,6 +449,30 @@ struct DownloadSnapshot {
   std::int64_t bytes_total = 0;
 };
 
+/// What `.backup/` held when the last prune finished (M11-21, #316): what the
+/// retention rule left, and how much of that it could not free.
+///
+/// The last `backup::PruneReport`'s numbers, not a fresh walk of the directory:
+/// `GetStatus` is frame-polled and must never touch the card. A prune runs once
+/// after boot and then after a completed tick that wrote a backup, so between
+/// those this is what the directory still holds.
+struct BackupUsage {
+  /// A prune has finished since boot. False is "not measured yet", and every
+  /// number below is zero and says nothing.
+  bool measured = false;
+
+  /// Bytes, and backups, left in `.backup/` after the prune.
+  std::int64_t bytes = 0;
+  std::int64_t backups = 0;
+
+  /// Of those, kept past the rule because no other copy of their bytes could be
+  /// shown -- the "why" behind a directory that stays big (`PruneReport`).
+  std::int64_t kept_unique = 0;
+
+  /// Still over `[backup] max_mib` after everything provable went.
+  bool over_cap = false;
+};
+
 /// Everything the status screen needs, in one call.
 struct Status {
   /// `kVersion` as this sysmodule was built with, so the overlay can compare
@@ -530,6 +558,9 @@ struct Status {
   /// floor on a console that could compare it with nothing, which the overlay
   /// draws as "not set".
   std::int64_t clock_skew_seconds = 0;
+
+  /// See `BackupUsage` (#316).
+  BackupUsage backup;
 
   DownloadSnapshot download;
 };
@@ -1220,6 +1251,8 @@ struct EngineSnapshot {
   /// See `Status::clock_trusted` and `Status::clock_skew_seconds` (#295).
   bool clock_trusted = true;
   std::int64_t clock_skew_seconds = 0;
+  /// See `Status::backup` (#316).
+  BackupUsage backup;
   DownloadSnapshot download;
 };
 

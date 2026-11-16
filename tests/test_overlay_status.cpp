@@ -728,8 +728,63 @@ void CheckClock(Checks& checks) {
                 "pairing outranks the clock in the hint");
 }
 
+// M11-21 (#316): what `.backup/` holds after the prune, and -- when it is still
+// over `max_mib` -- why, so a player whose card is filling can see it without
+// reading the log.
+void CheckBackups(Checks& checks) {
+  const overlay::StatusView never = RenderOverWire(checks, Healthy());
+  checks.ExpectEq(ValueOf(never, "Backups"), std::string("Not measured yet"),
+                  "before the first prune the row says so rather than drawing a zero");
+  checks.Expect(ToneOf(never, "Backups") == overlay::Tone::kNeutral, "in the neutral tone");
+
+  ipc::Status measured = Healthy();
+  measured.backup.measured = true;
+  measured.backup.bytes = 41 * 1024 * 1024 + 200 * 1024;
+  measured.backup.backups = 12;
+  measured.backup.kept_unique = 3;
+  const overlay::StatusView under = RenderOverWire(checks, measured);
+  checks.ExpectEq(ValueOf(under, "Backups"), std::string("41.2 MiB, 12 backups"),
+                  "under the cap: what is left, and how many");
+  checks.Expect(ToneOf(under, "Backups") == overlay::Tone::kNeutral,
+                "is nothing to worry about, only-copies and all");
+  checks.ExpectEq(under.hint, std::string(), "and sends nobody anywhere");
+  ExpectNothingBlank(checks, under, "backups under the cap");
+
+  ipc::Status one = measured;
+  one.backup.bytes = 512;
+  one.backup.backups = 1;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, one), "Backups"), std::string("512 B, 1 backup"),
+                  "one backup is singular");
+
+  ipc::Status over = measured;
+  over.backup.bytes = 612LL * 1024 * 1024;
+  over.backup.backups = 40;
+  over.backup.kept_unique = 9;
+  over.backup.over_cap = true;
+  const overlay::StatusView full = RenderOverWire(checks, over);
+  checks.ExpectEq(ValueOf(full, "Backups"), std::string("612.0 MiB; 9 only copies"),
+                  "over the cap, the row says why the prune could not free it");
+  checks.Expect(ToneOf(full, "Backups") == overlay::Tone::kWarn, "in the warning tone");
+  checks.ExpectEq(full.hint, std::string("See TROUBLESHOOTING.md: The SD card is full"),
+                  "and the hint points at the section that says what to do");
+  ExpectNothingBlank(checks, full, "backups over the cap");
+
+  ipc::Status newest = over;
+  newest.backup.kept_unique = 0;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, newest), "Backups"),
+                  std::string("612.0 MiB; over the cap"),
+                  "over the cap with no only-copies -- the newest of each save -- says so");
+
+  // A worse problem keeps the hint: a held upload outranks a filling card.
+  ipc::Status clock = over;
+  clock.clock_trusted = false;
+  checks.ExpectEq(RenderOverWire(checks, clock).hint, std::string("Set the console's date and time"),
+                  "the clock outranks the backups in the hint");
+}
+
 int main() {
   Checks checks;
+  CheckBackups(checks);
   CheckClock(checks);
   CheckServerVersion(checks);
   CheckHealthy(checks);

@@ -87,6 +87,11 @@ ipc::Status LoadedStatus() {
   status.server_supported = false;
   status.clock_trusted = false;
   status.clock_skew_seconds = -7 * 86400;
+  status.backup.measured = true;
+  status.backup.bytes = 612LL * 1024 * 1024 + 7;
+  status.backup.backups = 41;
+  status.backup.kept_unique = 9;
+  status.backup.over_cap = true;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -226,9 +231,9 @@ int Version() {
   // older overlay has no decoder for. 15 since M11-11 (#295): `Status` gained
   // `clock_trusted` and `clock_skew_seconds`. 16 since M11-17 (#301):
   // `ConfigView` gained `play_sessions`. 17 since M11-4 (#288): and
-  // `server.ca_file`. What is frozen is command 0's
-  // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{17},
+  // `server.ca_file`. 18 since M11-21 (#316): `Status` gained `backup`. What
+  // is frozen is command 0's *encoding*, asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{18},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -362,6 +367,12 @@ int RoundTrip() {
     checks.ExpectEq(back.value.clock_trusted, sent.clock_trusted, "clock_trusted survives");
     checks.ExpectEq(back.value.clock_skew_seconds, sent.clock_skew_seconds,
                     "clock_skew_seconds survives, negative and all");
+    checks.ExpectEq(back.value.backup.measured, sent.backup.measured, "backup.measured survives");
+    checks.ExpectEq(back.value.backup.bytes, sent.backup.bytes, "backup.bytes survives");
+    checks.ExpectEq(back.value.backup.backups, sent.backup.backups, "backup.backups survives");
+    checks.ExpectEq(back.value.backup.kept_unique, sent.backup.kept_unique,
+                    "backup.kept_unique survives");
+    checks.ExpectEq(back.value.backup.over_cap, sent.backup.over_cap, "backup.over_cap survives");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");
@@ -1738,8 +1749,17 @@ int DispatchTable() {
     engine.settings.server.url = "http://romm.lan:8080";
     engine.snapshot.auth = ipc::AuthState::kPaired;
     engine.snapshot.queue_depth = 3;
+    engine.snapshot.backup.measured = true;
+    engine.snapshot.backup.bytes = 4096;
+    engine.snapshot.backup.backups = 2;
+    engine.snapshot.backup.kept_unique = 1;
+    engine.snapshot.backup.over_cap = true;
     ipc::ServiceCore core(engine);
     const ipc::Status status = core.GetStatus();
+    checks.Expect(status.backup.measured && status.backup.bytes == 4096 &&
+                      status.backup.backups == 2 && status.backup.kept_unique == 1 &&
+                      status.backup.over_cap,
+                  "backup usage comes off the engine, every field of it (#316)");
     checks.ExpectEq(status.enabled, false, "the switch is the one in config.ini");
     checks.ExpectEq(status.configured, true, "and configured follows from a usable server");
     checks.ExpectEq(status.queue_depth, std::int64_t{3}, "the queue depth comes off the engine");
