@@ -85,8 +85,8 @@ def user_facing(repo: str) -> list:
 # --- stale ----------------------------------------------------------------------
 
 def phase_stale(args) -> int:
-    bad = []
-    for rel in user_facing(args.repo):
+    bad, files = [], user_facing(args.repo)
+    for rel in files:
         for n, line in enumerate(read(os.path.join(args.repo, rel)).splitlines(), 1):
             for pattern, why in STALE:
                 if re.search(pattern, line, re.IGNORECASE):
@@ -95,7 +95,7 @@ def phase_stale(args) -> int:
         print(f"FAIL: {line}", file=sys.stderr)
     if bad:
         return 1
-    print(f"no stale claim in {len(user_facing(args.repo))} user-facing files")
+    print(f"no stale claim in {len(files)} user-facing files")
     return 0
 
 
@@ -157,7 +157,10 @@ def parse_yaml(source: str, name: str):
         n, ind, text, _ = lines[i]
         if ind != indent:
             raise YamlError(f"{name}:{n}: expected indent {indent}, got {ind}")
-        if text == "-" or text.startswith("- "):
+        if text == "-":
+            raise YamlError(f"{name}:{n}: a bare `-` item is not understood; "
+                            "put its value on the line")
+        if text.startswith("- "):
             return sequence(i, indent)
         return mapping(i, indent)
 
@@ -169,6 +172,8 @@ def parse_yaml(source: str, name: str):
                 break
             if text and base is None:
                 base = ind
+            if text and ind < base:
+                raise YamlError(f"{name}:{n}: literal block line indented less than its first")
             out.append(raw[base:] if text else "")
             i += 1
         while out and not out[-1]:
@@ -178,9 +183,11 @@ def parse_yaml(source: str, name: str):
         return "\n".join(out) + "\n", i
 
     def value_after(i, indent, rest, where):
-        """The value of a key whose text after the colon is `rest`."""
         if rest is None or rest == "":
             j = skip(i + 1)
+            if j < len(lines) and lines[j][1] == indent and lines[j][2].startswith("- "):
+                raise YamlError(f"{where}: a sequence at its key's indent is not understood; "
+                                "indent it")
             if j >= len(lines) or lines[j][1] <= indent:
                 raise YamlError(f"{where}: key with no value")
             return block(j, lines[j][1])
@@ -411,8 +418,11 @@ def phase_bug_fields(args) -> int:
         if el.get("type") != "dropdown":
             bad.append(f"`{fid}` is not a dropdown")
             continue
-        opts = " ".join(el["attributes"].get("options", []))
-        bad += [f"`{fid}` has no {w} option" for w in wanted if w not in opts]
+        # An option may explain itself ("Erista (the original 2017 model)"), so
+        # it is matched by its first word.
+        firsts = {str(o).split()[0] for o in el["attributes"].get("options", [])
+                  if str(o).split()}
+        bad += [f"`{fid}` has no {w} option" for w in wanted if w not in firsts]
 
     header = read(os.path.join(args.repo, "core", "include", "rommsync", "log.hpp"))
     m = re.search(r'kLogSdPath = "([^"]+)"', header)

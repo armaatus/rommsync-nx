@@ -1170,7 +1170,10 @@ answer: the module was never launched, which is an install problem
 
 Paste them as they are. Nothing in the log is a credential — see [Reading the
 log](#reading-the-log) — so it does not need editing first, and editing it is
-how the line that explains the failure gets lost.
+how the line that explains the failure gets lost. The one thing in it you may
+want to hide is your server's hostname: replace it, rather than deleting the
+lines it is on. The bug report form asks for each of these, together with the
+console's setup -- firmware, Atmosphère, loader, model and other sysmodules.
 
 Do **not** attach `token.dat`, `device.dat`, or a screenshot of the pairing
 screen while a code is on it.

@@ -10,9 +10,11 @@ body:
         use [Security → Report a vulnerability](https://github.com/armaatus/rommsync-nx/security/advisories/new)
         (see [SECURITY.md](https://github.com/armaatus/rommsync-nx/blob/main/SECURITY.md)).
 
-        > Note: rommsync-nx is **pre-release** — the on-console client isn't
-        > implemented yet. Bugs today will mostly concern the docs, the API
-        > contract, or the `server/` probe script.
+        Most problems have a section in
+        [TROUBLESHOOTING.md](https://github.com/armaatus/rommsync-nx/blob/main/docs/TROUBLESHOOTING.md):
+        search it for the line your log shows first. The fields below are the
+        questions a console bug gets asked before anything else; for a bug in the
+        docs or the repo's tooling, answer the console ones with "n/a".
   - type: checkboxes
     id: preflight
     attributes:
@@ -57,14 +59,92 @@ body:
     validations:
       required: true
   - type: input
+    id: version
+    attributes:
+      label: rommsync-nx version
+      description: The **Build** row of the overlay's status screen, or the first line of `rommsync.log` (`boot rommsync-nx/<version>`). If the status screen also shows an **Overlay** row, give both.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: atmosphere
+    attributes:
+      label: Atmosphère version
+      description: System Settings → System shows it after the firmware number, as `AMS 1.x.y`. The versions rommsync-nx is built for are in [INSTALL.md](https://github.com/armaatus/rommsync-nx/blob/main/docs/INSTALL.md).
+      placeholder: "1.7.1"
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Horizon firmware
+      description: System Settings → System, the number before `AMS`.
+      placeholder: "16.0.0"
+    validations:
+      required: true
+  - type: input
+    id: loader
+    attributes:
+      label: Ultrahand and nx-ovlloader versions
+      description: The Ultrahand Overlay release you installed, and the nx-ovlloader it came with or that you installed beside it.
+      placeholder: "Ultrahand 2.5.4, nx-ovlloader 2.0.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: mmc
+    attributes:
+      label: emuMMC or sysMMC
+      description: Which one Atmosphère booted when the problem happened.
+      options:
+        - "emuMMC"
+        - "sysMMC"
+        - "n/a"
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Console model
+      options:
+        - "Erista (the original 2017 model)"
+        - "Mariko (the 2019 model with the longer battery life)"
+        - "Lite"
+        - "OLED"
+        - "n/a"
+    validations:
+      required: true
+  - type: input
     id: romm-version
     attributes:
       label: RomM version
       description: The status screen's RomM row shows it. rommsync-nx syncs with RomM 5.4.0 or later.
       placeholder: "5.4.0"
+    validations:
+      required: true
+  - type: textarea
+    id: sysmodules
+    attributes:
+      label: Other sysmodules enabled
+      description: Everything else that starts with the console -- ovl-sysmodules lists them. Write "none" if there are none.
+      placeholder: |
+        sys-clk
+        MissionControl
+    validations:
+      required: true
   - type: textarea
     id: logs
     attributes:
-      label: Logs / output
-      description: Paste any relevant output. **Redact tokens and URLs.**
-      render: text
+      label: Log files
+      description: |
+        Drag `sdmc:/config/rommsync/rommsync.log` into this box, and `sdmc:/config/rommsync/rommsync.log.old` beside it if there is one.
+
+        Attach them as they are. The log is scrubbed as it is written -- no token, no pairing code and no password in a URL ever reaches it -- and editing it is how the line that explains a failure gets lost ([TROUBLESHOOTING.md, "What to attach to a bug report"](https://github.com/armaatus/rommsync-nx/blob/main/docs/TROUBLESHOOTING.md#what-to-attach-to-a-bug-report)). The one thing in it you may want to hide is your server's hostname: replace it rather than deleting the lines it is on. Never attach `token.dat` or `device.dat`.
+    validations:
+      required: true
+  - type: textarea
+    id: crash-reports
+    attributes:
+      label: Crash reports
+      description: If the overlay says the sysmodule is not running, drag the newest file from `sdmc:/atmosphere/crash_reports/` into this box. Atmosphère writes it, so it exists even when nothing reached the log. Write "empty" if the directory is empty -- that is itself an answer -- or "n/a" if the sysmodule is running.
+    validations:
+      required: true

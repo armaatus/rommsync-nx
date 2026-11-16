@@ -15,9 +15,9 @@
 issue, an issue becomes a worktree, and a worktree becomes a merged PR, including
 the parts that run without a human. The short form:
 
-1. Pick an issue carrying `ready` (start at milestone **M0**; `good-first-issue`
-   where labelled). Do not start a `blocked` one — those labels are derived, not
-   hand-set.
+1. Pick an issue carrying `ready` (`good-first-issue` where labelled; the
+   oldest open milestone first). Do not start a `blocked` one — those labels
+   are derived, not hand-set.
 2. Branch from `main`: `feature/M2-2-rom-matching`.
 3. **Plan before you edit.** Files that change, order of work, risks, proof —
    it goes in the PR body under `## Plan`.
@@ -34,10 +34,11 @@ does not have to be a spec yet.
 
 ## Order of work
 
-M0 (especially **M0-1**, the TLS spike) gates the networked milestones. Auth
-(M1) → sync engine (M2) and downloads (M3) can proceed in parallel once the
-`HttpClient` interface (M0-2) exists. The overlay (M4) can start against a stub
-IPC and integrate later.
+The client exists: M0-M10 built the engine, the sysmodule and the overlay, and
+what is open now is launch readiness -- the milestones still open on the
+tracker, gated by the v1 gate (M8-1, `./scripts/v1-gate.sh`) before anything
+touches a real console. The `ready`/`blocked` labels already encode the order
+within them; follow those rather than a list here, which would go stale.
 
 ## Ground rules
 
