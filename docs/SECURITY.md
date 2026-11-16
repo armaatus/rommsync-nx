@@ -135,4 +135,8 @@ that mistake usually takes but cannot catch a plausible-looking constant.
 
 - No inbound listeners on the Switch.
 - No third-party services — the client talks only to your RomM.
-- No telemetry.
+- No telemetry. Everything the client sends your RomM, and how to turn off what
+  save sync does not need (play sessions), is listed in [PRIVACY.md](PRIVACY.md).
+- No console serial, Nintendo account, or title id of a running game in any
+  request ([The console identifier](#the-console-identifier),
+  [PRIVACY.md](PRIVACY.md#play-sessions)).

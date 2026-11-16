@@ -71,6 +71,8 @@ void DefaultsAreTheDocumentedOnes(checks::Checks& c) {
   // is a core memory snapshot and does not survive a different core.
   c.Expect(!defaults.sync.states, "states do NOT sync by default");
   c.Expect(defaults.sync.conflict_show, "conflicts are surfaced by default");
+  // On, and recorded in #301: the play time goes only to the user's own RomM.
+  c.Expect(defaults.sync.play_sessions, "play sessions are sent by default");
   c.Expect(defaults.downloads.enabled && defaults.downloads.verify_hash &&
                defaults.downloads.resume,
            "downloads, hash verification and resume are all on by default");
@@ -304,6 +306,7 @@ on_boot       = false
 saves         = yes
 states        = ON
 conflict_show = 0
+play_sessions = off
 
 [downloads]
 enabled     = true
@@ -324,6 +327,7 @@ states = /retroarch/states, /tico/states/snes
   c.Expect(result.value.sync.saves, "saves = yes");
   c.Expect(result.value.sync.states, "states = ON is case-insensitive");
   c.Expect(!result.value.sync.conflict_show, "conflict_show = 0");
+  c.Expect(!result.value.sync.play_sessions, "play_sessions = off (#301)");
   c.Expect(!result.value.downloads.verify_hash, "verify_hash = false");
   c.Expect(result.value.downloads.resume, "resume = 1");
 

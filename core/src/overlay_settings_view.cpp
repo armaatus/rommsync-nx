@@ -129,6 +129,17 @@ SettingsRow MapStateSlotsRow(bool in_force) {
   return Changeable("sync", "map_state_slots", kValues, in_force ? "true" : "false");
 }
 
+/// `[sync] play_sessions` (#301). Offered: neither value touches a save. Off
+/// stops recording and sending play time from the next tick; the notes say
+/// what each value sends, since this row is the opt-out docs/PRIVACY.md names.
+SettingsRow PlaySessionsRow(bool in_force) {
+  static constexpr Choice kValues[] = {
+      {"Off", "false", "play time is not recorded or sent; saves still sync"},
+      {"On", "true", "play time worked out from your saves is sent to your RomM"},
+  };
+  return Changeable("sync", "play_sessions", kValues, in_force ? "true" : "false");
+}
+
 /// `[tico] account` (#231, #271), and the accounts the last tick found under
 /// `users/` as the answers to it.
 ///
@@ -341,6 +352,7 @@ SettingsSection SyncSection(const config::SyncConfig& sync) {
   section.rows.push_back(SlotRow(sync.slot));
   section.rows.push_back(Value("states", BoolText(sync.states)));
   section.rows.push_back(MapStateSlotsRow(sync.map_state_slots));
+  section.rows.push_back(PlaySessionsRow(sync.play_sessions));
   {
     // Said next to the value, because the value is the only explanation a user
     // gets for a menu row that is not there.

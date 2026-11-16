@@ -646,6 +646,11 @@ void TicoAndPlayWith(checks::Checks& c) {
   const std::string mapped =
       Applied(c, before, One("sync", "map_state_slots", "on"), "map_state_slots = true");
   c.Expect(Parsed(mapped).sync.map_state_slots, "map_state_slots reads back");
+
+  // #301's opt-out is a flag the settings screen's press sends the same way.
+  const std::string quiet =
+      Applied(c, before, One("sync", "play_sessions", "off"), "play_sessions = false");
+  c.Expect(!Parsed(quiet).sync.play_sessions, "play_sessions reads back");
 }
 
 }  // namespace

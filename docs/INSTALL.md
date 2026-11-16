@@ -430,7 +430,9 @@ time. See [AUTH.md](AUTH.md#re-pairing--revocation).
 ## Security
 
 Three things are worth knowing before you expose any of this to a network. Each
-is one paragraph here and a full section in [SECURITY.md](SECURITY.md).
+is one paragraph here and a full section in [SECURITY.md](SECURITY.md). What
+the console sends your RomM, play time included, and how to turn play time off,
+is [PRIVACY.md](PRIVACY.md).
 
 **Plain `http://` sends your token in the clear.** Every request carries the
 bearer token, so anything between the console and RomM can read it on an

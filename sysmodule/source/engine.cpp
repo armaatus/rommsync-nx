@@ -1895,7 +1895,14 @@ void SdEngine::StampPlayWindow() {
   // What the foreground was seen doing goes with it: nothing seen before the
   // window opens can have written a save the next window finds (#261).
   static_cast<void>(TakeSightings());
+  if (!play_sessions_on_) {
+    // `[sync] play_sessions = off` (#301): `play.db` is not written at all, not
+    // even stamped, so the next tick with it on stamps instead of deriving.
+    play_window_stale_ = true;
+    return;
+  }
   LogPlayStore(play_.Record({}, std::chrono::system_clock::now()));
+  play_window_stale_ = false;
 }
 
 void SdEngine::LogPlayStore(const play::StoreResult& stored) {
@@ -2458,6 +2465,7 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
 
 bool SdEngine::StartTick(TickInputs* inputs) {
   inputs->config = ConfigSnapshot();
+  play_sessions_on_ = inputs->config->sync.play_sessions;
   bool blocked = false;
   // This tick's cancel token, registered before anything is read so that a
   // shutdown or a sleep landing an instant later finds something to fire.
@@ -2746,7 +2754,7 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   // reach `TickOutcome`: the feature writes no save, and a sync tick lost to it
   // would be an optional extra taking hard rule 2's machinery down with it.
   const sync::Timestamp play_now = std::chrono::system_clock::now();
-  if (config.sync.enabled) {
+  if (config.sync.enabled && config.sync.play_sessions && !play_window_stale_) {
     play::Derivation played =
         play::DeriveSessions(ObservationsOf(found.loaded.value), ObservationsOf(found.scanned.saves),
                              play_.last_seen(), play_now);
@@ -2763,7 +2771,9 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
     // `[sync] enabled = false`: nothing is recorded and nothing is sent, because
     // a user who switched save sync off did not ask this console to keep
     // telling a server what they played. The window still moves -- see
-    // `StampPlayWindow`.
+    // `StampPlayWindow`. `[sync] play_sessions = off` (#301) records and sends
+    // nothing either, and leaves `play.db` untouched; the first tick after it
+    // is turned back on lands here too, so its window opens now (`play_window_stale_`).
     StampPlayWindow();
   }
   return found;

@@ -7610,6 +7610,144 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M11-17 (#301)'s acceptance, through the whole engine against RomM 5.4.0:
+/// with `[sync] play_sessions = off` every completion carries an empty
+/// `play_sessions[]` and `play.db` is never written -- not even stamped. Then
+/// the overlay's press turns it on, and play that straddled the switch is not
+/// reported (the window would open at a stamp from before it was off), while
+/// play after it is.
+///
+/// Every tick changes the save, so each one negotiates and completes: a
+/// completion is the request a session would ride on, and a tick that made
+/// none would pass the "carries nothing" checks by never asking.
+int PlaySessionsOff(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-play-off");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+  const std::string stamp = harness::UniqueSlot("play-off");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Intercepting wire(client);
+  std::mutex bodies_mutex;
+  std::vector<std::string> completions;
+  wire.Use([&bodies_mutex, &completions](const http::Request& request) -> std::optional<http::Result> {
+    if (request.method == http::Method::kPost &&
+        request.url.find("/api/sync/sessions/") != std::string::npos &&
+        request.url.find("/complete") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(bodies_mutex);
+      completions.push_back(request.body);
+    }
+    return std::nullopt;
+  });
+  const auto taken = [&bodies_mutex, &completions]() {
+    std::lock_guard<std::mutex> lock(bodies_mutex);
+    std::vector<std::string> out;
+    out.swap(completions);
+    return out;
+  };
+
+  Console console(c, "engine-play-off");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 console.sandbox.Read("/config/rommsync/config.ini") +
+                                     "play_sessions = off\n"),
+           "play sessions are off in config.ini");
+  const std::string save = "/tico/saves/nes/nova.srm";
+  console.sandbox.MakeDirs("/tico/saves/nes");
+  console.sandbox.SeedSave(save, "nova, first synced " + stamp + "\n");
+
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&wire, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  c.Expect(!console.Configured().config.sync.play_sessions,
+           "the running engine reads play_sessions = off");
+
+  // Each completion a tick made, and whether any carried a session.
+  const auto carried = [](const std::vector<std::string>& bodies, std::string* rendered) {
+    bool any = false;
+    for (const std::string& body : bodies) {
+      any = any || body.find("\"play_sessions\":[]") == std::string::npos;
+      *rendered += "\n  " + body;
+    }
+    return any;
+  };
+  const auto play = [&console, &c, &save](const std::string& bytes) {
+    // Past a whole second, so the save's mtime is after any window edge the
+    // tick before it stamped.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    c.Expect(console.sandbox.Reseed(save, bytes), "the game writes its save");
+  };
+
+  // 1-2. Off: the first sync, then play while off.
+  for (int n = 1; n <= 2; ++n) {
+    if (n == 2) {
+      play("nova, played while play sessions are off " + stamp + "\n");
+    }
+    const std::string what = "off, tick " + std::to_string(n);
+    if (!TickOnce(console, ticks, c, what)) {
+      break;
+    }
+    const std::vector<std::string> bodies = taken();
+    std::string rendered;
+    c.Expect(!bodies.empty(), what + ": the tick completed a sync session");
+    c.Expect(!carried(bodies, &rendered),
+             what + ": and no completion carried a play session:" + rendered);
+    c.Expect(!console.sandbox.Exists("/config/rommsync/play.db"),
+             what + ": and play.db was never written" + Rendered(console.Log()));
+  }
+
+  // 3. Played, then turned on from the settings screen: that play straddled the
+  // switch and is not reported, but the window now starts here.
+  play("nova, played across the switch " + stamp + "\n");
+  c.Expect(console.Set(Edit("sync", "play_sessions", "on")).outcome == ipc::WriteOutcome::kApplied,
+           "the settings screen's press turns play sessions on");
+  if (TickOnce(console, ticks, c, "on, tick 3")) {
+    std::string rendered;
+    c.Expect(!carried(taken(), &rendered),
+             "the tick after turning it on reports nothing played while it was off:" + rendered);
+    c.Expect(console.sandbox.Exists("/config/rommsync/play.db"),
+             "and stamps the window in play.db, now that it is on");
+  }
+
+  // 4. Played with it on: reported.
+  play("nova, played with play sessions on " + stamp + "\n");
+  if (TickOnce(console, ticks, c, "on, tick 4")) {
+    std::string rendered;
+    c.Expect(carried(taken(), &rendered),
+             "play with it on rides the completion, as before #301:" + rendered +
+                 Rendered(console.Log()));
+  }
+
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+    if (std::find(before.begin(), before.end(), id) == before.end()) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  }
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -7652,6 +7790,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"keep_local", KeepLocalChoice},
       {"keep_local_overtaken", KeepLocalOvertaken},
       {"keep_local_switched", KeepLocalSwitched},
+      {"play_off", PlaySessionsOff},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {

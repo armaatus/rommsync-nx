@@ -382,6 +382,7 @@ const bool* BoolField(const Config& config, const std::string& section,
     if (key == "states") return &config.sync.states;
     if (key == "map_state_slots") return &config.sync.map_state_slots;
     if (key == "conflict_show") return &config.sync.conflict_show;
+    if (key == "play_sessions") return &config.sync.play_sessions;
     return nullptr;
   }
   if (section == "downloads") {

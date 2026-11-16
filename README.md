@@ -74,6 +74,9 @@ When a sync does not happen,
 this client knows how to have, the line it writes in
 `sdmc:/config/rommsync/rommsync.log` when it has one, and what to do about it.
 
+[`docs/PRIVACY.md`](docs/PRIVACY.md) lists everything the sysmodule sends your
+RomM and keeps on the card, and how to turn off play-time reporting.
+
 ## Architecture at a glance
 
 ```

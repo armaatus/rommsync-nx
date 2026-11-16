@@ -1389,6 +1389,20 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// IPC surface reads it today -- play time is not on any screen.
   play::Buffer play_{std::string(play::kBufferSdPath)};
 
+  /// `[sync] play_sessions` as this tick's snapshot says (#301), set by
+  /// `StartTick` so `StampPlayWindow` -- called from paths that hold no config
+  /// -- leaves `play.db` alone when it is off. The worker's alone, like `play_`.
+  bool play_sessions_on_ = true;
+
+  /// A tick ran with play sessions off since the window last moved (#301).
+  /// The window's start is then a stamp from before the switch, and the first
+  /// session derived against it would claim play nobody agreed to report, up
+  /// to `play::kMaxWindowSeconds` of it. So the first tick back on stamps and
+  /// derives nothing, losing at most one interval's play: the safe direction.
+  /// In memory only, since `play.db` is not written while off; a reboot with
+  /// it switched on in between falls back to that window bound.
+  bool play_window_stale_ = false;
+
   /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
   /// here too because a restore opens two files through it.
   ///

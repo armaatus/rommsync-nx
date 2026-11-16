@@ -1193,6 +1193,16 @@ They ride out on the completion the tick is making anyway, so a console on
 battery spends no extra request. `POST /api/play-sessions` is the other route,
 for flushing without a sync (`play::Flush`).
 
+**`[sync] play_sessions = false` turns all of it off** (#301; on by default,
+[PRIVACY.md](PRIVACY.md#play-sessions)). Nothing is derived, `play.db` is not
+written -- not even the window stamp -- and every completion carries
+`"play_sessions": []`. What `play.db` already holds stays there unsent. Because
+the window was not stamped while it was off, the first tick after it is turned
+back on stamps and derives nothing (`SdEngine::play_window_stale_`): its window
+would open before the switch and report play nobody agreed to send. That memory
+is the running sysmodule's; across a reboot in between, the twelve-hour bound is
+the backstop.
+
 An answer this build cannot read is a **warning**, not an error: it leaves
 `play_session_ingest` absent, which already means "keep them buffered", and the
 tick completes normally. A malformed play-session answer failing a completion the

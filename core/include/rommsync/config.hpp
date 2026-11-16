@@ -212,6 +212,14 @@ struct SyncConfig {
 
   bool conflict_show = true;
 
+  /// Derive play sessions from the saves, keep them in `play.db` and send them
+  /// to RomM with each completion (M7-4, #39). On by default (#301): the only
+  /// place they go is the RomM server the user paired with, which shows them as
+  /// play time, and the feature predates the switch. Off records nothing,
+  /// writes nothing to `play.db` and sends nothing; sessions already buffered
+  /// stay there, unsent, until it is turned back on. docs/PRIVACY.md.
+  bool play_sessions = true;
+
   OnServerDelete on_server_delete = OnServerDelete::kRemove;
 };
 

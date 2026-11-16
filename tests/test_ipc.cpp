@@ -129,6 +129,8 @@ ipc::ConfigView LoadedConfigView() {
   view.config.tico.uid = "fedcba9876543210fedcba9876543210";
   view.tico_accounts = {"0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"};
   view.config.play_with["snes"] = config::PlayWith::kRetroArch;
+  // ...and #301's opt-out, off its default of on.
+  view.config.sync.play_sessions = false;
   config::Diagnostic note;
   note.severity = config::Severity::kWarning;
   note.line = 9;
@@ -220,9 +222,10 @@ int Version() {
   // replaced `game_running`, and a conflict row gained a required
   // `keep_local`. 14 since M10-35 (#279): `CancelKeepLocal`, whose answer an
   // older overlay has no decoder for. 15 since M11-11 (#295): `Status` gained
-  // `clock_trusted` and `clock_skew_seconds`. What is frozen is command 0's
+  // `clock_trusted` and `clock_skew_seconds`. 16 since M11-17 (#301):
+  // `ConfigView` gained `play_sessions`. What is frozen is command 0's
   // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{15},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{16},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -451,6 +454,7 @@ int RoundTrip() {
                     "[sources] retroarch_content_dir survives");
     checks.ExpectEq(back.value.config.sync.slot, std::string("mine"), "[sync] slot survives");
     checks.ExpectEq(back.value.config.sync.map_state_slots, true, "map_state_slots survives");
+    checks.ExpectEq(back.value.config.sync.play_sessions, false, "play_sessions survives");
     checks.ExpectEq(config::AccountText(back.value.config.tico),
                     std::string("fedcba9876543210fedcba9876543210"), "[tico] account survives");
     checks.Expect(back.value.tico_accounts == sent.tico_accounts,
@@ -979,6 +983,7 @@ int Refuses() {
            {"\"slot\":\"mine\"", "\"slot\":\"../mine\""},
            {"\"slot\":\"mine\"", "\"slot\":\"\""},
            {"\"map_state_slots\":true", "\"map_state_slots\":\"true\""},
+           {"\"play_sessions\":false", "\"play_sessions\":0"},
            {"\"account\":\"fedcba9876543210fedcba9876543210\"", "\"account\":\"someone\""},
            {"\"accounts\":[\"0123456789abcdef0123456789abcdef\"",
             "\"accounts\":[\"../../saves\""},

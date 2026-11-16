@@ -918,6 +918,7 @@ std::string EncodeConfigView(const ConfigView& view) {
   AppendText(&out, "on_server_delete", config::ToString(view.config.sync.on_server_delete));
   AppendText(&out, "slot", view.config.sync.slot);
   AppendBool(&out, "map_state_slots", view.config.sync.map_state_slots);
+  AppendBool(&out, "play_sessions", view.config.sync.play_sessions);
   out += '}';
 
   AppendKey(&out, "tico");
@@ -974,7 +975,8 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
                       "remove or keep", &out->config.sync.on_server_delete, error) ||
             !ReadText(*sync_section, "slot", &out->config.sync.slot, error) ||
             !ReadBool(*sync_section, "map_state_slots", &out->config.sync.map_state_slots,
-                      error)) {
+                      error) ||
+            !ReadBool(*sync_section, "play_sessions", &out->config.sync.play_sessions, error)) {
           return;
         }
         // The rule `config.ini` holds a slot to, so a slot drawn on the

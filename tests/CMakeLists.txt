@@ -2117,7 +2117,9 @@ foreach(scenario
         # docs/INTEROP.md (#243): the other devices' half of the install guide.
         interop          # its sections, the links to it, the two config pages
         interop_facts    # versions, limits, keys and names read off the code
-        interop_table)   # the per-system table both ways against save_source.cpp
+        interop_table    # the per-system table both ways against save_source.cpp
+        # docs/PRIVACY.md (#301): what leaves the console, read off the request bodies.
+        privacy)
   add_test(NAME docs.install_${scenario}
            COMMAND ${Python3_EXECUTABLE} "${DOCS_INSTALL_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
@@ -2557,6 +2559,7 @@ set(ENGINE_RIG_SCENARIOS
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
   keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
   keep_local_switched  # #317: a Keep local armed against one server sends no overwrite=true to the next
+  play_off     # #301: [sync] play_sessions = off sends no session and never writes play.db
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})

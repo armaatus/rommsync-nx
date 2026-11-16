@@ -19,6 +19,7 @@ states        = false              ; fragile across cores; opt-in
 map_state_slots = false            ; Tico's state slots under RetroArch's names; see below
 conflict_show = true               ; surface conflicts in the overlay
 on_server_delete = remove          ; remove | keep; a save deleted in RomM, see below
+play_sessions = true               ; send play time worked out from saves to RomM; see below
 
 [downloads]
 enabled       = true
@@ -489,6 +490,25 @@ Anything else is a `warning` and the current value stays. The overlay's
 settings screen shows it under `[sync]`, and a press switches it between
 `remove` and `keep`.
 
+### `play_sessions`: play time sent to RomM
+
+On by default. Each sync works out, from which saves changed since the last
+one, roughly when each game was played, and sends those sessions to RomM with
+the sync it was making anyway; RomM shows them as play time. The application
+that was running is noted in `play.db` and the log on the console and never
+sent. [PRIVACY.md](PRIVACY.md#play-sessions) has the detail.
+
+`play_sessions = false` stops it from the next sync: nothing is worked out,
+`/config/rommsync/play.db` is not written, and every sync sends an empty list.
+Sessions already waiting in `play.db` stay there unsent; delete the file to
+discard them. The first sync after turning it back on reports nothing, so play
+that happened while it was off is never sent. Saves sync either way.
+
+On rather than off because the only place the sessions go is the RomM server
+you paired with, which you run, and RomM's play-time view is a reason people
+pair a console with it. The settings screen shows it under `[sync]`, and a
+press switches it.
+
 ### `[backup]`: how much of `.backup/` is kept
 
 Every save and state this client overwrites or removes is copied under
@@ -699,8 +719,8 @@ rewrites the file and re-reads it, so the change is in force before the call
 comes back. No restart, and no second copy of the settings anywhere.
 
 The settings screen offers this for the settings that are a choice between a
-few words — `[sync] on_server_delete`, `[sync] map_state_slots`, `[sources]` and
-each platform's `play_with` — where a press steps the row to its next value and
+few words — `[sync] on_server_delete`, `[sync] map_state_slots`,
+`[sync] play_sessions`, `[sources]` and each platform's `play_with` — where a press steps the row to its next value and
 pressing again sets it back. What a sync did in between stays done: states
 uploaded under `map_state_slots`' other names stay on the server (see
 [above](#states-and-map_state_slots-save-states)), and a save placed by one

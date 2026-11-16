@@ -21,7 +21,8 @@
 // settings that are a choice between a few words: `[sync] on_server_delete` and
 // `[sources]`; since M10-31 (#271) also `[sync] map_state_slots`, a platform's
 // `play_with`, and `[tico] account` -- a picker over the accounts the last tick
-// found, one row each. `[sync] slot` is shown and not offered, the reason in
+// found, one row each; since M11-17 (#301) `[sync] play_sessions`, the
+// play-time opt-out. `[sync] slot` is shown and not offered, the reason in
 // its note. Every other row carries `editable` to mark where a value the write
 // path takes *could* become editable, and no way to change it.
 //

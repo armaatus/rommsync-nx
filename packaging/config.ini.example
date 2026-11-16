@@ -38,6 +38,9 @@ conflict_show = true               ; surface conflicts in the overlay
 ; A save you deleted in RomM: remove takes it off the card, after backing it up
 ; under /config/rommsync/.backup/; keep leaves it here and never uploads it.
 on_server_delete = remove
+; Play time worked out from which saves changed, sent to your RomM with each
+; sync. false sends none and writes nothing to play.db (docs/PRIVACY.md).
+play_sessions = true
 
 [downloads]
 enabled     = true

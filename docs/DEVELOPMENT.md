@@ -997,7 +997,9 @@ tick found, and each platform's `play_with` (M10-31, #271) made it 11, and Keep
 local's refusals `superseded`, `game_running` and `keep_local_full` (M10-33,
 #273) made it 12, and `held` in place of `game_running` with a conflict row's
 `keep_local` (M10-34, #275) made it 13, and `CancelKeepLocal` -- a held Keep
-local withdrawn before the game closes (M10-35, #279) -- made it 14.
+local withdrawn before the game closes (M10-35, #279) -- made it 14, and
+`Status` carrying the clock check (M11-11, #295) made it 15, and `GetConfig`
+carrying `[sync] play_sessions` (M11-17, #301) made it 16.
 
 `KeepLocal` is the conflicts screen's Keep local (#249): a restore of a save
 conflict's backup, polled the same way, after which the sysmodule arms that

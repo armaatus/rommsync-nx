@@ -324,6 +324,8 @@ void ApplySync(const ParseState& state, int line, std::string_view key, std::str
     target = &config->sync.map_state_slots;
   } else if (key == "conflict_show") {
     target = &config->sync.conflict_show;
+  } else if (key == "play_sessions") {
+    target = &config->sync.play_sessions;
   }
   if (target == nullptr) {
     diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
