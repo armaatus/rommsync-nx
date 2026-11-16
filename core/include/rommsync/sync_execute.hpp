@@ -470,6 +470,8 @@ OperationError UnchangedSinceBackup(fs::FileSystem& files, const std::string& sd
 /// removes.
 ///
 ///   - `backup_sd_path` empty is nothing found to back up, and nothing to check.
+///   - `expected` empty is a placement's: the scan found nothing at `sd_path`,
+///     so a backup of anything is a file written since, and `kUnverified` (#318).
 ///   - A backup that cannot be read back is `kUnreadableCard`, and it stays.
 OperationError BackupIsReported(fs::FileSystem& files, const std::string& sd_path,
                                 const std::string& expected, std::string* backup_sd_path,

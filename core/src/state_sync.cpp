@@ -548,13 +548,14 @@ StateOperationResult Upload(http::HttpClient& client, fs::FileSystem& files,
 /// up, commit. `sync_execute.cpp`'s order, over the one check a state gets.
 ///
 /// `sd_path` is where the bytes go and `previous` is the backup discriminator's
-/// name; for a placement there is nothing at `sd_path`, so `BackUpFirst` finds
-/// no source and there is nothing to protect.
+/// name; for a placement there was nothing at `sd_path` when the scan looked, so
+/// a source `BackUpFirst` finds there is a state saved since, and it stands down.
 ///
 /// `scanned` is the digest the scan took of the state being replaced, which the
 /// decision to download was made against (#286) -- `Decide` downloads only over
 /// a state its row still describes, digest included. Empty for a placement,
-/// which replaces nothing the scan saw.
+/// which replaces nothing the scan saw -- and so is held to there being nothing
+/// to back up (#318).
 StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
                            const auth::StoredToken& token, const ServerState& server,
                            const std::string& sd_path, const std::string& scanned,
@@ -639,7 +640,9 @@ StateOperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // **The backup is the state the download was decided against** (#286): one
   // saved on a hotkey while the download ran is a state nothing ruled on, and
   // replaced, it would be in `.backup/` alone with the next run seeing it synced.
-  if (!scanned.empty()) {
+  // A placement was decided against an empty path, so any state the backup
+  // found there was saved since the scan (#318).
+  if (!scanned.empty() || action == StateAction::kPlace) {
     const OperationError held =
         BackupIsReported(files, sd_path, scanned, &result.backup_sd_path, &message);
     if (held != OperationError::kNone) {
