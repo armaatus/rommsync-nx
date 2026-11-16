@@ -188,6 +188,11 @@ class CancelToken {
   ///
   /// Read `canceled()` *after* constructing one: a cancel that landed before
   /// it is not replayed as a call to `abort`.
+  ///
+  /// `abort` runs under the token's lock, on whichever thread cancels -- the
+  /// quiescing one, holding the engine's own lock. So it must be short, must
+  /// take no lock that is held around a `Cancel`, and must never cancel this
+  /// token itself: one IPC that tells a service to stop, and nothing more.
   class Abort {
    public:
     Abort(const CancelToken* token, void (*abort)(void*), void* context) {

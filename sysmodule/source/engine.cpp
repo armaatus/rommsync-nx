@@ -1656,12 +1656,18 @@ void SdEngine::Quiesce() {
   // transport. There is no socket to close -- one is opened per request inside
   // `ssl_http_client.cpp` and closed when the request ends, and there is no
   // listening socket in this process at all, so the waits above are what make it
-  // true that none is open. And releasing the bsd transfer memory means
-  // `socketExit()`, which cannot be undone: `socketInitialize` is not refcounted
-  // and answers `0xF59 AlreadyInitialized` forever afterwards (`main.cpp`
-  // argues the same point about not retrying the transport). Doing it would buy
-  // 116 KiB the kernel keeps mapped either way and cost the network for the rest
-  // of the boot.
+  // true that none is open -- **when they end inside the budget**. That needs
+  // every phase of opening one to end at the cancel too: the name lookup, the
+  // connect and the TLS handshake each did not, until M11-6 (#290), and a sleep
+  // that landed in one was acknowledged with that call still running
+  // (`Connector::Open`). A worker that runs the budget out anyway still gets
+  // the acknowledgement, and the `power.sleep` line above.
+  //
+  // And releasing the bsd transfer memory means `socketExit()`, which cannot be
+  // undone: `socketInitialize` is not refcounted and answers `0xF59
+  // AlreadyInitialized` forever afterwards (`main.cpp` argues the same point
+  // about not retrying the transport). Doing it would buy 116 KiB the kernel
+  // keeps mapped either way and cost the network for the rest of the boot.
   //
   // **Last, and it is the piece parking the worker cannot buy.** A `log::Write`
   // from any thread opens the log file, appends and closes it, so a single line

@@ -248,13 +248,21 @@ class Handshaking final : public sysmodule::Connector {
     const int fd =
         sysmodule::ConnectTo(origin, connect_timeout, connect_timeout, error, message, cancel);
     if (fd < 0) return nullptr;
-    // The handshake the console did before #290: one blocking call, bounded by
-    // the connect budget and by nothing a sleep could reach.
-    pollfd descriptor{fd, POLLIN, 0};
-    poll(&descriptor, 1, static_cast<int>(connect_timeout.count()));
+    // `SslConnector`'s handshake loop: one non-blocking try, then a wait for
+    // the server of at most a slice, in `RunInSlices` -- with a poll of the
+    // socket standing in for `sslConnectionPoll`, and a server that never
+    // answers standing in for one that is slow to.
+    const sysmodule::Sliced shook = sysmodule::RunInSlices(
+        [fd](std::chrono::milliseconds slice) {
+          pollfd descriptor{fd, POLLIN, 0};
+          return poll(&descriptor, 1, static_cast<int>(slice.count())) > 0
+                     ? sysmodule::Step::kFailed
+                     : sysmodule::Step::kPending;
+        },
+        cancel, connect_timeout);
     close(fd);
-    *error = http::Error::kTls;
-    *message = "the TLS handshake failed";
+    *error = shook == sysmodule::Sliced::kCanceled ? http::Error::kCanceled : http::Error::kTls;
+    *message = "the TLS handshake did not finish";
     return nullptr;
   }
 };

@@ -43,6 +43,37 @@ bool g_socket_up = false;
 bool g_ssl_up = false;
 bool g_nifm_up = false;
 
+/// `ssl`'s ResultIoWouldBlock (module 123, description 204): a non-blocking
+/// `DoHandshake` that has sent what it can and is waiting on the server
+/// (switchbrew, Error codes). libnx names no constant for it.
+constexpr Result kSslResultWouldBlock = MAKERESULT(123, 204);
+
+void CancelLookup(void* handle) {
+  resolverCancel(static_cast<u32>(reinterpret_cast<std::uintptr_t>(handle)));
+}
+
+/// `getaddrinfo` with a way out (M11-6, #290). On the console a lookup is one
+/// IPC to `sfdnsres` that returns when the resolver does, which no slice on
+/// this thread can shorten -- so the handle `sfdnsres` cancels by is taken
+/// first and handed to the token, and a sleep that fires the token cancels the
+/// lookup from the quiescing thread. `ResolveBlocking` reads the token before
+/// it asks, which covers a cancel that landed before the hook was armed.
+///
+/// **What no console has confirmed** (#43's list): that a handle taken before
+/// the call cancels the call, which is what libnx documents
+/// (`resolverGetCancelHandle`, "the next resolver command on the current
+/// thread"), and that a cancel landing between the check and the IPC is not
+/// lost. A zero handle -- the request for one failed -- arms nothing, and the
+/// lookup is as cancellable as it was before #290: not at all.
+bool ResolveCancellable(const std::string& host, std::uint32_t* address,
+                        const http::CancelToken* cancel) {
+  const u32 handle = resolverGetCancelHandle();
+  const http::CancelToken::Abort abort(
+      handle != 0 ? cancel : nullptr, CancelLookup,
+      reinterpret_cast<void*>(static_cast<std::uintptr_t>(handle)));
+  return ResolveBlocking(host, address, cancel);
+}
+
 /// One `SslConnection`, and the socket it was handed.
 ///
 /// The teardown order is the API's, not a preference: the descriptor
@@ -120,7 +151,7 @@ class SslConnector final : public Connector {
   std::unique_ptr<Connection> Open(const Origin& origin,
                                    std::chrono::milliseconds connect_timeout,
                                    const http::ClientOptions& options,
-                                   const http::CancelToken*, http::Error* error,
+                                   const http::CancelToken* cancel, http::Error* error,
                                    std::string* message) override {
     *error = http::Error::kNone;
     if (!g_socket_up) {
@@ -147,7 +178,8 @@ class SslConnector final : public Connector {
     // The handshake's own bound, and the socket's. Deliberately the connect
     // budget: a handshake that has not finished in as long as a connection took
     // to make is one that is not going to.
-    const int fd = ConnectTo(origin, connect_timeout, connect_timeout, error, message);
+    const int fd = ConnectTo(origin, connect_timeout, connect_timeout, error, message, cancel,
+                             ResolveCancellable);
     if (fd < 0) return nullptr;
 
     if (!origin.tls) {
@@ -162,7 +194,7 @@ class SslConnector final : public Connector {
     // has taken the descriptor it is the one `ssl` handed back that has to be
     // closed instead, and closing both would be a double close of a descriptor
     // another process is using.
-    return OpenTls(fd, origin, options, error, message);
+    return OpenTls(fd, origin, connect_timeout, options, cancel, error, message);
   }
 
  private:
@@ -170,7 +202,9 @@ class SslConnector final : public Connector {
   /// `socketSslConnectionSetSocketDescriptor` succeeds; after that the service
   /// owns it and the caller must not close it.
   std::unique_ptr<Connection> OpenTls(int fd, const Origin& origin,
-                                      const http::ClientOptions& options, http::Error* error,
+                                      std::chrono::milliseconds handshake_timeout,
+                                      const http::ClientOptions& options,
+                                      const http::CancelToken* cancel, http::Error* error,
                                       std::string* message) {
     // One context for the process, so a CA import is paid once rather than per
     // request -- and guarded, because a context is one `ssl` session and two
@@ -178,9 +212,10 @@ class SslConnector final : public Connector {
     // **Only the shared `SslContext` needs the lock**, and it is released
     // before the handshake. Holding it across `DoHandshake` would mean a
     // download's handshake to an unresponsive server blocking a sync tick's
-    // `Send` inside `Connector::Open` -- where neither the `CancelToken` nor
-    // the `Budget` is polled -- for the `ssl` service's own I/O ceiling. A
-    // shared client has to be safe for exactly that (`http.hpp`).
+    // `Send` inside `Connector::Open` -- waiting on a lock, where neither the
+    // `CancelToken` nor the `Budget` is read -- for the whole of another
+    // request's handshake. A shared client has to be safe for exactly that
+    // (`http.hpp`), and a sleep has to be able to end it (#290).
     SslConnection connection{};
     {
       std::lock_guard<std::mutex> held(mutex_);
@@ -251,18 +286,43 @@ class SslConnector final : public Connector {
     }
     if (R_FAILED(rc)) return fail(http::Error::kTls, "sslConnectionSetVerifyOption failed");
 
-    // Blocking, with the wait bounded from above: every read and write goes
-    // through `sslConnectionPoll` with the caller's slice first (`SslStream`),
-    // and on [16.0.0+] the service's own ceiling comes down from five minutes
-    // to something a sync tick can wait out.
-    rc = sslConnectionSetIoMode(&connection, SslIoMode_Blocking);
+    // **The handshake non-blocking, in slices** (M11-6, #290). One blocking
+    // `DoHandshake` waits for `SO_RCVTIMEO` -- the connect budget, ten seconds
+    // -- or the service's own I/O ceiling, and nothing a sleep does can end it:
+    // the descriptor is the service's now, so there is no socket left here to
+    // shut down under it. Non-blocking, each try returns `ResultIoWouldBlock`
+    // until the server has answered, and the wait between tries is a
+    // `sslConnectionPoll` of one slice, with the token read before each.
+    //
+    // Read only, not Write: past the ClientHello a handshake waits on the
+    // server, and a socket is nearly always writable, so polling for it would
+    // spin the tries with no wait between them. A handshake that does wait to
+    // write loses at most a slice per wait.
+    rc = sslConnectionSetIoMode(&connection, SslIoMode_NonBlocking);
     if (R_FAILED(rc)) return fail(http::Error::kTls, "sslConnectionSetIoMode failed");
-    if (hosversionAtLeast(16, 0, 0)) {
-      sslConnectionSetIoTimeout(&connection, kIoTimeoutMs);
+    const Sliced shook = RunInSlices(
+        [&connection, &rc](std::chrono::milliseconds slice) {
+          rc = sslConnectionDoHandshake(&connection, nullptr, nullptr, nullptr, 0);
+          if (R_SUCCEEDED(rc)) return Step::kDone;
+          if (rc != kSslResultWouldBlock) return Step::kFailed;
+          // A poll that fails is the end, not another try: it fails at once,
+          // so retrying would spin `DoHandshake` with no wait until the timeout.
+          u32 signalled = 0;
+          const Result polled =
+              sslConnectionPoll(&connection, SslPollEvent_Read | SslPollEvent_Except, &signalled,
+                                static_cast<u32>(slice.count()));
+          return R_FAILED(polled) ? Step::kFailed : Step::kPending;
+        },
+        cancel, handshake_timeout);
+    if (shook == Sliced::kCanceled) {
+      return fail(http::Error::kCanceled, "canceled during the TLS handshake");
     }
-
-    rc = sslConnectionDoHandshake(&connection, nullptr, nullptr, nullptr, 0);
-    if (R_FAILED(rc)) {
+    if (shook == Sliced::kTimedOut) {
+      // `kTls`, as a handshake that outlived the socket's timeout always was:
+      // what a caller makes of the error is not this change's to move.
+      return fail(http::Error::kTls, "the TLS handshake did not finish in time");
+    }
+    if (shook == Sliced::kFailed) {
       // Why it was refused, if the service will say. The cmd clears the stored
       // value as it reads it, so this is the only chance to ask -- and "the
       // handshake failed" and "the certificate was rejected, for this reason"
@@ -270,6 +330,16 @@ class SslConnector final : public Connector {
       const Result verify = sslConnectionGetVerifyCertError(&connection);
       return fail(http::Error::kTls, R_FAILED(verify) ? "the server's certificate was refused"
                                                       : "the TLS handshake failed");
+    }
+
+    // Then blocking, with the wait bounded from above: every read and write
+    // goes through `sslConnectionPoll` with the caller's slice first
+    // (`SslStream`), and on [16.0.0+] the service's own ceiling comes down from
+    // five minutes to something a sync tick can wait out.
+    rc = sslConnectionSetIoMode(&connection, SslIoMode_Blocking);
+    if (R_FAILED(rc)) return fail(http::Error::kTls, "sslConnectionSetIoMode failed");
+    if (hosversionAtLeast(16, 0, 0)) {
+      sslConnectionSetIoTimeout(&connection, kIoTimeoutMs);
     }
 
     std::unique_ptr<Connection> stream(new (std::nothrow) SslStream(connection, returned));
