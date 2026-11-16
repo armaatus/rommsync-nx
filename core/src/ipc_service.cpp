@@ -147,6 +147,13 @@ ConfigView ServiceCore::GetConfig() const {
                                "the configured server URL is too long to send over IPC; "
                                "edit config.ini directly"));
   }
+  // The same for the CA path (#288), which `ParseConfig` already bounds; this is
+  // for a `Config` that reached here some other way.
+  if (view.config.server.ca_file.size() > config::kMaxPathLength) {
+    view.config.server.ca_file.clear();
+    diagnostics.push_back(Note(config::Severity::kError, "server", "ca_file",
+                               "the configured CA file path is too long to send over IPC"));
+  }
 
   view.diagnostics = TrimDiagnostics(diagnostics);
 

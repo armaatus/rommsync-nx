@@ -199,6 +199,25 @@ struct ParseState {
 
 void ApplyServer(const ParseState& state, int line, std::string_view key, std::string_view value,
                  Config* config, Diagnostics* diags) {
+  if (key == "ca_file") {
+    // Taken as written: whether the file is there is `CheckCaFile`'s question,
+    // because this function is pure and the card is not. Only what could never
+    // name a file is refused here. Empty clears it, like any other key.
+    for (const char c : value) {
+      if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) {
+        diags->Add(Severity::kWarning, line, state.section, key,
+                   "has a control character in it, ignored");
+        return;
+      }
+    }
+    if (value.size() > kMaxPathLength) {
+      diags->Add(Severity::kWarning, line, state.section, key,
+                 "is longer than " + std::to_string(kMaxPathLength) + " characters, ignored");
+      return;
+    }
+    config->server.ca_file = std::string(value);
+    return;
+  }
   if (key != "url") {
     diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
     return;
@@ -1420,6 +1439,14 @@ LoadResult ParseConfig(std::string_view text) {
     it = it->second.empty() ? result.value.platforms.erase(it) : std::next(it);
   }
 
+  // Said once, at the end, because which line came first is not the point: a
+  // CA file only ever verifies a handshake, and plain http has none. The user
+  // who set it believes it is protecting something.
+  if (!result.value.server.ca_file.empty() && result.value.server.url.rfind("http://", 0) == 0) {
+    diags.Add(Severity::kNotice, 0, "server", "ca_file",
+              "is only used for an https:// server; this one is plain http");
+  }
+
   // Exactly one error for "no server", whatever the cause: absent, or present
   // and unusable. The line that was unusable already has its own warning, and a
   // second error repeating it is how a user stops reading them.
@@ -1432,11 +1459,65 @@ LoadResult ParseConfig(std::string_view text) {
   return result;
 }
 
+void CheckCaFile(LoadResult* result) {
+  const std::string& path = result->value.server.ca_file;
+  if (path.empty()) {
+    return;
+  }
+  std::string contents;
+  std::string problem;
+  switch (io::ReadBounded(path, kMaxCaFileBytes, &contents)) {
+    case io::BoundedRead::kOk:
+      break;
+    case io::BoundedRead::kMissing:
+      problem = path + " does not exist";
+      break;
+    case io::BoundedRead::kUnreadable:
+      problem = path + " exists and could not be read";
+      break;
+    case io::BoundedRead::kTooLarge:
+      problem = path + " is larger than the " + std::to_string(kMaxCaFileBytes) +
+                " bytes a CA file can be";
+      break;
+  }
+  if (problem.empty()) {
+    // A DER certificate is one ASN.1 SEQUENCE, so it opens with 0x30 -- which
+    // no PEM file does, since PEM is text. Named, because "no certificate" is
+    // false for the commonest wrong export.
+    static constexpr std::string_view kBegin = "-----BEGIN CERTIFICATE-----";
+    static constexpr std::string_view kEnd = "-----END CERTIFICATE-----";
+    const std::size_t begin = contents.find(kBegin);
+    const std::size_t end =
+        begin == std::string::npos ? std::string::npos : contents.find(kEnd, begin);
+    if (!contents.empty() && static_cast<unsigned char>(contents.front()) == 0x30) {
+      problem = path + " is DER, not PEM -- convert it with: openssl x509 -inform der -in " +
+                path + " -out ca.pem";
+    } else if (end == std::string::npos ||
+               Trim(std::string_view(contents).substr(begin + kBegin.size(),
+                                                      end - begin - kBegin.size()))
+                   .empty()) {
+      problem = path + " holds no PEM certificate (a -----BEGIN CERTIFICATE----- block)";
+    }
+  }
+  if (problem.empty()) {
+    return;
+  }
+  Diagnostic entry;
+  entry.severity = Severity::kError;
+  entry.section = "server";
+  entry.key = "ca_file";
+  entry.message = problem + "; every https request will fail certificate verification";
+  // First, and past the cap if it has to be: it is the reason nothing syncs.
+  result->diagnostics.insert(result->diagnostics.begin(), std::move(entry));
+}
+
 LoadResult LoadConfig(const std::string& path) {
   std::string contents;
   const io::BoundedRead outcome = ReadBounded(path, &contents);
   if (outcome == io::BoundedRead::kOk) {
-    return ParseConfig(contents);
+    LoadResult parsed = ParseConfig(contents);
+    CheckCaFile(&parsed);
+    return parsed;
   }
 
   if (outcome == io::BoundedRead::kMissing) {
@@ -1449,6 +1530,7 @@ LoadResult LoadConfig(const std::string& path) {
     std::string previous;
     if (ReadBounded(io::PreviousPathFor(path), &previous) == io::BoundedRead::kOk) {
       LoadResult recovered = ParseConfig(previous);
+      CheckCaFile(&recovered);
       Diagnostics diags;
       diags.Add(Severity::kWarning, 0, "", "",
                 path + " is missing and was read from " + io::PreviousPathFor(path) +

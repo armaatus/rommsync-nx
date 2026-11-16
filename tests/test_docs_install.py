@@ -88,8 +88,9 @@ RUNTIME_SUBDIRS = ("flags",)
 # precisely because it is NOT in the archive: an upgrade must leave it alone.
 # `.backup` is a directory, named for the same reason: it holds every save
 # backup, and an upgrade or an uninstall that took it would take those too.
+# `ca.pem` is the user's own certificate, copied there by hand (#288).
 RUNTIME_FILES = ("config.ini", "token.dat", "device.dat", "state.db", "queue.json",
-                 "conflicts.db", "rommsync.log", "rommsync.log.old", ".backup")
+                 "conflicts.db", "rommsync.log", "rommsync.log.old", ".backup", "ca.pem")
 
 # The ten sections of #35, in the order a user meets them.
 SECTIONS = [

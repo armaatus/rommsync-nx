@@ -22,8 +22,8 @@
 // `[sources]`; since M10-31 (#271) also `[sync] map_state_slots`, a platform's
 // `play_with`, and `[tico] account` -- a picker over the accounts the last tick
 // found, one row each; since M11-17 (#301) `[sync] play_sessions`, the
-// play-time opt-out. `[sync] slot` is shown and not offered, the reason in
-// its note. Every other row carries `editable` to mark where a value the write
+// play-time opt-out. `[sync] slot` and `[server] ca_file` (#288) are shown and
+// not offered, the reason in each one's note. Every other row carries `editable` to mark where a value the write
 // path takes *could* become editable, and no way to change it.
 //
 // **A `Diagnostic` about `server.url` never quotes the URL** (`config.hpp`), and
@@ -152,7 +152,7 @@ struct SettingsRow {
   ///
   /// **The renderer deliberately draws nothing for it**, and that is not an
   /// omission: every row that is not a `kNavigate` is editable but `[sync]
-  /// slot` (#271), so a marker would be on nearly every configuration row on
+  /// slot` (#271) and `[server] ca_file` (#288), so a marker would be on nearly every configuration row on
   /// the screen and would separate nothing. What separates the rows a press
   /// changes is the A prompt drawn over them (`press_label`). The flag is the
   /// model saying which keys `config::ApplyEdit` accepts, held by

@@ -116,6 +116,22 @@ SettingsRow SlotRow(const std::string& slot) {
   return row;
 }
 
+/// `[server] ca_file` (#288): shown, and **not offered**, like `slot`. The
+/// certificate has to be copied onto the card from a PC, so the line naming it
+/// is written there too -- and a console whose trust could be repointed from a
+/// menu is one more way to aim it at the wrong server. Shown either way, since
+/// "which certificates does this console trust" is what the row is read for
+/// when an https server will not answer.
+SettingsRow CaFileRow(const std::string& ca_file) {
+  SettingsRow row = Value("ca_file", ca_file.empty() ? "(none)" : ca_file);
+  row.editable = false;
+  row.note = ca_file.empty()
+                 ? "https is checked against the console's built-in certificates; set in "
+                   "config.ini"
+                 : "https is also checked against this certificate; set in config.ini";
+  return row;
+}
+
 /// `[sync] map_state_slots` (#239, #271). Offered: either value is safe to land
 /// on -- a state never touches a save, a local one is backed up before it is
 /// written over, and a renamed state that meets another's row is kept apart
@@ -339,6 +355,7 @@ SettingsSection ServerSection(const config::Config& config) {
     return section;
   }
   section.rows.push_back(Value("url", config.server.url));
+  section.rows.push_back(CaFileRow(config.server.ca_file));
   return section;
 }
 

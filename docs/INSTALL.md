@@ -212,6 +212,40 @@ The overlay's Settings screen
 ([#26](https://github.com/armaatus/rommsync-nx/issues/26)) shows the server URL
 but cannot change it; the file is the way.
 
+### Self-signed or private CA
+
+If your RomM's certificate was signed by no public CA — a self-signed one, or
+one from your own CA — the console has to be given that certificate, or every
+request fails at the handshake (`net.tls` in the log). Verification stays on:
+the server is checked against the certificate you chose. Why this is the only
+way past it is in [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server).
+
+1. Get the certificate in **PEM** form: a text file starting
+   `-----BEGIN CERTIFICATE-----`. Use the CA's certificate if you have one, or
+   the server's own if it is self-signed. A DER file (binary, often `.cer` or
+   `.der`) converts with
+   `openssl x509 -inform der -in server.der -out ca.pem`.
+2. Copy it to the card as `config/rommsync/ca.pem`.
+3. Name it under `[server]`, beside the url:
+
+   ```ini
+   [server]
+   url = https://romm.example.com
+   ca_file = sdmc:/config/rommsync/ca.pem
+   ```
+
+4. Restart the sysmodule (ovl-sysmodules, or reboot).
+
+The certificate must carry the name in your `url` — its `subjectAltName` has to
+list `romm.example.com`, or the IP address if the url uses one — because the
+hostname is checked too.
+
+The Settings screen shows `ca_file` under `[server]`, and if the file is missing,
+too large, DER, or holds no certificate, says so there and in the log. A file
+holding several certificates is read whole; whether the console accepts more
+than one at a time is not yet verified on hardware, so put only the one you need
+in it.
+
 The full key list — the sync interval, the download options, and the folder map
 that decides where roms land and which folders saves are read from — is in
 [CONFIG.md](CONFIG.md). It is not repeated here.
@@ -454,7 +488,8 @@ VPN or a tailnet —
 
 **A self-signed certificate is imported, not waved through.** If your RomM's
 certificate is one no public CA signed, the answer is to import that certificate
-so the console checks against a CA you chose. Verification stays on. There is no
+so the console checks against a CA you chose —
+[Self-signed or private CA](#self-signed-or-private-ca) has the steps. Verification stays on. There is no
 setting in this client that turns it off, and there will not be — see
 [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server).
 

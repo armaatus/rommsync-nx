@@ -132,4 +132,16 @@ bool ConsoleIsOnline();
 /// already handles rather than a null pointer every caller would have to check.
 std::unique_ptr<http::HttpClient> MakeHorizonHttpClient(const http::ClientOptions& options = {});
 
+/// Trust `path` -- `[server] ca_file`, a PEM -- for every `https://` request
+/// from here on, beside the console's CertStore (#288). Empty is the CertStore
+/// alone. Only records it: the next TLS connection imports it
+/// (`sslContextImportServerPki`), so this is safe to call under the engine's
+/// lock (`SdEngine::UseCaTrust`). A `ClientOptions::ca_bundle_path` given to
+/// `MakeHorizonHttpClient` wins over it.
+///
+/// *Unverified on Horizon:* a bundle of more than one certificate in one
+/// `ImportServerPki` call. The host backend takes one; the console is M12's
+/// server matrix to answer.
+void TrustServerCa(const std::string& path);
+
 }  // namespace rommsync::sysmodule

@@ -182,7 +182,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **16** since M11-17 (#301), which added `play_sessions` to `ConfigView`'s
 /// `sync` -- a required field, so a v16 overlay reading a v15 sysmodule's
 /// `GetConfig` fails to decode it.
-inline constexpr std::uint32_t kVersion = 16;
+///
+/// **17** since M11-4 (#288), which added `ca_file` to `ConfigView`'s
+/// `server` -- a required field, so a v17 overlay reading a v16 sysmodule's
+/// `GetConfig` fails to decode it.
+inline constexpr std::uint32_t kVersion = 17;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

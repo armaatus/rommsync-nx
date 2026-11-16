@@ -8,6 +8,7 @@ version = 1                        ; the format of this file; see "Version" belo
 
 [server]
 url = https://romm.example.com     ; RomM origin, HTTPS strongly recommended
+; ca_file = sdmc:/config/rommsync/ca.pem   ; a self-signed server's certificate (PEM); see below
 
 [sync]
 enabled       = true
@@ -629,6 +630,21 @@ Each report carries a severity, the line number, and the section and key:
   URL, for the same reason.
 - Plain `http://` is accepted with a `warning`: the token and every save cross
   the network in the clear.
+- `ca_file` names a PEM certificate an `https://` server is verified against,
+  beside the console's built-in ones: the CA that signed your server's
+  certificate, or that certificate itself when it is self-signed. Unset is the
+  built-in ones alone. Verification stays on either way; there is no key that
+  turns it off ([SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server)).
+  The path is opened as written, so on the console it starts `sdmc:/`. The file
+  is checked at boot and whenever the overlay writes this file: missing,
+  unreadable, larger than 256 KiB, DER rather than PEM, or holding no
+  `-----BEGIN CERTIFICATE-----` block is an `error` that names the problem, and
+  every `https` request then fails `net.tls`. Under a plain `http://` url it is a
+  `notice` that it is unused. The overlay shows it and does not change it.
+  A new or changed path is imported on the next request; a certificate already
+  imported stays trusted until the sysmodule restarts, so restart it after
+  removing or replacing one.
+  [INSTALL.md](INSTALL.md#self-signed-or-private-ca) has the steps.
 - A `url` line the parser cannot use is a `warning`, like any other rejected
   line. Ending the file with no usable `url` at all is the `error` — one of them,
   whether the setting was absent or present and rejected. It is the one setting
@@ -738,7 +754,9 @@ saves of an account nobody chose. Only accounts on the card are offered;
 
 The sync switch is on the **Sync** screen. Every other key is still set in this
 file. `[sync] slot` is shown and refused on purpose, since a new slot moves
-every save to it on the server and leaves the old one behind.
+every save to it on the server and leaves the old one behind; so is
+`[server] ca_file`, whose certificate has to be copied onto the card from a PC
+anyway.
 
 **Your file survives the edit.** One line changes; every other byte is the byte
 you typed. Comments, blank lines, the order of your `[platform.x]` sections, a

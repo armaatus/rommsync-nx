@@ -434,6 +434,20 @@ class SdEngine : public ipc::Engine, public power::Sink {
   using NetworkClock = std::function<std::optional<std::chrono::system_clock::time_point>()>;
   void UseNetworkClock(NetworkClock clock);
 
+  /// Where `[server] ca_file` goes to be trusted (#288): `main.cpp` passes the
+  /// console transport's `TrustServerCa`, a host test a client it can rebuild.
+  /// Injected for `NetworkProbe`'s reason, and because the `http::HttpClient`
+  /// this engine is handed has no way to change its trust once built.
+  ///
+  /// Called once at install with the CA file in force (empty for none), then
+  /// with every configuration adopted -- boot, and each `SetConfig`, which
+  /// re-reads the whole file and so picks up a hand edit of the line. **Called
+  /// under `mutex_`**, so it may only record the path: the import happens on
+  /// the next request, on whichever thread makes it. Install it after `Load`
+  /// and before `UseServer`, so the first request already trusts the file.
+  using CaTrust = std::function<void(const std::string& ca_file)>;
+  void UseCaTrust(CaTrust trust);
+
   /// The probe's answer, now, noted as a sighting when it names an application.
   /// `ipc::ServiceCore::SyncNow` reads it to say a press is held rather than
   /// started (`ipc::SyncOutcome::kDeferred`).
@@ -1662,6 +1676,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// `UseNetworkClock`'s. Guarded by `mutex_`, copied out and called outside it.
   NetworkClock network_clock_;
+
+  /// `UseCaTrust`'s. Guarded by `mutex_` and, unlike the probes, called under
+  /// it: it is handed each configuration as `AdoptConfigLocked` swaps it in.
+  CaTrust ca_trust_;
 
   /// What the last tick that negotiated made of the console's clock (#295):
   /// `Status::clock_trusted` and `clock_skew_seconds`. Guarded by `mutex_`.

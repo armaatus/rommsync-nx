@@ -176,7 +176,9 @@ phase_ca_file() {
   # refusal it earns is the CA's, not a hostname mismatch.
   local scratch
   scratch="$(mktemp -d)"
-  trap 'rm -rf "$scratch"' EXIT
+  # Expanded now: `scratch` is local, and gone by the time EXIT fires.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$scratch'" EXIT
   openssl req -x509 -newkey rsa:2048 -nodes -keyout "$scratch/wrong.key" \
       -out "$scratch/wrong.crt" -days 1 -subj "/CN=$CERT_NAME/O=not the fixture" \
       -addext "subjectAltName=DNS:$CERT_NAME,DNS:localhost,IP:127.0.0.1" \

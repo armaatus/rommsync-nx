@@ -178,6 +178,14 @@ void SdEngine::UseNetworkClock(NetworkClock clock) {
   network_clock_ = std::move(clock);
 }
 
+void SdEngine::UseCaTrust(CaTrust trust) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ca_trust_ = std::move(trust);
+  if (ca_trust_) {
+    ca_trust_(ConfigSnapshot()->server.ca_file);
+  }
+}
+
 sync::ClockCheck SdEngine::LocalClock() const {
   NetworkClock network;
   {
@@ -556,6 +564,10 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
     config_ = std::make_shared<const config::Config>(std::move(loaded.value));
   }
   server_tag_ = binding::TagOf(binding::IdentityOf(ConfigSnapshot()->server.url));
+  // Before anything can send a request on this configuration (#288).
+  if (ca_trust_) {
+    ca_trust_(ConfigSnapshot()->server.ca_file);
+  }
   // In the same breath, so a changed interval takes effect with no reboot and a
   // changed `server.url` lifts a TLS park (`sync::Scheduler::Reconfigure`).
   scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
@@ -966,6 +978,11 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   //
   // This is what makes the change take effect with no reboot: `GetStatus` and
   // `GetConfig` read `config_`, and it is now the new one.
+  //
+  // The CA file is checked as boot checks it (#288), outside the lock because
+  // it reads the card: `ParseConfig` is pure, and a `ca_file` that went missing
+  // since boot would otherwise vanish from the settings screen's complaints.
+  config::CheckCaFile(&parsed);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     AdoptConfigLocked(std::move(parsed));

@@ -905,6 +905,7 @@ std::string EncodeConfigView(const ConfigView& view) {
   AppendKey(&out, "server", /*first=*/true);
   out += '{';
   AppendText(&out, "url", view.config.server.url, /*first=*/true);
+  AppendText(&out, "ca_file", view.config.server.ca_file);
   out += '}';
 
   AppendKey(&out, "sync");
@@ -955,7 +956,8 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
   return DecodeObject<ConfigView>(
       text, "config", [](const json::Value& object, ConfigView* out, json::Error* error) {
         const json::Value* server = ReadObject(object, "server", error);
-        if (server == nullptr || !ReadText(*server, "url", &out->config.server.url, error)) {
+        if (server == nullptr || !ReadText(*server, "url", &out->config.server.url, error) ||
+            !ReadText(*server, "ca_file", &out->config.server.ca_file, error)) {
           return;
         }
 

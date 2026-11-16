@@ -285,9 +285,15 @@ The three causes, in the order they are likely:
 1. **`https://` in front of a server that speaks plain HTTP.** RomM on `:8080`
    with no reverse proxy is `http://`, not `https://`.
 2. **A certificate no public CA signed.** A home server with a self-signed
-   certificate has to have that certificate *imported* — verification is not
-   turned off, and there is no setting in this client that turns it off. See
-   [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server).
+   certificate has to have that certificate *imported* with `[server] ca_file`
+   — [INSTALL.md](INSTALL.md#self-signed-or-private-ca) has the steps.
+   Verification is not turned off, and there is no setting in this client that
+   turns it off; see
+   [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server). If
+   `ca_file` is set and this still happens, the Settings screen's `[server]`
+   complaints say whether the file was found and read; a file that reads fine
+   but is not the CA that signed the server, or does not carry the url's name,
+   fails here.
 3. **A server offering only TLS 1.3.** The console's TLS ceiling is **1.2**
    ([DEVELOPMENT.md](DEVELOPMENT.md#tls-in-a-sysmodule)), so a reverse proxy
    configured 1.3-only cannot be talked to at all. Allow 1.2 as well.

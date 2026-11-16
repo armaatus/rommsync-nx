@@ -31,6 +31,7 @@
 #include "http_wire.hpp"
 #include "nifm_verdict.hpp"
 #include "posix_connection.hpp"
+#include "rommsync/config.hpp"
 #include "rommsync/log.hpp"
 
 namespace rommsync::sysmodule {
@@ -42,6 +43,19 @@ namespace {
 bool g_socket_up = false;
 bool g_ssl_up = false;
 bool g_nifm_up = false;
+
+/// `[server] ca_file` as the engine last handed it over (`TrustServerCa`,
+/// #288). Process-wide for the reason the flags above are: there is one
+/// `SslContext`, made by the one client `main.cpp` builds. Its own lock, not
+/// the connector's, so the IPC thread recording a path never waits behind a
+/// request importing one.
+std::mutex g_trusted_ca_mutex;
+std::string g_trusted_ca;
+
+std::string TrustedCa() {
+  std::lock_guard<std::mutex> lock(g_trusted_ca_mutex);
+  return g_trusted_ca;
+}
 
 /// `ssl`'s ResultIoWouldBlock (module 123, description 204): a non-blocking
 /// `DoHandshake` that has sent what it can and is waiting on the server
@@ -362,13 +376,19 @@ class SslConnector final : public Connector {
       }
       context_open_ = true;
     }
-    if (options.ca_bundle_path.empty() || imported_ca_ == options.ca_bundle_path) return true;
-    if (!ImportCa(options.ca_bundle_path)) {
+    // The client's own option first, then what `config.ini` names. A path that
+    // changes is imported on the next request; one that is cleared or replaced
+    // stays imported until the process restarts, since a context cannot forget
+    // a CA and connections may still be open on this one.
+    const std::string wanted =
+        options.ca_bundle_path.empty() ? TrustedCa() : options.ca_bundle_path;
+    if (wanted.empty() || imported_ca_ == wanted) return true;
+    if (!ImportCa(wanted)) {
       *error = http::Error::kTls;
-      *message = "could not import " + options.ca_bundle_path;
+      *message = "could not import the CA file " + wanted;
       return false;
     }
-    imported_ca_ = options.ca_bundle_path;
+    imported_ca_ = wanted;
     return true;
   }
 
@@ -382,8 +402,9 @@ class SslConnector final : public Connector {
     const long size = std::ftell(file);
     std::fseek(file, 0, SEEK_SET);
     // A PEM this big is a mistake rather than a CA bundle, and
-    // `ImportServerPki` takes a u32 size.
-    if (size <= 0 || size > 256 * 1024) {
+    // `ImportServerPki` takes a u32 size. The bound `LoadConfig` checks the
+    // file against, so the settings screen and this agree.
+    if (size <= 0 || static_cast<unsigned long>(size) > config::kMaxCaFileBytes) {
       std::fclose(file);
       return false;
     }
@@ -527,6 +548,11 @@ bool ConsoleIsOnline() {
                                            "; read as no internet connection");
   }
   return false;
+}
+
+void TrustServerCa(const std::string& path) {
+  std::lock_guard<std::mutex> lock(g_trusted_ca_mutex);
+  g_trusted_ca = path;
 }
 
 std::unique_ptr<http::HttpClient> MakeHorizonHttpClient(const http::ClientOptions& options) {

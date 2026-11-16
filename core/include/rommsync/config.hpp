@@ -133,7 +133,25 @@ struct ServerConfig {
   ///
   /// Never carries `user:password@`: see `NormalizeServerUrl`.
   std::string url;
+
+  /// `ca_file`: a PEM certificate -- the CA, or the server's own self-signed
+  /// one -- that an `https://` server is verified against, *in addition to*
+  /// the platform's trust store (#288). Empty, the default, is that store
+  /// alone. Verification stays on either way: this is how a self-signed home
+  /// server is trusted, and there is no key that turns checking off
+  /// (docs/SECURITY.md).
+  ///
+  /// Opened as written -- `sdmc:/config/rommsync/ca.pem` on a console, any
+  /// path on a host -- by `LoadConfig`'s check and by the transport alike, so
+  /// the two cannot disagree about whether it exists. PEM only: a DER file is
+  /// refused with the command that converts it.
+  std::string ca_file;
 };
+
+/// The largest `ca_file` read. A CA bundle is a few KiB; past this it is a
+/// mistake rather than a bundle, and it is read into the sysmodule's heap
+/// (`ssl_http_client.cpp` holds the transport to the same bound).
+inline constexpr std::size_t kMaxCaFileBytes = 256 * 1024;
 
 /// `[sync] on_server_delete`: what a save RomM deleted does on the card (#233).
 enum class OnServerDelete {
@@ -615,6 +633,19 @@ LoadResult ParseConfig(std::string_view text);
 /// Only a missing file takes it -- a file that exists and will not open is a bad
 /// moment, not evidence that the previous record is the current one.
 LoadResult LoadConfig(const std::string& path);
+
+/// Check `result->value.server.ca_file` on the card, and add a `kError` naming
+/// what is wrong with it: missing, unreadable, past `kMaxCaFileBytes`, DER, or
+/// holding no PEM certificate. Nothing when the key is unset or the file is
+/// usable. The path stays in force either way, so the transport fails at the
+/// import and says so rather than quietly trusting a store that does not hold
+/// the server's CA.
+///
+/// Apart from `ParseConfig` because it reads a file; `LoadConfig` runs it, and
+/// so does the sysmodule on a configuration `SetConfig` adopts. "Parses" is
+/// structural -- a PEM certificate block with a body -- not an X.509 decode,
+/// which is the TLS stack's and happens at the handshake.
+void CheckCaFile(LoadResult* result);
 
 // --- the write path ----------------------------------------------------------
 //

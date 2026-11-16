@@ -1821,6 +1821,10 @@ int main(int, char**) {
   rommsync::sysmodule::SdEngine engine;
   engine.Load();
 
+  // `[server] ca_file` into the transport (#288), now and on every adopted
+  // edit -- before anything below can send the first request.
+  engine.UseCaTrust(&rommsync::sysmodule::TrustServerCa);
+
   // The transport M1-7 (#126) built, installed through the seam this issue
   // (M1-6, #123) added. #126 wrote this call out commented, because the seam was
   // not on `main` when it landed; this is that line, uncommented.

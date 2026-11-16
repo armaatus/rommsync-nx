@@ -49,7 +49,7 @@ client, and that rule is about ownership rather than about the link map.
   `[sync] map_state_slots` and each platform's `play_with`; `[tico] account` is
   a list of the accounts found under Tico's `users/`, a press naming one, and
   `[sync] slot` is shown and not
-  offered (M10-31, #271). Nothing here writes `config.ini`.
+  offered (M10-31, #271), as is `[server] ca_file` (#288). Nothing here writes `config.ini`.
 - **Conflicts** — what a sync overwrote, and putting the backup back ✅ M7-1
   (#36). The one conditional row of the settings menu: `[sync] conflict_show`
   hides it, and never stops the recording.

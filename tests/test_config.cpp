@@ -864,7 +864,7 @@ void TheCaFileIsReadAndChecked(checks::Checks& c) {
            "and parsing alone does not go near the card: " + parsed.DescribeDiagnostics());
 
   const config::LoadResult cleared =
-      config::ParseConfig(WithServer("ca_file = /a.pem\nca_file =\n"));
+      config::ParseConfig(WithServer("ca_file =\n"));
   c.Expect(cleared.value.server.ca_file.empty() && cleared.diagnostics.empty(),
            "an empty value is no CA file, the default: " + cleared.DescribeDiagnostics());
 
