@@ -2843,6 +2843,166 @@ std::string Rendered(const ipc::LogTail& tail) {
   return out.empty() ? std::string(" (the log is empty)") : out;
 }
 
+// --- M11-5 (#289): a tick waits for the network, every time ------------------
+
+/// A server that answers nothing and counts what it was asked.
+///
+/// What a tick sent to a console nifm says is offline would reach: the request
+/// fails as the connector's own pre-check fails it. The count is the whole of
+/// what these scenarios read -- a tick held for the network sends nothing.
+class Unanswered final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request&) override {
+    ++requests_;
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    result.message = "the console has no internet connection";
+    return result;
+  }
+  http::Result Download(const http::Request& request, const http::DownloadTarget&) override {
+    return Send(request);
+  }
+  int requests() const { return requests_.load(); }
+
+ private:
+  std::atomic<int> requests_{0};
+};
+
+/// A paired card with the boot tick as given and no interval, so every request
+/// these scenarios count is attributable to one tick.
+void SeedOfflineCard(checks::Checks& c, Console& console, bool on_boot) {
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 std::string("[server]\n"
+                                             "url = https://romm.example.com\n"
+                                             "\n"
+                                             "[sync]\n"
+                                             "enabled = true\n"
+                                             "interval_min = 0\n"
+                                             "on_boot = ") +
+                                     (on_boot ? "true" : "false") + "\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-offline";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one, so nothing but the network stands in front of the tick");
+}
+
+bool AwaitRequests(const Unanswered& server, int above, std::chrono::milliseconds budget) {
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (server.requests() <= above && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  return server.requests() > above;
+}
+
+/// M11-5 (#289): a console that boots with no Wi-Fi does not spend its boot
+/// tick on it once the boot wait runs out.
+///
+/// Until this issue the boot wait was the only thing that ever asked the
+/// probe: when its budget ran out the boot tick ran anyway, failed offline and
+/// put the schedule on its backoff -- so the console that came into range a
+/// minute later waited out a retry it had earned by being in a bag. Now the
+/// tick is held for as long as the probe says no, sends nothing, records
+/// nothing, and runs the moment the probe says yes.
+void BootsOffline(checks::Checks& c) {
+  Console console(c, "engine-boots-offline");
+  SeedOfflineCard(c, console, /*on_boot=*/true);
+  Unanswered server;
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  std::atomic<bool> online{false};
+  std::atomic<int> probes{0};
+  console.engine.UseNetworkProbe(
+      [&] {
+        ++probes;
+        return online.load();
+      },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.StartWorker();
+
+  // Well past the boot budget, and several re-checks after it.
+  std::this_thread::sleep_for(std::chrono::milliseconds{600});
+  c.Expect(probes.load() > 12, "the probe is asked after the boot wait gave up, not only during it");
+  c.ExpectEq(server.requests(), 0,
+             "and the boot tick sends nothing while the console is offline -- the boot wait "
+             "running out is not the network coming up");
+  const ipc::Status held = console.Status();
+  c.Expect(held.last_sync_result == ipc::SyncResult::kNever,
+           "nothing is recorded: a tick that never ran did not fail");
+  c.Expect(!held.sync_in_progress, "and nothing is drawn as running");
+  const ipc::LogTail tail = console.Log();
+  int said = 0;
+  for (const std::string& line : tail.lines) {
+    if (line.find(" net.offline ") != std::string::npos &&
+        line.find("waits for the network") != std::string::npos) {
+      ++said;
+    }
+  }
+  c.ExpectEq(said, 1,
+             "the hold says so once, in the line docs/TROUBLESHOOTING.md shows:" + Rendered(tail));
+
+  online = true;
+  c.Expect(AwaitRequests(server, 0, std::chrono::seconds{3}),
+           "and the held tick runs as soon as the probe says yes, on no backoff");
+}
+
+/// M11-5 (#289): a tick due at a wake waits for Wi-Fi to reassociate.
+///
+/// The boot wait is given again after a wake only when the boot tick never saw
+/// the network; a console that had was handed straight to the tick the wake
+/// made due, racing nifm, and earned an offline backoff for it. Here the press
+/// the console slept through is that tick: it sends nothing while the probe says
+/// no, and runs the moment it says yes.
+void WakesOffline(checks::Checks& c) {
+  Console console(c, "engine-wakes-offline");
+  SeedOfflineCard(c, console, /*on_boot=*/false);
+  Unanswered server;
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  std::atomic<bool> online{true};
+  std::atomic<int> probes{0};
+  console.engine.UseNetworkProbe(
+      [&] {
+        ++probes;
+        return online.load();
+      },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.StartWorker();
+  for (int waited = 0; waited < 200 && probes.load() == 0; ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  c.Expect(probes.load() > 0, "the boot wait saw the network");
+
+  power_fake::Scripted psc;
+  power_fake::Running watching(psc, console.engine);
+  psc.Deliver(power::State::kSleepReady);
+  c.Expect(psc.AwaitAcks(1, std::chrono::seconds{10}), "the console goes to sleep");
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "Sync now is pressed while asleep");
+  online = false;
+  psc.Deliver(power::State::kMinimumAwake);
+  c.Expect(psc.AwaitAcks(2, std::chrono::seconds{10}), "and it wakes with Wi-Fi not yet back");
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{400});
+  c.ExpectEq(server.requests(), 0,
+             "the tick the wake made due sends nothing while nifm says the console is offline");
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kNever,
+           "and records no failure, so the schedule earns no backoff for it");
+
+  online = true;
+  c.Expect(AwaitRequests(server, 0, std::chrono::seconds{3}),
+           "the tick runs once Wi-Fi is back, rather than having been spent on the race");
+}
+
 /// Every misconfiguration docs/TROUBLESHOOTING.md answers that needs no server.
 ///
 /// Three consoles, because each is a different section of the guide and a
@@ -7521,6 +7681,10 @@ int main(int argc, char** argv) {
     Reenable(checks);
   } else if (scenario == "sleeps") {
     Sleeps(checks);
+  } else if (scenario == "boots_offline") {
+    BootsOffline(checks);
+  } else if (scenario == "wakes_offline") {
+    WakesOffline(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
   } else if (scenario == "restore_polled") {

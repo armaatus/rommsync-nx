@@ -163,9 +163,14 @@ void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
   lists_.UseAuthObserver([this](auth::Answer answer) { ObserveAnswer(answer); });
 }
 
-void SdEngine::UseNetworkProbe(NetworkProbe probe) {
+void SdEngine::UseNetworkProbe(NetworkProbe probe, std::chrono::milliseconds budget,
+                               std::chrono::milliseconds poll,
+                               std::chrono::milliseconds idle_poll) {
   std::lock_guard<std::mutex> lock(mutex_);
   network_probe_ = std::move(probe);
+  network_budget_ = budget;
+  network_poll_ = poll;
+  network_idle_poll_ = idle_poll;
 }
 
 void SdEngine::UseNetworkClock(NetworkClock clock) {
@@ -1084,16 +1089,19 @@ bool SdEngine::AwaitNetwork() {
   // (CLAUDE.md, docs/ARCHITECTURE.md §1). A null probe is "the network is up",
   // which is what every host build is.
   NetworkProbe probe;
+  std::chrono::milliseconds budget{0};
+  std::chrono::milliseconds poll{0};
   {
     std::lock_guard<std::mutex> lock(mutex_);
     probe = network_probe_;
+    budget = network_budget_;
+    poll = network_poll_;
   }
   if (!probe) {
     return true;
   }
 
-  const std::chrono::steady_clock::time_point deadline =
-      std::chrono::steady_clock::now() + kNetworkWaitBudget;
+  const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + budget;
   std::unique_lock<std::mutex> lock(mutex_);
   // `suspended_` as well as `stopping_`, and for the same reason: this runs
   // before the worker's loop, so a console that sleeps during the boot wait
@@ -1122,7 +1130,7 @@ bool SdEngine::AwaitNetwork() {
     }
     // `wait_for` rather than a sleep, so a shutdown cuts this short instead of
     // costing the destructor the rest of the poll interval.
-    wake_.wait_for(lock, kNetworkPollInterval,
+    wake_.wait_for(lock, poll,
                    [this] { return stopping_ || suspended_ || restore_pending_; });
   }
   // False when the budget ran out, the process is going away, or the console

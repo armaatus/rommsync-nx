@@ -123,6 +123,13 @@ inline constexpr const char* kSdRoot = "sdmc:";
 inline constexpr std::chrono::seconds kNetworkWaitBudget{120};
 inline constexpr std::chrono::seconds kNetworkPollInterval{2};
 
+/// How often a tick held for the network asks again once it has been held for
+/// `kNetworkWaitBudget` (M11-5, #289). The schedule's backoff floor, which is
+/// what an offline console retried at before a tick was held rather than run:
+/// a console on a coffee table with no Wi-Fi asks nifm twice a minute and
+/// sends nothing.
+inline constexpr std::chrono::seconds kNetworkIdlePollInterval{30};
+
 /// How long the worker waits before trying a drain that did not get anywhere,
 /// and the ceiling that wait doubles up to (M9-5, #197).
 ///
@@ -368,8 +375,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// Called on the **worker thread**, never on the IPC one, and never while
   /// `mutex_` is held. Boot is not held either way: `main` starts this thread
   /// and returns.
+  ///
+  /// `budget` and `poll` are the boot wait's (`AwaitNetwork`) and the first
+  /// stretch of a held tick's; `idle_poll` is how often a tick held longer than
+  /// `budget` asks again. Parameters for the host suite, which cannot spend two
+  /// minutes finding out; `main.cpp` passes the defaults.
   using NetworkProbe = std::function<bool()>;
-  void UseNetworkProbe(NetworkProbe probe);
+  void UseNetworkProbe(NetworkProbe probe,
+                       std::chrono::milliseconds budget = kNetworkWaitBudget,
+                       std::chrono::milliseconds poll = kNetworkPollInterval,
+                       std::chrono::milliseconds idle_poll = kNetworkIdlePollInterval);
 
   /// Whether an application -- a retail game, Tico, RetroArch launched over a
   /// title -- is in the foreground right now (M10-16, #242).
@@ -1613,8 +1628,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   http::HttpClient* server_ = nullptr;
   std::string list_token_;
 
-  /// Whether the console is on a network. Null means "up".
+  /// Whether the console is on a network. Null means "up". The three paces
+  /// `UseNetworkProbe` took with it. All guarded by `mutex_`.
   NetworkProbe network_probe_;
+  std::chrono::milliseconds network_budget_ = kNetworkWaitBudget;
+  std::chrono::milliseconds network_poll_ = kNetworkPollInterval;
+  std::chrono::milliseconds network_idle_poll_ = kNetworkIdlePollInterval;
 
   /// Whether a game is in the foreground, and how often to ask while a tick
   /// waits for it (#242). Null means "nothing is running". Both guarded by
