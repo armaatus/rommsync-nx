@@ -161,8 +161,10 @@ void ServiceServer::Run() {
     // line anywhere and the overlay saying *not running* (#291). The sessions
     // go -- whichever one the failure was about cannot be told from here, and
     // a client whose session vanished opens a new one on its next call -- and
-    // the port stays, because re-registering it needs `sm`, which this process
-    // let go of at boot (server.hpp).
+    // the port stays. Nothing says the port is what failed, and unregistering
+    // and re-registering the name would open a window in which the overlay's
+    // lookup answers *not running* -- the very symptom this replaces. (`sm`
+    // itself is still open: main.cpp holds it for the process's life, #195.)
     const int dropped = static_cast<int>(handle_count_) - 1;
     DropSessions();
     const bool last = errors.Fail();
