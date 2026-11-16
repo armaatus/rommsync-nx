@@ -15,7 +15,10 @@
 
 #include "ipc_client.hpp"
 #include "lifecycle.hpp"
+#include <cstddef>
+
 #include "rommsync/overlay_log_view.hpp"
+#include "rommsync/overlay_scroll.hpp"
 #include "screen_frame.hpp"
 
 namespace rommsync::overlay {
@@ -35,8 +38,17 @@ class LogScreen : public tsl::Gui {
   /// and a log moves at the speed a tick does, not at sixty a second.
   void update() override;
 
+  /// Up/Down scroll the log and L/R a page, repeating while held (#298's
+  /// `ScrollRepeat`); Y writes the diagnostics bundle (#304). B is not handled,
+  /// so Tesla pops the screen.
+  bool handleInput(u64 keys_down, u64 keys_held, const HidTouchState& touch,
+                   HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
+
  private:
   void Poll();
+
+  /// One press of Y: ask for the bundle, and keep what came of it on screen.
+  void WriteDiagnostics();
 
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
@@ -53,6 +65,17 @@ class LogScreen : public tsl::Gui {
   /// Starts as "not running" rather than as an empty screen: the first frame
   /// is drawn before the first poll returns.
   LogView view_ = RenderLogUnreachable(Link::kNotRunning);
+
+  /// The held key, and how far the log is scrolled up from its end (#304).
+  ScrollRepeat repeat_;
+  std::size_t back_ = 0;
+
+  /// How many lines the panel held when it was last drawn: `Draw` is const and
+  /// called by libtesla, and this is the one thing it learns that input needs.
+  mutable std::size_t room_ = 0;
+
+  /// What the last Y came to; outlives every poll's redraw.
+  LogNotice notice_;
 };
 
 }  // namespace rommsync::overlay

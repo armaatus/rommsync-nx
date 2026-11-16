@@ -253,6 +253,18 @@ class FakeEngine : public ipc::Engine {
     return cancel_result;
   }
 
+  /// #304: answered with `diagnostics_error` and `diagnostics_result`, and the
+  /// request kept so a test can see what the overlay said about itself.
+  ipc::Error WriteDiagnostics(const ipc::DiagnosticsRequest& request,
+                              ipc::DiagnosticsResult* result) override {
+    last_diagnostics_request = request;
+    ++diagnostics_requests;
+    if (diagnostics_error == ipc::Error::kOk) {
+      *result = diagnostics_result;
+    }
+    return diagnostics_error;
+  }
+
   ipc::RestoreState TakeLocked(std::int64_t entry_id) {
     if (restore_.phase == ipc::RestorePhase::kRunning) {
       return restore_;
@@ -292,6 +304,10 @@ class FakeEngine : public ipc::Engine {
   int keep_local_requests = 0;
   std::int64_t last_cancel_id = 0;
   ipc::CancelKeepLocalResult cancel_result;
+  ipc::DiagnosticsRequest last_diagnostics_request;
+  int diagnostics_requests = 0;
+  ipc::Error diagnostics_error = ipc::Error::kOk;
+  ipc::DiagnosticsResult diagnostics_result{"/config/rommsync/diagnostics-20261118-110640.txt"};
   conflicts::RestoreReport restore_report;
   bool restore_runs_inline = true;
 

@@ -236,6 +236,10 @@ enum class Event {
   /// result, the sessions dropped, and whether the loop carries on or -- after
   /// a run of them -- stops. The overlay says *not running* after the last.
   kIpcError,
+
+  /// The diagnostics bundle was written, or could not be (M11-20, #304): the
+  /// file's path, which is the file the user was told to attach.
+  kDiagnostics,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -250,7 +254,7 @@ inline constexpr std::array kAllEvents = {
     Event::kServerVersion, Event::kServerUnsupported,
     Event::kSyncHeld,    Event::kSaveDeleted, Event::kBackupPruned, Event::kRemoteInstall,
     Event::kPlayRecorded, Event::kTerminated, Event::kClockSkew, Event::kNetTlsClock,
-    Event::kIpcError,
+    Event::kIpcError,   Event::kDiagnostics,
 };
 
 /// Stable tag -- `net.offline`. Never null.

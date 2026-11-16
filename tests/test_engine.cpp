@@ -3385,6 +3385,63 @@ int ServerDisabled(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #304: Y on the log screen writes one file a bug report can carry -- through
+/// the table the console runs, against a card, with the platform's facts
+/// injected the way `main.cpp` injects them -- and no secret on the card is in
+/// it.
+void Diagnostics(checks::Checks& c) {
+  rlog::Reset();
+  Console console(c, "engine-diagnostics");
+  const std::string token = "tok3n-in-token-dat-SECRET";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n"
+                                 "[sync]\nstates = true\n"),
+           "a configured console");
+  c.Expect(console.sandbox.Write("/config/rommsync/token.dat", token + "\n"),
+           "with a token on the card");
+  c.Expect(console.sandbox.Write("/config/rommsync/rommsync.log",
+                                 "1 info boot rommsync-nx/0.9.0\n2 info sync.tick ok\n"),
+           "and a log");
+  console.sandbox.MakeDirs("/atmosphere/crash_reports");
+  c.Expect(console.sandbox.Write("/atmosphere/crash_reports/01795000600_4200000000524d53.log",
+                                 "registers and a stack"),
+           "and a crash of ours");
+  c.Expect(console.sandbox.Write("/atmosphere/crash_reports/01795000700_0100000000001000.log",
+                                 "someone else's"),
+           "and one of someone else's");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  sysmodule::PlatformFacts facts;
+  facts.hos = "19.0.1";
+  facts.libnx = "4.10.0-1";
+  facts.atmosphere = "not read: sys-rommsync holds no spl: grant";
+  console.engine.UsePlatformFacts(facts);
+
+  std::string response;
+  c.Expect(console.Call(ipc::Command::kWriteDiagnostics,
+                        ipc::EncodeDiagnosticsRequest({"0.9.0", ipc::kVersion, "v2.5.4"}),
+                        &response) == ipc::Error::kOk,
+           "WriteDiagnostics writes the bundle");
+  const ipc::Decoded<ipc::DiagnosticsResult> answer = ipc::DecodeDiagnosticsResult(response);
+  c.Expect(answer.ok() && answer.value.sd_path.rfind("/config/rommsync/diagnostics-", 0) == 0,
+           "and answers where it is, as a card reader shows it: " + answer.value.sd_path);
+  const std::string bundle = console.sandbox.Read(answer.value.sd_path);
+  c.Expect(!bundle.empty(), "the file is there");
+  for (const char* expected :
+       {"overlay = 0.9.0", "libultrahand = v2.5.4", "hos = 19.0.1", "libnx = 4.10.0-1",
+        "spl: grant", "url = https://romm.example.com", "states = true", "sync.tick ok",
+        "01795000600_4200000000524d53.log", "measured = no"}) {
+    c.Expect(bundle.find(expected) != std::string::npos,
+             std::string("the bundle carries \"") + expected + "\"");
+  }
+  c.Expect(bundle.find(token) == std::string::npos && bundle.find("SECRET") == std::string::npos,
+           "token.dat's token is not in it");
+  c.Expect(bundle.find("0100000000001000") == std::string::npos,
+           "nor another program's crash");
+}
+
 void Commands(checks::Checks& c) {
   Console console(c, "engine-commands");
   console.Boot();
@@ -8040,6 +8097,8 @@ int main(int argc, char** argv) {
     KeepLocalServer(checks);
   } else if (scenario == "keep_local_cancel") {
     KeepLocalCancel(checks);
+  } else if (scenario == "diagnostics") {
+    Diagnostics(checks);
   } else if (scenario == "keep_local_cancel_race") {
     KeepLocalCancelRace(checks);
   } else if (scenario == "syncnow") {

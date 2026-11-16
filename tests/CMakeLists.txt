@@ -1309,6 +1309,27 @@ endif()
 # this uploads and deletes saves on the shared fixture device.
 set_tests_properties(conflicts.recorded PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# --- M11-20 (#304): the diagnostics bundle -----------------------------------
+# What a beta tester attaches to a bug report, written on the overlay's press.
+# Serverless: the files it streams are planted in a scratch directory.
+add_executable(test_diagnostics test_diagnostics.cpp)
+target_link_libraries(test_diagnostics PRIVATE rommsync::core)
+target_include_directories(test_diagnostics PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_diagnostics PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(scenario
+        redaction   # no token, device_code, user_code or password reaches the bundle
+        sections    # versions, status, state.db, backup usage and config.ini are in it
+        log         # the last kLogLines lines, across the rotation, oldest first
+        crashes     # only our crash reports, newest first, names and dates only
+        name        # one file per press, named for the moment in UTC
+        program_id  # diag::kProgramId is sys-rommsync.json's
+        missing)    # a bare card still gets a bundle
+  add_test(NAME diagnostics.${scenario} COMMAND test_diagnostics ${scenario})
+  set_tests_properties(diagnostics.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M11-8 (#292): `.backup/` bounded, and nothing pruned is the only copy ----
 add_executable(test_backup_prune test_backup_prune.cpp)
 target_link_libraries(test_backup_prune PRIVATE rommsync::host)
@@ -2504,6 +2525,7 @@ set(ENGINE_SCENARIOS
   keep_local_server  # #317: Keep local is refused on another server's conflict, and dropped by a switch
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
+  diagnostics  # #304: Y on the log screen writes a redacted bundle beside config.ini
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write

@@ -125,11 +125,24 @@ who takes the card out:
 | `queue.json` | the roms queued for download |
 | `rommsync.log` | what each sync did |
 | `.backup/` | a copy of every save before it was overwritten |
+| `diagnostics-<time>.txt` | only if you pressed *Write diagnostics*: see below |
 
 The log names the server URL, this console's RomM device id, save paths, rom
 ids and the play sessions recorded. It never contains the token: it says only
 whether one is present and how long it is. It is never uploaded. If you attach
 it to a bug report, that is the list of what you are sharing.
+
+A diagnostics file is written only when you press **Y** (*Write diagnostics*)
+on the overlay's log screen, one new file per press. It holds the versions of
+the overlay, the sysmodule, libultrahand, libnx and the firmware; the status
+screen's numbers; how many rows `state.db` has and how much `.backup/` holds;
+`config.ini`, including the server URL; the last 200 log lines; and the names
+and dates of Atmosphère's crash reports for sys-rommsync. Any value whose key
+names a token, code, password or secret is replaced by `<redacted>`, every line
+is scrubbed the way the log is, and `token.dat` and `device.dat` are never read.
+It is never uploaded; attaching it to a bug report is your choice, and it is
+the list of what you are sharing
+([TROUBLESHOOTING.md](TROUBLESHOOTING.md#what-to-attach-to-a-bug-report)).
 
 ## What is never sent
 
@@ -138,8 +151,9 @@ it to a bug report, that is the list of what you are sharing.
 - The title id of any running game, or a list of installed software.
 - Any file outside the save and state folders `config.ini` maps, and states only
   when `[sync] states = true`.
-- The log, `state.db`, `conflicts.db` or anything else under
-  `/config/rommsync/`, except the play sessions in `play.db` as described above.
+- The log, a diagnostics file, `state.db`, `conflicts.db` or anything else
+  under `/config/rommsync/`, except the play sessions in `play.db` as described
+  above.
 
 ## Turning things off
 

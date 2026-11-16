@@ -839,6 +839,49 @@ int RoundTrip() {
                   "and a rom id where an entry id belongs is refused, not acted on");
   }
 
+  // #304: the overlay says which build it is and asks for a bundle; the answer
+  // is where the bundle landed, and a card that refused it is a named failure.
+  {
+    const ipc::DiagnosticsRequest asked{"0.9.0", ipc::kVersion, "v2.5.4"};
+    const ipc::Decoded<ipc::DiagnosticsRequest> request =
+        ipc::DecodeDiagnosticsRequest(ipc::EncodeDiagnosticsRequest(asked));
+    checks.Expect(request.ok() && request.value.overlay == "0.9.0" &&
+                      request.value.overlay_interface == ipc::kVersion &&
+                      request.value.libultrahand == "v2.5.4",
+                  "a diagnostics request reads back as itself: " + request.error.Describe());
+    checks.Expect(!ipc::DecodeDiagnosticsRequest(ipc::EncodeDiagnosticsRequest(
+                                                    {std::string(200, 'v'), 1, "v2.5.4"}))
+                       .ok(),
+                  "an overlay version longer than any build's is refused, not copied");
+    const ipc::Decoded<ipc::DiagnosticsResult> result = ipc::DecodeDiagnosticsResult(
+        ipc::EncodeDiagnosticsResult({"/config/rommsync/diagnostics-20261118-110640.txt"}));
+    checks.Expect(result.ok() &&
+                      result.value.sd_path == "/config/rommsync/diagnostics-20261118-110640.txt",
+                  "and so does its answer: " + result.error.Describe());
+    checks.Expect(!ipc::DecodeDiagnosticsResult("{}").ok(),
+                  "an answer that does not say where the bundle is is refused");
+
+    FakeEngine engine;
+    ipc::ServiceCore core(engine);
+    std::string response;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kWriteDiagnostics),
+                                ipc::EncodeDiagnosticsRequest(asked), &response) ==
+                      ipc::Error::kOk,
+                  "WriteDiagnostics answers once the bundle is on the card");
+    checks.ExpectEq(engine.diagnostics_requests, 1, "it asks the engine once");
+    checks.ExpectEq(engine.last_diagnostics_request.libultrahand, std::string("v2.5.4"),
+                    "with what the overlay said about itself");
+    checks.Expect(ipc::DecodeDiagnosticsResult(response).ok(), "answering where it landed");
+    engine.diagnostics_error = ipc::Error::kWriteFailed;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kWriteDiagnostics),
+                                ipc::EncodeDiagnosticsRequest(asked), &response) ==
+                      ipc::Error::kWriteFailed,
+                  "a card that refused the bundle is kWriteFailed");
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kWriteDiagnostics),
+                                ipc::EncodeEmpty(), &response) == ipc::Error::kMalformedRequest,
+                  "and a request that does not say which overlay asked is refused");
+  }
+
   // Every string field is user data and may hold anything a filesystem allows.
   // `json::Quote` is what carries it rather than interpreting it, and this is
   // the check that nothing here builds a payload by concatenation instead.
@@ -1151,6 +1194,7 @@ int Secrets() {
       {ipc::Command::kGetRestoreState, ipc::EncodeEmpty()},
       {ipc::Command::kKeepLocal, ipc::EncodeEntryId(3)},
       {ipc::Command::kCancelKeepLocal, ipc::EncodeEntryId(3)},
+      {ipc::Command::kWriteDiagnostics, ipc::EncodeDiagnosticsRequest({"0.9.0", 18, "v2.5.4"})},
   };
 
   // The log is the newest way a credential could reach this wire: a call site

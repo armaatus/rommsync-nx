@@ -252,6 +252,7 @@ enum class Command : std::uint32_t {
   kGetRestoreState = 17,
   kKeepLocal = 18,
   kCancelKeepLocal = 19,
+  kWriteDiagnostics = 20,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -264,7 +265,7 @@ inline constexpr std::array kAllCommands = {
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
     Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
     Command::kRestoreBackup,       Command::kGetLog,       Command::kGetRestoreState,
-    Command::kKeepLocal,           Command::kCancelKeepLocal,
+    Command::kKeepLocal,           Command::kCancelKeepLocal, Command::kWriteDiagnostics,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -1122,6 +1123,31 @@ struct LogTail {
 /// `kMaxLogLines` is not a size. Returns false without touching `tail`.
 bool AppendIfItFits(LogTail* tail, std::string line);
 
+// --- the diagnostics bundle ---------------------------------------------------
+
+/// The longest version string `WriteDiagnostics` takes from the overlay. A
+/// version is `0.9.0-rc.2` or `v2.5.4`; anything near this is not one, and it is
+/// copied into a file on the card, so it is refused rather than written.
+inline constexpr std::size_t kMaxDiagnosticsVersionBytes = 64;
+
+/// `WriteDiagnostics`' request (M11-20, #304): what the overlay is, because the
+/// sysmodule cannot know. The two halves ship as separate files, and "which
+/// overlay is on this card" is half of the first question a bug report asks.
+struct DiagnosticsRequest {
+  /// The overlay's `rommsync::version()` and `kVersion`.
+  std::string overlay;
+  std::uint32_t overlay_interface = 0;
+
+  /// The libultrahand tag the overlay was built against, or empty.
+  std::string libultrahand;
+};
+
+/// Where the bundle landed: an SD-root path, which is what a user with a card
+/// reader opens (`/config/rommsync/diagnostics-<time>.txt`).
+struct DiagnosticsResult {
+  std::string sd_path;
+};
+
 // --- codecs -------------------------------------------------------------------
 //
 // Every one of these round-trips losslessly and every decoder refuses a payload
@@ -1220,6 +1246,15 @@ Decoded<std::int32_t> DecodeLogRequest(std::string_view text);
 
 std::string EncodeLogTail(const LogTail& tail);
 Decoded<LogTail> DecodeLogTail(std::string_view text);
+
+/// `{"overlay":...,"overlay_interface":<u32>,"libultrahand":...}`. Each string
+/// at most `kMaxDiagnosticsVersionBytes`; `libultrahand` may be empty.
+std::string EncodeDiagnosticsRequest(const DiagnosticsRequest& request);
+Decoded<DiagnosticsRequest> DecodeDiagnosticsRequest(std::string_view text);
+
+/// `{"sd_path":...}`, never empty.
+std::string EncodeDiagnosticsResult(const DiagnosticsResult& result);
+Decoded<DiagnosticsResult> DecodeDiagnosticsResult(std::string_view text);
 
 /// The payload of a command that carries none: `{}`. A shape rather than an
 /// empty buffer, so every decoder on both sides can assume a JSON object.
@@ -1405,6 +1440,17 @@ class Engine {
   /// Where the last restore stands. Safe at any rate, from the IPC thread,
   /// while one runs.
   virtual RestoreState restore_state() const = 0;
+
+  /// Write the diagnostics bundle (M11-20, #304) and say where it landed.
+  /// `kWriteFailed` when the card refused it. Answered on the IPC thread: the
+  /// bundle is streamed a line at a time from files of bounded size
+  /// (`diag::Write`), the same class of card write `SetConfig` already makes
+  /// there. `kUnavailable` by default, for an engine with no card.
+  virtual Error WriteDiagnostics(const DiagnosticsRequest& request, DiagnosticsResult* result) {
+    (void)request;
+    (void)result;
+    return Error::kUnavailable;
+  }
 };
 
 /// The service, as a plain C++ class with one method per command.
@@ -1509,6 +1555,10 @@ class ServiceCore {
   /// so a console whose card refused the log file still answers this
   /// (`log::FileSink` is silent about its own failures for the same reason).
   LogTail GetLog(std::int32_t lines) const;
+
+  /// Command 20 (#304). Write the diagnostics bundle; `result` is set on
+  /// `kOk` only.
+  Error WriteDiagnostics(const DiagnosticsRequest& request, DiagnosticsResult* result);
 
  private:
   /// A pairing status cut to what a payload carries. See the definition: the

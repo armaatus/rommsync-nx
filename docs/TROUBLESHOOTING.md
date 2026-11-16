@@ -116,12 +116,14 @@ and a log is not worth it. A save is never in that position; see
 | `clock.skew` | the console's clock is not believed — unset, or a day or more off the network clock or the server's — so saves the server would choose by timestamp are held; or it agrees again | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 | `net.tls_clock` | a TLS failure the console's clock is the likely cause of | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 | `ipc.error` | the service the overlay talks to met a kernel error, dropped the overlay's connections and carried on — or, after several in a row, stopped | [The overlay's connection failed](#the-overlays-connection-failed) |
+| `diagnostics.bundle` | the diagnostics file was written, and where — or why the card refused it | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
 [DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so the lines above can be
-read without an SD reader. It is the last lines the sysmodule kept in memory;
-the whole log is the file on the card.
+read without an SD reader. Up and Down scroll it, L and R a page at a time. It
+is the last lines the sysmodule kept in memory; the whole log is the file on
+the card.
 
 ---
 
@@ -1149,7 +1151,36 @@ the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug-repo
 
 ## What to attach to a bug report
 
-Five things, and the log has four of them:
+**The quickest way: one file.** Open **Settings → Log** on the overlay and press
+**Y** (*Write diagnostics*). The sysmodule writes
+`sdmc:/config/rommsync/diagnostics-<date>-<time>.txt`, the screen names it, and
+the log says so:
+
+```
+212 info diagnostics.bundle written: /config/rommsync/diagnostics-20261118-110640.txt
+```
+
+Attach that file. It holds everything below in one place:
+
+- the versions of the overlay, the sysmodule and the IPC contract each speaks,
+  libultrahand, libnx and the console's firmware;
+- the status screen's numbers, `state.db`'s row count, and how much `.backup/`
+  holds (or that no prune has measured it since boot);
+- `config.ini`, with any value whose key names a token, code, password or secret
+  replaced by `<redacted>`;
+- the last 200 lines of `rommsync.log` and `rommsync.log.old`;
+- the names and dates — never the contents — of the Atmosphère crash reports
+  written for sys-rommsync.
+
+It is redacted line by line as it is written — no token, no pairing code and no
+password in a URL reaches it — and `token.dat` and `device.dat` are never read.
+It stays on the card; nothing sends it anywhere ([PRIVACY.md](PRIVACY.md)).
+Atmosphère's own version and whether this is emuMMC are not in it yet: reading
+them needs a system service the sysmodule does not hold, so give those in the
+bug report form.
+
+If the overlay cannot reach the sysmodule, or you would rather pick the lines
+yourself, attach the log instead. Five things, and the log has four of them:
 
 1. **The version.** The first line of the log, and also on the overlay's status
    screen:

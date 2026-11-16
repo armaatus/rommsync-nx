@@ -430,6 +430,11 @@ constexpr ClientCall kClientCalls[] = {
        ipc::CancelKeepLocalResult out;
        return c.CancelKeepLocal(3, &out);
      }},
+    {ipc::Command::kWriteDiagnostics, "WriteDiagnostics",
+     [](overlay::IpcClient& c) {
+       ipc::DiagnosticsResult out;
+       return c.WriteDiagnostics(&out);
+     }},
 };
 
 int RunWire(Checks& checks) {
@@ -2348,6 +2353,60 @@ int RunLog(Checks& checks) {
     overlay::PaintLog(view, palette, out, kPanelX, kPanelY, kPanelWidth, 40);
     checks.Expect(out.Drew(overlay::Prompt(overlay::kGlyphB, "Back")),
                   "the way out survives a panel with no room");
+  }
+
+  // #304: the log scrolls. Up shows older lines, as far as the oldest and no
+  // further; Down comes back to the newest and stops there.
+  {
+    Recorder first;
+    const std::size_t room =
+        overlay::PaintLog(view, palette, first, kPanelX, kPanelY, kPanelWidth, kPanelHeight);
+    checks.Expect(room > 0 && room < view.lines.size(),
+                  "the panel holds fewer than forty lines, so there is something to scroll");
+    checks.Expect(first.Drew(overlay::Prompt(overlay::kGlyphY, "Write diagnostics")),
+                  "and the log screen offers the bundle a bug report wants");
+
+    std::size_t back = overlay::ScrollLog(0, -1, view.lines.size(), room);
+    checks.ExpectEq(back, std::size_t{1}, "one press up hides the newest line");
+    back = overlay::ScrollLog(back, -1000, view.lines.size(), room);
+    checks.ExpectEq(back, view.lines.size() - room, "a held key stops at the oldest line");
+    overlay::LogView scrolled = view;
+    scrolled.back = back;
+    Recorder top;
+    overlay::PaintLog(scrolled, palette, top, kPanelX, kPanelY, kPanelWidth, kPanelHeight);
+    checks.Expect(top.Drew(view.lines.front()), "scrolled to the top, the oldest line is drawn");
+    checks.Expect(!top.Drew(view.lines.back()), "and the newest is not");
+    checks.ExpectEq(overlay::ScrollLog(back, 1000, view.lines.size(), room), std::size_t{0},
+                    "down goes back to the newest and no further");
+    checks.ExpectEq(overlay::ScrollLog(0, -5, 3, room), std::size_t{0},
+                    "a log shorter than the panel does not scroll at all");
+  }
+
+  // #304: what the press said, under the headline.
+  {
+    const overlay::LogNotice written = overlay::RenderDiagnostics(
+        overlay::DiagnosticsOutcome::kWritten, "/config/rommsync/diagnostics-20261118-110640.txt");
+    checks.Expect(written.text.find("diagnostics-20261118-110640.txt") != std::string::npos &&
+                      written.tone == overlay::Tone::kGood,
+                  "a written bundle names the file to attach: " + written.text);
+    const overlay::LogNotice old =
+        overlay::RenderDiagnostics(overlay::DiagnosticsOutcome::kOutdated, "");
+    checks.Expect(old.text.find("sysmodule") != std::string::npos,
+                  "a sysmodule too old to write one says which half to update: " + old.text);
+    const overlay::LogNotice refused =
+        overlay::RenderDiagnostics(overlay::DiagnosticsOutcome::kWriteFailed, "");
+    checks.Expect(refused.tone == overlay::Tone::kBad && !refused.text.empty(),
+                  "a card that refused it is a failure, said");
+    checks.Expect(!overlay::RenderDiagnostics(overlay::DiagnosticsOutcome::kNoAnswer, "")
+                       .text.empty(),
+                  "and so is no answer");
+
+    overlay::LogView noted = view;
+    noted.notice = written.text;
+    noted.notice_tone = written.tone;
+    Recorder out;
+    overlay::PaintLog(noted, palette, out, kPanelX, kPanelY, kPanelWidth, kPanelHeight);
+    checks.Expect(out.Drew(written.text), "the notice is drawn");
   }
   return checks.failures();
 }

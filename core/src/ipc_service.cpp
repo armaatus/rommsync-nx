@@ -359,6 +359,7 @@ bool TakesRequest(Command command) {
     case Command::kGetLog:
     case Command::kKeepLocal:
     case Command::kCancelKeepLocal:
+    case Command::kWriteDiagnostics:
       return true;
     case Command::kGetInterfaceVersion:
     case Command::kGetStatus:
@@ -428,6 +429,11 @@ CancelKeepLocalResult ServiceCore::CancelKeepLocal(std::int64_t entry_id) {
 }
 
 RestoreState ServiceCore::GetRestoreState() const { return Bounded(engine_.restore_state()); }
+
+Error ServiceCore::WriteDiagnostics(const DiagnosticsRequest& request,
+                                    DiagnosticsResult* result) {
+  return engine_.WriteDiagnostics(request, result);
+}
 
 LogTail ServiceCore::GetLog(std::int32_t lines) const {
   // Clamped here rather than at the decoder, so an over-large ask is a smaller
@@ -653,6 +659,19 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
         return Error::kMalformedRequest;
       }
       payload = EncodeLogTail(core.GetLog(lines.value));
+      break;
+    }
+
+    case Command::kWriteDiagnostics: {
+      const Decoded<DiagnosticsRequest> asked = DecodeDiagnosticsRequest(request);
+      if (!asked.ok()) {
+        return Error::kMalformedRequest;
+      }
+      DiagnosticsResult result;
+      error = core.WriteDiagnostics(asked.value, &result);
+      if (error == Error::kOk) {
+        payload = EncodeDiagnosticsResult(result);
+      }
       break;
     }
   }

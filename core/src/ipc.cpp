@@ -564,6 +564,8 @@ const char* ToString(Command command) {
       return "KeepLocal";
     case Command::kCancelKeepLocal:
       return "CancelKeepLocal";
+    case Command::kWriteDiagnostics:
+      return "WriteDiagnostics";
   }
   return "Unknown";
 }
@@ -1704,6 +1706,57 @@ bool AppendIfItFits(LogTail* tail, std::string line) {
   }
   tail->lines.pop_back();
   return false;
+}
+
+// --- the diagnostics bundle ---------------------------------------------------
+
+std::string EncodeDiagnosticsRequest(const DiagnosticsRequest& request) {
+  std::string out("{");
+  AppendText(&out, "overlay", request.overlay, /*first=*/true);
+  AppendInteger(&out, "overlay_interface", request.overlay_interface);
+  AppendText(&out, "libultrahand", request.libultrahand);
+  out += '}';
+  return out;
+}
+
+Decoded<DiagnosticsRequest> DecodeDiagnosticsRequest(std::string_view text) {
+  return DecodeObject<DiagnosticsRequest>(
+      text, "diagnostics request",
+      [](const json::Value& object, DiagnosticsRequest* out, json::Error* error) {
+        std::int64_t interface_version = 0;
+        if (!ReadText(object, "overlay", &out->overlay, error) ||
+            !ReadInteger(object, "overlay_interface", &interface_version, 0, 0xFFFFFFFFLL,
+                         error) ||
+            !ReadText(object, "libultrahand", &out->libultrahand, error)) {
+          return;
+        }
+        out->overlay_interface = static_cast<std::uint32_t>(interface_version);
+        // Copied into a file a user attaches: a string no build ever spelled is
+        // refused rather than written there.
+        if (out->overlay.size() > kMaxDiagnosticsVersionBytes) {
+          Fail(error, "overlay", "is longer than any version");
+        } else if (out->libultrahand.size() > kMaxDiagnosticsVersionBytes) {
+          Fail(error, "libultrahand", "is longer than any version");
+        }
+      });
+}
+
+std::string EncodeDiagnosticsResult(const DiagnosticsResult& result) {
+  std::string out("{");
+  AppendText(&out, "sd_path", result.sd_path, /*first=*/true);
+  out += '}';
+  return out;
+}
+
+Decoded<DiagnosticsResult> DecodeDiagnosticsResult(std::string_view text) {
+  return DecodeObject<DiagnosticsResult>(
+      text, "diagnostics result",
+      [](const json::Value& object, DiagnosticsResult* out, json::Error* error) {
+        if (ReadText(object, "sd_path", &out->sd_path, error) && out->sd_path.empty()) {
+          // The whole answer is where to look; an empty one tells a user nothing.
+          Fail(error, "sd_path", "is empty");
+        }
+      });
 }
 
 std::string EncodeEmpty() { return "{}"; }

@@ -373,6 +373,8 @@ const char* ToString(Event event) {
       return "net.tls_clock";
     case Event::kIpcError:
       return "ipc.error";
+    case Event::kDiagnostics:
+      return "diagnostics.bundle";
   }
   return "unknown";
 }

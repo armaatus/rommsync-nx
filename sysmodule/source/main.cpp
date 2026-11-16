@@ -40,6 +40,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "boot_wait.hpp"
 #include "card.hpp"
@@ -1110,6 +1111,10 @@ Handle g_service_port = INVALID_HANDLE;
 /// hardware and, through a warranty record, a person (docs/SECURITY.md).
 char g_serial[0x18] = {};
 
+/// The firmware's display version (`19.0.1`), for the diagnostics bundle
+/// (#304). Read in `__appInit` beside the serial, for the serial's reason.
+char g_firmware[0x18] = {};
+
 /// The one `http::HttpClient` this process has: the Horizon `ssl` backend
 /// (M1-7, #126). File scope because it outlives every caller and because there
 /// is only ever one -- the download worker and the sync engine share it, which
@@ -1519,6 +1524,8 @@ void __appInit(void) {
     diagAbortWithResult(rc);
   }
   hosversionSet(MAKEHOSVERSION(fw.major, fw.minor, fw.micro));
+  fw.display_version[sizeof(fw.display_version) - 1] = '\0';
+  rommsync::sysmodule::boot::Append(g_firmware, sizeof(g_firmware), 0, fw.display_version);
 
   // The console's serial, read here because this is the only moment `set:sys`
   // is open -- and read into `g_serial` rather than used, because what leaves
@@ -1824,6 +1831,23 @@ int main(int, char**) {
   // `[server] ca_file` into the transport (#288), now and on every adopted
   // edit -- before anything below can send the first request.
   engine.UseCaTrust(&rommsync::sysmodule::TrustServerCa);
+
+  // The platform's half of the diagnostics bundle (#304), read once: none of it
+  // changes while the console is up. Atmosphère's version and the emuMMC flag
+  // are `splGetConfig` items, and `spl:` is not a grant this process holds --
+  // a new service is a boot wait, a handle and an npdm line of its own -- so
+  // the bundle says why rather than leaving them blank.
+  {
+    rommsync::sysmodule::PlatformFacts facts;
+    facts.hos = g_firmware;
+#ifdef ROMMSYNC_LIBNX
+    facts.libnx = ROMMSYNC_LIBNX;
+#endif
+    const char* const no_spl = "not read: sys-rommsync holds no spl: grant";
+    facts.atmosphere = no_spl;
+    facts.emummc = no_spl;
+    engine.UsePlatformFacts(std::move(facts));
+  }
 
   // The transport M1-7 (#126) built, installed through the seam this issue
   // (M1-6, #123) added. #126 wrote this call out commented, because the seam was

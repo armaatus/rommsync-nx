@@ -59,6 +59,12 @@ endif
 # be the one half not tracking VERSION.
 APP_VERSION := $(ROMMSYNC_VERSION)
 
+# Which libnx this image is built against, for the diagnostics bundle (#304):
+# the package's own version, as the pinned toolchain image installed it. Empty
+# outside a devkitPro image, which the code writes as "unknown".
+ROMMSYNC_LIBNX := $(strip $(shell dkp-pacman -Q libnx 2>/dev/null | cut -d' ' -f2))
+DEFINES += -DROMMSYNC_LIBNX="\"$(ROMMSYNC_LIBNX)\""
+
 #---------------------------------------------------------------------------------
 # TARGET is the name of the output
 # BUILD is the directory where object files & intermediate files will be placed
@@ -120,6 +126,12 @@ $(error $(ULTRAHAND_DIR) is empty -- run `git submodule update --init --recursiv
 	# than Ultrahand's own, so uninstalling one does not take the other's
 	# settings with it (libultra/include/global_vars.hpp).
 	DEFINES += -DUI_OVERRIDE_PATH="\"/config/rommsync/\""
+
+	# The pinned tag, for the diagnostics bundle (#304). The library has no
+	# version macro, so .gitmodules' pin line is the only record of it -- the
+	# same line `toolchain.submodule` holds the gitlink to.
+	ROMMSYNC_LIBULTRAHAND := $(strip $(shell sed -nE 's/^\# Pinned at tag (v[0-9][0-9A-Za-z.-]*) = .*/\1/p' $(ROMMSYNC_ROOT)/.gitmodules 2>/dev/null))
+	DEFINES += -DROMMSYNC_LIBULTRAHAND="\"$(ROMMSYNC_LIBULTRAHAND)\""
 endif
 
 # Third-party sources compiled into this target.

@@ -1048,6 +1048,14 @@ A removed command leaves a hole.
 | 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed \| not_a_conflict \| changed_since_backup \| superseded \| keep_local_full \| held` |
 | 18 | `KeepLocal` | `entry_id` -> `RestoreState` | never fails; `RestoreBackup` for a save conflict, and the next upload of it goes with `overwrite=true`; refused, nothing written, when superseded or with `sync::kMaxKeepLocal` waiting; `held`, nothing written yet, under a running game -- it lands when the game closes |
 | 19 | `CancelKeepLocal` | `entry_id` -> outcome (`cancelled \| landed \| not_held`) + the row's `keep_local` | never fails; withdraws a `held` Keep local with nothing written; one that already landed is `landed` and stands |
+| 20 | `WriteDiagnostics` | `DiagnosticsRequest` (the overlay's version, `kVersion` and libultrahand tag) -> `DiagnosticsResult` (the bundle's SD path) | `kWriteFailed`; writes `/config/rommsync/diagnostics-<time>.txt`, redacted, streamed a line at a time |
+
+`WriteDiagnostics` (M11-20, #304) is the log screen's Y. It adds a command and
+nothing an older overlay decodes, so it does not move `ipc::kVersion`: an older
+sysmodule answers `kUnknownCommand`, which the log screen draws as "update the
+sysmodule". What goes into the bundle is `core/include/rommsync/diagnostics.hpp`'s
+to say, and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#what-to-attach-to-a-bug-report)
+is where a user is told about it.
 
 `RestoreBackup` and `GetRestoreState` are one restore in two calls, since M9-6
 (#209). A restore copies a whole save, and a save is as large as a game makes

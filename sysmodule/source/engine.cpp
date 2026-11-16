@@ -17,7 +17,9 @@
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
 #include "rommsync/conflict_record.hpp"
+#include "rommsync/core.hpp"
 #include "rommsync/device_identity.hpp"
+#include "rommsync/diagnostics.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
@@ -184,6 +186,75 @@ void SdEngine::UseCaTrust(CaTrust trust) {
   if (ca_trust_) {
     ca_trust_(ConfigSnapshot()->server.ca_file);
   }
+}
+
+void SdEngine::UsePlatformFacts(PlatformFacts facts) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  platform_facts_ = std::move(facts);
+}
+
+ipc::Error SdEngine::WriteDiagnostics(const ipc::DiagnosticsRequest& request,
+                                      ipc::DiagnosticsResult* result) {
+  diag::Bundle bundle;
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  bundle.written_at = now;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    bundle.versions.hos = platform_facts_.hos;
+    bundle.versions.libnx = platform_facts_.libnx;
+    bundle.versions.atmosphere = platform_facts_.atmosphere;
+    bundle.versions.emummc = platform_facts_.emummc;
+  }
+  bundle.versions.overlay = request.overlay;
+  bundle.versions.overlay_interface = request.overlay_interface;
+  bundle.versions.libultrahand = request.libultrahand;
+  bundle.versions.sysmodule = version();
+
+  // `GetStatus`' reading, so the bundle and the status screen cannot disagree
+  // about the console they describe -- and #316's backup numbers with it,
+  // never a second walk of `.backup/`.
+  bundle.engine = Snapshot();
+  const config::Config& settings = config();
+  bundle.enabled = settings.sync.enabled;
+  bundle.configured = settings.configured();
+  for (const config::Diagnostic& diagnostic : config_diagnostics()) {
+    if (diagnostic.severity == config::Severity::kError) {
+      ++bundle.config_errors;
+    }
+  }
+
+  bundle.config_path = PathTo(config::kConfigFileName);
+  bundle.state_path = PathTo(state::kStateFileName);
+  const std::string log_path = PathTo(log::kLogFileName);
+  bundle.log_paths = {log::PreviousLogPathFor(log_path), log_path};
+  std::vector<log::Line> tail;
+  log::Tail(log::kTailLines, &tail);
+  for (log::Line& line : tail) {
+    bundle.memory_tail.push_back(std::move(line.text));
+  }
+
+  if (card_ == nullptr) {
+    bundle.crash_note = "not listed: this build cannot open the SD card";
+  } else {
+    const fs::Listing listing = card_->List(diag::kCrashReportsSdDir);
+    if (listing.ok() || listing.error == fs::ListError::kTooManyEntries) {
+      bundle.crashes = diag::OurCrashReports(listing);
+    } else if (listing.error != fs::ListError::kMissing) {
+      bundle.crash_note = std::string("not listed: ") + fs::ToString(listing.error);
+    }
+  }
+
+  const std::string name = diag::FileName(now);
+  const io::WriteResult written = diag::Write(PathTo(name.c_str()), bundle);
+  if (!written.ok()) {
+    log::Warn(log::Event::kDiagnostics, "not written: " + written.message);
+    return ipc::Error::kWriteFailed;
+  }
+  result->sd_path = std::string(kConfigSdDir) + "/" + name;
+  log::Info(log::Event::kDiagnostics, "written: " + result->sd_path);
+  return ipc::Error::kOk;
 }
 
 sync::ClockCheck SdEngine::LocalClock() const {

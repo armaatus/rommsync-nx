@@ -117,6 +117,17 @@ inline constexpr const char* kConfigSdDir = "/config/rommsync";
 /// is what `Load` is *given* rather than something it derives.
 inline constexpr const char* kSdRoot = "sdmc:";
 
+/// What the diagnostics bundle says about the platform (M11-20, #304): read by
+/// `main.cpp` once at boot, because each is a libnx call and this file names no
+/// libnx type, and none of them changes while the console is up. Empty is
+/// "unknown"; a sentence saying why is better than empty.
+struct PlatformFacts {
+  std::string hos;         ///< `setsysGetFirmwareVersion`'s display version
+  std::string libnx;       ///< the libnx this image was built against
+  std::string atmosphere;  ///< Atmosphère's version, or why it was not read
+  std::string emummc;      ///< whether this is emuMMC, or why it was not read
+};
+
 /// How long the worker waits for the network before its first tick, and how
 /// often it asks (M7-2, #37). See `SdEngine::AwaitNetwork` for why it is bounded
 /// at all.
@@ -448,6 +459,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   using CaTrust = std::function<void(const std::string& ca_file)>;
   void UseCaTrust(CaTrust trust);
 
+  /// The platform's half of the diagnostics bundle (#304). Install it before
+  /// the service starts answering; a build that never does writes "unknown".
+  void UsePlatformFacts(PlatformFacts facts);
+
   /// The probe's answer, now, noted as a sighting when it names an application.
   /// `ipc::ServiceCore::SyncNow` reads it to say a press is held rather than
   /// started (`ipc::SyncOutcome::kDeferred`).
@@ -708,6 +723,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// choice, as `ListConflicts` draws it.
   ipc::CancelKeepLocalResult CancelKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
+
+  /// The diagnostics bundle (M11-20, #304), written beside `config.ini` and
+  /// answered with its SD-root path. On the IPC thread: `diag::Write` streams it
+  /// a line at a time from files of bounded size, and it opens no save.
+  ipc::Error WriteDiagnostics(const ipc::DiagnosticsRequest& request,
+                              ipc::DiagnosticsResult* result) override;
 
   /// Serialises `history_` -- the vector, and nothing else.
   ///
@@ -1680,6 +1701,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `UseCaTrust`'s. Guarded by `mutex_` and, unlike the probes, called under
   /// it: it is handed each configuration as `AdoptConfigLocked` swaps it in.
   CaTrust ca_trust_;
+
+  /// `UsePlatformFacts`'. Under `mutex_`.
+  PlatformFacts platform_facts_;
 
   /// What the last tick that negotiated made of the console's clock (#295):
   /// `Status::clock_trusted` and `clock_skew_seconds`. Guarded by `mutex_`.
