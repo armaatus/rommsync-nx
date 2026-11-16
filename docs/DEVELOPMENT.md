@@ -1172,7 +1172,8 @@ state (paired / unauthenticated / never paired), configured, online, the last
 sync's time, result and counts, whether a tick is running right now
 (`sync_in_progress`), the queue depth, the RomM version the last heartbeat
 read and whether this build syncs with it (`server_version`,
-`server_supported`, #228), and the **current download**
+`server_supported`, #228), what the last prune left in `.backup/` and whether
+it is still over `max_mib` (`backup`, #316), and the **current download**
 (`rom_id`, `fs_name`, `bytes_done`, `bytes_total`, state). That last field is how
 M3-5 is served: one poll per frame, not a second round trip. Per-item queue
 progress rides on the `queue` list kind (M5-4).

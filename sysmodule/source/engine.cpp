@@ -732,6 +732,7 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
     snapshot.server_supported = !server_too_old_;
     snapshot.clock_trusted = clock_check_.trusted();
     snapshot.clock_skew_seconds = clock_check_.skew_seconds;
+    snapshot.backup = backup_usage_;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -2474,6 +2475,20 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   // A prune that could not read or remove something is asked again next tick,
   // rather than waiting for the next backup to be written.
   backups_pruned_ = report.warnings.empty();
+  // What the status screen draws (#316). A truncated listing measured only what
+  // it listed, which is still the best number there is: the card holds at
+  // least that, and the log says the listing was cut. A directory that could
+  // not be listed at all -- the one way to warn with no backup found -- measured
+  // nothing, and leaves the last measurement standing rather than a zero.
+  if (report.backups > 0 || report.warnings.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    backup_usage_.measured = true;
+    backup_usage_.bytes = report.bytes_after;
+    backup_usage_.backups =
+        static_cast<std::int64_t>(report.backups) - static_cast<std::int64_t>(report.pruned);
+    backup_usage_.kept_unique = static_cast<std::int64_t>(report.kept_unique);
+    backup_usage_.over_cap = report.over_cap;
+  }
   log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
   if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap) {
     log::Info(log::Event::kBackupPruned, backup::Describe(report));

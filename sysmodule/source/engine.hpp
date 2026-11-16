@@ -1685,6 +1685,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `Status::clock_trusted` and `clock_skew_seconds`. Guarded by `mutex_`.
   sync::ClockCheck clock_check_;
 
+  /// What the last prune left in `.backup/` (#316): `Status::backup`. Guarded
+  /// by `mutex_`. Kept from one prune to the next, since none runs over a
+  /// directory no tick has written to.
+  ipc::BackupUsage backup_usage_;
+
   /// What the probe named since the play window last moved (#261). Guarded by
   /// `mutex_`; `mutable` because `application_running` is the one place that
   /// asks, and it is const for the IPC surface. Replaced, slack and all, by

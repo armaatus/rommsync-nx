@@ -842,6 +842,14 @@ std::string EncodeStatus(const Status& status) {
   AppendBool(&out, "server_supported", status.server_supported);
   AppendBool(&out, "clock_trusted", status.clock_trusted);
   AppendInteger(&out, "clock_skew_seconds", status.clock_skew_seconds);
+  AppendKey(&out, "backup");
+  out += '{';
+  AppendBool(&out, "measured", status.backup.measured, /*first=*/true);
+  AppendInteger(&out, "bytes", status.backup.bytes);
+  AppendInteger(&out, "backups", status.backup.backups);
+  AppendInteger(&out, "kept_unique", status.backup.kept_unique);
+  AppendBool(&out, "over_cap", status.backup.over_cap);
+  out += '}';
   AppendKey(&out, "download");
   out += '{';
   AppendText(&out, "state", ToString(status.download.state), /*first=*/true);
@@ -883,6 +891,18 @@ Decoded<Status> DecodeStatus(std::string_view text) {
       return;
     }
     out->interface = static_cast<std::uint32_t>(interface_version);
+
+    const json::Value* backup = ReadObject(object, "backup", error);
+    if (backup == nullptr) {
+      return;
+    }
+    if (!ReadBool(*backup, "measured", &out->backup.measured, error) ||
+        !ReadInteger(*backup, "bytes", &out->backup.bytes, 0, kMaxBytes, error) ||
+        !ReadInteger(*backup, "backups", &out->backup.backups, 0, kMaxCount, error) ||
+        !ReadInteger(*backup, "kept_unique", &out->backup.kept_unique, 0, kMaxCount, error) ||
+        !ReadBool(*backup, "over_cap", &out->backup.over_cap, error)) {
+      return;
+    }
 
     const json::Value* download = ReadObject(object, "download", error);
     if (download == nullptr) {

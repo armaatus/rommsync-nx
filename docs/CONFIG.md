@@ -540,7 +540,9 @@ one you put there — is never touched.
 
 `keep` below `1`, or a value that is not a whole number, is a `warning` and the
 current value stays; a value past the maximum (1000, 3650 days, 1 TiB) is
-clamped to it. The overlay does not edit these yet.
+clamped to it. The overlay does not edit these yet; its status screen shows
+what the last prune left on a **Backups** row, and says so when that is still
+over `max_mib`.
 
 ### Where a rom lands
 

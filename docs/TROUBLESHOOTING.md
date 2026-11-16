@@ -536,6 +536,14 @@ copy any you want to keep to a computer, then delete them by hand; that is safe
 and is the fastest space you will find. Lowering `max_mib` does not remove them,
 by design.
 
+The overlay's status screen shows the same numbers on its **Backups** row, so
+you need not read the log for them: *41.2 MiB, 12 backups* is what the last
+prune left. While the directory is still over `max_mib` the row turns to a
+warning and says why — *612.0 MiB; 9 only copies* counts the backups described
+above, and *612.0 MiB; over the cap* means what is left is the newest backup of
+each save, which is never pruned — and the screen points here. *Not measured
+yet* is a console that has not finished a sync since it started.
+
 ---
 
 ## `config.ini` complaints
