@@ -74,6 +74,8 @@ def scenario_judge() -> None:
            r"^FAIL +proto\.download_resume .*skip", what="a required row skipped")
     expect(judge("na-on-fat32.json"), 1,
            r"^FAIL +card\.fat32_ceiling .*na", what="na on a FAT32 card")
+    expect(judge("na-on-unknown.json"), 1,
+           r"^FAIL +card\.fat32_ceiling .*na", what="na on a card of unknown format")
     for name, why in (("malformed-truncated.json", "not JSON"),
                       ("malformed-result.json", "maybe"),
                       ("malformed-duplicate.json", "net\\.tls.*twice")):
