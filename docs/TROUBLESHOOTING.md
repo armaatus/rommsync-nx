@@ -1047,7 +1047,13 @@ so a sync holds a bounded amount of everything
 - **32 states**, when states are on, sharing those records with the saves.
 - **1,024 roms** in the library index a sync holds, the ones with the lowest
   RomM ids. A save of any other game is *unmatched*, with the index named as
-  the likely reason.
+  the likely reason. Past this bound a save is matched only by its exact name
+  in a folder that names one platform, such as Tico's per-platform folders:
+  never in RetroArch's shared `saves/` folder, which names none, and never by
+  its name without `(USA)`-style tags. A rom the index never read may share
+  the name, and a save synced into the wrong game is worse than one not
+  synced, so those are *unmatched* too, with the rom it would have matched
+  named.
 - **A game with more than 128 saves on the server** — one plan's worth — is
   left out of the sync whole: none of its saves is offered and nothing of it is
   touched. The `sync.refused` line names it on every sync, and the sync reads
@@ -1057,8 +1063,9 @@ so a sync holds a bounded amount of everything
 games you no longer play out of them, or switch a platform's saves off in the
 folder map ([CONFIG.md](CONFIG.md#a-platform-section-replaces-that-platforms-defaults)).
 For a game with too many saves on the server, delete old versions in RomM's web
-UI. For a library past the index, nothing on the console helps yet; the roms
-with the lowest ids are the ones matched.
+UI. For a library past the index, the roms with the lowest ids are the ones
+matched, and a save in a folder that names no platform syncs again once the
+library is back under the bound.
 
 ---
 

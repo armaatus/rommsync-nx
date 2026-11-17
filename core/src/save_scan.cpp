@@ -913,14 +913,8 @@ void Walk(const std::vector<ScanFolder>& folders, Folders which, const roms::Rom
         continue;
       }
       if (!match.matched()) {
-        // With a short index "no rom named X" may be a rom that was never read,
-        // and reporting it flatly would send a user looking for a library
-        // problem that is really this client's bound.
-        record_skip(SkipReason::kUnmatched, sd_path,
-                    result->index_truncated
-                        ? match.reason + "; the rom index is incomplete, so this may be a rom "
-                                         "that was never read rather than one you do not have"
-                        : match.reason);
+        // A short index says so in the reason itself (`RomIndex::Find`, #287).
+        record_skip(SkipReason::kUnmatched, sd_path, match.reason);
         continue;
       }
 

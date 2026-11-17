@@ -1090,12 +1090,14 @@ target_compile_definitions(test_save_scan PRIVATE
 set(SCAN_UNIT_SCENARIOS
   names        # base names, emulators, slots, and which folder implies a platform
   ambiguous    # one name on two platforms, in a hintless folder, is skipped
+  short_index  # #287: a truncated index matches only an exact name under a platform's folder
   walked_once  # RetroArch's flat saves/, listed under a dozen platforms
   unusable     # a record sync::Validate refuses costs one file, not the tick
   truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move
   hashing      # the digest is real, reused when nothing changed, null only when unreadable
   sources      # fixture trees for each source scan to the emulator id that wrote them
   grown        # the index is reserved from total; a library that grows mid-fetch stops there
+  shrunk       # #287: a rom deleted below the offset mid-fetch marks the index short
   retroarch    # flat, sorted, beside the content and cloud-synced, as retroarch.cfg says
   tico         # Tico 0.7.9 and 0.8.0 with one and two accounts; litter is never a save
   isolated     # #238: tico-* ids, DuckStation's cards, and PPSSPP's folders as a named skip
@@ -2083,6 +2085,7 @@ foreach(scenario
         deterministic   # the same inputs, the same bytes
         upgrade         # unzipping over an install keeps config.ini and the rest
         notices         # every linked library has a notice row, every row ships (#300)
+        source          # the source tarball is HEAD plus the pinned submodule, deterministic (#320)
         wording)        # PRE-RELEASE and "never run on a console" only when true (#303)
   add_test(NAME package.${scenario}
            COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" ${scenario})
@@ -2116,6 +2119,14 @@ set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 L
 add_test(NAME package.reproducible
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" reproducible)
 set_tests_properties(package.reproducible PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1500
+                     LABELS toolchain RUN_SERIAL TRUE)
+
+# The release's source archive (#320), unpacked alone and built with docker's
+# network cut off: what GPL-2.0 section 3's "complete source" means for the
+# overlay, checked rather than asserted. Same image, label and skip as above.
+add_test(NAME package.source_builds
+         COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" source_builds)
+set_tests_properties(package.source_builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
                      LABELS toolchain RUN_SERIAL TRUE)
 
 # --- the install guide: docs/INSTALL.md --------------------------------------

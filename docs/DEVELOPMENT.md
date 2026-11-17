@@ -422,6 +422,7 @@ packaging/           # what the release zip ships beside the two artifacts
   licenses/          # each one's licence text, and the GPL-2.0 the overlay ships
 scripts/package.sh   # the two build outputs -> dist/rommsync-nx-<VERSION>.zip
 scripts/notices.sh   # the manifest -> THIRD_PARTY_NOTICES.txt; --check its coverage
+scripts/source-archive.sh  # the tag + submodules -> dist/rommsync-nx-<VERSION>-source.tar.gz
 scripts/release-notes.sh  # the body a `v*` tag's GitHub Release carries
 ```
 
@@ -644,14 +645,17 @@ and that the tagged commit is an ancestor of `main` — the three jobs say the
 commit is *good*, nothing else says it was *reviewed*, and a tag can be pushed at
 any branch head — then takes the three artifacts `switch-build` built and
 checked in the same run, re-reads them with `scripts/artifact-check.py`, runs
-`scripts/package.sh` on them in `devkitpro/devkita64`, writes a `SHA256SUMS`
-beside the archive, and attests both with `actions/attest` (signed build
+`scripts/package.sh` on them in `devkitpro/devkita64`, builds the complete
+source archive with `scripts/source-archive.sh` — the tag with libultrahand
+inside it, which GitHub's own "Source code" archives omit, for the overlay's
+GPL-2.0 source offer (#320, [LICENSING.md](LICENSING.md)) — writes a
+`SHA256SUMS` covering both, and attests all three with `actions/attest` (signed build
 provenance; `gh attestation verify <zip> --repo <owner>/<repo>` checks it). It
 builds nothing itself: what ships is the build `switch-build`'s checks read
 (#303).
 
-It publishes in that order too: the release is created as a **draft**, the two
-assets are uploaded, both are pulled back *out* of the release through the API
+It publishes in that order too: the release is created as a **draft**, the three
+assets are uploaded, all are pulled back *out* of the release through the API
 and checked with `sha256sum -c`, and only then is the draft flipped to public. A
 release is live the instant it is created, so anything less would leave a public
 page advertising a truncated download whenever an upload failed. The body is

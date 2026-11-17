@@ -28,6 +28,7 @@ switch.tlsprobe    test_switch_build.sh  tlsprobe
 npdm.svcs          test_npdm.sh          svcs
 package.builds     test_package.sh       builds
 package.reproducible test_package.sh     reproducible
+package.source_builds test_package.sh    source_builds
 stack.measured     test_stack_budget.sh  measured
 '
 
