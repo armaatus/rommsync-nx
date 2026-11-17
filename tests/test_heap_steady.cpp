@@ -915,8 +915,12 @@ class ScheduleWatch final : public rlog::Sink {
  public:
   void Write(rlog::Level, std::string_view line) override {
     if (line.find("sync.tick") != std::string_view::npos) {
+      const bool done = line.find("outcome=completed") != std::string_view::npos;
+      if (done) {
+        HoldIfAsked();
+      }
       ticks.fetch_add(1, std::memory_order_relaxed);
-      if (line.find("outcome=completed") != std::string_view::npos) {
+      if (done) {
         completed.fetch_add(1, std::memory_order_relaxed);
       }
     }
@@ -925,9 +929,70 @@ class ScheduleWatch final : public rlog::Sink {
     }
   }
 
+  /// Stop the next completed tick's line on the worker before it is counted,
+  /// until `Release`: a tick that began under one stretch's conditions and is
+  /// counted in the next, made certain rather than left to a loaded runner
+  /// (#321). Sleeps rather than waits on a condition, for the reason above.
+  void HoldNextCompleted() { hold_.store(kArmed); }
+  bool Held() const { return hold_.load() == kHolding; }
+  void Release() { hold_.store(kIdle); }
+
   std::atomic<std::int64_t> ticks{0};
   std::atomic<std::int64_t> completed{0};
   std::atomic<std::int64_t> rejected{0};
+
+ private:
+  enum : int { kIdle, kArmed, kHolding };
+
+  void HoldIfAsked() {
+    int armed = kArmed;
+    if (!hold_.compare_exchange_strong(armed, kHolding)) {
+      return;
+    }
+    while (hold_.load() == kHolding) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+  }
+
+  std::atomic<int> hold_{kIdle};
+};
+
+/// An edge with a tick in flight across it, every run (#321): the next completed
+/// tick's line is held on the worker, the conditions change under it, and it is
+/// let go a moment later -- after the stretch has begun. Where no tick completes
+/// in time, the edge simply happens without one.
+class InFlight {
+ public:
+  explicit InFlight(ScheduleWatch& watch) : watch_(watch) {
+    watch_.HoldNextCompleted();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{3};
+    while (!watch_.Held() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    if (!watch_.Held()) {
+      watch_.Release();
+      std::cout << "  (no tick completed in time to hold across the edge)\n";
+    }
+  }
+  /// The conditions have changed: let the held tick finish shortly.
+  void Changed() {
+    releaser_ = std::thread([this] {
+      std::this_thread::sleep_for(std::chrono::milliseconds{50});
+      watch_.Release();
+    });
+  }
+  ~InFlight() {
+    if (releaser_.joinable()) {
+      releaser_.join();
+    }
+    watch_.Release();
+  }
+  InFlight(const InFlight&) = delete;
+  InFlight& operator=(const InFlight&) = delete;
+
+ private:
+  ScheduleWatch& watch_;
+  std::thread releaser_;
 };
 
 /// The real client, counting what reaches it.
@@ -1029,7 +1094,9 @@ void Schedule(checks::Checks& c, http::HttpClient& client, const std::string& ba
 
     Stretch offline;
     {
+      InFlight across(watch);
       harness::Fault down(c, client, base, R"({"mode":"drop","bytes":0,"count":1000000})");
+      across.Changed();
       offline = stretch(hours);
     }
     say("offline", offline);
@@ -1075,8 +1142,10 @@ void Schedule(checks::Checks& c, http::HttpClient& client, const std::string& ba
     Stretch expiring;
     Stretch expired;
     {
+      InFlight across(watch);
       harness::Fault revoked(c, client, base,
                              R"({"mode":"status","status":401,"count":1000000})");
+      across.Changed();
       expiring = stretch(hours / 2);
       expired = stretch(hours - hours / 2);
     }
