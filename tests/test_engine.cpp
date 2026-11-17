@@ -2977,16 +2977,19 @@ void NifmVerdicts(checks::Checks& c) {
 /// tick is held for as long as the probe says no, sends nothing, records
 /// nothing, and runs the moment the probe says yes.
 void BootsOffline(checks::Checks& c) {
+  // Everything the worker reaches is declared before the console, so the
+  // engine's destructor joins the worker while all of it is still alive: the
+  // probe keeps polling and the held tick may still be sending at the return.
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<bool> online{false};
+  std::atomic<int> probes{0};
   Console console(c, "engine-boots-offline");
   SeedOfflineCard(c, console, /*on_boot=*/true);
-  Unanswered server;
-  const std::unique_ptr<fs::FileSystem> card =
-      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
   console.Boot();
   console.engine.UseServer(&server, "not-a-real-token");
   console.engine.UseCard(card.get());
-  std::atomic<bool> online{false};
-  std::atomic<int> probes{0};
   console.engine.UseNetworkProbe(
       [&] {
         ++probes;
@@ -3030,16 +3033,19 @@ void BootsOffline(checks::Checks& c) {
 /// the console slept through is that tick: it sends nothing while the probe says
 /// no, and runs the moment it says yes.
 void WakesOffline(checks::Checks& c) {
+  // Everything the worker reaches is declared before the console, so the
+  // engine's destructor joins the worker while all of it is still alive: the
+  // probe keeps polling and the held tick may still be sending at the return.
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<bool> online{true};
+  std::atomic<int> probes{0};
   Console console(c, "engine-wakes-offline");
   SeedOfflineCard(c, console, /*on_boot=*/false);
-  Unanswered server;
-  const std::unique_ptr<fs::FileSystem> card =
-      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
   console.Boot();
   console.engine.UseServer(&server, "not-a-real-token");
   console.engine.UseCard(card.get());
-  std::atomic<bool> online{true};
-  std::atomic<int> probes{0};
   console.engine.UseNetworkProbe(
       [&] {
         ++probes;
