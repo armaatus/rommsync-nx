@@ -149,6 +149,8 @@ fi
 
 TAG="v$VERSION"
 ZIP="rommsync-nx-$VERSION.zip"
+# What scripts/source-archive.sh names it, and the release job uploads (#320).
+SOURCE="rommsync-nx-$VERSION-source.tar.gz"
 
 # Where the project lives. Three sources, in this order, and none of them is a
 # URL typed into this file: CI's own environment, then whichever git remote
@@ -259,8 +261,13 @@ Built with $(toolchain), for $ATMOSPHERE_TARGET.
 distributed under the GPL, version 2; the sysmodule is MIT. The archive carries
 both texts and the notices for every library either binary links, under
 \`config/rommsync/\` (\`COPYING.GPL-2.0\`, \`LICENSE\`, \`THIRD_PARTY_NOTICES.txt\`).
-The complete corresponding source of this release, with the libultrahand
-commit it pins, is the tree at this tag:
+The complete corresponding source of this release is attached to it, with the
+libultrahand commit it pins inside -- GitHub's own "Source code" archives
+leave that submodule out:
+
+  $URL/releases/download/$TAG/$SOURCE
+
+It is the tree at this tag, which is also browsable here:
 
   $URL/tree/$TAG
 

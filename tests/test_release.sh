@@ -342,6 +342,25 @@ phase_ci() {
   grep -q 'SHA256SUMS' <<<"$uploads" ||
     fail "the Publish step does not upload SHA256SUMS beside the archive"
 
+  # --- and the source the overlay's GPL-2.0 offer is about (#320) ---
+  #
+  # GitHub's automatic "Source code" archives hold libultrahand as an empty
+  # directory, so the complete source has to be an asset of its own, built from
+  # the tag by scripts/source-archive.sh -- and carried through every step the
+  # zip is: checksummed, attested, uploaded, and read back before the undraft.
+  local source_name='rommsync-nx-$VERSION-source.tar.gz'
+  grep -q 'scripts/source-archive.sh' <<<"$code" ||
+    fail "the release job never builds the source archive"
+  grep -qF -- "$source_name" <<<"$(release_step Checksums | uncommented)" ||
+    fail "SHA256SUMS does not cover the source archive"
+  grep -qF -- '-source.tar.gz' <<<"$attest" ||
+    fail "the attestation does not cover the source archive"
+  grep -qF -- "$source_name" <<<"$uploads" ||
+    fail "the Publish step does not upload the source archive"
+  grep -E '^ +for asset in ' <<<"$(release_step 'The published checksums match the published asset')" |
+    grep -qF -- "$source_name" ||
+    fail "the source archive is never read back out of the release before the undraft"
+
   # A tag with a semver prerelease suffix has to publish as a prerelease. The
   # rule itself lives in scripts/release-notes.sh, where `release.prerelease`
   # can exercise it against made-up versions -- so what this asserts is that the
@@ -394,6 +413,11 @@ phase_notes() {
   # pins libultrahand as a submodule -- and where the notices are.
   grep -q "rommsync-nx/tree/v$version" "$body" ||
     fail "the notes do not link the source at tree/v$version"
+  # ...and the archive that IS that source, submodule included, attached to the
+  # same release (#320): the tree link alone resolves to GitHub's archive, which
+  # leaves libultrahand out.
+  grep -q "rommsync-nx/releases/download/v$version/rommsync-nx-$version-source\.tar\.gz" "$body" ||
+    fail "the notes do not link the release's rommsync-nx-$version-source.tar.gz"
   grep -q 'THIRD_PARTY_NOTICES.txt' "$body" ||
     fail "the notes do not say where the third-party notices are"
   grep -q 'GPL' "$body" || fail "the notes do not say the overlay is GPL-2.0"

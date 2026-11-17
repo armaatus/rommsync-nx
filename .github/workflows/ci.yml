@@ -315,8 +315,15 @@ jobs:
       # minutes; host-tests takes longer, and runs beside it.
       #
       # Last, for the reason Package is after the upload.
+      #
+      # `package.source_builds` reads the submodule's git objects to build the
+      # release's source archive (#320); safe.directory for it, as the release
+      # job does, in case the container's git does not own that checkout.
       - name: The toolchain's ctest entries
-        run: bash tests/toolchain_suite.sh --here
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/overlay/lib/libultrahand"
+          bash tests/toolchain_suite.sh --here
 
   # The same three builds against `:latest`, so a devkitPro release that breaks
   # us is learned here, as one red job, rather than as a red required check on
@@ -498,6 +505,19 @@ jobs:
             --nsp switch-build/sysmodule/sys-rommsync.nsp \
             --ovl switch-build/overlay/ovl-rommsync.ovl
 
+      # The overlay is GPL-2.0, and section 3 wants its complete source offered
+      # from the same place as the binary (#320, docs/LICENSING.md). GitHub's
+      # automatic "Source code" archives hold libultrahand as an empty directory,
+      # so this is an asset of its own: the tagged tree with the pinned submodule
+      # inside it, read out of git objects. The submodule is a second repository
+      # to this container's git, owned by the runner's user rather than root, so
+      # it needs the same safe.directory the workspace got in the first step.
+      - name: Source archive
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/overlay/lib/libultrahand"
+          scripts/source-archive.sh --out dist
+
       # Computed beside the build, in the same job. The archive is
       # byte-deterministic for one `zip` build, which is what makes this a
       # statement about these bytes -- a checksum computed anywhere else is a
@@ -509,7 +529,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum "rommsync-nx-$VERSION.zip" > SHA256SUMS
+          sha256sum "rommsync-nx-$VERSION.zip" "rommsync-nx-$VERSION-source.tar.gz" > SHA256SUMS
           cat SHA256SUMS
 
       # Signed provenance for both assets: which workflow, commit and run made
@@ -522,6 +542,7 @@ jobs:
         with:
           subject-path: |
             dist/rommsync-nx-${{ env.VERSION }}.zip
+            dist/rommsync-nx-${{ env.VERSION }}-source.tar.gz
             dist/SHA256SUMS
 
       - name: Release notes
@@ -575,7 +596,7 @@ jobs:
           upload="$(python3 -c 'import json; print(json.load(open("release.json"))["upload_url"].split("{")[0])')"
           python3 -c 'import json; print(json.load(open("release.json"))["id"])' > release-id
 
-          for asset in "dist/rommsync-nx-$VERSION.zip" dist/SHA256SUMS; do
+          for asset in "dist/rommsync-nx-$VERSION.zip" "dist/rommsync-nx-$VERSION-source.tar.gz" dist/SHA256SUMS; do
             curl -fsS -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -598,7 +619,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p published
-          for asset in "rommsync-nx-$VERSION.zip" SHA256SUMS; do
+          for asset in "rommsync-nx-$VERSION.zip" "rommsync-nx-$VERSION-source.tar.gz" SHA256SUMS; do
             id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' \
                   "upload-$asset.json")"
             curl -fsSL \

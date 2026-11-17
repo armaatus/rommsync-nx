@@ -73,19 +73,28 @@ under GPL-2.0. Everything else in it has to be compatible with that, and is:
 **The sysmodule is MIT.** It links libnx, newlib and the GCC runtime and
 nothing else — no libultrahand, no portlibs — so nothing makes it a GPL work.
 
-**The source offer is the tag.** GPL-2.0 §3 lets the source be offered "from
-the same place" as the binary. Every release's notes link
-`https://github.com/armaatus/rommsync-nx/tree/v<VERSION>`, which pins
-libultrahand by commit; the notices file names the source of every other
-component at its exact version.
+**The source offer is the tag, and an archive of it on the release.** GPL-2.0
+§3 lets the source be offered "from the same place" as the binary. GitHub's
+automatic "Source code" archives hold libultrahand as an empty directory, so
+every release also carries `rommsync-nx-<VERSION>-source.tar.gz` (#320):
+the tagged tree with every submodule's tree, at the commit the tag pins,
+inside it. [`scripts/source-archive.sh`](../scripts/source-archive.sh) builds
+it out of git objects, deterministically, and the release job checksums,
+attests and uploads it beside the zip. The notes and `THIRD_PARTY_NOTICES.txt`
+both link it, and `tree/v<VERSION>` besides; the notices name the source of
+every other component at its exact version.
 
-That last point is the weakest part of this, and worth knowing. GitHub's
-automatic "Source code" archives do not include submodules, and the Mbed TLS,
-curl and zlib sources are linked at their upstream tags rather than hosted
-here. The strict reading of §3 — "complete source code ... for all modules it
-contains" offered by the distributor — is better served by a source archive,
-submodules included, attached to each release. That is a follow-up, not part
-of #300.
+`ctest -R package.source` holds the archive to exactly the tag plus the pinned
+submodule; `ctest -R package.source_builds` unpacks it alone and builds both
+binaries in the pinned image with Docker's network cut off.
+
+What it does not carry is the weakest part of this, and worth knowing: the
+Mbed TLS, curl and zlib sources are linked at their upstream tags rather than
+hosted here. Those come prebuilt in the pinned devkitPro image, which is the
+one thing a rebuilder brings, and the archive builds offline against it. The
+strictest reading of §3 — "complete source code ... for all modules it
+contains" offered by the distributor — would also attach those portlibs'
+source tarballs; #320 made that optional and it is not done.
 
 ## Keeping it true
 

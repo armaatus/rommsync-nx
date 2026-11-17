@@ -189,6 +189,10 @@ toolchain_missing() {
 # `package.reproducible` builds two copies at two different paths, and every
 # copy would otherwise be built at the same one. In the image (--here) DIR is
 # built where it is, so the copies' own paths already differ.
+#
+# TOOLCHAIN_NETWORK, when set, is docker's --network: `package.source_builds`
+# sets it to `none` to prove a release's source archive builds offline (#320).
+# In the image (--here) there is no container to cut off, so it has no effect.
 toolchain_run() {
   local dir="$1" script="$2" workdir="${TOOLCHAIN_WORKDIR:-/work}"
   shift 2
@@ -196,6 +200,7 @@ toolchain_run() {
     ( cd "$dir" && bash -lc "$script" _ "$@" )
   else
     docker run --rm --user "$(id -u):$(id -g)" -v "$dir:$workdir" -w "$workdir" \
+      ${TOOLCHAIN_NETWORK:+--network "$TOOLCHAIN_NETWORK"} \
       "$DEVKITPRO_IMAGE" bash -lc "$script" _ "$@"
   fi
 }

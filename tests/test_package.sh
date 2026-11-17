@@ -577,8 +577,88 @@ phase_notices() {
     [ -z "$missing" ] || fail "the notices lack a line of packaging/licenses/$text: $missing"
   done < <(grep -vE '^[[:space:]]*(#|$)' "$manifest")
   grep -q "tree/v$VERSION" "$out" || fail "the notices do not link the source tag v$VERSION"
+  # ...and the release's own source archive, submodule included (#320).
+  grep -q "releases/download/v$VERSION/rommsync-nx-$VERSION-source\.tar\.gz" "$out" ||
+    fail "the notices do not link rommsync-nx-$VERSION-source.tar.gz on the v$VERSION release"
 
   echo "ok: every linked library has a row, and every row reaches the notices"
+}
+
+# --- the source archive: the GPL-2.0 section 3 offer (#320) --------------------
+
+# The regular files (and links) a tar.gz holds, one a line, sorted -- read by
+# tar rather than by the script under test's own Python.
+archive_files() {
+  tar -tzf "$1" | grep -v '/$' | LC_ALL=C sort
+}
+
+phase_source() {
+  local script="$REPO_ROOT/scripts/source-archive.sh"
+  [ -x "$script" ] || fail "no executable $script"
+  bash -n "$script" || fail "$script does not parse"
+  SCRATCH="$(mktemp -d)"
+
+  local name="rommsync-nx-$VERSION-source.tar.gz" top="rommsync-nx-$VERSION"
+  "$script" --out "$SCRATCH/one" >"$SCRATCH/out" 2>"$SCRATCH/err" ||
+    { cat "$SCRATCH/err" >&2; fail "source-archive.sh failed"; }
+  local tgz="$SCRATCH/one/$name"
+  [ -s "$tgz" ] || fail "no $name in --out; it wrote: $(ls "$SCRATCH/one")"
+  [ "$(ls "$SCRATCH/one")" = "$name" ] || fail "--out holds more than $name: $(ls "$SCRATCH/one")"
+
+  # Exactly the tagged tree and the tree the submodule pointer names -- the half
+  # GitHub's own "Source code" archive drops -- under one top directory, and
+  # nothing a checkout happens to have lying around.
+  local sub=overlay/lib/libultrahand pinned
+  pinned="$(git -C "$REPO_ROOT" ls-tree HEAD "$sub" | awk '$2 == "commit" { print $3 }')"
+  [ -n "$pinned" ] || fail "cannot read the $sub gitlink"
+  git -C "$REPO_ROOT/$sub" cat-file -e "$pinned^{commit}" 2>/dev/null ||
+    fail "$sub is not checked out at $pinned (git submodule update --init --recursive)"
+  {
+    git -C "$REPO_ROOT" ls-tree -r HEAD | awk -F'\t' '$1 !~ / commit / { print $2 }'
+    git -C "$REPO_ROOT/$sub" ls-tree -r --name-only "$pinned" | sed "s|^|$sub/|"
+  } | sed "s|^|$top/|" | LC_ALL=C sort > "$SCRATCH/want"
+  archive_files "$tgz" > "$SCRATCH/got" || fail "tar cannot read $name"
+  grep -q "^$top/$sub/ultrahand.mk\$" "$SCRATCH/got" ||
+    fail "the archive has no libultrahand sources; it is GitHub's archive over again"
+  diff "$SCRATCH/want" "$SCRATCH/got" >"$SCRATCH/diff" ||
+    { head -n 20 "$SCRATCH/diff" >&2; fail "the archive is not exactly HEAD plus the pinned submodule"; }
+
+  # ...with the committed bytes, not the work tree's.
+  mkdir -p "$SCRATCH/x"
+  tar -xzf "$tgz" -C "$SCRATCH/x" || fail "cannot unpack $name"
+  git -C "$REPO_ROOT/$sub" show "$pinned:ultrahand.mk" | cmp -s - "$SCRATCH/x/$top/$sub/ultrahand.mk" ||
+    fail "the archive's ultrahand.mk is not the pinned commit's"
+  git -C "$REPO_ROOT" show HEAD:switch.mk | cmp -s - "$SCRATCH/x/$top/switch.mk" ||
+    fail "the archive's switch.mk is not HEAD's"
+
+  # Deterministic like the zip: a gzip header carrying the time it was written
+  # would make every run, and so every checksum, different.
+  [ "$(od -An -tx1 -j4 -N4 "$tgz" | tr -d ' \n')" = 00000000 ] ||
+    fail "the gzip header carries a timestamp"
+  "$script" --out "$SCRATCH/two" >/dev/null 2>&1 || fail "the second run failed"
+  cmp -s "$tgz" "$SCRATCH/two/$name" || fail "two runs on the same commit produced different bytes"
+
+  # A submodule whose commit is not here is refused, not archived as the empty
+  # directory GitHub's archive leaves -- and no half-written archive is left.
+  local repo="$SCRATCH/repo"
+  mkdir -p "$repo/scripts"
+  cp "$script" "$repo/scripts/"
+  echo "$VERSION" > "$repo/VERSION"
+  printf '[submodule "lib/gone"]\n\tpath = lib/gone\n\turl = https://example.invalid/gone.git\n' \
+    > "$repo/.gitmodules"
+  git -C "$repo" init -q
+  git -C "$repo" add VERSION .gitmodules scripts
+  git -C "$repo" update-index --add --cacheinfo \
+    "160000,1111111111111111111111111111111111111111,lib/gone"
+  git -C "$repo" -c user.name=t -c user.email=t@t -c commit.gpgsign=false \
+      -c core.hooksPath=/dev/null commit -qm fixture ||
+    fail "cannot build the fixture repo"
+  "$repo/scripts/source-archive.sh" --out "$SCRATCH/gone" >/dev/null 2>"$SCRATCH/err" &&
+    fail "a submodule with no checkout was archived"
+  grep -q 'lib/gone' "$SCRATCH/err" || fail "the refusal does not name lib/gone: $(cat "$SCRATCH/err")"
+  [ ! -e "$SCRATCH/gone/$name" ] || fail "a refused run left an archive behind"
+
+  echo "ok: $name is HEAD plus the pinned libultrahand, byte for byte and deterministic"
 }
 
 # --- what the README says about the build -------------------------------------
@@ -798,6 +878,39 @@ phase_builds() {
   echo "ok: a real devkitPro build packages into the install layout under $tid"
 }
 
+# The release's source archive is the complete source (#320): unpacked on its
+# own -- no checkout, no .git, no submodule fetch -- it builds both shipped
+# binaries in the pinned image with the network cut off. The portlibs and libnx
+# come from that image, which is the one thing a rebuilder brings.
+phase_source_builds() {
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
+  [ -f "$REPO_ROOT/overlay/lib/libultrahand/ultrahand.mk" ] ||
+    skip "overlay/lib/libultrahand is empty (git submodule update --init --recursive)"
+
+  SCRATCH="$(mktemp -d)"
+  "$REPO_ROOT/scripts/source-archive.sh" --out "$SCRATCH/dist" >/dev/null 2>"$SCRATCH/err" ||
+    { cat "$SCRATCH/err" >&2; fail "source-archive.sh failed"; }
+  local tree="$SCRATCH/src"
+  mkdir -p "$tree"
+  tar -xzf "$SCRATCH/dist/rommsync-nx-$VERSION-source.tar.gz" -C "$tree" ||
+    fail "cannot unpack the source archive"
+  tree="$tree/rommsync-nx-$VERSION"
+  [ -d "$tree" ] || fail "the archive has no rommsync-nx-$VERSION/ at its top"
+
+  local log="$SCRATCH/build.log"
+  if ! TOOLCHAIN_NETWORK=none toolchain_run "$tree" \
+         'make -C sysmodule -j"$(nproc)" && make -C overlay -j"$(nproc)"' >"$log" 2>&1; then
+    tail -n 60 "$log" >&2
+    fail "the source archive does not build both binaries offline"
+  fi
+  "${PYTHON:-python3}" "$REPO_ROOT/scripts/artifact-check.py" container \
+      "$tree/sysmodule/sys-rommsync.nsp" "$tree/overlay/ovl-rommsync.ovl" ||
+    fail "the source archive built something that is not a loadable .nsp and .ovl"
+
+  echo "ok: the source archive alone builds sys-rommsync.nsp and ovl-rommsync.ovl, offline"
+}
+
 case "${1:-}" in
   layout)        phase_layout ;;
   toolbox)       phase_toolbox ;;
@@ -805,8 +918,10 @@ case "${1:-}" in
   deterministic) phase_deterministic ;;
   upgrade)       phase_upgrade ;;
   notices)       phase_notices ;;
+  source)        phase_source ;;
   wording)       phase_wording ;;
   reproducible)  phase_reproducible ;;
   builds)        phase_builds ;;
-  *) echo "usage: $0 {layout|toolbox|refuses|deterministic|upgrade|notices|wording|reproducible|builds}" >&2; exit 2 ;;
+  source_builds) phase_source_builds ;;
+  *) echo "usage: $0 {layout|toolbox|refuses|deterministic|upgrade|notices|source|wording|reproducible|builds|source_builds}" >&2; exit 2 ;;
 esac

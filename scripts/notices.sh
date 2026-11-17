@@ -188,7 +188,13 @@ SOURCE CODE
 -----------
 
 The complete source of this release, at the tag it was built from, including
-the libultrahand commit it pins as a submodule:
+the libultrahand commit it pins as a submodule, is attached to the release
+beside this archive:
+
+  $URL/releases/download/v$VERSION/rommsync-nx-$VERSION-source.tar.gz
+
+and browsable at the tag (GitHub's own "Source code" downloads there leave the
+submodule out; the archive above does not):
 
   $URL/tree/v$VERSION
 

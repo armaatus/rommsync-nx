@@ -2083,6 +2083,7 @@ foreach(scenario
         deterministic   # the same inputs, the same bytes
         upgrade         # unzipping over an install keeps config.ini and the rest
         notices         # every linked library has a notice row, every row ships (#300)
+        source          # the source tarball is HEAD plus the pinned submodule, deterministic (#320)
         wording)        # PRE-RELEASE and "never run on a console" only when true (#303)
   add_test(NAME package.${scenario}
            COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" ${scenario})
@@ -2116,6 +2117,14 @@ set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 L
 add_test(NAME package.reproducible
          COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" reproducible)
 set_tests_properties(package.reproducible PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1500
+                     LABELS toolchain RUN_SERIAL TRUE)
+
+# The release's source archive (#320), unpacked alone and built with docker's
+# network cut off: what GPL-2.0 section 3's "complete source" means for the
+# overlay, checked rather than asserted. Same image, label and skip as above.
+add_test(NAME package.source_builds
+         COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" source_builds)
+set_tests_properties(package.source_builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
                      LABELS toolchain RUN_SERIAL TRUE)
 
 # --- the install guide: docs/INSTALL.md --------------------------------------
