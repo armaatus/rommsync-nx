@@ -351,15 +351,26 @@ std::string ClockText(std::int64_t skew_seconds) {
          (skew_seconds > 0 ? " ahead" : " behind") + "; uploads held";
 }
 
+/// "≥ ", spelled in bytes: a `u8` literal is `char8_t` in C++20.
+constexpr const char* kAtLeast = "\xE2\x89\xA5 ";
+
 /// The Backups row (#316). Over the cap, the count gives way to the reason the
 /// prune could not get under it: backups that are the only copy of their bytes,
 /// or -- with none of those -- the newest of each save, which nothing removes.
+///
+/// A listing cut short counted only what it listed, so the row leads with `≥`
+/// (#323): every number on it is a floor. The sign rather than "At least",
+/// which puts the widest row -- over the cap, only-copies shown -- at 33
+/// characters against a column of about 25; `≥` keeps it at the 26 the Clock
+/// row already draws. Not in the Standard shared font, but libtesla falls back
+/// glyph by glyph to the Chinese Simplified one, which has it.
 void AddBackups(StatusView* view, const ipc::BackupUsage& backup) {
   if (!backup.measured) {
     Add(&view->lines, "Backups", "Not measured yet");
     return;
   }
-  const std::string bytes = FormatBytes(backup.bytes);
+  const std::string bytes =
+      (backup.truncated ? std::string(kAtLeast) : std::string()) + FormatBytes(backup.bytes);
   if (!backup.over_cap) {
     Add(&view->lines, "Backups",
         bytes + ", " + std::to_string(backup.backups) +

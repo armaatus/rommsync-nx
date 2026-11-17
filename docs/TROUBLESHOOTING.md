@@ -544,7 +544,13 @@ prune left. While the directory is still over `max_mib` the row turns to a
 warning and says why — *612.0 MiB; 9 only copies* counts the backups described
 above, and *612.0 MiB; over the cap* means what is left is the newest backup of
 each save, which is never pruned — and the screen points here. *Not measured
-yet* is a console that has not finished a sync since it started.
+yet* is a console that has not finished a sync since it started. A row that
+starts with *≥* — *≥ 41.2 MiB, 512 backups* — is a `.backup/` holding more
+files than one listing returns (512): the numbers are at least what is there,
+counting only what was listed, and `backup.pruned` ends with "the directory
+holds more than one listing shows". The diagnostics bundle says the same:
+*at least* before each count, and `truncated = yes`.
+Clearing out old backups by hand, as above, brings it back under.
 
 ---
 

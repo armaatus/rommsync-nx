@@ -167,10 +167,14 @@ std::string Header(const Bundle& bundle) {
     Line(&out, "measured", "no (not measured yet: no prune has finished since boot)");
   } else {
     Line(&out, "measured", "yes");
-    Line(&out, "bytes", b.bytes);
-    Line(&out, "backups", b.backups);
-    Line(&out, "kept_unique", b.kept_unique);
+    // A listing cut short counted only what it listed (#323): each count is a
+    // floor, and says so on its own line rather than only in `truncated`.
+    const std::string at_least = b.truncated ? "at least " : "";
+    Line(&out, "bytes", at_least + std::to_string(b.bytes));
+    Line(&out, "backups", at_least + std::to_string(b.backups));
+    Line(&out, "kept_unique", at_least + std::to_string(b.kept_unique));
     Line(&out, "over_cap", YesNo(b.over_cap));
+    Line(&out, "truncated", YesNo(b.truncated));
   }
 
   out += "\n[crash_reports]\n";
