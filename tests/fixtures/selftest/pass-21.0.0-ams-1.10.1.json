@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "tool": "rommsync-selftest",
+  "version": "0.9.0",
+  "started": "2026-12-01T10:00:00Z",
+  "console": {
+    "hos": "21.0.0",
+    "ams": "1.10.1",
+    "emummc": true,
+    "sd_format": "fat32"
+  },
+  "server": "https://romm.fixture.local:25000",
+  "rows": [
+    {
+      "id": "platform.hos",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.ams",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.emummc",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.sd_format",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.free_space",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.clock",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.mtime_utc",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.atomic_write",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.commit_device",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.backup_then_commit",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.fat32_ceiling",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.long_unicode_path",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "net.nifm",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "net.dns",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "net.tls",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "net.tls13_only",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "net.handshake_leak",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "net.timeout",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "net.connect_50",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "proto.pair",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "proto.negotiate",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "proto.tick",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "proto.download_resume",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "footprint.heap",
+      "result": "pass",
+      "detail": "canned"
+    }
+  ]
+}

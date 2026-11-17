@@ -70,17 +70,24 @@ without them is not a run of this plan.
 
 ### PRE-02: The selftest NRO first, no sysmodule yet
 
-**Steps.** Before any sysmodule is installed, launch the selftest NRO (M12-1,
-#306) from hbmenu against the disposable RomM -- or, while #306 has not landed,
-[`tlsprobe/`](../tlsprobe/README.md) as its README says. Keep the report.
+**Steps.** Before any sysmodule is installed, copy `rommsync-selftest.nro`
+(switch-build's artifact) to `/switch/` and write
+`/config/rommsync-selftest/selftest.ini` as [selftest/README.md](../selftest/README.md)
+says, naming the disposable RomM. Launch it from hbmenu, approve its device code
+in RomM, and toggle airplane mode when it asks. Copy
+`/config/rommsync-selftest/report-<ts>.json` off the card into
+`docs/selftest/` and run `scripts/selftest-judge.py` on it.
 
-**Pass.** The report is judged PASS by #306's judge script (once it ships);
-for `tlsprobe/`, a verified TLS handshake and a 200.
+**Pass.** The judge prints `VERDICT PASS` for the report. The launch gate's
+`selftest` row wants two such reports from two HOS/Atmosphere pairs:
+`scripts/selftest-judge.py --pairs 2 docs/selftest/report-*.json`.
 
 **Answers.** The three `ssl` questions in
 [DEVELOPMENT.md](DEVELOPMENT.md#m0-1-the-measurement-and-the-decision)
-(`sslConnectionPoll`, `sslConnectionSetIoTimeout`, who owns the descriptor on
-`ENOENT`), and the `st_mtime` question CLK-04 also asks.
+(`sslConnectionPoll` and `sslConnectionSetIoTimeout` are the report's
+*net.timeout* row when `selftest.ini` names a stall listener, who owns the
+descriptor on `ENOENT` its *net.handshake_leak*), and the `st_mtime` question
+CLK-04 also asks (its *platform.mtime_utc* row).
 
 ### PRE-03: The files on the card are the build under test
 
@@ -656,7 +663,8 @@ held*.
 **Steps.** Set the console to a zone far from UTC (UTC+9). Note a UTC instant,
 write a save at it, and read its `st_mtime` the way
 `sysmodule/source/card.cpp` does -- the `updated_at` the next negotiate sends
-shows it (RomM's access log, or the selftest's report). Then repeat LIFE-10's
+shows it (RomM's access log), and so does PRE-02's selftest run in that zone
+(its report's *platform.mtime_utc* row). Then repeat LIFE-10's
 first step in that zone.
 
 **Pass.** The answer -- UTC or local -- is recorded in

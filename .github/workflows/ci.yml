@@ -251,6 +251,13 @@ jobs:
       - name: Build the TLS probe
         run: make -C tlsprobe -j"$(nproc)"
 
+      # The on-console selftest (M12-1, #306; selftest/README.md): an .nro a
+      # person launches against a disposable RomM, never installed. Built here
+      # for tlsprobe's reason, and uploaded, because switch-build's artifact is
+      # what docs/HARDWARE_TEST_PLAN.md's PRE-02 tells them to copy.
+      - name: Build the selftest
+        run: make -C selftest -j"$(nproc)"
+
       # `make` exiting 0 is not the same as having produced something loadable,
       # and upload-artifact would happily publish an empty set. An .ovl without
       # its ULTR signature is the sharp case: it builds, it uploads, and
@@ -265,7 +272,8 @@ jobs:
           python3 scripts/artifact-check.py container \
             sysmodule/sys-rommsync.nsp \
             overlay/ovl-rommsync.ovl \
-            tlsprobe/rommsync-tlsprobe.nro
+            tlsprobe/rommsync-tlsprobe.nro \
+            selftest/rommsync-selftest.nro
 
       - name: Collect artifacts
         uses: actions/upload-artifact@v7
@@ -275,6 +283,7 @@ jobs:
             sysmodule/sys-rommsync.nsp
             overlay/ovl-rommsync.ovl
             tlsprobe/rommsync-tlsprobe.nro
+            selftest/rommsync-selftest.nro
           if-no-files-found: error
 
       # The sysmodule's memory budget, measured off the linked image rather than
@@ -325,7 +334,7 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE/overlay/lib/libultrahand"
           bash tests/toolchain_suite.sh --here
 
-  # The same three builds against `:latest`, so a devkitPro release that breaks
+  # The same four builds against `:latest`, so a devkitPro release that breaks
   # us is learned here, as one red job, rather than as a red required check on
   # an unrelated PR the day the pin moves (#199; ovl-sysmodules#32 is what that
   # looks like). Allowed to fail and needed by nothing: it is news, not a gate.
@@ -359,6 +368,9 @@ jobs:
 
       - name: Build the TLS probe
         run: make -C tlsprobe -j"$(nproc)"
+
+      - name: Build the selftest
+        run: make -C selftest -j"$(nproc)"
 
   # A tag becomes something a user can download. Nothing else publishes: the
   # `if` below is what keeps this job off every other push, since the tag

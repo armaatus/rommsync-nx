@@ -43,7 +43,7 @@ fake_repo() {
   cp "$GATE" "$root/scripts/launch-gate.sh"
   for f in docs/HARDWARE_TEST_PLAN.md docs/HARDWARE_RESULTS.md docs/INSTALL.md \
            docs/TROUBLESHOOTING.md docs/INTEROP.md sysmodule/sys-rommsync.json sysmodule/README.md \
-           overlay/README.md; do
+           overlay/README.md scripts/selftest-judge.py; do
     mkdir -p "$root/$(dirname "$f")"
     cp "$REPO_ROOT/$f" "$root/$f"
   done

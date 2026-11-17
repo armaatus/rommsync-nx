@@ -1915,9 +1915,9 @@ set_tests_properties(ci.static_python PROPERTIES TIMEOUT 60)
 # wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
 # failure under that option precisely so CI cannot go green on a skip -- and
 # that is the right default, so each exception needs its reason recorded rather
-# than inferred. There are six, all with this one's reason, and all carrying
-# the `toolchain` label: `switch.builds`, `switch.tlsprobe`, `toolchain.libnx`,
-# `npdm.svcs`, `package.builds` and `stack.measured`.
+# than inferred. Each has this one's reason, and each carries the `toolchain`
+# label: `switch.builds`, `switch.tlsprobe`, `switch.selftest`, `toolchain.libnx`,
+# `npdm.svcs`, the `package.*` builds and `stack.measured`.
 #
 # They skip in host-tests and run in `switch-build` instead. That job is inside
 # the pinned image already, and it runs tests/toolchain_suite.sh --here, which
@@ -1943,6 +1943,29 @@ add_test(NAME switch.tlsprobe
 set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# The M12-1 selftest (#306, selftest/README.md): an NRO linking core/ and the
+# sysmodule's own backends. Same image, same skip, same enforcement in
+# switch-build. Its report's judge needs no image: `selftest.*` below.
+add_test(NAME switch.selftest
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" selftest)
+set_tests_properties(switch.selftest PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# scripts/selftest-judge.py against canned reports, and the selftest's sources
+# held to it. None of them needs the image or a console, so none skips.
+set(SELFTEST_JUDGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_selftest_judge.py")
+foreach(scenario
+        judge   # pass, fail, missing and skipped rows; malformed reports refused
+        pairs   # --pairs N counts distinct HOS/Atmosphere pairs among passing reports
+        rows    # the NRO writes exactly the judged rows; its heap budget is the sysmodule's
+        roots   # the NRO writes only under sdmc:/config/rommsync-selftest/
+        gate)   # the launch gate's note, the plan's PRE-02 and the judge cite each other
+  add_test(NAME selftest.${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${SELFTEST_JUDGE_TEST}" ${scenario})
+  set_tests_properties(selftest.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
 
 # tlsprobe/measure-footprint.sh reads its compile flags from switch.mk rather
 # than carrying a copy (#256). This reads the script only, so it never skips;
