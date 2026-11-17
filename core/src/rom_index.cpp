@@ -306,6 +306,8 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
   bool probing = false;
 
   std::int64_t offset = 0;
+  std::int64_t first_total = -1;
+  bool shrank = false;
   std::size_t room = 0;
   bool reserved = false;
   // The roms left out, counted, and the first named by where it was: a count
@@ -431,6 +433,26 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
       result.shape = error;
       result.message = "the rom index is not the shape this client reads: " + error.Describe();
       return finished();
+    }
+
+    // RomM has no id cursor -- `/api/roms` takes no `id >` filter -- so this
+    // pages by offset, and a rom deleted below `offset` between two requests
+    // moves every later rom down one: the one that slides across the boundary
+    // is never read, and nothing in the page that follows looks wrong (#287).
+    // A `total` smaller than the first page's is the only sign of it, so it
+    // marks the index short, before the empty-page check below: a shrunken
+    // library can end exactly at `offset` and still have lost a rom. Roms read
+    // after it are still real and still kept. A deletion matched by an addition
+    // leaves `total` alone; that one is read on the next tick, like any change.
+    if (first_total < 0) {
+      first_total = page.total;
+    } else if (page.total < first_total && !shrank) {
+      shrank = true;
+      result.index.set_truncated(true);
+      result.message += std::string(result.message.empty() ? "" : "; ") +
+                        "the library shrank from " + std::to_string(first_total) + " to " + std::to_string(page.total) +
+                        " roms while it was being read, so a rom may have been skipped and is "
+                        "matched from the next tick";
     }
 
     if (page.roms.empty()) {

@@ -281,7 +281,9 @@ the file instead and stops offering it
 - **32 states**, sharing those 128 records with the saves; saves come first.
 - **1,024 roms** in the index one sync holds, the ones with the lowest RomM ids.
   A save for a game past that is skipped as unmatched, and the log says the
-  index is incomplete.
+  index is incomplete. While it is, a save matches only by its exact name in a
+  folder that names one platform — not in RetroArch's shared `saves/`, and not
+  by a tag-stripped name — because a rom the index never read may share it.
 - **A game with more than 128 saves on the server** is left out of the sync
   altogether — nothing of it is offered or touched — and named in the log on
   every sync.

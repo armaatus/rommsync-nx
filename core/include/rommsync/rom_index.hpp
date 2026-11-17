@@ -126,9 +126,10 @@ class RomIndex {
   std::size_t size() const { return roms_.size(); }
   bool empty() const { return roms_.empty(); }
 
-  /// The fetch stopped at `FetchOptions::max_roms` before the library ran out.
-  /// Matching still works; it just cannot see the roms that were not read, so a
-  /// caller logs this rather than treating the misses as unmatched files.
+  /// The index is not the whole library: the fetch stopped at
+  /// `FetchOptions::max_roms`, left out a rom too wide to read, or saw the
+  /// library change under it. `Find` then matches only what it cannot get
+  /// wrong (#287), and says so in every miss.
   bool truncated() const { return truncated_; }
   void set_truncated(bool truncated) { truncated_ = truncated; }
 
@@ -142,6 +143,11 @@ class RomIndex {
   /// candidate, it is the wrong one. A hintless directory -- RetroArch's one
   /// flat `saves/` -- searches the whole library, and two hits there is the
   /// ambiguity that gets skipped.
+  ///
+  /// On a `truncated()` index a unique hit proves nothing -- the other rom of
+  /// that name may be one that was never read -- so only an exact name under a
+  /// hint matches. A hintless hit and the tag-stripped fallback are reported
+  /// `kUnmatched`, the rom declined named in the reason (#287).
   Match Find(std::string_view base_name, std::string_view platform_fs_slug) const;
 
  private:
