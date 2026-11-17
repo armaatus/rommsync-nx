@@ -271,7 +271,10 @@ guess, and is still wrong to make now.
   says so, so taking it would make every game launch wait on this process.
   M10-26 (#261) asks the same session which application it is
   (`pmdmntGetProgramId`), so a play session names the title seen writing its
-  save, at no new grant or handle.
+  save, at no new grant or handle. M11-23 (#322) added `spl:`: Atmosphère's
+  version and the emuMMC flag are `splGetConfig` items, read once in
+  `__appInit` for the diagnostics bundle and closed again before `fsp-srv` is
+  opened, so — like `set:sys` — it is no term in the handle count above.
 
 ## Where the work is
 

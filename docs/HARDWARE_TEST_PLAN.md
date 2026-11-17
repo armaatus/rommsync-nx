@@ -690,7 +690,9 @@ is recorded, with the screen file it is in.
 
 **Pass.** The file exists, holds versions, config, state counts, backup usage,
 the last 200 log lines and crash-report names, and no token, `device_code` or
-URL credential.
+URL credential. Its `atmosphere` line is the version the console's Atmosphère
+reports, and its `emummc` line is `yes (partition)`, `yes (file)` or
+`no (sysMMC)` as this card boots -- neither starts with `not read:` (#322).
 
 ---
 

@@ -1176,7 +1176,8 @@ the log says so:
 Attach that file. It holds everything below in one place:
 
 - the versions of the overlay, the sysmodule and the IPC contract each speaks,
-  libultrahand, libnx and the console's firmware;
+  libultrahand, libnx and the console's firmware, Atmosphère's version, and
+  whether the console booted emuMMC or sysMMC;
 - the status screen's numbers, `state.db`'s row count, and how much `.backup/`
   holds (or that no prune has measured it since boot);
 - `config.ini`, with any value whose key names a token, code, password or secret
@@ -1188,9 +1189,8 @@ Attach that file. It holds everything below in one place:
 It is redacted line by line as it is written — no token, no pairing code and no
 password in a URL reaches it — and `token.dat` and `device.dat` are never read.
 It stays on the card; nothing sends it anywhere ([PRIVACY.md](PRIVACY.md)).
-Atmosphère's own version and whether this is emuMMC are not in it yet: reading
-them needs a system service the sysmodule does not hold, so give those in the
-bug report form.
+If its `atmosphere` or `emummc` line starts with `not read:`, the sysmodule
+could not ask the console; give those two in the bug report form instead.
 
 If the overlay cannot reach the sysmodule, or you would rather pick the lines
 yourself, attach the log instead. Five things, and the log has four of them:

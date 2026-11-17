@@ -104,6 +104,7 @@
 #include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "http/nifm_verdict.hpp"
+#include "platform_facts.hpp"
 #include "power.hpp"
 #include "power_fake.hpp"
 #include "rig.hpp"
@@ -3446,6 +3447,86 @@ void Diagnostics(checks::Checks& c) {
            "token.dat's token is not in it");
   c.Expect(bundle.find("0100000000001000") == std::string::npos,
            "nor another program's crash");
+}
+
+/// #322: Atmosphère's version and the emuMMC flag, as `__appInit` reads them
+/// out of `spl:`, decoded the way `main.cpp` decodes them and carried into the
+/// bundle through `UsePlatformFacts`. `spl:` itself is a console's to answer;
+/// what can be wrong off one is the decoding and the sentence a failed read
+/// leaves, and those are what this pins.
+void PlatformFactsFromSpl(checks::Checks& c) {
+  namespace platform = sysmodule::platform;
+
+  // Exosphere's packing of item 65000 (`secmon_smc_info.cpp`): major, minor and
+  // micro in the top three bytes, then the key generation, then the target
+  // firmware. A release 1.8.0 on firmware 19.0.1, and 1.10.2 so a two-digit minor is
+  // read as a byte and not a nibble.
+  platform::ConfigRead version{};
+  version.read = true;
+  version.value = 0x0108001313000100ULL;
+  c.Expect(platform::AtmosphereVersion(version) == "1.8.0",
+           "65000 decodes to major.minor.micro: " + platform::AtmosphereVersion(version));
+  version.value = 0x010A021313000100ULL;
+  c.Expect(platform::AtmosphereVersion(version) == "1.10.2",
+           "a two-digit minor: " + platform::AtmosphereVersion(version));
+
+  // Item 65007 is the emuMMC configuration's type: none, partition or file.
+  platform::ConfigRead emummc{};
+  emummc.read = true;
+  for (const auto& [type, expected] :
+       std::vector<std::pair<std::uint64_t, std::string>>{{0, "no (sysMMC)"},
+                                                          {1, "yes (partition)"},
+                                                          {2, "yes (file)"},
+                                                          {7, "yes (type 7)"}}) {
+    emummc.value = type;
+    c.Expect(platform::Emummc(emummc) == expected,
+             "emuMMC type " + std::to_string(type) + " reads \"" + expected +
+                 "\": " + platform::Emummc(emummc));
+  }
+
+  // A read that never happened, and one that failed, keep saying why -- and a
+  // failed call never reads as a version or as sysMMC.
+  const platform::ConfigRead not_asked{};
+  c.Expect(platform::AtmosphereVersion(not_asked) == "not read: spl: was not available at boot",
+           "spl: never opened: " + platform::AtmosphereVersion(not_asked));
+  platform::ConfigRead failed{};
+  failed.failed = "splGetConfig";
+  failed.result = 0xE01A;
+  c.Expect(platform::Emummc(failed) == "not read: splGetConfig answered 0xe01a",
+           "a failed call names itself and its result: " + platform::Emummc(failed));
+  failed.failed = "splInitialize";
+  c.Expect(platform::AtmosphereVersion(failed) == "not read: splInitialize answered 0xe01a",
+           "so does a failed open: " + platform::AtmosphereVersion(failed));
+
+  // And into the bundle, the way `main.cpp` hands them over: one read that
+  // worked and one that did not, side by side.
+  Console console(c, "engine-platform-facts");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  platform::ConfigRead atmosphere{};
+  atmosphere.read = true;
+  atmosphere.value = 0x0108001313000100ULL;
+  platform::ConfigRead unanswered{};
+  unanswered.failed = "splGetConfig";
+  unanswered.result = 0xE01A;
+  sysmodule::PlatformFacts facts;
+  facts.atmosphere = platform::AtmosphereVersion(atmosphere);
+  facts.emummc = platform::Emummc(unanswered);
+  console.engine.UsePlatformFacts(facts);
+
+  std::string response;
+  c.Expect(console.Call(ipc::Command::kWriteDiagnostics,
+                        ipc::EncodeDiagnosticsRequest({"0.9.0", ipc::kVersion, "v2.5.4"}),
+                        &response) == ipc::Error::kOk,
+           "WriteDiagnostics writes the bundle");
+  const ipc::Decoded<ipc::DiagnosticsResult> answer = ipc::DecodeDiagnosticsResult(response);
+  const std::string bundle = answer.ok() ? console.sandbox.Read(answer.value.sd_path) : "";
+  c.Expect(bundle.find("atmosphere = 1.8.0\n") != std::string::npos,
+           "the bundle's atmosphere line carries the version:\n" + bundle);
+  c.Expect(bundle.find("emummc = not read: splGetConfig answered 0xe01a\n") != std::string::npos,
+           "and its emummc line says why it has none");
 }
 
 void Commands(checks::Checks& c) {
@@ -8222,6 +8303,8 @@ int main(int argc, char** argv) {
     KeepLocalCancel(checks);
   } else if (scenario == "diagnostics") {
     Diagnostics(checks);
+  } else if (scenario == "platform_facts") {
+    PlatformFactsFromSpl(checks);
   } else if (scenario == "keep_local_cancel_race") {
     KeepLocalCancelRace(checks);
   } else if (scenario == "syncnow") {

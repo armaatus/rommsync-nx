@@ -44,6 +44,11 @@ Four phases, one CTest entry each, so a red run names the promise that broke:
             application process id and handed to the engine as its foreground
             probe -- and never hooked, because the application hook is
             `dmnt:cht`'s and a hooked launch waits for its hooker.
+
+  spl       M11-23 (#322): `spl:` granted, waited for without aborting, asked
+            for Exosphere's version and emuMMC items, and closed again inside
+            `__appInit` before `fsp-srv` is opened -- which is what keeps it out
+            of the handle budget.
 """
 import argparse
 import json
@@ -73,6 +78,7 @@ SERVICE_OF_INIT = {
     "sslInitialize": ["ssl"],
     "pscmInitialize": ["psc:m"],
     "pmdmntInitialize": ["pm:dmnt"],
+    "splInitialize": ["spl:"],
 }
 
 
@@ -314,6 +320,64 @@ def phase_foreground(repo):
     return 0
 
 
+def phase_spl(repo):
+    """`spl:` granted, read once at boot and closed again (M11-23, #322).
+
+    The diagnostics bundle's `atmosphere` and `emummc` lines are two
+    `splGetConfig` items. Without the grant the open fails on every boot and the
+    bundle says "not read" forever, with every host test green -- those hand the
+    engine their own facts. An abort on a missing `spl:` would take the overlay
+    down over two lines of a support file. And the session is closed before
+    `fsp-srv` is opened, as `set:sys` is, because `handle_budget.hpp` counts the
+    peak and leaves both out of it on exactly that ground.
+    """
+    failures = 0
+    if "spl:" not in npdm(repo).get("service_access", []):
+        failures += fail(
+            "sys-rommsync.json does not grant `spl:`; splInitialize would fail on every "
+            "boot and the bundle would never carry Atmosphere's version (#322)")
+    body = app_init(read(repo, "sysmodule/source/main.cpp"))
+    if re.search(r"WaitForServiceOrAbort\s*\(\s*\"spl:\"", body):
+        failures += fail(
+            "__appInit aborts on a missing `spl:`; two diagnostics lines are not worth a "
+            "sysmodule that refuses to start (#322)")
+    opened = re.search(r"\bsplInitialize\s*\(", body)
+    closed = re.search(r"\bsplExit\s*\(", body)
+    fs = re.search(r"\bfsInitialize\s*\(", body)
+    if not opened:
+        failures += fail("__appInit never calls splInitialize() (#322)")
+    elif not closed or (fs and not opened.start() < closed.start() < fs.start()):
+        failures += fail(
+            "__appInit does not close `spl:` again before fsInitialize(); "
+            "handle_budget.hpp leaves it out of the peak because it is closed by "
+            "then (#322)")
+    # Asked between the open and the close: a read after `splExit` is a call on
+    # a closed session, and one before `splInitialize` is a call on none.
+    for item in ("kExosphereApiVersion", "kExosphereEmummcType"):
+        asked = re.search(r"\bAskExosphere\s*\([^;]*\b" + item + r"\b", body)
+        if not asked or (opened and closed and
+                         not opened.start() < asked.start() < closed.start()):
+            failures += fail(
+                "__appInit never asks for %s between splInitialize() and splExit() (#322)"
+                % item)
+    # `GetConfig` is command 0 of `spl:`'s general interface. Through libnx's
+    # `splGetConfig` it would need 65000 cast into an enum that stops at 17.
+    if not re.search(r"\bserviceDispatchInOut\s*\(\s*splGetServiceSession\s*\(\s*\)\s*,\s*0\s*,",
+                     uncommented(read(repo, "sysmodule/source/main.cpp"))):
+        failures += fail(
+            "main.cpp does not dispatch GetConfig (command 0) on the spl: session (#322)")
+    header = read(repo, "sysmodule/source/platform_facts.hpp")
+    for item, number in (("kExosphereApiVersion", 65000), ("kExosphereEmummcType", 65007)):
+        if not re.search(r"\b%s\s*=\s*%d\s*;" % (item, number), header):
+            failures += fail(
+                "platform_facts.hpp does not define %s as %d, Atmosphere's item (#322)"
+                % (item, number))
+    if failures:
+        return 1
+    print("ok: spl: is granted, read without aborting, and closed before fsp-srv opens")
+    return 0
+
+
 def read(repo, relative):
     with open(repo + "/" + relative, "r", encoding="utf-8") as handle:
         return handle.read()
@@ -330,6 +394,7 @@ PHASES = {
     "comments": phase_comments,
     "psc": phase_psc,
     "foreground": phase_foreground,
+    "spl": phase_spl,
 }
 
 

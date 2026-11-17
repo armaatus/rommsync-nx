@@ -87,8 +87,8 @@ inline constexpr std::size_t kDnsInFlight = 2;
 /// application for a play session (#261) asks the same session, so still one.
 inline constexpr std::size_t kPm = 1;
 
-/// The peak. `set:sys` is not in it: `__appInit` closes it before anything
-/// else here is open.
+/// The peak. `set:sys` and `spl:` (#322) are not in it: `__appInit` closes
+/// both before anything else here is open, and `boot.spl` holds `spl:` to that.
 inline constexpr std::size_t kHeld = kThreads + kSm + kFs + kTime + kPsc + kNifm + kBsd +
                                      kSsl + kService + kDnsInFlight + kPm;
 

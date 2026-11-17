@@ -2583,6 +2583,7 @@ set(ENGINE_SCENARIOS
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   diagnostics  # #304: Y on the log screen writes a redacted bundle beside config.ini
+  platform_facts  # #322: spl:'s Atmosphère version and emuMMC flag, decoded into the bundle
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
@@ -2794,7 +2795,7 @@ add_test(NAME boot.journal COMMAND test_boot_services journal)
 set_tests_properties(boot.resolve boot.wait boot.journal PROPERTIES TIMEOUT 60)
 
 set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
-foreach(scenario IN ITEMS dns clock bounded comments psc foreground)
+foreach(scenario IN ITEMS dns clock bounded comments psc foreground spl)
   add_test(NAME boot.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${SYSMODULE_BOOT_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
