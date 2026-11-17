@@ -83,6 +83,18 @@ settle_repo_rows() {
   printf '\n### Run 2027-01-01 -- someone, Switch OLED\n' >> "$root/docs/HARDWARE_RESULTS.md"
 }
 
+# The checkout's README with its declaration line (M12-6, #308) replaced by
+# `$2`: the old bullet's opening, so the id is still named but not final. The
+# checkout's own README is frozen now, so a tree that fails tid has to be made
+# rather than copied.
+unfreeze_tid() {
+  local root="$1" tail="${2:-}"
+  sed "s/^- \*\*Title id \`0x4200000000524D53\` is final\*\*.*/- **Title id \`0x4200000000524D53\`.**$tail/" \
+    "$REPO_ROOT/sysmodule/README.md" > "$root/sysmodule/README.md"
+  ! grep -qi 'is final' "$root/sysmodule/README.md" ||
+    fail "unfreeze_tid left a declaration in the README: has its bullet been reworded?"
+}
+
 # Every hardware row's kind changed to repo: what the reviewed edit does.
 flip_console_rows() {
   sed 's/^\([a-z]*\)|console|/\1|repo|/' "$1/scripts/launch-gate.sh" > "$1/scripts/launch-gate.edited"
@@ -183,8 +195,26 @@ phase_repo() {
   local dir; dir="$(scratch)"
   local root
 
-  # Today's tree: title id and guides not settled, so FAIL, and exit 1.
-  root="$dir/today"; fake_repo "$root"; gh_answers "$root" 3
+  # The checkout's README: M12-6 (#308) froze the id, and tid reads that.
+  root="$dir/frozen"; fake_repo "$root"
+  run_gate "$root" --dry
+  row_is PASS tid "the checkout's README, which declares the id final"
+
+  # Each half of tid on its own: the old sentence kept beside the declaration,
+  # and the declaration missing without the sentence.
+  root="$dir/halfway"; fake_repo "$root"
+  echo 'Nothing verifies it is unused.' >> "$root/sysmodule/README.md"
+  run_gate "$root" --dry
+  row_is FAIL tid "a README that declares the id final but still says nothing verifies it"
+  unfreeze_tid "$root"
+  run_gate "$root" --dry
+  row_is FAIL tid "a README that never declares the id final"
+  echo "ok: tid passes the frozen README, and fails with either half missing"
+
+  # A tree before the launch work: title id and guides not settled, so FAIL,
+  # and exit 1.
+  root="$dir/today"; fake_repo "$root"
+  unfreeze_tid "$root" ' Nothing verifies it is unused.'; gh_answers "$root" 3
   run_gate "$root"
   row_is FAIL tid "a README that says nothing verifies the id"
   row_is FAIL notes "guides that say they are unvalidated"
@@ -195,7 +225,7 @@ phase_repo() {
     fail "the selftest row does not cite the plan's scenarios:
 $OUT"
   [ "$STATUS" -eq 1 ] || fail "expected exit 1 with failing rows, got $STATUS"
-  echo "ok: today's tree fails tid, notes and m11, and holds every console row"
+  echo "ok: an unsettled tree fails tid, notes and m11, and holds every console row"
 
   # Every repo row settled: only the console rows hold, and that is exit 3.
   root="$dir/settled"; fake_repo "$root"; settle_repo_rows "$root"; gh_answers "$root" 0
