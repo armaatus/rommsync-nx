@@ -35,6 +35,8 @@
 //   library      -- a Sandbox scanned against the docker library, end to end
 //   grown        -- the index is reserved from the first page's total, and a
 //                   library that grows mid-fetch stops it there, and says so
+//   shrunk       -- #287: a rom deleted below the offset mid-fetch leaves the
+//                   index short, and it says so
 //   paging       -- limit=1 over a six-rom library still finds the last page
 #include <algorithm>
 #include <chrono>
@@ -2180,6 +2182,44 @@ void Grown(::checks::Checks& checks) {
   checks.Expect(capped.index.truncated(), "and says so");
 }
 
+/// #287: the index is paged by offset over `order_by=id`, and RomM has no id
+/// cursor (`/api/roms` takes no `id >` filter). A rom deleted below the offset
+/// between two pages moves every later rom down one, and the rom that slid
+/// across the boundary is never read -- so a library that shrank mid-fetch is
+/// an index that says it is short, whether or not the next page came back empty.
+void Shrunk(::checks::Checks& checks) {
+  roms::FetchOptions options;
+  options.base_url = "http://library.invalid";
+  options.page_size = 1;
+
+  // {1, 2, 3}, then rom 1 is deleted: offset 1 is now rom 3, and rom 2 is lost.
+  ScriptedLibrary skipped({OneRomPage(1, 3, 0), OneRomPage(3, 2, 1)});
+  const roms::FetchResult shifted = roms::FetchRomIndex(skipped, options);
+  checks.Expect(shifted.ok(), "a library that shrank mid-fetch is still an index: " +
+                                  shifted.message);
+  checks.ExpectEq(shifted.index.size(), std::size_t{2}, "of the roms it did read");
+  checks.Expect(shifted.index.ById(2) == nullptr, "which lack the one that slid past a page");
+  checks.Expect(shifted.index.truncated(), "so it says it is short");
+  checks.Expect(shifted.message.find("shrank") != std::string::npos,
+                "and why: " + shifted.message);
+
+  // {1, 2, 3}, two read, then rom 1 is deleted: offset 2 is past the new end,
+  // and rom 3 -- now at offset 1 -- is never read.
+  ScriptedLibrary ended({OneRomPage(1, 3, 0), OneRomPage(2, 3, 1),
+                         R"({"items":[],"total":2,"limit":1,"offset":2})"});
+  const roms::FetchResult short_tail = roms::FetchRomIndex(ended, options);
+  checks.ExpectEq(short_tail.index.size(), std::size_t{2}, "an empty page ends the fetch");
+  checks.Expect(short_tail.index.truncated(),
+                "and one past a shrunken end still says the index is short: " +
+                    short_tail.message);
+
+  // The control: a library that did not change is read whole.
+  ScriptedLibrary steady({OneRomPage(1, 3, 0), OneRomPage(2, 3, 1), OneRomPage(3, 3, 2)});
+  const roms::FetchResult whole = roms::FetchRomIndex(steady, options);
+  checks.Expect(whole.ok() && !whole.index.truncated() && whole.index.size() == 3,
+                "a steady library is read whole: " + whole.message);
+}
+
 /// #258, #237's open (4): one rom's RetroArch copy and Tico copy contest one
 /// pairing key -- a save's `(rom_id, slot)` since #236, a state's name under
 /// `[sync] map_state_slots` -- and the frontend `play_with` plays the platform
@@ -2276,7 +2316,8 @@ int main(int argc, char** argv) {
   if (scenario == "names" || scenario == "ambiguous" || scenario == "short_index" ||
       scenario == "walked_once" ||
       scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
-      scenario == "sources" || scenario == "grown" || scenario == "retroarch" ||
+      scenario == "sources" || scenario == "grown" || scenario == "shrunk" ||
+      scenario == "retroarch" ||
       scenario == "tico" || scenario == "isolated" || scenario == "contest") {
     if (scenario == "names") {
       Names(checks);
@@ -2294,6 +2335,8 @@ int main(int argc, char** argv) {
       Sources(checks);
     } else if (scenario == "grown") {
       Grown(checks);
+    } else if (scenario == "shrunk") {
+      Shrunk(checks);
     } else if (scenario == "retroarch") {
       RetroArch(checks);
     } else if (scenario == "tico") {

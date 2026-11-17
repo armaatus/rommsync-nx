@@ -1097,6 +1097,7 @@ set(SCAN_UNIT_SCENARIOS
   hashing      # the digest is real, reused when nothing changed, null only when unreadable
   sources      # fixture trees for each source scan to the emulator id that wrote them
   grown        # the index is reserved from total; a library that grows mid-fetch stops there
+  shrunk       # #287: a rom deleted below the offset mid-fetch marks the index short
   retroarch    # flat, sorted, beside the content and cloud-synced, as retroarch.cfg says
   tico         # Tico 0.7.9 and 0.8.0 with one and two accounts; litter is never a save
   isolated     # #238: tico-* ids, DuckStation's cards, and PPSSPP's folders as a named skip
