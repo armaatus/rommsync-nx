@@ -13,6 +13,7 @@
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/disk.hpp"
 #include "card.hpp"
+#include "platform_facts.hpp"
 #include "rommsync/sync_execute.hpp"
 #include "selftest.hpp"
 
@@ -20,10 +21,6 @@ namespace selftest {
 namespace {
 
 using rommsync::fs::Format;
-
-// Atmosphere's own config items (exosphere), past the ones spl names.
-constexpr SplConfigItem kExosphereApiVersion = static_cast<SplConfigItem>(65000);
-constexpr SplConfigItem kExosphereEmummcType = static_cast<SplConfigItem>(65007);
 
 // Enough room for a run: a fixture save, a homebrew rom twice, its backups.
 constexpr std::uint64_t kFreeFloor = 64ull * 1024 * 1024;
@@ -33,8 +30,6 @@ constexpr std::uint64_t kFreeFloor = 64ull * 1024 * 1024;
 constexpr s64 kPastFat32 = 0x100000000LL + 1;
 
 std::string Quoted(const std::string& text) { return "\"" + text + "\""; }
-
-std::string Number(long long value) { return std::to_string(value); }
 
 /// The sysmodule's own reading of the card (main.cpp's `CardFormat`), which is
 /// what decides the 4 GiB ceiling it holds downloads to: Horizon will not say
@@ -73,14 +68,20 @@ std::string ProbeCardFormat(const std::string& scratch_sd, std::string* detail) 
   return room ? "fat32" : "unknown";
 }
 
-std::string AmsVersion() {
+/// One of Atmosphere's config items, in the shape the sysmodule's boot read
+/// keeps it (platform_facts.hpp), so both say the same thing about a failure.
+rommsync::sysmodule::platform::ConfigRead ReadConfig(std::uint32_t item, const char* name) {
+  rommsync::sysmodule::platform::ConfigRead read = {nullptr, 0, 0, false};
   u64 value = 0;
-  if (R_FAILED(splGetConfig(kExosphereApiVersion, &value))) return "unknown";
-  char text[32];
-  std::snprintf(text, sizeof(text), "%u.%u.%u", static_cast<unsigned>((value >> 56) & 0xFF),
-                static_cast<unsigned>((value >> 48) & 0xFF),
-                static_cast<unsigned>((value >> 40) & 0xFF));
-  return text;
+  const Result rc = splGetConfig(static_cast<SplConfigItem>(item), &value);
+  if (R_SUCCEEDED(rc)) {
+    read.value = value;
+    read.read = true;
+  } else {
+    read.failed = name;
+    read.result = rc;
+  }
+  return read;
 }
 
 /// The console's zone offset from UTC, in seconds, at `now`.
@@ -139,23 +140,21 @@ void RunPlatform(Run& run) {
   report.Row("platform.hos", hos != "unknown" ? Outcome::kPass : Outcome::kFail,
              "HOS " + hos, Quoted(hos));
 
-  std::string ams = "unknown";
-  bool emummc = false;
-  bool emummc_known = false;
+  namespace platform = rommsync::sysmodule::platform;
+  platform::ConfigRead api = {nullptr, 0, 0, false};
+  platform::ConfigRead emummc_type = {nullptr, 0, 0, false};
   if (R_SUCCEEDED(splInitialize())) {
-    ams = AmsVersion();
-    u64 type = 0;
-    if (R_SUCCEEDED(splGetConfig(kExosphereEmummcType, &type))) {
-      emummc = type != 0;
-      emummc_known = true;
-    }
+    api = ReadConfig(platform::kExosphereApiVersion, "splGetConfig(ExosphereApiVersion)");
+    emummc_type = ReadConfig(platform::kExosphereEmummcType, "splGetConfig(ExosphereEmummcType)");
     splExit();
   }
-  report.Row("platform.ams", ams != "unknown" ? Outcome::kPass : Outcome::kFail,
-             "Atmosphere " + ams, Quoted(ams));
-  report.Row("platform.emummc", emummc_known ? Outcome::kPass : Outcome::kFail,
-             emummc_known ? (emummc ? "emuMMC" : "sysMMC") : "spl did not say",
-             emummc ? "true" : "false");
+  const std::string ams = api.read ? platform::AtmosphereVersion(api) : "unknown";
+  const bool emummc = emummc_type.read && emummc_type.value != 0;
+  report.Row("platform.ams", api.read ? Outcome::kPass : Outcome::kFail,
+             "Atmosphere " + platform::AtmosphereVersion(api), Quoted(ams));
+  report.Row("platform.emummc", emummc_type.read ? Outcome::kPass : Outcome::kFail,
+             platform::Emummc(emummc_type),
+             emummc_type.read ? (emummc ? "true" : "false") : "null");
 
   std::string why;
   run.sd_format = ProbeCardFormat(run.scratch_sd, &why);

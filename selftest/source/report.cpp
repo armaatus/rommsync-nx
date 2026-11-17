@@ -51,6 +51,12 @@ std::string Trim(std::string text) {
 
 }  // namespace
 
+std::string Describe(const rommsync::http::Result& result) {
+  if (result.ok()) return "HTTP " + Number(result.response.status);
+  return std::string(rommsync::http::ToString(result.error)) +
+         (result.message.empty() ? "" : ": " + result.message);
+}
+
 std::string UnderRoot(const std::string& leaf) { return std::string(kRoot) + leaf; }
 
 void Say(const char* format, ...) {

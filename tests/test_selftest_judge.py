@@ -8,7 +8,7 @@ docs/HARDWARE_TEST_PLAN.md's PRE-02, not a claim made here.
 
   judge    a passing report passes; a failed, skipped or missing required row
            fails and is named; `na` passes only where the row allows it
-           (card.fat32_ceiling, off a FAT32 card); an optional row's skip
+           (card.fat32_ceiling, on an exFAT card); an optional row's skip
            passes; a malformed report (not JSON, an unknown result, a row
            twice) is refused as MALFORMED with exit 2, never judged.
   pairs    `--pairs N` -- the launch gate's `selftest` row -- needs N distinct

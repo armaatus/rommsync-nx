@@ -29,17 +29,9 @@ namespace {
 
 using rommsync::sync::Timestamp;
 
-std::string Number(long long value) { return std::to_string(value); }
-
 // Larger than this and the download row would hold a rom in memory twice to
 // compare it; the fixture's homebrew roms are kilobytes.
 constexpr std::size_t kMaxCompareBytes = 8 * 1024 * 1024;
-
-std::string Describe(const rommsync::http::Result& result) {
-  if (result.ok()) return "HTTP " + Number(result.response.status);
-  return std::string(rommsync::http::ToString(result.error)) +
-         (result.message.empty() ? "" : ": " + result.message);
-}
 
 void NotRun(Report& report, const char* id, const char* because) {
   report.Row(id, Outcome::kFail, std::string("not run: ") + because);
@@ -153,7 +145,9 @@ void Download(Run& run) {
   rommsync::http::Request get;
   get.url = rommsync::download::ContentUrl(run.config.url, rom.id, rom.fs_name);
   get.headers.push_back({"Authorization", bearer});
-  get.timeout = std::chrono::milliseconds(0);  // a rom: the stall timeout decides
+  // A rom, so no ceiling on the whole: the stall timeout decides, as it does
+  // for every download the sysmodule makes (http.hpp, `Request::timeout`).
+  get.timeout = std::chrono::milliseconds(0);
   const auto size = static_cast<std::uint64_t>(rom.size_bytes);
 
   // Whole, first: the bytes the resumed copy has to match.

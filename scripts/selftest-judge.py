@@ -42,9 +42,10 @@ SCHEMA = 1
 # `ctest -R selftest.rows` holds selftest/source to exactly these ids.
 #
 #   required  must be `pass`. `skip` is a FAIL: a step nobody ran proved nothing.
-#   na_unless a required row that may answer `na` when the console's
-#             `sd_format` is anything but the value named -- the FAT32 ceiling
-#             has nothing to refuse on exFAT. `na` on that format is a FAIL.
+#   na_when   a required row that may answer `na` only when the console's
+#             `sd_format` is the value named -- the FAT32 ceiling has nothing
+#             to refuse on exFAT. `na` on FAT32, or on a card whose format the
+#             run could not learn, is a FAIL: nothing showed the row moot.
 #   optional  `pass`, `skip` and `na` all pass; only `fail` fails. For the steps
 #             that need something the minimum setup does not have (a TLS
 #             1.3-only listener).
@@ -62,7 +63,7 @@ ROWS = (
     ("card.atomic_write", REQUIRED, None, "write .tmp, rename over, read back"),
     ("card.commit_device", REQUIRED, None, "fsdevCommitDevice(\"sdmc\") succeeds"),
     ("card.backup_then_commit", REQUIRED, None, "the save-overwrite sequence: backup first"),
-    ("card.fat32_ceiling", REQUIRED, "fat32", "a file past 4 GiB is refused before writing"),
+    ("card.fat32_ceiling", REQUIRED, "exfat", "a file past 4 GiB is refused before writing"),
     ("card.long_unicode_path", REQUIRED, None, "a long, non-ASCII path round-trips"),
     # 3. Network and TLS.
     ("net.nifm", REQUIRED, None, "nifm says the console is online"),
@@ -127,14 +128,14 @@ def load(path: str) -> dict:
 
 
 def judge_row(spec: tuple, row: dict, console: dict) -> bool:
-    row_id, kind, na_unless, _ = spec
+    row_id, kind, na_when, _ = spec
     result = row["result"]
     if result == "pass":
         return True
     if kind == OPTIONAL:
         return result in ("skip", "na")
-    if result == "na" and na_unless is not None:
-        return str(console.get("sd_format", "")).lower() != na_unless
+    if result == "na" and na_when is not None:
+        return str(console.get("sd_format", "")).lower() == na_when
     return False
 
 
@@ -183,8 +184,8 @@ def main(argv: list) -> int:
     args = parser.parse_args(argv)
 
     if args.rows:
-        for row_id, kind, na_unless, what in ROWS:
-            extra = f", na unless {na_unless}" if na_unless else ""
+        for row_id, kind, na_when, what in ROWS:
+            extra = f", na on {na_when}" if na_when else ""
             print(f"{row_id} {kind}{extra}: {what}")
         return 0
     if not args.reports:

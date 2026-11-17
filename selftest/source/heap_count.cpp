@@ -29,17 +29,27 @@ void Note(std::size_t size) {
   }
 }
 
-void* Allocate(std::size_t size, std::size_t alignment) {
+/// Null when the heap is out; the throwing forms abort on that instead.
+void* TryAllocate(std::size_t size, std::size_t alignment) {
   const std::size_t header = alignment > kHeader ? alignment : kHeader;
-  void* block = alignment > kHeader ? std::aligned_alloc(alignment, header + size)
-                                    : std::malloc(header + size);
-  // -fno-exceptions: there is no bad_alloc to throw, and the sysmodule's answer
-  // to running out is the same abort (switch.mk says why).
-  if (block == nullptr) std::abort();
+  // aligned_alloc wants a multiple of the alignment.
+  const std::size_t whole =
+      alignment > kHeader ? (header + size + alignment - 1) / alignment * alignment
+                          : header + size;
+  void* block = alignment > kHeader ? std::aligned_alloc(alignment, whole) : std::malloc(whole);
+  if (block == nullptr) return nullptr;
   unsigned char* user = static_cast<unsigned char*>(block) + header;
   reinterpret_cast<std::size_t*>(user)[-1] = size;
   reinterpret_cast<std::size_t*>(user)[-2] = header;
   Note(size);
+  return user;
+}
+
+void* Allocate(std::size_t size, std::size_t alignment) {
+  void* user = TryAllocate(size, alignment);
+  // -fno-exceptions: there is no bad_alloc to throw, and the sysmodule's answer
+  // to running out is the same abort (switch.mk says why).
+  if (user == nullptr) std::abort();
   return user;
 }
 
@@ -56,9 +66,19 @@ void Release(void* pointer) {
 
 void* operator new(std::size_t size) { return Allocate(size, 0); }
 void* operator new[](std::size_t size) { return Allocate(size, 0); }
-void* operator new(std::size_t size, const std::nothrow_t&) noexcept { return Allocate(size, 0); }
+// Every form, the nothrow aligned ones included: a block one of them took from
+// libstdc++'s own would reach Release below without a header.
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+  return TryAllocate(size, 0);
+}
 void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
-  return Allocate(size, 0);
+  return TryAllocate(size, 0);
+}
+void* operator new(std::size_t size, std::align_val_t align, const std::nothrow_t&) noexcept {
+  return TryAllocate(size, static_cast<std::size_t>(align));
+}
+void* operator new[](std::size_t size, std::align_val_t align, const std::nothrow_t&) noexcept {
+  return TryAllocate(size, static_cast<std::size_t>(align));
 }
 void* operator new(std::size_t size, std::align_val_t align) {
   return Allocate(size, static_cast<std::size_t>(align));
@@ -74,6 +94,14 @@ void operator delete(void* pointer, std::align_val_t) noexcept { Release(pointer
 void operator delete[](void* pointer, std::align_val_t) noexcept { Release(pointer); }
 void operator delete(void* pointer, std::size_t, std::align_val_t) noexcept { Release(pointer); }
 void operator delete[](void* pointer, std::size_t, std::align_val_t) noexcept {
+  Release(pointer);
+}
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { Release(pointer); }
+void operator delete[](void* pointer, const std::nothrow_t&) noexcept { Release(pointer); }
+void operator delete(void* pointer, std::align_val_t, const std::nothrow_t&) noexcept {
+  Release(pointer);
+}
+void operator delete[](void* pointer, std::align_val_t, const std::nothrow_t&) noexcept {
   Release(pointer);
 }
 

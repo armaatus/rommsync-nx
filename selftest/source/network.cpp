@@ -22,8 +22,6 @@ using rommsync::http::Error;
 using rommsync::http::Request;
 using rommsync::http::Result;
 
-std::string Number(long long value) { return std::to_string(value); }
-
 long long MillisSince(Clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - start).count();
 }
@@ -35,12 +33,6 @@ std::string HostOf(const std::string& url) {
   std::size_t end = url.find_first_of(":/", start);
   if (end == std::string::npos) end = url.size();
   return url.substr(start, end - start);
-}
-
-std::string Describe(const Result& result) {
-  if (result.ok()) return "HTTP " + Number(result.response.status);
-  return std::string(rommsync::http::ToString(result.error)) +
-         (result.message.empty() ? "" : ": " + result.message);
 }
 
 Request Get(const std::string& url) {

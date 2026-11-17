@@ -124,6 +124,11 @@ void RunFootprint(Run& run);
 /// someone watched and a report someone judged cannot tell different stories.
 void Say(const char* format, ...) __attribute__((format(printf, 1, 2)));
 
+inline std::string Number(long long value) { return std::to_string(value); }
+
+/// A transport result for a row's detail: the status, or the error and why.
+std::string Describe(const rommsync::http::Result& result);
+
 /// `sdmc:/config/rommsync-selftest/<leaf>`.
 std::string UnderRoot(const std::string& leaf);
 
