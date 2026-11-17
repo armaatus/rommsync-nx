@@ -185,7 +185,14 @@ Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_sl
     BuildLookup();
   }
 
-  for (int pass = 0; pass < 2; ++pass) {
+  // A short index (#287) has read only some of the library, so a name it holds
+  // once may be held again by a rom it never read. Only a lookup that cannot
+  // land on another game survives that: an exact name, scoped to the platform
+  // the folder names -- one platform's folder holds one rom of a name. The
+  // fallback is refused outright, because it runs on "no exact hit", and with a
+  // short index that is as likely to mean the exact rom was not read.
+  const int passes = truncated_ ? 1 : 2;
+  for (int pass = 0; pass < passes; ++pass) {
     const std::vector<std::uint32_t>& order = pass == 0 ? by_no_ext_ : by_no_tags_;
     const std::string Rom::*key = pass == 0 ? &Rom::fs_name_no_ext : &Rom::fs_name_no_tags;
     const auto before = [this, key](std::uint32_t left, std::string_view right) {
@@ -216,6 +223,15 @@ Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_sl
     if (hits == 0) {
       continue;
     }
+    if (hits == 1 && truncated_ && platform_fs_slug.empty()) {
+      match.reason = "\"" + std::string(base_name) + "\" names rom " + std::to_string(found->id) +
+                     " (" + found->platform_fs_slug + ") alone of the " +
+                     std::to_string(roms_.size()) +
+                     " roms read, but the rom index is incomplete and this folder names no "
+                     "platform, so a rom of the same name that was never read may be its own; "
+                     "a folder mapped to one platform would match it";
+      return match;
+    }
     if (hits == 1) {
       match.outcome = MatchOutcome::kMatched;
       match.rom = found;
@@ -241,7 +257,12 @@ Match RomIndex::Find(std::string_view base_name, std::string_view platform_fs_sl
   }
 
   match.outcome = MatchOutcome::kUnmatched;
-  match.reason = "no rom named \"" + std::string(base_name) + "\"" + scope;
+  // Said here rather than by each caller, so none reports a miss as a rom the
+  // user does not have when it may be one this client never read.
+  match.reason = "no rom named \"" + std::string(base_name) + "\"" + scope +
+                 (truncated_ ? "; the rom index is incomplete, so this may be a rom that was "
+                               "never read rather than one you do not have"
+                             : "");
   return match;
 }
 
