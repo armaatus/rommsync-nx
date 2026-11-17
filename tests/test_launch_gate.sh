@@ -42,7 +42,7 @@ fake_repo() {
   mkdir -p "$root/scripts" "$root/bin"
   cp "$GATE" "$root/scripts/launch-gate.sh"
   for f in docs/HARDWARE_TEST_PLAN.md docs/HARDWARE_RESULTS.md docs/INSTALL.md \
-           docs/TROUBLESHOOTING.md sysmodule/sys-rommsync.json sysmodule/README.md \
+           docs/TROUBLESHOOTING.md docs/INTEROP.md sysmodule/sys-rommsync.json sysmodule/README.md \
            overlay/README.md; do
     mkdir -p "$root/$(dirname "$f")"
     cp "$REPO_ROOT/$f" "$root/$f"
@@ -77,7 +77,7 @@ settle_repo_rows() {
     > "$root/sysmodule/README.md"
   echo '`0x4200000000524D53` is final.' >> "$root/sysmodule/README.md"
   local doc
-  for doc in docs/INSTALL.md docs/TROUBLESHOOTING.md; do
+  for doc in docs/INSTALL.md docs/TROUBLESHOOTING.md docs/INTEROP.md; do
     grep -vi 'not yet validated on hardware' "$REPO_ROOT/$doc" > "$root/$doc"
   done
   printf '\n### Run 2027-01-01 -- someone, Switch OLED\n' >> "$root/docs/HARDWARE_RESULTS.md"
@@ -218,6 +218,12 @@ $OUT"
   [ "$STATUS" -eq 0 ] || fail "every row settled and flipped, but the gate exited $STATUS:
 $OUT"
   echo "$OUT" | grep -q "LAUNCH GATE PASSES" || fail "exit 0 without saying it passes"
+  # INTEROP carries the same note as the two guides, and a stable release may
+  # not ship any of the three still saying it.
+  cp "$REPO_ROOT/docs/INTEROP.md" "$root/docs/INTEROP.md"
+  V1_EXIT=0 run_gate "$root"
+  row_is FAIL notes "an INTEROP that says it is unvalidated"
+  grep -vi 'not yet validated on hardware' "$REPO_ROOT/docs/INTEROP.md" > "$root/docs/INTEROP.md"
   # A flip with no run recorded behind it is refused.
   cp "$REPO_ROOT/docs/HARDWARE_RESULTS.md" "$root/docs/HARDWARE_RESULTS.md"
   V1_EXIT=0 run_gate "$root"
