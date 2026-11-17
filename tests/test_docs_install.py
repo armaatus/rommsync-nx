@@ -52,7 +52,17 @@ gives a user is read off the code that decides it.
                  in core/src/save_source.cpp, and the RetroArch core folders
                  against RomM's table pinned in the same file.
 
-`links` covers both pages.
+docs/PRIVACY.md (#301) is what leaves the console, and rots the moment a request
+gains a field nobody wrote down -- so its field names are read off the code that
+builds each body, not off a list kept here.
+
+  privacy        its sections in order; README, INSTALL and SECURITY.md linking
+                 it; every field the pairing, negotiate, completion and
+                 play-session bodies send named on it; the opt-out key the
+                 parser takes with the default config.hpp gives it; the
+                 User-Agent and every /config/rommsync file it names.
+
+`links` covers all three pages.
 """
 import argparse
 import json
@@ -78,8 +88,9 @@ RUNTIME_SUBDIRS = ("flags",)
 # precisely because it is NOT in the archive: an upgrade must leave it alone.
 # `.backup` is a directory, named for the same reason: it holds every save
 # backup, and an upgrade or an uninstall that took it would take those too.
+# `ca.pem` is the user's own certificate, copied there by hand (#288).
 RUNTIME_FILES = ("config.ini", "token.dat", "device.dat", "state.db", "queue.json",
-                 "conflicts.db", "rommsync.log", "rommsync.log.old", ".backup")
+                 "conflicts.db", "rommsync.log", "rommsync.log.old", ".backup", "ca.pem")
 
 # The ten sections of #35, in the order a user meets them.
 SECTIONS = [
@@ -280,7 +291,7 @@ def phase_links(args) -> int:
     repo = args.repo
     checked = 0
 
-    for guide in (guide_path(repo), interop_path(repo)):
+    for guide in (guide_path(repo), interop_path(repo), privacy_path(repo)):
         name = os.path.relpath(guide, repo)
         text = read(guide)
         page_links = 0
@@ -303,7 +314,7 @@ def phase_links(args) -> int:
                         "CONFIG.md, SYNC_PROTOCOL.md and SECURITY.md rather than restate them")
         checked += page_links
 
-    print(f"{checked} relative links resolve across INSTALL.md and INTEROP.md")
+    print(f"{checked} relative links resolve across INSTALL.md, INTEROP.md and PRIVACY.md")
     return 0
 
 
@@ -775,7 +786,180 @@ def phase_interop_table(args) -> int:
     return 0
 
 
+# --- privacy ------------------------------------------------------------------
+
+def privacy_path(repo: str) -> str:
+    path = os.path.join(repo, "docs", "PRIVACY.md")
+    if not os.path.exists(path):
+        raise SystemExit(fail("there is no docs/PRIVACY.md: the one place that lists what "
+                              "leaves the console (#301)"))
+    return path
+
+
+PRIVACY_SECTIONS = [
+    "Where it goes",
+    "What is sent",
+    "Play sessions",
+    "What stays on the console",
+    "What is never sent",
+    "Turning things off",
+]
+
+
+def function_body(text: str, signature: str, where: str) -> str:
+    """From `signature` to the first line that is a lone `}` -- the end of a
+    top-level function in this codebase's formatting."""
+    start = text.find(signature)
+    if start < 0:
+        raise SystemExit(fail(f"cannot find `{signature}` in {where}"))
+    end = re.search(r"^}\s*$", text[start:], re.MULTILINE)
+    return text[start: start + end.end()] if end else text[start:]
+
+
+def sent_fields(body: str) -> set:
+    """Every JSON key a body builder writes: `"\"key\":` literals, and the
+    keys handed to a helper that writes one (`AppendMember(body, "slot", ...)`)."""
+    keys = set(re.findall(r'\\"(\w+)\\":', body))
+    keys |= set(re.findall(r'Append\w*\(\s*\w+,\s*"(\w+)"', body))
+    return keys
+
+
+def phase_privacy(args) -> int:
+    repo = args.repo
+    path = privacy_path(repo)
+    text = read(path)
+
+    found = [h.strip() for h in re.findall(r"^##\s+(.*?)\s*$", text, re.MULTILINE)]
+    if found != PRIVACY_SECTIONS:
+        return fail("docs/PRIVACY.md's sections are not #301's, in order.\n"
+                    "  expected: " + " / ".join(PRIVACY_SECTIONS) + "\n"
+                    "  found:    " + " / ".join(found))
+
+    for linker, target in (("README.md", "docs/PRIVACY.md"),
+                           (os.path.join("docs", "INSTALL.md"), "PRIVACY.md"),
+                           (os.path.join("docs", "SECURITY.md"), "PRIVACY.md")):
+        if f"]({target}" not in read(os.path.join(repo, linker)):
+            return fail(f"{linker} does not link {target} (#301)")
+
+    spans = set(code_spans(text))
+    core = os.path.join(repo, "core", "src")
+    bodies = {
+        "pairing": function_body(read(os.path.join(core, "pairing.cpp")),
+                                 "std::string InitBody(", "core/src/pairing.cpp"),
+        "negotiate": function_body(read(os.path.join(core, "sync.cpp")),
+                                   "Encoded EncodeNegotiateRequest(const std::optional<std::string>& device_id,",
+                                   "core/src/sync.cpp"),
+        "completion": function_body(read(os.path.join(core, "sync_complete.cpp")),
+                                    "Encoded EncodeCompleteRequest(",
+                                    "core/src/sync_complete.cpp"),
+        "play session": function_body(read(os.path.join(core, "sync_complete.cpp")),
+                                      "Encoded EncodePlaySessions(",
+                                      "core/src/sync_complete.cpp"),
+    }
+    named = 0
+    for request, body in bodies.items():
+        fields = sent_fields(body)
+        if not fields:
+            return fail(f"read no fields out of the {request} body; this test is reading "
+                        "the wrong function")
+        missing = sorted(f for f in fields if f not in spans)
+        if missing:
+            return fail(f"the {request} body sends {', '.join(missing)}, which docs/PRIVACY.md "
+                        "never names: a field that leaves the console is on that page")
+        named += len(fields)
+
+    # The opt-out: a key the parser takes, the default the page states.
+    if '"play_sessions"' not in read(os.path.join(core, "config.cpp")):
+        return fail("docs/PRIVACY.md's opt-out, [sync] play_sessions, is not a key "
+                    "core/src/config.cpp reads")
+    if "play_sessions = false" not in text:
+        return fail("docs/PRIVACY.md never shows the line that turns play sessions off")
+    default = re.search(r"bool play_sessions = (true|false);",
+                        read(os.path.join(repo, "core", "include", "rommsync", "config.hpp")))
+    if not default:
+        return fail("cannot find play_sessions' default in core/include/rommsync/config.hpp")
+    stated = "**On by default.**" if default.group(1) == "true" else "**Off by default.**"
+    if stated not in text:
+        return fail(f"config.hpp defaults play_sessions to {default.group(1)}, and "
+                    f"docs/PRIVACY.md does not say {stated}")
+
+    agent = re.search(r'kUserAgent = "([^"@]+)@',
+                      read(os.path.join(repo, "core", "include", "rommsync", "version.hpp.in")))
+    if not agent or f"User-Agent: {agent.group(1)}<version>" not in spans:
+        return fail("docs/PRIVACY.md's User-Agent is not version.hpp.in's kUserAgent")
+
+    # Every record it says is on the card is one a header names.
+    headers = headers_text(repo)
+    files = set(re.findall(r"^\| `([\w.]+/?)` \|", text, re.MULTILINE))
+    for name in sorted(files):
+        if f"/config/rommsync/{name.rstrip('/')}" not in headers and \
+                f'"{name}"' not in headers and name not in headers:
+            return fail(f"docs/PRIVACY.md lists /config/rommsync/{name}, which no header in "
+                        "core/include/rommsync names")
+    for record in ("token.dat", "play.db", "rommsync.log", "state.db"):
+        if record not in files:
+            return fail(f"docs/PRIVACY.md's table of what stays on the console has no {record}")
+
+    print(f"{len(found)} sections in order, linked from README, INSTALL and SECURITY.md; "
+          f"{named} sent fields named; the opt-out and its default match the code; "
+          f"{len(files)} on-card records named")
+    return 0
+
+
+# --- the self-signed answer (#288) --------------------------------------------
+
+CA_HEADING = "Self-signed or private CA"
+CA_ANCHOR = "self-signed-or-private-ca"
+CA_EXAMPLE = "ca_file = sdmc:/config/rommsync/ca.pem"
+
+
+def phase_ca_file(args) -> int:
+    """Every page that says "import the certificate" now names the one way to:
+    `[server] ca_file`, in one INSTALL section the others link to. Read against
+    the parser, so a renamed key is red here rather than a line a user copies
+    that the console ignores with a warning."""
+    repo = args.repo
+    parser = read(os.path.join(repo, "core", "src", "config.cpp"))
+    if '"ca_file"' not in parser:
+        return fail("core/src/config.cpp no longer reads a \"ca_file\" key; "
+                    "the docs below describe one")
+
+    guide = read(guide_path(repo))
+    found = re.search(rf"^#+ {re.escape(CA_HEADING)}\s*$", guide, re.MULTILINE)
+    if not found:
+        return fail(f"docs/INSTALL.md has no '{CA_HEADING}' section")
+    rest = guide[found.end():]
+    end = re.search(r"^#+ ", rest, re.MULTILINE)
+    body = rest[: end.start()] if end else rest
+    for needle, why in (
+        (CA_EXAMPLE, "the exact line to put under [server]"),
+        ("[server]", "which section the key goes in"),
+        ("config/rommsync/ca.pem", "where the file goes on the card"),
+        ("PEM", "the one format it reads"),
+        ("openssl x509 -inform der", "how to convert a DER certificate"),
+        ("SECURITY.md", "the reasoning, rather than restating it"),
+    ):
+        if needle not in body:
+            return fail(f"docs/INSTALL.md's '{CA_HEADING}' does not give {why} ({needle!r})")
+
+    example = read(os.path.join(repo, "packaging", "config.ini.example"))
+    if CA_EXAMPLE not in example:
+        return fail(f"packaging/config.ini.example does not document {CA_EXAMPLE!r}")
+    if "ca_file" not in read(os.path.join(repo, "docs", "CONFIG.md")):
+        return fail("docs/CONFIG.md does not describe [server] ca_file")
+
+    for page in ("SECURITY.md", "TROUBLESHOOTING.md"):
+        text = read(os.path.join(repo, "docs", page))
+        if f"INSTALL.md#{CA_ANCHOR}" not in text:
+            return fail(f"docs/{page} tells the user to import a certificate and does not "
+                        f"link INSTALL.md#{CA_ANCHOR}, which says how")
+    print(f"INSTALL.md's '{CA_HEADING}' names {CA_EXAMPLE!r}; the example, CONFIG.md, "
+          "SECURITY.md and TROUBLESHOOTING.md agree")
+    return 0
+
+
 PHASES = {
+    "ca_file": phase_ca_file,
     "paths": phase_paths,
     "links": phase_links,
     "safety": phase_safety,
@@ -785,6 +969,7 @@ PHASES = {
     "interop": phase_interop,
     "interop_facts": phase_interop_facts,
     "interop_table": phase_interop_table,
+    "privacy": phase_privacy,
 }
 
 

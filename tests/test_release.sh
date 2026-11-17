@@ -10,10 +10,11 @@
 #                             GITHUB_REF for every step, so the `host-tests` job
 #                             runs this without knowing it exists, and the
 #                             release job depends on that job.
-#   test_release.sh ci        the release job in .github/workflows/ci.yml builds
-#                             all three Switch targets, packages, checksums and
-#                             uploads both assets, and is gated on the two test
-#                             jobs. Also that exactly ONE thing triggers a
+#   test_release.sh ci        the release job in .github/workflows/ci.yml
+#                             packages the very .nsp and .ovl switch-build built
+#                             and checked -- it rebuilds nothing (#303) --
+#                             checksums, attests and uploads both assets, and is
+#                             gated on the test jobs. Also that exactly ONE thing triggers a
 #                             release: the workflow shipped `on: release:` with
 #                             no job consuming it, so a tag published nothing and
 #                             nothing said so.
@@ -28,6 +29,11 @@
 #                             makes is written down ONCE, and the second place
 #                             it is quoted -- docs/INSTALL.md, which asks for
 #                             exactly this check -- still says the same thing.
+#   test_release.sh wording   what the release says about itself follows the
+#                             two facts it is about (#303): "pre-release" only on
+#                             a prerelease VERSION, and "not yet verified on
+#                             hardware" -- pointing at #44 -- only while the
+#                             launch gate (#305) holds a console row.
 #   test_release.sh history   ...and it picks the right previous tag, against a
 #                             throwaway repo with real tags in it. This repo has
 #                             none before VERSION's own, which the notes skip,
@@ -114,14 +120,20 @@ phase_version() {
 # the `on: release:` trigger is spelled, so a workflow that declared that
 # trigger and no job would otherwise hand back the trigger's own body, and every
 # assertion below would be read against it and pass or fail on the wrong text.
-release_job() {
-  awk '/^jobs:/ { in_jobs = 1; next }
+workflow_job() {
+  awk -v want="  $1:" '/^jobs:/ { in_jobs = 1; next }
        in_jobs && /^[^ #]/ { in_jobs = 0 }
        !in_jobs { next }
-       /^  release:/ { in_job = 1; next }
+       $0 == want { in_job = 1; next }
        in_job && /^  [^ #]+:/ { in_job = 0 }
        in_job { print }' "$WORKFLOW"
 }
+release_job() { workflow_job release; }
+
+# A job's text without its comments. This file's comments explain the steps
+# they sit above, and explaining a step names what it does -- "rebuilds",
+# "make -C" -- so an assertion that something is ABSENT has to read the code.
+uncommented() { grep -v '^[[:space:]]*#'; }
 
 # One step of that job, by name, up to the next step. Needed because the job has
 # two `for asset in ...` loops -- one uploading, one pulling the assets back out
@@ -219,10 +231,65 @@ phase_ci() {
       fail "the release job runs in a container and uses 'set -o pipefail', but never asks for bash -- dash has no pipefail"
   fi
 
-  local target
-  for target in sysmodule overlay tlsprobe; do
-    grep -q -- "make -C $target" <<<"$job" || fail "the release job does not build $target"
-  done
+  # --- it ships the bytes switch-build checked, not a second build (#303) ---
+  #
+  # The job used to run its own three `make`s. Those bytes went through none of
+  # switch-build's checks -- artifact-check, the image budget, the toolchain's
+  # ctest entries -- and nothing compared them with what had been checked, so
+  # what a user downloaded was a build nobody had looked at. It downloads
+  # switch-build's upload, from this same run, instead.
+  local code
+  code="$(uncommented <<<"$job")"
+  grep -qE 'make[[:space:]]+-C' <<<"$code" &&
+    fail "the release job builds the Switch targets itself; it must package switch-build's"
+
+  local upload_name
+  upload_name="$(workflow_job switch-build | uncommented |
+                 awk '/uses: actions\/upload-artifact@/ { up = 1; next }
+                      up && /^ +name:/ { sub(/^ +name: */, ""); print; exit }')"
+  [ -n "$upload_name" ] || fail "switch-build uploads no named artifact for the release to take"
+  grep -q 'uses: actions/download-artifact@' <<<"$code" ||
+    fail "the release job never downloads switch-build's artifacts"
+  grep -qE "^ +name: $upload_name\$" <<<"$(awk '/uses: actions\/download-artifact@/ { d = 1 }
+                                                d { print }' <<<"$code")" ||
+    fail "the release job does not download '$upload_name', the artifact switch-build uploads"
+
+  # What it packages is what it downloaded, named, rather than package.sh's
+  # defaults -- which are where a `make` would have put a build.
+  local package_step
+  package_step="$(release_step Package | uncommented)"
+  grep -q 'scripts/package.sh' <<<"$package_step" ||
+    fail "the release job's Package step does not run scripts/package.sh"
+  grep -q -- '--nsp' <<<"$package_step" && grep -q -- '--ovl' <<<"$package_step" ||
+    fail "the release job packages package.sh's default paths, not the downloaded artifacts"
+  # ...and they are re-read as what they claim to be on the way in: an artifact
+  # store is one more hop the bytes took since switch-build checked them.
+  grep -q 'artifact-check.py container' <<<"$code" ||
+    fail "the release job does not check the downloaded artifacts' containers"
+
+  # --- provenance ---
+  #
+  # A checksum says the download is the file the job published; an attestation
+  # says which workflow, commit and run produced it, signed by something other
+  # than the repo's own token.
+  local attest
+  attest="$(awk '/uses: actions\/attest(-build-provenance)?@/ { a = 1; next }
+                 a && /^      - / { a = 0 }
+                 a { print }' <<<"$code")"
+  [ -n "$attest" ] || fail "the release job attests nothing"
+  grep -q 'rommsync-nx-' <<<"$attest" || fail "the attestation does not cover the archive"
+  grep -q 'SHA256SUMS' <<<"$attest" || fail "the attestation does not cover SHA256SUMS"
+  grep -qE '^ +id-token: write' <<<"$code" ||
+    fail "the release job cannot mint the OIDC token an attestation is signed with"
+  grep -qE '^ +attestations: write' <<<"$code" ||
+    fail "the release job cannot store an attestation"
+  # Before anyone can download: an attestation added after the undraft is a
+  # window in which the release exists without one.
+  local attest_line undraft_line
+  attest_line="$(grep -nE 'uses: actions/attest' <<<"$code" | head -n 1 | cut -d: -f1)"
+  undraft_line="$(grep -n -- '-X PATCH' <<<"$code" | head -n 1 | cut -d: -f1)"
+  [ -n "$undraft_line" ] && [ "$attest_line" -lt "$undraft_line" ] ||
+    fail "the release is undrafted before it is attested"
 
   # A shallow checkout has neither the previous tag nor the commits since it, and
   # the notes would silently come out empty.
@@ -288,7 +355,7 @@ phase_ci() {
   # assertion about that job, and lives with it in
   # tests/test_switch_build.sh (`switch.ci_requires_artifacts`).
 
-  echo "ok: one trigger, and a gated release job that builds, packages and uploads"
+  echo "ok: one trigger, and a gated release job that packages switch-build's bytes, attests and uploads"
 }
 
 # --- the body that goes on the release ----------------------------------------
@@ -321,6 +388,15 @@ phase_notes() {
   # release note pointing at a 404 is worse than one pointing at the front page.
   grep -q 'github.com/.*rommsync-nx' "$body" ||
     fail "the notes do not link the project"
+
+  # The source offer (#300): the overlay is GPL-2.0, and the release that ships
+  # it names where the corresponding source is -- the tree at this tag, which
+  # pins libultrahand as a submodule -- and where the notices are.
+  grep -q "rommsync-nx/tree/v$version" "$body" ||
+    fail "the notes do not link the source at tree/v$version"
+  grep -q 'THIRD_PARTY_NOTICES.txt' "$body" ||
+    fail "the notes do not say where the third-party notices are"
+  grep -q 'GPL' "$body" || fail "the notes do not say the overlay is GPL-2.0"
 
   # What it was built against, which is the one compatibility statement a
   # release makes -- and it is a statement about a target, not a verified claim:
@@ -523,6 +599,108 @@ phase_prerelease() {
   echo "ok: a semver suffix is a prerelease and a build identifier is not"
 }
 
+# --- what a release says about itself ----------------------------------------
+
+# A stand-in for scripts/launch-gate.sh (#305), which answers `--rows` with
+# `id|kind|claim` lines the way scripts/v1-gate.sh does. The notes read only
+# whether any row is still `console` -- held until a person records what a
+# console did -- so that is all a fake has to vary.
+fake_gate() {
+  local dir="$1" held="$2"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '[ "${1:-}" = --rows ] || exit 2'
+    echo "echo 'v1gate|repo|scripts/v1-gate.sh exits 0'"
+    case "$held" in
+      held)   echo "echo 'smoke|console|#44 complete'" ;;
+      broken) echo 'exit 1' ;;
+      *)      echo "echo 'smoke|repo|#44 complete'" ;;
+    esac
+  } > "$dir/scripts/launch-gate.sh"
+  chmod +x "$dir/scripts/launch-gate.sh"
+}
+
+phase_wording() {
+  [ -x "$NOTES" ] || fail "no executable $NOTES"
+  SCRATCH="$(mktemp -d)"
+  mkdir -p "$SCRATCH/scripts" "$SCRATCH/packaging"
+  cp "$NOTES" "$SCRATCH/scripts/"
+  cp "$REPO_ROOT/packaging/README.txt.in" "$SCRATCH/packaging/"
+  git -C "$SCRATCH" init -q
+  git -C "$SCRATCH" config user.email "test@example.invalid"
+  git -C "$SCRATCH" config user.name "release test"
+  echo "1.0.0" > "$SCRATCH/VERSION"
+  git -C "$SCRATCH" add -A
+  git -C "$SCRATCH" commit -q -m "the only commit"
+  local notes="$SCRATCH/scripts/release-notes.sh" body="$SCRATCH/notes.md"
+
+  # --- the verdict ---
+  #
+  # No launch gate is not a passed one. #305 has not landed, and until a gate
+  # exists nothing has said a console ran this build.
+  [ "$("$notes" --verified)" = false ] ||
+    fail "--verified says true with no scripts/launch-gate.sh to say so"
+  fake_gate "$SCRATCH" held
+  [ "$("$notes" --verified)" = false ] ||
+    fail "--verified says true while the launch gate still holds a console row"
+  fake_gate "$SCRATCH" passed
+  [ "$("$notes" --verified)" = true ] ||
+    fail "--verified says false with no console row left in the launch gate"
+  # A gate that cannot answer is not a gate that has no console rows.
+  fake_gate "$SCRATCH" broken
+  "$notes" --verified >/dev/null 2>&1 &&
+    fail "--verified answered although the launch gate failed"
+
+  # ...and this checkout's own answer is its gate's, not a constant.
+  local here
+  here="$("$NOTES" --verified)" || fail "--verified failed in this checkout"
+  if [ -f "$REPO_ROOT/scripts/launch-gate.sh" ]; then
+    if bash "$REPO_ROOT/scripts/launch-gate.sh" --rows | grep -q '^[^|]*|console|'; then
+      [ "$here" = false ] ||
+        fail "--verified says true while scripts/launch-gate.sh holds a console row"
+    fi
+  else
+    [ "$here" = false ] || fail "--verified says true in a checkout with no launch gate"
+  fi
+
+  # --- the notes, in each of the four states ---
+  local version gate
+  for version in 1.0.0 1.0.0-rc1; do
+    for gate in held passed; do
+      echo "$version" > "$SCRATCH/VERSION"
+      fake_gate "$SCRATCH" "$gate"
+      "$notes" > "$body" || fail "release-notes.sh failed on $version, gate $gate"
+
+      if [ "$gate" = held ]; then
+        grep -q 'Not yet verified on hardware' "$body" ||
+          fail "$version, gate held: the notes do not say the build is unverified on hardware"
+        # The issue whose console run removes the note -- not the M8-1 gate,
+        # whose passing only means hardware work may BEGIN.
+        grep -q '/issues/44' "$body" ||
+          fail "$version, gate held: the hardware note does not point at #44"
+      else
+        grep -qi 'verified on hardware' "$body" &&
+          fail "$version, gate passed: the notes still say the build is unverified on hardware"
+      fi
+      grep -q 'M8-1' "$body" &&
+        fail "$version: the notes send a user to the M8-1 gate, which is not the hardware test"
+
+      case "$version" in
+        *-*) grep -qi 'pre-release' "$body" ||
+               fail "$version: a prerelease's notes do not say it is one" ;;
+        *)   grep -qi 'pre-release' "$body" &&
+               fail "$version: a stable release's notes call it a pre-release" ;;
+      esac
+
+      # How to check the provenance the release job attests (#303).
+      grep -q 'gh attestation verify' "$body" ||
+        fail "$version: the notes do not say how to verify the attestation"
+    done
+  done
+
+  echo "ok: 'pre-release' follows VERSION, 'unverified on hardware' follows the launch gate"
+}
+
 # --- which tag the changes are counted from -----------------------------------
 
 # A throwaway repo: one commit per tag, so "which commits are listed" and "which
@@ -600,7 +778,8 @@ case "${1:-}" in
   notes)      phase_notes ;;
   prerelease) phase_prerelease ;;
   history)    phase_history ;;
+  wording)    phase_wording ;;
   compatibility) phase_compatibility ;;
-  *)          echo "usage: $0 {version|ci|notes|prerelease|history|compatibility}" >&2
+  *)          echo "usage: $0 {version|ci|notes|prerelease|history|compatibility|wording}" >&2
               exit 2 ;;
 esac

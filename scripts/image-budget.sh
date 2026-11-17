@@ -23,6 +23,13 @@
 #   mapped image  page_align(text) + page_align(rodata) + page_align(data+bss),
 #                 the three LOAD segments an NSO maps, under IMAGE_BUDGET. This
 #                 is the number Atmosphere's sysmodule pool pays.
+#   footprint     the mapped image, the main thread's stack (the npdm's
+#                 `main_thread_stack_size`, which the kernel allocates at
+#                 launch) and the TLS page, against RESIDENT_FOOTPRINT: the
+#                 one number docs/DEVELOPMENT.md and INSTALL quote for what this
+#                 process costs the pool (M11-12, #296). It fails both ways --
+#                 over the number, and more than RESIDENT_SLACK under it, which
+#                 is a number that stopped being a measurement.
 #   .bss tie      `.bss` holds `kInnerHeapSize` (read out of main.cpp) and at
 #                 most BSS_OTHER besides it: a heap that grew without the
 #                 constant moving, and a constant that moved without the heap,
@@ -57,6 +64,24 @@ set -euo pipefail
 # (docs/DEVELOPMENT.md#what-the-image-costs reconciles the two figures once
 # quoted), and this process is one tenant of it.
 IMAGE_BUDGET=$(( 2304 * 1024 ))
+# What the process costs the custom-sysmodule pool, resident, for its whole
+# life (M11-12, #296): the mapped image above -- whose `.bss` is the inner heap,
+# and the inner heap holds the three thread stacks and the bsd transfer memory
+# -- plus the main thread's npdm-sized stack and the TLS page its four threads
+# share. `ssl` costs nothing here: its buffers live in the `ssl` sysmodule's own
+# process (docs/DEVELOPMENT.md#m0-1-the-measurement-and-the-decision).
+#
+# Measured at 2,318,336 bytes when this was set (mapped 2,281,472) and recorded
+# 24 KiB over it, so a small change does not have to restate it. Growth past it
+# is the same decision as the image budget's, and moving it is an edit here and
+# in the two documents `ctest -R heap.footprint` holds to it. A footprint that
+# falls more than RESIDENT_SLACK under it fails too: then the number the docs
+# give the M12 co-resident run is no longer what the build costs.
+RESIDENT_FOOTPRINT=$(( 2342912 ))
+RESIDENT_SLACK=$(( 64 * 1024 ))
+# One page: a thread's TLS slot is 0x200 bytes, eight to a page, and the main
+# thread, the pairing thread, the worker and the PSC watcher are four.
+TLS_BYTES=$(( 4096 ))
 # What `.bss` may hold besides the heap: every other file-scope object.
 # ~17 KiB today (libnx's and newlib's state, the log ring's bookkeeping).
 BSS_OTHER=$(( 64 * 1024 ))
@@ -87,7 +112,10 @@ while [ $# -gt 0 ]; do
     --ovl-budget)
       [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--ovl-budget takes a byte count" >&2; exit 2; }
       OVL_BUDGET="$2"; shift 2 ;;
-    *) echo "usage: $0 [--root DIR] [--image-budget BYTES] [--ovl-budget BYTES]" >&2; exit 2 ;;
+    --footprint)
+      [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--footprint takes a byte count" >&2; exit 2; }
+      RESIDENT_FOOTPRINT="$2"; shift 2 ;;
+    *) echo "usage: $0 [--root DIR] [--image-budget BYTES] [--ovl-budget BYTES] [--footprint BYTES]" >&2; exit 2 ;;
   esac
 done
 
@@ -96,11 +124,12 @@ SYSMODULE="$ROOT/sysmodule/sys-rommsync.elf"
 OVERLAY="$ROOT/overlay/ovl-rommsync.elf"
 OVL="$ROOT/overlay/ovl-rommsync.ovl"
 MAIN="$ROOT/sysmodule/source/main.cpp"
+NPDM="$ROOT/sysmodule/sys-rommsync.json"
 
 failures=0
 error() { echo "::error::$*" >&2; failures=$(( failures + 1 )); }
 
-for file in "$SYSMODULE" "$OVERLAY" "$OVL" "$MAIN"; do
+for file in "$SYSMODULE" "$OVERLAY" "$OVL" "$MAIN" "$NPDM"; do
   [ -s "$file" ] || { echo "::error::no $file; build sysmodule and overlay first" >&2; exit 1; }
 done
 [ -x "$BIN/aarch64-none-elf-size" ] ||
@@ -135,6 +164,12 @@ heap="$(sed -n 's/^constexpr size_t kInnerHeapSize = \(0x[0-9A-Fa-f]*\);.*/\1/p'
 [ -n "$heap" ] || { echo "::error::no kInnerHeapSize in $MAIN" >&2; exit 1; }
 heap=$(( heap ))
 
+# The main thread's stack, as the npdm the .nsp was built from declares it.
+main_stack="$(sed -n 's/^[[:space:]]*"main_thread_stack_size":[[:space:]]*"\(0x[0-9A-Fa-f]*\)".*/\1/p' "$NPDM")"
+[ -n "$main_stack" ] || { echo "::error::no main_thread_stack_size in $NPDM" >&2; exit 1; }
+main_stack=$(( main_stack ))
+resident=$(( mapped + main_stack + TLS_BYTES ))
+
 bss="$(section "$SYSMODULE" .bss)"
 eh="$(section "$SYSMODULE" .eh_frame)"
 text="$(section "$SYSMODULE" .text)"
@@ -147,6 +182,14 @@ done
 if [ "$mapped" -gt "$IMAGE_BUDGET" ]; then
   error "the sysmodule maps $mapped bytes, past its $IMAGE_BUDGET-byte budget" \
         "(scripts/image-budget.sh, #204)"
+fi
+if [ "$resident" -gt "$RESIDENT_FOOTPRINT" ]; then
+  error "the sysmodule's resident footprint is $resident bytes, past the" \
+        "$RESIDENT_FOOTPRINT scripts/image-budget.sh records and the docs quote (#296)"
+elif [ $(( RESIDENT_FOOTPRINT - resident )) -gt "$RESIDENT_SLACK" ]; then
+  error "the sysmodule's resident footprint is $resident bytes, more than" \
+        "$RESIDENT_SLACK under the $RESIDENT_FOOTPRINT recorded; the recorded number" \
+        "is stale -- lower it here and in the docs (#296)"
 fi
 if [ "$bss" -lt "$heap" ]; then
   error "the sysmodule's .bss is $bss bytes and main.cpp declares a $heap-byte" \
@@ -179,6 +222,9 @@ report() {
     echo "| segment ${names[i]} (paged) | ${pages[i]} | |"
   done
   echo "| **mapped image** | **$mapped** | $IMAGE_BUDGET |"
+  echo "| main thread stack (npdm) | $main_stack | |"
+  echo "| TLS page | $TLS_BYTES | |"
+  echo "| **resident footprint** | **$resident** | $RESIDENT_FOOTPRINT |"
   echo "| \`.bss\` | $bss | $(( heap + BSS_OTHER )) |"
   echo "| of which the heap (\`kInnerHeapSize\`) | $heap | |"
   echo "| \`.eh_frame\` | $eh | $EH_FRAME_CEILING |"
@@ -211,3 +257,4 @@ if [ "$failures" -gt 0 ]; then
 fi
 echo "ok: the sysmodule maps $mapped of its $IMAGE_BUDGET-byte budget" \
      "($(( IMAGE_BUDGET - mapped )) bytes to spare)"
+echo "ok: the sysmodule's resident footprint is $resident of the $RESIDENT_FOOTPRINT recorded"

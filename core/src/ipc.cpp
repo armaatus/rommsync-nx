@@ -564,6 +564,8 @@ const char* ToString(Command command) {
       return "KeepLocal";
     case Command::kCancelKeepLocal:
       return "CancelKeepLocal";
+    case Command::kWriteDiagnostics:
+      return "WriteDiagnostics";
   }
   return "Unknown";
 }
@@ -842,6 +844,14 @@ std::string EncodeStatus(const Status& status) {
   AppendBool(&out, "server_supported", status.server_supported);
   AppendBool(&out, "clock_trusted", status.clock_trusted);
   AppendInteger(&out, "clock_skew_seconds", status.clock_skew_seconds);
+  AppendKey(&out, "backup");
+  out += '{';
+  AppendBool(&out, "measured", status.backup.measured, /*first=*/true);
+  AppendInteger(&out, "bytes", status.backup.bytes);
+  AppendInteger(&out, "backups", status.backup.backups);
+  AppendInteger(&out, "kept_unique", status.backup.kept_unique);
+  AppendBool(&out, "over_cap", status.backup.over_cap);
+  out += '}';
   AppendKey(&out, "download");
   out += '{';
   AppendText(&out, "state", ToString(status.download.state), /*first=*/true);
@@ -884,6 +894,18 @@ Decoded<Status> DecodeStatus(std::string_view text) {
     }
     out->interface = static_cast<std::uint32_t>(interface_version);
 
+    const json::Value* backup = ReadObject(object, "backup", error);
+    if (backup == nullptr) {
+      return;
+    }
+    if (!ReadBool(*backup, "measured", &out->backup.measured, error) ||
+        !ReadInteger(*backup, "bytes", &out->backup.bytes, 0, kMaxBytes, error) ||
+        !ReadInteger(*backup, "backups", &out->backup.backups, 0, kMaxCount, error) ||
+        !ReadInteger(*backup, "kept_unique", &out->backup.kept_unique, 0, kMaxCount, error) ||
+        !ReadBool(*backup, "over_cap", &out->backup.over_cap, error)) {
+      return;
+    }
+
     const json::Value* download = ReadObject(object, "download", error);
     if (download == nullptr) {
       return;
@@ -905,6 +927,7 @@ std::string EncodeConfigView(const ConfigView& view) {
   AppendKey(&out, "server", /*first=*/true);
   out += '{';
   AppendText(&out, "url", view.config.server.url, /*first=*/true);
+  AppendText(&out, "ca_file", view.config.server.ca_file);
   out += '}';
 
   AppendKey(&out, "sync");
@@ -918,6 +941,7 @@ std::string EncodeConfigView(const ConfigView& view) {
   AppendText(&out, "on_server_delete", config::ToString(view.config.sync.on_server_delete));
   AppendText(&out, "slot", view.config.sync.slot);
   AppendBool(&out, "map_state_slots", view.config.sync.map_state_slots);
+  AppendBool(&out, "play_sessions", view.config.sync.play_sessions);
   out += '}';
 
   AppendKey(&out, "tico");
@@ -954,7 +978,8 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
   return DecodeObject<ConfigView>(
       text, "config", [](const json::Value& object, ConfigView* out, json::Error* error) {
         const json::Value* server = ReadObject(object, "server", error);
-        if (server == nullptr || !ReadText(*server, "url", &out->config.server.url, error)) {
+        if (server == nullptr || !ReadText(*server, "url", &out->config.server.url, error) ||
+            !ReadText(*server, "ca_file", &out->config.server.ca_file, error)) {
           return;
         }
 
@@ -974,7 +999,8 @@ Decoded<ConfigView> DecodeConfigView(std::string_view text) {
                       "remove or keep", &out->config.sync.on_server_delete, error) ||
             !ReadText(*sync_section, "slot", &out->config.sync.slot, error) ||
             !ReadBool(*sync_section, "map_state_slots", &out->config.sync.map_state_slots,
-                      error)) {
+                      error) ||
+            !ReadBool(*sync_section, "play_sessions", &out->config.sync.play_sessions, error)) {
           return;
         }
         // The rule `config.ini` holds a slot to, so a slot drawn on the
@@ -1680,6 +1706,57 @@ bool AppendIfItFits(LogTail* tail, std::string line) {
   }
   tail->lines.pop_back();
   return false;
+}
+
+// --- the diagnostics bundle ---------------------------------------------------
+
+std::string EncodeDiagnosticsRequest(const DiagnosticsRequest& request) {
+  std::string out("{");
+  AppendText(&out, "overlay", request.overlay, /*first=*/true);
+  AppendInteger(&out, "overlay_interface", request.overlay_interface);
+  AppendText(&out, "libultrahand", request.libultrahand);
+  out += '}';
+  return out;
+}
+
+Decoded<DiagnosticsRequest> DecodeDiagnosticsRequest(std::string_view text) {
+  return DecodeObject<DiagnosticsRequest>(
+      text, "diagnostics request",
+      [](const json::Value& object, DiagnosticsRequest* out, json::Error* error) {
+        std::int64_t interface_version = 0;
+        if (!ReadText(object, "overlay", &out->overlay, error) ||
+            !ReadInteger(object, "overlay_interface", &interface_version, 0, 0xFFFFFFFFLL,
+                         error) ||
+            !ReadText(object, "libultrahand", &out->libultrahand, error)) {
+          return;
+        }
+        out->overlay_interface = static_cast<std::uint32_t>(interface_version);
+        // Copied into a file a user attaches: a string no build ever spelled is
+        // refused rather than written there.
+        if (out->overlay.size() > kMaxDiagnosticsVersionBytes) {
+          Fail(error, "overlay", "is longer than any version");
+        } else if (out->libultrahand.size() > kMaxDiagnosticsVersionBytes) {
+          Fail(error, "libultrahand", "is longer than any version");
+        }
+      });
+}
+
+std::string EncodeDiagnosticsResult(const DiagnosticsResult& result) {
+  std::string out("{");
+  AppendText(&out, "sd_path", result.sd_path, /*first=*/true);
+  out += '}';
+  return out;
+}
+
+Decoded<DiagnosticsResult> DecodeDiagnosticsResult(std::string_view text) {
+  return DecodeObject<DiagnosticsResult>(
+      text, "diagnostics result",
+      [](const json::Value& object, DiagnosticsResult* out, json::Error* error) {
+        if (ReadText(object, "sd_path", &out->sd_path, error) && out->sd_path.empty()) {
+          // The whole answer is where to look; an empty one tells a user nothing.
+          Fail(error, "sd_path", "is empty");
+        }
+      });
 }
 
 std::string EncodeEmpty() { return "{}"; }

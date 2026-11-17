@@ -178,7 +178,19 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **15** since M11-11 (#295), which added `clock_trusted` and
 /// `clock_skew_seconds` to `Status` -- required fields, so a v14 overlay
 /// reading a v15 sysmodule's `Status` fails to decode it.
-inline constexpr std::uint32_t kVersion = 15;
+///
+/// **16** since M11-17 (#301), which added `play_sessions` to `ConfigView`'s
+/// `sync` -- a required field, so a v16 overlay reading a v15 sysmodule's
+/// `GetConfig` fails to decode it.
+///
+/// **17** since M11-4 (#288), which added `ca_file` to `ConfigView`'s
+/// `server` -- a required field, so a v17 overlay reading a v16 sysmodule's
+/// `GetConfig` fails to decode it.
+///
+/// **18** since M11-21 (#316), which added `backup` to `Status` -- a required
+/// object, so a v17 overlay reading a v18 sysmodule's `Status` fails to decode
+/// it.
+inline constexpr std::uint32_t kVersion = 18;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -240,6 +252,7 @@ enum class Command : std::uint32_t {
   kGetRestoreState = 17,
   kKeepLocal = 18,
   kCancelKeepLocal = 19,
+  kWriteDiagnostics = 20,
 };
 
 /// Every command, in id order. The dispatch table and the documentation are both
@@ -252,7 +265,7 @@ inline constexpr std::array kAllCommands = {
     Command::kEnqueue,             Command::kDequeue,      Command::kListBegin,
     Command::kListNext,            Command::kListEnd,      Command::kListConflicts,
     Command::kRestoreBackup,       Command::kGetLog,       Command::kGetRestoreState,
-    Command::kKeepLocal,           Command::kCancelKeepLocal,
+    Command::kKeepLocal,           Command::kCancelKeepLocal, Command::kWriteDiagnostics,
 };
 
 /// Stable, log-friendly name -- `GetStatus`. Never null; "Unknown" for an id
@@ -437,6 +450,30 @@ struct DownloadSnapshot {
   std::int64_t bytes_total = 0;
 };
 
+/// What `.backup/` held when the last prune finished (M11-21, #316): what the
+/// retention rule left, and how much of that it could not free.
+///
+/// The last `backup::PruneReport`'s numbers, not a fresh walk of the directory:
+/// `GetStatus` is frame-polled and must never touch the card. A prune runs once
+/// after boot and then after a completed tick that wrote a backup, so between
+/// those this is what the directory still holds.
+struct BackupUsage {
+  /// A prune has finished since boot. False is "not measured yet", and every
+  /// number below is zero and says nothing.
+  bool measured = false;
+
+  /// Bytes, and backups, left in `.backup/` after the prune.
+  std::int64_t bytes = 0;
+  std::int64_t backups = 0;
+
+  /// Of those, kept past the rule because no other copy of their bytes could be
+  /// shown -- the "why" behind a directory that stays big (`PruneReport`).
+  std::int64_t kept_unique = 0;
+
+  /// Still over `[backup] max_mib` after everything provable went.
+  bool over_cap = false;
+};
+
 /// Everything the status screen needs, in one call.
 struct Status {
   /// `kVersion` as this sysmodule was built with, so the overlay can compare
@@ -522,6 +559,9 @@ struct Status {
   /// floor on a console that could compare it with nothing, which the overlay
   /// draws as "not set".
   std::int64_t clock_skew_seconds = 0;
+
+  /// See `BackupUsage` (#316).
+  BackupUsage backup;
 
   DownloadSnapshot download;
 };
@@ -1083,6 +1123,31 @@ struct LogTail {
 /// `kMaxLogLines` is not a size. Returns false without touching `tail`.
 bool AppendIfItFits(LogTail* tail, std::string line);
 
+// --- the diagnostics bundle ---------------------------------------------------
+
+/// The longest version string `WriteDiagnostics` takes from the overlay. A
+/// version is `0.9.0-rc.2` or `v2.5.4`; anything near this is not one, and it is
+/// copied into a file on the card, so it is refused rather than written.
+inline constexpr std::size_t kMaxDiagnosticsVersionBytes = 64;
+
+/// `WriteDiagnostics`' request (M11-20, #304): what the overlay is, because the
+/// sysmodule cannot know. The two halves ship as separate files, and "which
+/// overlay is on this card" is half of the first question a bug report asks.
+struct DiagnosticsRequest {
+  /// The overlay's `rommsync::version()` and `kVersion`.
+  std::string overlay;
+  std::uint32_t overlay_interface = 0;
+
+  /// The libultrahand tag the overlay was built against, or empty.
+  std::string libultrahand;
+};
+
+/// Where the bundle landed: an SD-root path, which is what a user with a card
+/// reader opens (`/config/rommsync/diagnostics-<time>.txt`).
+struct DiagnosticsResult {
+  std::string sd_path;
+};
+
 // --- codecs -------------------------------------------------------------------
 //
 // Every one of these round-trips losslessly and every decoder refuses a payload
@@ -1182,6 +1247,15 @@ Decoded<std::int32_t> DecodeLogRequest(std::string_view text);
 std::string EncodeLogTail(const LogTail& tail);
 Decoded<LogTail> DecodeLogTail(std::string_view text);
 
+/// `{"overlay":...,"overlay_interface":<u32>,"libultrahand":...}`. Each string
+/// at most `kMaxDiagnosticsVersionBytes`; `libultrahand` may be empty.
+std::string EncodeDiagnosticsRequest(const DiagnosticsRequest& request);
+Decoded<DiagnosticsRequest> DecodeDiagnosticsRequest(std::string_view text);
+
+/// `{"sd_path":...}`, never empty.
+std::string EncodeDiagnosticsResult(const DiagnosticsResult& result);
+Decoded<DiagnosticsResult> DecodeDiagnosticsResult(std::string_view text);
+
 /// The payload of a command that carries none: `{}`. A shape rather than an
 /// empty buffer, so every decoder on both sides can assume a JSON object.
 std::string EncodeEmpty();
@@ -1212,6 +1286,8 @@ struct EngineSnapshot {
   /// See `Status::clock_trusted` and `Status::clock_skew_seconds` (#295).
   bool clock_trusted = true;
   std::int64_t clock_skew_seconds = 0;
+  /// See `Status::backup` (#316).
+  BackupUsage backup;
   DownloadSnapshot download;
 };
 
@@ -1364,6 +1440,17 @@ class Engine {
   /// Where the last restore stands. Safe at any rate, from the IPC thread,
   /// while one runs.
   virtual RestoreState restore_state() const = 0;
+
+  /// Write the diagnostics bundle (M11-20, #304) and say where it landed.
+  /// `kWriteFailed` when the card refused it. Answered on the IPC thread: the
+  /// bundle is streamed a line at a time from files of bounded size
+  /// (`diag::Write`), the same class of card write `SetConfig` already makes
+  /// there. `kUnavailable` by default, for an engine with no card.
+  virtual Error WriteDiagnostics(const DiagnosticsRequest& request, DiagnosticsResult* result) {
+    (void)request;
+    (void)result;
+    return Error::kUnavailable;
+  }
 };
 
 /// The service, as a plain C++ class with one method per command.
@@ -1468,6 +1555,10 @@ class ServiceCore {
   /// so a console whose card refused the log file still answers this
   /// (`log::FileSink` is silent about its own failures for the same reason).
   LogTail GetLog(std::int32_t lines) const;
+
+  /// Command 20 (#304). Write the diagnostics bundle; `result` is set on
+  /// `kOk` only.
+  Error WriteDiagnostics(const DiagnosticsRequest& request, DiagnosticsResult* result);
 
  private:
   /// A pairing status cut to what a payload carries. See the definition: the

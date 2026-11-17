@@ -21,6 +21,11 @@ version = 1
 ; token and every save cross your network in the clear. A path prefix is kept,
 ; so RomM behind a reverse proxy at /romm works.
 url = https://romm.example.com
+; A self-signed or private-CA certificate on your server: copy it (PEM) to the
+; card and name it here. Verification stays on -- the server is checked against
+; it. Unset, the console's built-in certificates are used. See docs/INSTALL.md,
+; "Self-signed or private CA".
+; ca_file = sdmc:/config/rommsync/ca.pem
 
 [sync]
 enabled       = true
@@ -38,6 +43,9 @@ conflict_show = true               ; surface conflicts in the overlay
 ; A save you deleted in RomM: remove takes it off the card, after backing it up
 ; under /config/rommsync/.backup/; keep leaves it here and never uploads it.
 on_server_delete = remove
+; Play time worked out from which saves changed, sent to your RomM with each
+; sync. false sends none and writes nothing to play.db (docs/PRIVACY.md).
+play_sessions = true
 
 [downloads]
 enabled     = true

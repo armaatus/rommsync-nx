@@ -38,9 +38,13 @@ Horizon `ssl` service verifies against the console's own CertStore, with
 - **Import the certificate** (`sslContextImportServerPki`). Verification stays
   **on** — the server is checked, against a CA the user chose. Hostname checking
   stays on too: set SNI to a name the certificate carries and the server may
-  still be addressed by IP. This is the supported path, and it is what
-  `ClientOptions::ca_bundle_path` in
-  [`core/include/rommsync/http.hpp`](../core/include/rommsync/http.hpp) is for.
+  still be addressed by IP. This is the supported path: `[server] ca_file` in
+  `config.ini` names the certificate, and the sysmodule imports it before the
+  first `https` request — [INSTALL.md](INSTALL.md#self-signed-or-private-ca)
+  has the steps. Underneath it is `ClientOptions::ca_bundle_path` in
+  [`core/include/rommsync/http.hpp`](../core/include/rommsync/http.hpp). A
+  context cannot forget a CA once imported, so a removed or replaced `ca_file`
+  stays trusted until the sysmodule restarts — restart it when you revoke one.
 - **Turn verification off** (`SslOptionType_SkipDefaultVerify`, then
   `SetVerifyOption(0)`). This is not "trust this one server": it is trust
   *anything* on that connection, so a machine on the same network can be RomM as
@@ -135,4 +139,8 @@ that mistake usually takes but cannot catch a plausible-looking constant.
 
 - No inbound listeners on the Switch.
 - No third-party services — the client talks only to your RomM.
-- No telemetry.
+- No telemetry. Everything the client sends your RomM, and how to turn off what
+  save sync does not need (play sessions), is listed in [PRIVACY.md](PRIVACY.md).
+- No console serial, Nintendo account, or title id of a running game in any
+  request ([The console identifier](#the-console-identifier),
+  [PRIVACY.md](PRIVACY.md#play-sessions)).

@@ -74,6 +74,9 @@ When a sync does not happen,
 this client knows how to have, the line it writes in
 `sdmc:/config/rommsync/rommsync.log` when it has one, and what to do about it.
 
+[`docs/PRIVACY.md`](docs/PRIVACY.md) lists everything the sysmodule sends your
+RomM and keeps on the card, and how to turn off play-time reporting.
+
 ## Architecture at a glance
 
 ```
@@ -136,6 +139,17 @@ is ever run before the hardware gate in M8:
 docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
   bash -lc 'make -C sysmodule && make -C overlay'
 ```
+
+## License
+
+rommsync-nx's own code is MIT ([LICENSE](LICENSE)), and so is the sysmodule
+binary. The overlay binary, `ovl-rommsync.ovl`, statically links
+[libultrahand], which is GPL-2.0, so it is distributed under the
+[GPL, version 2](packaging/licenses/GPL-2.0.txt). Every release zip carries both
+texts and `THIRD_PARTY_NOTICES.txt` — the licence and source of every library
+either binary links — under `config/rommsync/`, and its release notes link the
+tagged source. Why each licence is the one taken:
+[docs/LICENSING.md](docs/LICENSING.md).
 
 ## Credit / prior art
 

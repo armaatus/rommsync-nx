@@ -8,9 +8,17 @@ Ultrahand overlay (ovl-rommsync) to drive it.
 
   https://github.com/armaatus/rommsync-nx
 
-This is a PRE-RELEASE that has not yet been run on a real console. Try it
-on a spare SD card or an emuMMC with a NAND backup, against a RomM you do
-not mind losing saves on.
+@IF prerelease@
+This is a PRE-RELEASE: a release candidate, which may still change before
+the release it leads to.
+
+@ENDIF@
+@IF unverified@
+This build has not yet been run on a real console. Try it on a spare SD
+card or an emuMMC with a NAND backup, against a RomM you do not mind
+losing saves on.
+
+@ENDIF@
 
 
 YOU NEED
@@ -30,7 +38,7 @@ INSTALL
 -------
 
 Unzip this archive onto the ROOT of your SD card, keeping the folder
-structure. It merges with what is already there, adding six files and
+structure. It merges with what is already there, adding eight files and
 one empty folder, and changing nothing else:
 
   atmosphere/contents/@TITLE_ID@/exefs.nsp    the sysmodule
@@ -38,11 +46,12 @@ one empty folder, and changing nothing else:
   atmosphere/contents/@TITLE_ID@/flags/       empty: the sysmodule is off
   switch/.overlays/ovl-rommsync.ovl                 the overlay
   config/rommsync/config.ini.example                a starting configuration
-  README.txt                                        this file
-  LICENSE
+  config/rommsync/README.txt                        this file
+  config/rommsync/LICENSE                           the licences: see the
+  config/rommsync/THIRD_PARTY_NOTICES.txt           end of this file
+  config/rommsync/COPYING.GPL-2.0
 
-Note the last two: they land at the ROOT of the card under those names, so an
-unrelated README.txt or LICENSE already sitting there is replaced.
+Nothing lands at the root of the card itself.
 
 Then, in order:
 
@@ -79,7 +88,7 @@ Something not syncing? Settings > Log shows what the sysmodule last said.
 UPGRADING
 ---------
 
-Unzip a newer release over the top. The only files replaced are the six
+Unzip a newer release over the top. The only files replaced are the eight
 listed above. config.ini, token.dat, device.dat, state.db, queue.json,
 conflicts.db, rommsync.log and the .backup/ folder are not in the archive,
 so your settings, your pairing, your sync state, your save backups and
@@ -113,4 +122,10 @@ it means, and what to do about it:
 LICENSE
 -------
 
-See LICENSE, next to this file in the archive.
+The sysmodule (exefs.nsp) is MIT-licensed: see LICENSE. The overlay
+(ovl-rommsync.ovl) statically links libultrahand, so it is distributed under
+the GNU GPL version 2: see COPYING.GPL-2.0. THIRD_PARTY_NOTICES.txt lists
+every library either one links, with its licence and where its source is.
+All three are next to this file. The source of this release is at
+
+  https://github.com/armaatus/rommsync-nx/tree/v@VERSION@

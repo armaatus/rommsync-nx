@@ -350,6 +350,23 @@ endif()
 # ten-inits-a-minute limit is per IP, which is the whole suite.
 set_tests_properties(ipc.engine PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# M11-7 (#291). The service loop's decision about each `svcReplyAndReceive`
+# return, driven with the result/index pairs the kernel produces. The loop itself
+# is libnx (`sysmodule/source/ipc/server.cpp`); `ipc/wait_outcome.hpp` names no
+# libnx type, which is what lets it be compiled here (sysmodule/AGENTS.md).
+add_executable(test_ipc_wait test_ipc_wait.cpp)
+target_include_directories(test_ipc_wait PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+set(IPC_WAIT_SCENARIOS
+  closed     # a hang-up drops exactly that session, whether or not a reply was pending
+  received   # the port and the sessions signalling, unchanged
+  error      # any other result is logged and survived, until a run of them
+)
+foreach(scenario IN LISTS IPC_WAIT_SCENARIOS)
+  add_test(NAME ipc.wait_${scenario} COMMAND test_ipc_wait ${scenario})
+  set_tests_properties(ipc.wait_${scenario} PROPERTIES TIMEOUT 30)
+endforeach()
+
 # --- the three lists the overlay browses -------------------------------------
 # M5-4. The producer behind `ipc::ListBegin`/`ListNext`/`ListEnd`, driven through
 # `ipc::Dispatch` over a real `SdEngine` -- so what these scenarios assert on is
@@ -1006,6 +1023,7 @@ set(EXECUTE_RIG_SCENARIOS
   revoked         # M1-4: a 401 stops the plan where it stands, and touches no save
   late_fetch      # #263: a write between the backup and a download's or conflict's commit stays
   stale_fetch     # #286: ...and one between the scan and the backup, which the ruling never saw
+  stale_place     # #318: ...and a placement's, onto a path the scan found empty
 )
 foreach(scenario IN LISTS EXECUTE_RIG_SCENARIOS)
   add_test(NAME execute.${scenario} COMMAND test_sync_execute ${scenario})
@@ -1291,6 +1309,27 @@ endif()
 # this uploads and deletes saves on the shared fixture device.
 set_tests_properties(conflicts.recorded PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
+# --- M11-20 (#304): the diagnostics bundle -----------------------------------
+# What a beta tester attaches to a bug report, written on the overlay's press.
+# Serverless: the files it streams are planted in a scratch directory.
+add_executable(test_diagnostics test_diagnostics.cpp)
+target_link_libraries(test_diagnostics PRIVATE rommsync::core)
+target_include_directories(test_diagnostics PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(test_diagnostics PRIVATE
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch"
+  ROMMSYNC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+foreach(scenario
+        redaction   # no token, device_code, user_code or password reaches the bundle
+        sections    # versions, status, state.db, backup usage and config.ini are in it
+        log         # the last kLogLines lines, across the rotation, oldest first
+        crashes     # only our crash reports, newest first, names and dates only
+        name        # one file per press, named for the moment in UTC
+        program_id  # diag::kProgramId is sys-rommsync.json's
+        missing)    # a bare card still gets a bundle
+  add_test(NAME diagnostics.${scenario} COMMAND test_diagnostics ${scenario})
+  set_tests_properties(diagnostics.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M11-8 (#292): `.backup/` bounded, and nothing pruned is the only copy ----
 add_executable(test_backup_prune test_backup_prune.cpp)
 target_link_libraries(test_backup_prune PRIVATE rommsync::host)
@@ -1443,6 +1482,7 @@ set(STATES_RIG_SCENARIOS
   crash      # M9-14: ...and a power cut at every call of it loses nothing
   late_write # #270: ...and a write between its backup and its commit stays on the card
   stale_write # #286: ...and one between the scan and the backup, which nothing ruled on
+  stale_place # #318: ...and a placement's, onto a path the scan found empty
   truncate   # a clean short body never replaces a local state
   keeps_both # both sides moved: nothing is transferred, both survive
   mapped     # #239: Tico's Auto up as .state.auto with its screenshot, down as Tico's and RetroArch's
@@ -2041,7 +2081,9 @@ foreach(scenario
         toolbox         # every toolbox.json ovl-sysmodules skips or aborts on is refused (#211)
         refuses         # a wrong .nsp, an unsigned .ovl, a missing input
         deterministic   # the same inputs, the same bytes
-        upgrade)        # unzipping over an install keeps config.ini and the rest
+        upgrade         # unzipping over an install keeps config.ini and the rest
+        notices         # every linked library has a notice row, every row ships (#300)
+        wording)        # PRE-RELEASE and "never run on a console" only when true (#303)
   add_test(NAME package.${scenario}
            COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" ${scenario})
   set_tests_properties(package.${scenario} PROPERTIES TIMEOUT 120)
@@ -2065,6 +2107,17 @@ add_test(NAME package.builds
 set_tests_properties(package.builds PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 LABELS toolchain
                      RUN_SERIAL TRUE)
 
+# The same sources built twice, at two different paths, are the same bytes --
+# the three targets and the zip (#303). It is what lets the release job publish
+# switch-build's artifacts as "the build of this tag", and a rebuilder compare
+# against them. Two full cross-compiles, so it is the slowest entry here; same
+# image, label and skip as package.builds, and run in CI by the same
+# `tests/toolchain_suite.sh --here`.
+add_test(NAME package.reproducible
+         COMMAND "${BASH_PROGRAM}" "${PACKAGE_TEST}" reproducible)
+set_tests_properties(package.reproducible PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1500
+                     LABELS toolchain RUN_SERIAL TRUE)
+
 # --- the install guide: docs/INSTALL.md --------------------------------------
 # The one page in this repo nobody may verify by following it -- hard rule 1
 # puts a console on the far side of M8-1 -- so what it can be held to is that it
@@ -2087,7 +2140,11 @@ foreach(scenario
         # docs/INTEROP.md (#243): the other devices' half of the install guide.
         interop          # its sections, the links to it, the two config pages
         interop_facts    # versions, limits, keys and names read off the code
-        interop_table)   # the per-system table both ways against save_source.cpp
+        interop_table    # the per-system table both ways against save_source.cpp
+        # docs/PRIVACY.md (#301): what leaves the console, read off the request bodies.
+        privacy
+        ca_file     # #288: one "Self-signed or private CA" section, and every page links it
+        )
   add_test(NAME docs.install_${scenario}
            COMMAND ${Python3_EXECUTABLE} "${DOCS_INSTALL_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
@@ -2118,6 +2175,24 @@ foreach(scenario
            COMMAND ${Python3_EXECUTABLE} "${DOCS_TROUBLESHOOTING_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")
   set_tests_properties(docs.troubleshooting_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
+# --- the front door: SECURITY.md, SUPPORT.md, CONTRIBUTING.md, issue forms ---
+# Written before there was a client, and still saying so long after (#302):
+# nothing broke when the client landed, so nothing told them. The bug form is
+# held to the fields triage asks for first, and parsed against GitHub's form
+# schema so it renders rather than degrading to a blank issue. Reads files only.
+set(DOCS_COMMUNITY_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_docs_community.py")
+
+foreach(scenario
+        stale        # no user-facing page says the client does not exist
+        forms        # every issue form parses and keeps to the form schema
+        bug_fields   # the bug form requires #302's triage fields; the log paths are log.hpp's
+        versions)    # SECURITY.md's supported table names VERSION's series
+  add_test(NAME docs.community_${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${DOCS_COMMUNITY_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(docs.community_${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
 # --- M6-3: turning a tag into a release --------------------------------------
@@ -2167,6 +2242,13 @@ set_tests_properties(release.prerelease PROPERTIES TIMEOUT 60)
 add_test(NAME release.history
          COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" history)
 set_tests_properties(release.history PROPERTIES TIMEOUT 120)
+
+# What a release says about itself (#303): "pre-release" only when VERSION is
+# one, and "not yet verified on hardware" -- pointing at #44 -- only while the
+# launch gate (#305) still holds a console row. Every release used to say both.
+add_test(NAME release.wording
+         COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" wording)
+set_tests_properties(release.wording PROPERTIES TIMEOUT 60)
 
 # The one compatibility statement a release makes, and the fact that there is
 # only one of it. `ATMOSPHERE_TARGET` is restated in docs/INSTALL.md's "Before
@@ -2263,6 +2345,17 @@ endif()
 # that terminator for a verified 200.
 set_tests_properties(tls.isolated tls.cert tls.serves
                      PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+
+# #288's acceptance: a console pairs and syncs through the terminator only with
+# `[server] ca_file` naming its certificate. Through the engine, so it is the
+# real config -> transport path; skips with the rig, like `serves`. Serial with
+# the three above, since `cert` re-mints the certificate this one trusts.
+add_test(NAME tls.ca_file
+         COMMAND "${BASH_PROGRAM}" "${TLS_FIXTURE_TEST}" ca_file $<TARGET_FILE:test_engine>)
+if(NOT ROMMSYNC_REQUIRE_RIG)
+  set_tests_properties(tls.ca_file PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+set_tests_properties(tls.ca_file PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 
 # --- the M0 exit gate's mechanical clauses -----------------------------------
 # "No test in the suite requires a console or a production server"
@@ -2416,6 +2509,7 @@ set(ENGINE_SCENARIOS
   rollback  # a write that cannot happen changes neither the file nor memory
   corrupt   # a queue.json a yanked card left behind never blocks the boot
   config    # M5-3: an edit lands on the card and on the running engine
+  ca_trust  # #288: [server] ca_file reaches the transport at boot and on every adopted edit
   commit    # M5-3: a commit interrupted between the two renames loses nothing
   unpairs   # M5-3: a server change discards the pairing before it writes
   stale     # M5-3: "did the server change" is a question about the card
@@ -2431,9 +2525,13 @@ set(ENGINE_SCENARIOS
   keep_local_server  # #317: Keep local is refused on another server's conflict, and dropped by a switch
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
+  diagnostics  # #304: Y on the log screen writes a redacted bundle beside config.ini
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
+  nifm_verdict   # #289: a nifm probe that fails is the console offline, not online
+  boots_offline  # #289: a boot with no Wi-Fi holds its tick for the network, past the boot wait
+  wakes_offline  # #289: a tick due at a wake waits for Wi-Fi to reassociate, and earns no backoff
   romm_forgotten  # M10-2: a heartbeat answered after the engine forgot the server is not recorded
   index_canceled  # #251: a sleep in the library fetch's backoff is a cancelled tick, not an offline one
 )
@@ -2499,6 +2597,7 @@ set(ENGINE_RIG_SCENARIOS
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
   keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
   keep_local_switched  # #317: a Keep local armed against one server sends no overwrite=true to the next
+  play_off     # #301: [sync] play_sessions = off sends no session and never writes play.db
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
   add_test(NAME engine.${scenario} COMMAND test_engine ${scenario})
@@ -2572,6 +2671,31 @@ foreach(scenario states once)
   set_tests_properties(power.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# M11-6 (#290): a sleep that lands while a request is still opening its
+# connection. The quiesce waits a budget and then acknowledges anyway, so what
+# has to be true is that the lookup, the connect and the handshake each end at
+# the cancel -- otherwise the acknowledgement goes out on time with a bsd,
+# sfdnsres or ssl call still running. Through the shipping wire client and
+# plain connector; the handshake phase stands the `ssl` service's call in with
+# a server that never answers, waited on the way `SslConnector` waits.
+add_executable(test_sleep_connect test_sleep_connect.cpp
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/engine.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/power.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/http_wire.cpp"
+  "${CMAKE_SOURCE_DIR}/sysmodule/source/http/posix_connection.cpp")
+target_link_libraries(test_sleep_connect PRIVATE rommsync::host Threads::Threads)
+target_include_directories(test_sleep_connect PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/sysmodule/source")
+target_compile_definitions(test_sleep_connect PRIVATE
+  ROMMSYNC_PROXY_BASE_URL="${PROXY_BASE_URL}"
+  ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-sleep"
+  ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
+
+foreach(scenario dns connect handshake)
+  add_test(NAME sleep.${scenario} COMMAND test_sleep_connect ${scenario})
+  set_tests_properties(sleep.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M9-1: what `__appInit` does, and what it cannot be asked ----------------
 # Nothing in `sysmodule/source/main.cpp` runs off a console, which is how three
 # boot bugs sat in twenty lines through every green `ctest` (#195): a `smExit()`
@@ -2636,7 +2760,7 @@ endforeach()
 # second raise left seven files quoting the intermediate value -- two of them
 # already corrected once in the same branch.
 set(HEAP_BUDGET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_heap_budget.py")
-foreach(scenario IN ITEMS rows pinned margin dirs prose)
+foreach(scenario IN ITEMS rows pinned margin dirs prose footprint)
   add_test(NAME heap.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${HEAP_BUDGET_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")

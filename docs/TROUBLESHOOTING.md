@@ -115,12 +115,15 @@ and a log is not worth it. A save is never in that position; see
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
 | `clock.skew` | the console's clock is not believed — unset, or a day or more off the network clock or the server's — so saves the server would choose by timestamp are held; or it agrees again | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 | `net.tls_clock` | a TLS failure the console's clock is the likely cause of | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
+| `ipc.error` | the service the overlay talks to met a kernel error, dropped the overlay's connections and carried on — or, after several in a row, stopped | [The overlay's connection failed](#the-overlays-connection-failed) |
+| `diagnostics.bundle` | the diagnostics file was written, and where — or why the card refused it | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
 [DEVELOPMENT.md](DEVELOPMENT.md#the-command-set) — so the lines above can be
-read without an SD reader. It is the last lines the sysmodule kept in memory;
-the whole log is the file on the card.
+read without an SD reader. Up and Down scroll it, L and R a page at a time. It
+is the last lines the sysmodule kept in memory; the whole log is the file on
+the card.
 
 ---
 
@@ -135,6 +138,8 @@ in RomM and never come back from it. Nothing changes on the card.
 3 warn net.offline GET /api/roms: body ended early; the rom index could not be fetched: body ended early (transfer closed with 14822 bytes remaining to read)
 3 warn net.offline negotiate: connection failed; the negotiation did not complete: connection failed
 2 warn net.offline tick skipped: this build has no transport
+2 warn net.offline the console has no internet connection; the interval tick waits for the network
+2 warn net.offline nifm answered 0x123456; read as no internet connection
 ```
 
 The part before the `;` is where it failed and how — `GET /api/roms` is the
@@ -159,6 +164,19 @@ harmless; the next one picks up where this one would have.
    needs the port written out.
 4. If the detail says **host could not be resolved**, it is DNS: try the
    server's IP address in `[server] url` to confirm, then fix the name.
+
+`the console has no internet connection; the … tick waits for the network`
+is the console itself saying it is offline — airplane mode, Wi-Fi off, no
+known network in range, or a wake before Wi-Fi has reassociated. Nothing was
+sent and nothing failed: the tick (`boot`, `interval` or `on_demand`) is held,
+the console asks again every two seconds for two minutes and every thirty seconds
+after that, and the tick runs the moment Wi-Fi is
+back, with no backoff to wait out. It is written once per hold, so a console
+that sat in a bag all afternoon shows one line. If it keeps appearing while the
+console's own settings show a working connection, run the connection test under
+System Settings → Internet and include what it says in a bug report.
+`nifm answered 0x…` is the same verdict reached from an answer this client did
+not expect, and worth including in a bug report too.
 
 `tick skipped: this build has no transport` is a different sentence and is not
 a network problem — it is a build with no HTTP client wired in, which is not
@@ -269,9 +287,15 @@ The three causes, in the order they are likely:
 1. **`https://` in front of a server that speaks plain HTTP.** RomM on `:8080`
    with no reverse proxy is `http://`, not `https://`.
 2. **A certificate no public CA signed.** A home server with a self-signed
-   certificate has to have that certificate *imported* — verification is not
-   turned off, and there is no setting in this client that turns it off. See
-   [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server).
+   certificate has to have that certificate *imported* with `[server] ca_file`
+   — [INSTALL.md](INSTALL.md#self-signed-or-private-ca) has the steps.
+   Verification is not turned off, and there is no setting in this client that
+   turns it off; see
+   [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server). If
+   `ca_file` is set and this still happens, the Settings screen's `[server]`
+   complaints say whether the file was found and read; a file that reads fine
+   but is not the CA that signed the server, or does not carry the url's name,
+   fails here.
 3. **A server offering only TLS 1.3.** The console's TLS ceiling is **1.2**
    ([DEVELOPMENT.md](DEVELOPMENT.md#tls-in-a-sysmodule)), so a reverse proxy
    configured 1.3-only cannot be talked to at all. Allow 1.2 as well.
@@ -513,6 +537,14 @@ and no digest to compare. If the card is still full, those are what is left:
 copy any you want to keep to a computer, then delete them by hand; that is safe
 and is the fastest space you will find. Lowering `max_mib` does not remove them,
 by design.
+
+The overlay's status screen shows the same numbers on its **Backups** row, so
+you need not read the log for them: *41.2 MiB, 12 backups* is what the last
+prune left. While the directory is still over `max_mib` the row turns to a
+warning and says why — *612.0 MiB; 9 only copies* counts the backups described
+above, and *612.0 MiB; over the cap* means what is left is the newest backup of
+each save, which is never pruned — and the screen points here. *Not measured
+yet* is a console that has not finished a sync since it started.
 
 ---
 
@@ -1060,6 +1092,30 @@ the lines before this one say what it was doing. If it happens on every boot,
 move `config/rommsync/queue.json` out of the way first — a queue is the one
 thing a boot reads that grows with what you asked for.
 
+### The overlay's connection failed
+
+**Symptom.** The overlay says `sys-rommsync` is not running, or it said so
+once and came back on the next screen, and the log has lines like these:
+
+```
+640 error ipc.error svcReplyAndReceive failed: 2001-0114 (0xe401); dropped 1 session(s); 1 in a row -- the IPC service carries on
+648 error ipc.error svcReplyAndReceive failed: 2001-0114 (0xe401); dropped 0 session(s); 8 in a row -- the sysmodule is stopping, and the overlay will say it is not running until the console restarts
+```
+
+**What it means.** The console's kernel refused the call the sysmodule waits
+for the overlay in. The number after `failed:` is the kernel's own result code,
+the form Atmosphère's crash reports use. A single line that *carries on* is
+survived: the overlay's connection is dropped, it opens a new one on its next
+screen, and syncing never stopped. Eight in a row with nothing working between
+them stops the sysmodule: syncing stops with it until the console restarts.
+Every save is backed up before it is overwritten and every write is atomic, so
+a stop part way through a sync costs nothing that is not picked up again.
+
+**What to do.** One line that carries on needs nothing. A line that says *is
+stopping* is a bug in the client: restart the console to bring the sysmodule
+back, and report it with the log attached
+([What to attach to a bug report](#what-to-attach-to-a-bug-report)).
+
 ### Running, but "not responding" or "still applying"
 
 No log line marks this one, which is why it lives here rather than in a
@@ -1095,7 +1151,36 @@ the log attached ([What to attach to a bug report](#what-to-attach-to-a-bug-repo
 
 ## What to attach to a bug report
 
-Five things, and the log has four of them:
+**The quickest way: one file.** Open **Settings → Log** on the overlay and press
+**Y** (*Write diagnostics*). The sysmodule writes
+`sdmc:/config/rommsync/diagnostics-<date>-<time>.txt`, the screen names it, and
+the log says so:
+
+```
+212 info diagnostics.bundle written: /config/rommsync/diagnostics-20261118-110640.txt
+```
+
+Attach that file. It holds everything below in one place:
+
+- the versions of the overlay, the sysmodule and the IPC contract each speaks,
+  libultrahand, libnx and the console's firmware;
+- the status screen's numbers, `state.db`'s row count, and how much `.backup/`
+  holds (or that no prune has measured it since boot);
+- `config.ini`, with any value whose key names a token, code, password or secret
+  replaced by `<redacted>`;
+- the last 200 lines of `rommsync.log` and `rommsync.log.old`;
+- the names and dates — never the contents — of the Atmosphère crash reports
+  written for sys-rommsync.
+
+It is redacted line by line as it is written — no token, no pairing code and no
+password in a URL reaches it — and `token.dat` and `device.dat` are never read.
+It stays on the card; nothing sends it anywhere ([PRIVACY.md](PRIVACY.md)).
+Atmosphère's own version and whether this is emuMMC are not in it yet: reading
+them needs a system service the sysmodule does not hold, so give those in the
+bug report form.
+
+If the overlay cannot reach the sysmodule, or you would rather pick the lines
+yourself, attach the log instead. Five things, and the log has four of them:
 
 1. **The version.** The first line of the log, and also on the overlay's status
    screen:
@@ -1155,7 +1240,10 @@ answer: the module was never launched, which is an install problem
 
 Paste them as they are. Nothing in the log is a credential — see [Reading the
 log](#reading-the-log) — so it does not need editing first, and editing it is
-how the line that explains the failure gets lost.
+how the line that explains the failure gets lost. The one thing in it you may
+want to hide is your server's hostname: replace it, rather than deleting the
+lines it is on. The bug report form asks for each of these, together with the
+console's setup -- firmware, Atmosphère, loader, model and other sysmodules.
 
 Do **not** attach `token.dat`, `device.dat`, or a screenshot of the pairing
 screen while a code is on it.

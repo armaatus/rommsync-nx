@@ -8,6 +8,7 @@ version = 1                        ; the format of this file; see "Version" belo
 
 [server]
 url = https://romm.example.com     ; RomM origin, HTTPS strongly recommended
+; ca_file = sdmc:/config/rommsync/ca.pem   ; a self-signed server's certificate (PEM); see below
 
 [sync]
 enabled       = true
@@ -19,6 +20,7 @@ states        = false              ; fragile across cores; opt-in
 map_state_slots = false            ; Tico's state slots under RetroArch's names; see below
 conflict_show = true               ; surface conflicts in the overlay
 on_server_delete = remove          ; remove | keep; a save deleted in RomM, see below
+play_sessions = true               ; send play time worked out from saves to RomM; see below
 
 [downloads]
 enabled       = true
@@ -489,6 +491,25 @@ Anything else is a `warning` and the current value stays. The overlay's
 settings screen shows it under `[sync]`, and a press switches it between
 `remove` and `keep`.
 
+### `play_sessions`: play time sent to RomM
+
+On by default. Each sync works out, from which saves changed since the last
+one, roughly when each game was played, and sends those sessions to RomM with
+the sync it was making anyway; RomM shows them as play time. The application
+that was running is noted in `play.db` and the log on the console and never
+sent. [PRIVACY.md](PRIVACY.md#play-sessions) has the detail.
+
+`play_sessions = false` stops it from the next sync: nothing is worked out,
+`/config/rommsync/play.db` is not written, and every sync sends an empty list.
+Sessions already waiting in `play.db` stay there unsent; delete the file to
+discard them. The first sync after turning it back on reports nothing, so play
+that happened while it was off is never sent. Saves sync either way.
+
+On rather than off because the only place the sessions go is the RomM server
+you paired with, which you run, and RomM's play-time view is a reason people
+pair a console with it. The settings screen shows it under `[sync]`, and a
+press switches it.
+
 ### `[backup]`: how much of `.backup/` is kept
 
 Every save and state this client overwrites or removes is copied under
@@ -519,7 +540,9 @@ one you put there — is never touched.
 
 `keep` below `1`, or a value that is not a whole number, is a `warning` and the
 current value stays; a value past the maximum (1000, 3650 days, 1 TiB) is
-clamped to it. The overlay does not edit these yet.
+clamped to it. The overlay does not edit these yet; its status screen shows
+what the last prune left on a **Backups** row, and says so when that is still
+over `max_mib`.
 
 ### Where a rom lands
 
@@ -609,6 +632,21 @@ Each report carries a severity, the line number, and the section and key:
   URL, for the same reason.
 - Plain `http://` is accepted with a `warning`: the token and every save cross
   the network in the clear.
+- `ca_file` names a PEM certificate an `https://` server is verified against,
+  beside the console's built-in ones: the CA that signed your server's
+  certificate, or that certificate itself when it is self-signed. Unset is the
+  built-in ones alone. Verification stays on either way; there is no key that
+  turns it off ([SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server)).
+  The path is opened as written, so on the console it starts `sdmc:/`. The file
+  is checked at boot and whenever the overlay writes this file: missing,
+  unreadable, larger than 256 KiB, DER rather than PEM, or holding no
+  `-----BEGIN CERTIFICATE-----` block is an `error` that names the problem, and
+  every `https` request then fails `net.tls`. Under a plain `http://` url it is a
+  `notice` that it is unused. The overlay shows it and does not change it.
+  A new or changed path is imported on the next request; a certificate already
+  imported stays trusted until the sysmodule restarts, so restart it after
+  removing or replacing one.
+  [INSTALL.md](INSTALL.md#self-signed-or-private-ca) has the steps.
 - A `url` line the parser cannot use is a `warning`, like any other rejected
   line. Ending the file with no usable `url` at all is the `error` — one of them,
   whether the setting was absent or present and rejected. It is the one setting
@@ -699,8 +737,8 @@ rewrites the file and re-reads it, so the change is in force before the call
 comes back. No restart, and no second copy of the settings anywhere.
 
 The settings screen offers this for the settings that are a choice between a
-few words — `[sync] on_server_delete`, `[sync] map_state_slots`, `[sources]` and
-each platform's `play_with` — where a press steps the row to its next value and
+few words — `[sync] on_server_delete`, `[sync] map_state_slots`,
+`[sync] play_sessions`, `[sources]` and each platform's `play_with` — where a press steps the row to its next value and
 pressing again sets it back. What a sync did in between stays done: states
 uploaded under `map_state_slots`' other names stay on the server (see
 [above](#states-and-map_state_slots-save-states)), and a save placed by one
@@ -718,7 +756,9 @@ saves of an account nobody chose. Only accounts on the card are offered;
 
 The sync switch is on the **Sync** screen. Every other key is still set in this
 file. `[sync] slot` is shown and refused on purpose, since a new slot moves
-every save to it on the server and leaves the old one behind.
+every save to it on the server and leaves the old one behind; so is
+`[server] ca_file`, whose certificate has to be copied onto the card from a PC
+anyway.
 
 **Your file survives the edit.** One line changes; every other byte is the byte
 you typed. Comments, blank lines, the order of your `[platform.x]` sections, a

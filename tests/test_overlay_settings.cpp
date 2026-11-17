@@ -736,6 +736,50 @@ void CheckMapStateSlotsIsChanged(Checks& checks) {
                 "on says whose slot names, and that every Switch has to agree");
 }
 
+/// #301: `[sync] play_sessions` is a press, on by default, and each value says
+/// what it sends -- the screen is where a player turns it off.
+void CheckPlaySessionsIsChanged(Checks& checks) {
+  const overlay::SettingsView defaults = overlay::RenderSettings(ViewFor(checks, kMinimal));
+  ExpectChange(checks, defaults, "[sync]", "play_sessions", "On", "false");
+  const overlay::SettingsRow* on = RowNamed(defaults, "[sync]", "play_sessions");
+  checks.Expect(on != nullptr && Contains(on->note, "RomM"),
+                "on says where the play time goes: " +
+                    (on == nullptr ? std::string("no row") : on->note));
+  const overlay::SettingsView off = overlay::RenderSettings(
+      ViewFor(checks, std::string(kMinimal) + "[sync]\nplay_sessions = false\n"));
+  ExpectChange(checks, off, "[sync]", "play_sessions", "Off", "true");
+  const overlay::SettingsRow* row = RowNamed(off, "[sync]", "play_sessions");
+  checks.Expect(row != nullptr && Contains(row->note, "not recorded"),
+                "off says nothing is recorded: " +
+                    (row == nullptr ? std::string("no row") : row->note));
+}
+
+/// #288: `[server] ca_file` is shown and never offered -- the file has to be
+/// copied to the card from a PC anyway, so the line is written there too. The
+/// row says which trust is in force either way, since "why does https fail"
+/// is the question this row is looked at to answer.
+void CheckCaFileIsShownAndNotOffered(Checks& checks) {
+  const overlay::SettingsView none = overlay::RenderSettings(ViewFor(checks, kMinimal));
+  const overlay::SettingsRow* absent = RowNamed(none, "[server]", "ca_file");
+  checks.Expect(absent != nullptr && absent->value == "(none)",
+                "with no ca_file the row says none: " +
+                    (absent == nullptr ? std::string("no row") : absent->value));
+  checks.Expect(absent != nullptr && Contains(absent->note, "built-in"),
+                "and that the console's built-in trust is in force");
+
+  const overlay::SettingsView set = overlay::RenderSettings(ViewFor(
+      checks, std::string(kMinimal) + "ca_file = sdmc:/config/rommsync/ca.pem\n"));
+  const overlay::SettingsRow* row = RowNamed(set, "[server]", "ca_file");
+  checks.Expect(row != nullptr, "[server] ca_file is on the settings screen");
+  if (row == nullptr) {
+    return;
+  }
+  checks.ExpectEq(row->value, std::string("sdmc:/config/rommsync/ca.pem"), "showing the path");
+  checks.Expect(!row->editable && !row->change.has_value() && !row->selectable,
+                "and offering no edit: config::ApplyEdit refuses the key");
+  checks.Expect(Contains(row->note, "config.ini"), "the note says where it is set: " + row->note);
+}
+
 /// #271: `[tico] account`, and a picker over the accounts the last tick found.
 void CheckTicoAccountIsPicked(Checks& checks) {
   const std::string kA = "0123456789abcdef0123456789abcdef";
@@ -884,6 +928,7 @@ void CheckM10RestCycles(Checks& checks) {
   for (const auto& [base, section, label, values] :
        {std::tuple<std::string, std::string, std::string, std::size_t>{
             kMinimal, "[sync]", "map_state_slots", 2},
+        {kMinimal, "[sync]", "play_sessions", 2},
         {kMinimal, "[platform.snes]", "play_with", 2},
         {std::string(kMinimal) + "[platform.pico8]\nroms = /roms/pico8\n", "[platform.pico8]",
          "play_with", 2},
@@ -1395,6 +1440,8 @@ int main() {
   CheckM10SettingsAreShownAndChanged(checks);
   CheckSlotIsShownAndNotOffered(checks);
   CheckMapStateSlotsIsChanged(checks);
+  CheckPlaySessionsIsChanged(checks);
+  CheckCaFileIsShownAndNotOffered(checks);
   CheckTicoAccountIsPicked(checks);
   CheckPlayWithIsChanged(checks);
   CheckM10RestCycles(checks);

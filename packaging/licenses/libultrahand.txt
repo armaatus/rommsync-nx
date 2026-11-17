@@ -1,0 +1,9 @@
+  Copyright (c) 2023-2026 ppkantorski
+  libtesla: Copyright (C) 2020 werwolv
+
+libultrahand is licensed under the GNU General Public License, version 2. Its
+libtesla part is GPL-2.0-or-later, and its libultra part is offered under both
+GPLv2 and CC-BY-4.0. ovl-rommsync takes all of it under GPL-2.0, whose full
+text ships beside this file as COPYING.GPL-2.0.
+
+It vendors cJSON and stb_truetype, which are listed separately here.

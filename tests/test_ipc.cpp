@@ -87,6 +87,11 @@ ipc::Status LoadedStatus() {
   status.server_supported = false;
   status.clock_trusted = false;
   status.clock_skew_seconds = -7 * 86400;
+  status.backup.measured = true;
+  status.backup.bytes = 612LL * 1024 * 1024 + 7;
+  status.backup.backups = 41;
+  status.backup.kept_unique = 9;
+  status.backup.over_cap = true;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -129,6 +134,10 @@ ipc::ConfigView LoadedConfigView() {
   view.config.tico.uid = "fedcba9876543210fedcba9876543210";
   view.tico_accounts = {"0123456789abcdef0123456789abcdef", "fedcba9876543210fedcba9876543210"};
   view.config.play_with["snes"] = config::PlayWith::kRetroArch;
+  // ...and #301's opt-out, off its default of on.
+  view.config.sync.play_sessions = false;
+  // ...and #288's CA file, which a v16 decoder has no field for.
+  view.config.server.ca_file = "sdmc:/config/rommsync/ca.pem";
   config::Diagnostic note;
   note.severity = config::Severity::kWarning;
   note.line = 9;
@@ -220,9 +229,11 @@ int Version() {
   // replaced `game_running`, and a conflict row gained a required
   // `keep_local`. 14 since M10-35 (#279): `CancelKeepLocal`, whose answer an
   // older overlay has no decoder for. 15 since M11-11 (#295): `Status` gained
-  // `clock_trusted` and `clock_skew_seconds`. What is frozen is command 0's
-  // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{15},
+  // `clock_trusted` and `clock_skew_seconds`. 16 since M11-17 (#301):
+  // `ConfigView` gained `play_sessions`. 17 since M11-4 (#288): and
+  // `server.ca_file`. 18 since M11-21 (#316): `Status` gained `backup`. What
+  // is frozen is command 0's *encoding*, asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{18},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -356,6 +367,12 @@ int RoundTrip() {
     checks.ExpectEq(back.value.clock_trusted, sent.clock_trusted, "clock_trusted survives");
     checks.ExpectEq(back.value.clock_skew_seconds, sent.clock_skew_seconds,
                     "clock_skew_seconds survives, negative and all");
+    checks.ExpectEq(back.value.backup.measured, sent.backup.measured, "backup.measured survives");
+    checks.ExpectEq(back.value.backup.bytes, sent.backup.bytes, "backup.bytes survives");
+    checks.ExpectEq(back.value.backup.backups, sent.backup.backups, "backup.backups survives");
+    checks.ExpectEq(back.value.backup.kept_unique, sent.backup.kept_unique,
+                    "backup.kept_unique survives");
+    checks.ExpectEq(back.value.backup.over_cap, sent.backup.over_cap, "backup.over_cap survives");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");
@@ -438,6 +455,8 @@ int RoundTrip() {
     const ipc::Decoded<ipc::ConfigView> back = ipc::DecodeConfigView(ipc::EncodeConfigView(sent));
     checks.Expect(back.ok(), "a config round trips: " + back.error.Describe());
     checks.ExpectEq(back.value.config.server.url, sent.config.server.url, "the url survives");
+    checks.ExpectEq(back.value.config.server.ca_file, sent.config.server.ca_file,
+                    "the CA file survives (#288)");
     checks.ExpectEq(back.value.config.sync.interval_min, sent.config.sync.interval_min,
                     "the interval survives");
     checks.ExpectEq(back.value.config.sync.states, sent.config.sync.states, "states survives");
@@ -451,6 +470,7 @@ int RoundTrip() {
                     "[sources] retroarch_content_dir survives");
     checks.ExpectEq(back.value.config.sync.slot, std::string("mine"), "[sync] slot survives");
     checks.ExpectEq(back.value.config.sync.map_state_slots, true, "map_state_slots survives");
+    checks.ExpectEq(back.value.config.sync.play_sessions, false, "play_sessions survives");
     checks.ExpectEq(config::AccountText(back.value.config.tico),
                     std::string("fedcba9876543210fedcba9876543210"), "[tico] account survives");
     checks.Expect(back.value.tico_accounts == sent.tico_accounts,
@@ -819,6 +839,49 @@ int RoundTrip() {
                   "and a rom id where an entry id belongs is refused, not acted on");
   }
 
+  // #304: the overlay says which build it is and asks for a bundle; the answer
+  // is where the bundle landed, and a card that refused it is a named failure.
+  {
+    const ipc::DiagnosticsRequest asked{"0.9.0", ipc::kVersion, "v2.5.4"};
+    const ipc::Decoded<ipc::DiagnosticsRequest> request =
+        ipc::DecodeDiagnosticsRequest(ipc::EncodeDiagnosticsRequest(asked));
+    checks.Expect(request.ok() && request.value.overlay == "0.9.0" &&
+                      request.value.overlay_interface == ipc::kVersion &&
+                      request.value.libultrahand == "v2.5.4",
+                  "a diagnostics request reads back as itself: " + request.error.Describe());
+    checks.Expect(!ipc::DecodeDiagnosticsRequest(ipc::EncodeDiagnosticsRequest(
+                                                    {std::string(200, 'v'), 1, "v2.5.4"}))
+                       .ok(),
+                  "an overlay version longer than any build's is refused, not copied");
+    const ipc::Decoded<ipc::DiagnosticsResult> result = ipc::DecodeDiagnosticsResult(
+        ipc::EncodeDiagnosticsResult({"/config/rommsync/diagnostics-20261118-110640.txt"}));
+    checks.Expect(result.ok() &&
+                      result.value.sd_path == "/config/rommsync/diagnostics-20261118-110640.txt",
+                  "and so does its answer: " + result.error.Describe());
+    checks.Expect(!ipc::DecodeDiagnosticsResult("{}").ok(),
+                  "an answer that does not say where the bundle is is refused");
+
+    FakeEngine engine;
+    ipc::ServiceCore core(engine);
+    std::string response;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kWriteDiagnostics),
+                                ipc::EncodeDiagnosticsRequest(asked), &response) ==
+                      ipc::Error::kOk,
+                  "WriteDiagnostics answers once the bundle is on the card");
+    checks.ExpectEq(engine.diagnostics_requests, 1, "it asks the engine once");
+    checks.ExpectEq(engine.last_diagnostics_request.libultrahand, std::string("v2.5.4"),
+                    "with what the overlay said about itself");
+    checks.Expect(ipc::DecodeDiagnosticsResult(response).ok(), "answering where it landed");
+    engine.diagnostics_error = ipc::Error::kWriteFailed;
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kWriteDiagnostics),
+                                ipc::EncodeDiagnosticsRequest(asked), &response) ==
+                      ipc::Error::kWriteFailed,
+                  "a card that refused the bundle is kWriteFailed");
+    checks.Expect(ipc::Dispatch(core, static_cast<std::uint32_t>(ipc::Command::kWriteDiagnostics),
+                                ipc::EncodeEmpty(), &response) == ipc::Error::kMalformedRequest,
+                  "and a request that does not say which overlay asked is refused");
+  }
+
   // Every string field is user data and may hold anything a filesystem allows.
   // `json::Quote` is what carries it rather than interpreting it, and this is
   // the check that nothing here builds a payload by concatenation instead.
@@ -979,6 +1042,7 @@ int Refuses() {
            {"\"slot\":\"mine\"", "\"slot\":\"../mine\""},
            {"\"slot\":\"mine\"", "\"slot\":\"\""},
            {"\"map_state_slots\":true", "\"map_state_slots\":\"true\""},
+           {"\"play_sessions\":false", "\"play_sessions\":0"},
            {"\"account\":\"fedcba9876543210fedcba9876543210\"", "\"account\":\"someone\""},
            {"\"accounts\":[\"0123456789abcdef0123456789abcdef\"",
             "\"accounts\":[\"../../saves\""},
@@ -1130,6 +1194,7 @@ int Secrets() {
       {ipc::Command::kGetRestoreState, ipc::EncodeEmpty()},
       {ipc::Command::kKeepLocal, ipc::EncodeEntryId(3)},
       {ipc::Command::kCancelKeepLocal, ipc::EncodeEntryId(3)},
+      {ipc::Command::kWriteDiagnostics, ipc::EncodeDiagnosticsRequest({"0.9.0", 18, "v2.5.4"})},
   };
 
   // The log is the newest way a credential could reach this wire: a call site
@@ -1728,8 +1793,17 @@ int DispatchTable() {
     engine.settings.server.url = "http://romm.lan:8080";
     engine.snapshot.auth = ipc::AuthState::kPaired;
     engine.snapshot.queue_depth = 3;
+    engine.snapshot.backup.measured = true;
+    engine.snapshot.backup.bytes = 4096;
+    engine.snapshot.backup.backups = 2;
+    engine.snapshot.backup.kept_unique = 1;
+    engine.snapshot.backup.over_cap = true;
     ipc::ServiceCore core(engine);
     const ipc::Status status = core.GetStatus();
+    checks.Expect(status.backup.measured && status.backup.bytes == 4096 &&
+                      status.backup.backups == 2 && status.backup.kept_unique == 1 &&
+                      status.backup.over_cap,
+                  "backup usage comes off the engine, every field of it (#316)");
     checks.ExpectEq(status.enabled, false, "the switch is the one in config.ini");
     checks.ExpectEq(status.configured, true, "and configured follows from a usable server");
     checks.ExpectEq(status.queue_depth, std::int64_t{3}, "the queue depth comes off the engine");

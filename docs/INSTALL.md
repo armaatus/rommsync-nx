@@ -55,6 +55,16 @@ you have installed homebrew on a Switch before and have never seen RomM.
   That is the overlay that starts, stops and boot-toggles sysmodules, and it is
   the only supported way to turn `sys-rommsync` on. rommsync-nx does not ship
   its own boot switch.
+- **Room for one more sysmodule.** `sys-rommsync` is built to a resident
+  footprint of at most 2,342,912 bytes (2.23 MiB) for as long as it runs, out of
+  the memory Atmosphère sets aside for every custom sysmodule together — 7 MB on
+  Horizon 21 and 22, an experimental 16 MB on 23.0.0 with Atmosphère 1.12.x —
+  shared with nx-ovlloader's overlay heap and anything else you run beside it
+  (sys-clk, MissionControl, ldn_mitm, emuiibo…). If you already run several,
+  turn one off before enabling this one: Atmosphère's boot aborts a sysmodule
+  launch that does not fit. How the number is made up is in
+  [DEVELOPMENT.md](DEVELOPMENT.md#what-the-process-costs-the-pool); it is
+  computed from the build and has not yet been read on a real console (M12).
 - **A RomM 5.4.0 or later server the console can reach over the network** — an
   older one is refused before any save is offered to it
   ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#romm-is-too-old)) — and an account
@@ -73,11 +83,13 @@ Unzip the release onto the **root** of your SD card, keeping the folder
 structure. There is no wrapper directory: the archive merges into the
 `atmosphere/` and `switch/` folders your card already has.
 
-Six files and one empty folder land, and nothing else changes:
+Eight files and one empty folder land, and nothing else changes:
 
 ```
-README.txt
-LICENSE
+config/rommsync/README.txt
+config/rommsync/LICENSE
+config/rommsync/THIRD_PARTY_NOTICES.txt
+config/rommsync/COPYING.GPL-2.0
 atmosphere/contents/4200000000524D53/exefs.nsp
 atmosphere/contents/4200000000524D53/toolbox.json
 atmosphere/contents/4200000000524D53/flags/
@@ -101,8 +113,14 @@ switch/.overlays/ovl-rommsync.ovl
 - `config/rommsync/config.ini.example` is a starting configuration. It is an
   *example*: the file the client actually reads is `config/rommsync/config.ini`,
   which you make in step 3.
-- `README.txt` and `LICENSE` land at the **root** of the card under those names,
-  so an unrelated `README.txt` or `LICENSE` already sitting there is replaced.
+- `config/rommsync/README.txt` is the short version of this guide.
+  `config/rommsync/LICENSE`, `config/rommsync/COPYING.GPL-2.0` and
+  `config/rommsync/THIRD_PARTY_NOTICES.txt` are the licences: the sysmodule is
+  MIT, the overlay is GPL-2.0 because it links libultrahand, and the notices
+  cover every library either one links ([LICENSING.md](LICENSING.md)). Nothing
+  lands at the root of the card itself. Releases up to v1.0.0-rc2 put a
+  `README.txt` and a `LICENSE` there; if the ones at your root are rommsync-nx's,
+  they can go.
 
 The `flags/` folder arrives **empty**. Nothing in it means the sysmodule does
 not start at boot; ovl-sysmodules puts `boot2.flag` there the first time you
@@ -193,6 +211,40 @@ in the clear on every request — see [Security](#security) below.
 The overlay's Settings screen
 ([#26](https://github.com/armaatus/rommsync-nx/issues/26)) shows the server URL
 but cannot change it; the file is the way.
+
+### Self-signed or private CA
+
+If your RomM's certificate was signed by no public CA — a self-signed one, or
+one from your own CA — the console has to be given that certificate, or every
+request fails at the handshake (`net.tls` in the log). Verification stays on:
+the server is checked against the certificate you chose. Why this is the only
+way past it is in [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server).
+
+1. Get the certificate in **PEM** form: a text file starting
+   `-----BEGIN CERTIFICATE-----`. Use the CA's certificate if you have one, or
+   the server's own if it is self-signed. A DER file (binary, often `.cer` or
+   `.der`) converts with
+   `openssl x509 -inform der -in server.der -out ca.pem`.
+2. Copy it to the card as `config/rommsync/ca.pem`.
+3. Name it under `[server]`, beside the url:
+
+   ```ini
+   [server]
+   url = https://romm.example.com
+   ca_file = sdmc:/config/rommsync/ca.pem
+   ```
+
+4. Restart the sysmodule (ovl-sysmodules, or reboot).
+
+The certificate must carry the name in your `url` — its `subjectAltName` has to
+list `romm.example.com`, or the IP address if the url uses one — because the
+hostname is checked too.
+
+The Settings screen shows `ca_file` under `[server]`, and if the file is missing,
+too large, DER, or holds no certificate, says so there and in the log. A file
+holding several certificates is read whole; whether the console accepts more
+than one at a time is not yet verified on hardware, so put only the one you need
+in it.
 
 The full key list — the sync interval, the download options, and the folder map
 that decides where roms land and which folders saves are read from — is in
@@ -326,7 +378,7 @@ RetroArch's and the converters wait on real save files captured on hardware
 Download the newer release and unzip it over the top, onto the SD root, exactly
 as in step 1.
 
-The six files from step 1 are replaced. Nothing else is, because nothing else
+The eight files from step 1 are replaced. Nothing else is, because nothing else
 is in the archive:
 
 | File | What happens |
@@ -422,7 +474,9 @@ time. See [AUTH.md](AUTH.md#re-pairing--revocation).
 ## Security
 
 Three things are worth knowing before you expose any of this to a network. Each
-is one paragraph here and a full section in [SECURITY.md](SECURITY.md).
+is one paragraph here and a full section in [SECURITY.md](SECURITY.md). What
+the console sends your RomM, play time included, and how to turn play time off,
+is [PRIVACY.md](PRIVACY.md).
 
 **Plain `http://` sends your token in the clear.** Every request carries the
 bearer token, so anything between the console and RomM can read it on an
@@ -434,7 +488,8 @@ VPN or a tailnet —
 
 **A self-signed certificate is imported, not waved through.** If your RomM's
 certificate is one no public CA signed, the answer is to import that certificate
-so the console checks against a CA you chose. Verification stays on. There is no
+so the console checks against a CA you chose —
+[Self-signed or private CA](#self-signed-or-private-ca) has the steps. Verification stays on. There is no
 setting in this client that turns it off, and there will not be — see
 [SECURITY.md](SECURITY.md#a-self-signed-certificate-on-a-home-server).
 

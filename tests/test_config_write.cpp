@@ -199,6 +199,11 @@ void Rejects(checks::Checks& c) {
   cases.push_back({"a boolean that is not one", One("sync", "states", "maybe")});
   cases.push_back({"a section this build does not have", One("experimental", "future", "2")});
   cases.push_back({"a key this build does not have", One("sync", "nonsense", "4")});
+  // Read, never written (#288): the certificate itself has to reach the card
+  // from a PC, so the line naming it is written there too, and an overlay that
+  // could repoint the console's trust is one more way to aim it at the wrong
+  // server.
+  cases.push_back({"the CA file", One("server", "ca_file", "sdmc:/config/rommsync/ca.pem")});
   cases.push_back({"a folder whose name would read back as a comment",
                    One("platform.snes", "roms", "/tico/roms/great #2")});
   cases.push_back({"an empty entry in a folder list",
@@ -646,6 +651,11 @@ void TicoAndPlayWith(checks::Checks& c) {
   const std::string mapped =
       Applied(c, before, One("sync", "map_state_slots", "on"), "map_state_slots = true");
   c.Expect(Parsed(mapped).sync.map_state_slots, "map_state_slots reads back");
+
+  // #301's opt-out is a flag the settings screen's press sends the same way.
+  const std::string quiet =
+      Applied(c, before, One("sync", "play_sessions", "off"), "play_sessions = false");
+  c.Expect(!Parsed(quiet).sync.play_sessions, "play_sessions reads back");
 }
 
 }  // namespace

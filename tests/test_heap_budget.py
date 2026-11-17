@@ -27,6 +27,11 @@ Five phases, one CTest entry each, so a red run names what broke:
             open `DIR` out of this heap (fs_dev.c).
   prose     the rest of the tree quotes the heap's size as `kInnerHeapSize`
             says, in hex or in MiB/KiB.
+  footprint the process's whole resident cost against the custom-sysmodule
+            pool (M11-12, #296): the one number `scripts/image-budget.sh`
+            records, and measures off the linked image, covers what the tree
+            alone can add up, and the two documents a developer and a user read
+            quote that number and no other.
 """
 import argparse
 import re
@@ -312,12 +317,79 @@ def phase_prose(repo):
     return 0
 
 
+# The number `scripts/image-budget.sh` holds the linked image to, and the term
+# of it besides the heap and the stack that the script names.
+FOOTPRINT = re.compile(r"^RESIDENT_FOOTPRINT=\$\(\(\s*(\d+)\s*\)\)", re.M)
+TLS = re.compile(r"^TLS_BYTES=\$\(\(\s*(\d+)\s*\)\)", re.M)
+NPDM = "sysmodule/sys-rommsync.json"
+BUDGET_SCRIPT = "scripts/image-budget.sh"
+# Where a reader meets the number: the developer's derivation and the user's
+# requirements. Each quotes it in bytes, exactly as the script records it.
+FOOTPRINT_DOCS = ("docs/DEVELOPMENT.md", "docs/INSTALL.md")
+# A byte count on a line about the footprint, for the stale copy a raise leaves.
+FOOTPRINT_QUOTE = re.compile(r"(\d{1,3}(?:,\d{3}){2}) bytes")
+
+
+def phase_footprint(repo):
+    import json
+    script = read(repo, BUDGET_SCRIPT)
+    recorded = FOOTPRINT.search(script)
+    if recorded is None:
+        return fail("%s records no `RESIDENT_FOOTPRINT=$(( bytes ))`; nothing states what this "
+                    "process costs the custom-sysmodule pool it shares with every other "
+                    "sysmodule (#296)" % BUDGET_SCRIPT)
+    footprint = int(recorded.group(1))
+    tls = TLS.search(script)
+    if tls is None:
+        return fail("%s records no `TLS_BYTES=$(( bytes ))` (#296)" % BUDGET_SCRIPT)
+    heap = HEAP.search(read(repo, MAIN))
+    if heap is None:
+        return fail("no `constexpr size_t kInnerHeapSize = 0x...;` in %s (#207)" % MAIN)
+    stack = json.loads(read(repo, NPDM)).get("main_thread_stack_size")
+    if stack is None:
+        return fail("%s declares no main_thread_stack_size (#296)" % NPDM)
+    stack = int(stack, 16)
+    # The part of the footprint the tree can add up. The code segments are the
+    # rest, and only a link knows them -- `switch.builds` holds those.
+    floor = int(heap.group(1), 16) + stack + int(tls.group(1))
+    failures = 0
+    if footprint < floor:
+        failures += fail("the recorded footprint %d is under the heap, the main thread's stack "
+                         "and its TLS page alone, %d; it cannot be a measurement (#296)"
+                         % (footprint, floor))
+    quoted = "{:,}".format(footprint)
+    for doc in FOOTPRINT_DOCS:
+        text = read(repo, doc)
+        if quoted + " bytes" not in text:
+            failures += fail("%s does not quote the resident footprint %s records, %s bytes "
+                             "(#296)" % (doc, BUDGET_SCRIPT, quoted))
+        # A paragraph at a time, unwrapped: a stale number left a line below the
+        # word it belongs to is still that paragraph's footprint.
+        for paragraph in re.split(r"\n\s*\n", text):
+            paragraph = " ".join(paragraph.split())
+            if "footprint" not in paragraph.lower():
+                continue
+            for other in FOOTPRINT_QUOTE.findall(paragraph):
+                value = int(other.replace(",", ""))
+                # Within half a MiB is this quantity; further off is another one
+                # quoted beside it -- the heap, or the 7 MB pool.
+                if value != footprint and abs(value - footprint) < 512 * 1024:
+                    failures += fail("%s quotes a footprint of %s bytes and %s records %s "
+                                     "(#296)" % (doc, other, BUDGET_SCRIPT, quoted))
+    if failures:
+        return 1
+    print("ok: the resident footprint of %s bytes covers the tree's %d and is quoted in %s"
+          % (quoted, floor, " and ".join(FOOTPRINT_DOCS)))
+    return 0
+
+
 PHASES = {
     "rows": phase_rows,
     "pinned": phase_pinned,
     "margin": phase_margin,
     "dirs": phase_dirs,
     "prose": phase_prose,
+    "footprint": phase_footprint,
 }
 
 

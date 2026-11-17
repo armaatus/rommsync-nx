@@ -1622,6 +1622,90 @@ void StaleWrite(rig::Checks& checks, http::HttpClient& client, const std::string
   harness::DeleteState(client, base, fixture, state_id);
 }
 
+/// #318: `stale_write` for a placement. The scan found no state at the path, so
+/// the placement was decided against nothing -- and a state saved on a hotkey
+/// while the download runs is one nothing ruled on. It stays; `again` is a second
+/// write at the backup's rename, which makes that backup the only copy of the first.
+void StalePlace(rig::Checks& checks, http::HttpClient& client, const std::string& base,
+                const Fixture& fixture, std::int64_t rom_id, const std::string& rom_base,
+                const std::optional<std::string>& again) {
+  const std::string what = again.has_value() ? "only copy" : "placement";
+  Sandbox sandbox(checks, again.has_value() ? "states-stale-place-only-copy"
+                                            : "states-stale-place");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+  const auth::StoredToken token = TokenFor(base, fixture);
+  const roms::RomIndex index = IndexOf(rom_id, rom_base, "gb");
+  const std::string name = rom_base + ".state";
+  const std::string theirs = "a session another console pushed, which this one never held";
+  const std::string progress = "the first session saved here, on a hotkey while the download ran";
+
+  const std::string elsewhere = sandbox.Host("/elsewhere.state");
+  rig::WriteFile(elsewhere, theirs);
+  sync::ServerState row;
+  if (!harness::UploadState(checks, client, base, fixture, rom_id, "gambatte", elsewhere, name,
+                            &row)) {
+    return;
+  }
+
+  sync::StateSyncOptions options = OptionsAt(kStamp);
+  options.place = [&name](const sync::ServerState& server) {
+    rommsync::place::Placement placement;
+    if (server.file_name == name) {
+      placement.sd_path = StatePath(server.file_name);
+    } else {
+      placement.foreign = true;
+    }
+    return placement;
+  };
+
+  state::Baseline baseline;
+  sync::StateSyncReport report;
+  {
+    // The download's `.part` made durable: the scan found the path empty, and
+    // the backup has not begun.
+    const std::string part = http::PartialPathFor(io::TempPathFor(sandbox.Host(StatePath(name))));
+    faulty::LateWrite during([&] { sandbox.Reseed(StatePath(name), progress); }, part);
+    std::optional<faulty::LateWrite> after;
+    if (again.has_value()) {
+      after.emplace([&] { sandbox.Reseed(StatePath(name), *again); });
+    }
+    report = sync::SyncStates(client, *files, token, StatesOn(true), index, &baseline, options);
+    checks.Expect(during.fired(), what + ": the game saved while the download ran");
+    checks.Expect(!after.has_value() || after->fired(), what + ": and again after the backup");
+  }
+  const std::string& now = again.has_value() ? *again : progress;
+  checks.ExpectEq(sandbox.Read(StatePath(name)), now,
+                  what + ": the state written since the scan is still the state");
+  checks.ExpectEq(report.completed, 0, what + ": nothing was placed");
+  checks.ExpectEq(report.failed, 1, what + ": and the placement is counted failed, not done");
+  if (report.operations.size() == 1) {
+    const sync::StateOperationResult& done = report.operations.front();
+    checks.ExpectEq(std::string(sync::ToString(done.error)), std::string("changed_since_backup"),
+                    what + ": named as a state that moved -- " + done.message);
+    if (again.has_value()) {
+      checks.Expect(!done.backup_sd_path.empty() && sandbox.Read(done.backup_sd_path) == progress,
+                    what + ": the backup is kept and named, the only copy of the first write: " +
+                        done.backup_sd_path);
+    } else {
+      checks.Expect(done.backup_sd_path.empty(),
+                    what + ": no backup is claimed -- the state it copied is still there: " +
+                        done.backup_sd_path);
+    }
+  } else {
+    checks.Expect(false, what + ": the run decided about the state once");
+  }
+  checks.Expect(sandbox.HasBackupOf(progress) == again.has_value(),
+                what + (again.has_value()
+                            ? ": the first write is still under .backup/"
+                            : ": no copy of the state is left in .backup/ as a backup of "
+                              "something nothing replaced"));
+  checks.Expect(!io::Exists(io::TempPathFor(sandbox.Host(StatePath(name)))),
+                what + ": and the server's copy is not left staged beside it");
+
+  harness::DeleteState(client, base, fixture, row.id);
+}
+
 /// M9-14 (#203): `overwrite`, with a power cut at every call the second run
 /// makes. A state is a save (hard rule 2) and arrives through the same `.part`
 /// staging, so it is held to the same replay.
@@ -1982,6 +2066,10 @@ int main(int argc, char** argv) {
   } else if (scenario == "stale_write") {
     StaleWrite(checks, *client, base, fixture, rom.id, rom_base, std::nullopt);
     StaleWrite(checks, *client, base, fixture, rom.id, rom_base,
+               std::string("the session saved again, after the backup"));
+  } else if (scenario == "stale_place") {
+    StalePlace(checks, *client, base, fixture, rom.id, rom_base, std::nullopt);
+    StalePlace(checks, *client, base, fixture, rom.id, rom_base,
                std::string("the session saved again, after the backup"));
   } else if (scenario == "crash") {
     Crash(checks, *client, base, fixture, rom.id, rom_base);

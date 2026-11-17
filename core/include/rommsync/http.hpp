@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -158,13 +159,74 @@ struct FormPart {
 /// The backend polls this while transferring; a cancelled request returns
 /// `Error::kCanceled` and leaves no file where a complete one is expected.
 /// Safe to cancel from another thread.
+///
+/// Polling is not enough for a backend call that blocks with no way to look
+/// at the token -- a name lookup on the console is one IPC to `sfdnsres` that
+/// returns when the resolver does (M11-6, #290). Such a call is bracketed by an
+/// `Abort`, and `Cancel` runs it on the cancelling thread, which is what a
+/// console going to sleep needs: the lookup ends inside the quiesce budget
+/// rather than after it.
 class CancelToken {
  public:
-  void Cancel() noexcept { canceled_.store(true, std::memory_order_relaxed); }
+  void Cancel() noexcept {
+    // The flag first, then the hook under the lock: an `Abort` registered after
+    // the lock is released reads the flag through that same lock, so a cancel
+    // is either run as the hook or seen by the registrant's own check.
+    canceled_.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> held(abort_mutex_);
+    if (abort_ != nullptr) abort_(abort_context_);
+  }
   bool canceled() const noexcept { return canceled_.load(std::memory_order_relaxed); }
+
+  /// While alive, `abort(context)` is what `Cancel` also does.
+  ///
+  /// One per token at a time, because one blocking call is in flight per token
+  /// at a time: a token is a tick's or a drain's, and both run on one thread.
+  /// A second while the first is alive is not registered -- `armed()` says so,
+  /// and the caller is no worse off than with no hook at all. A null `token`
+  /// arms nothing.
+  ///
+  /// Read `canceled()` *after* constructing one: a cancel that landed before
+  /// it is not replayed as a call to `abort`.
+  ///
+  /// `abort` runs under the token's lock, on whichever thread cancels -- the
+  /// quiescing one, holding the engine's own lock. So it must be short, must
+  /// take no lock that is held around a `Cancel`, and must never cancel this
+  /// token itself: one IPC that tells a service to stop, and nothing more.
+  class Abort {
+   public:
+    Abort(const CancelToken* token, void (*abort)(void*), void* context) {
+      if (token == nullptr || abort == nullptr) return;
+      std::lock_guard<std::mutex> held(token->abort_mutex_);
+      if (token->abort_ != nullptr) return;
+      token->abort_ = abort;
+      token->abort_context_ = context;
+      token_ = token;
+    }
+    ~Abort() {
+      if (token_ == nullptr) return;
+      // Under the lock, so once this returns no `Cancel` is still inside
+      // `abort` with a `context` about to dangle.
+      std::lock_guard<std::mutex> held(token_->abort_mutex_);
+      token_->abort_ = nullptr;
+      token_->abort_context_ = nullptr;
+    }
+    Abort(const Abort&) = delete;
+    Abort& operator=(const Abort&) = delete;
+
+    bool armed() const noexcept { return token_ != nullptr; }
+
+   private:
+    const CancelToken* token_ = nullptr;
+  };
 
  private:
   std::atomic<bool> canceled_{false};
+  // `mutable` because a request holds its token `const` -- cancelling is the
+  // owner's, and arming a hook does not change whether it has happened.
+  mutable std::mutex abort_mutex_;
+  mutable void (*abort_)(void*) = nullptr;
+  mutable void* abort_context_ = nullptr;
 };
 
 /// Defaults chosen so a request on a sleeping Wi-Fi link fails in seconds rather

@@ -3,6 +3,7 @@
 #
 #   scripts/release-notes.sh [--checksums FILE]
 #   scripts/release-notes.sh --prerelease
+#   scripts/release-notes.sh --verified
 #
 # Three parts, in this order:
 #
@@ -14,9 +15,17 @@
 #                    finds that tag, so this needs an unshallow checkout with
 #                    tags -- .github/workflows/ci.yml uses fetch-depth: 0.
 #   the checksums    whatever SHA256SUMS the job just built and verified,
-#                    verbatim. The archive is byte-deterministic for one `zip`
-#                    build (scripts/package.sh), so someone rebuilding the tag
-#                    can compare against this without downloading a second file.
+#                    verbatim. The binaries are reproducible across checkout
+#                    paths and the archive is byte-deterministic for one `zip`
+#                    build (`ctest -R package.reproducible`), so someone
+#                    rebuilding the tag in the pinned image can compare against
+#                    this without downloading a second file.
+#
+# The header says two things about the build that are not true of every
+# release, and each is keyed off the fact it is about (#303): "pre-release"
+# off VERSION (`--prerelease`), and "not yet verified on hardware" off the
+# launch gate (`--verified`). scripts/package.sh asks the same two questions
+# for the README.txt inside the archive.
 #
 # The version comes from VERSION, read the same way CMakeLists.txt, switch.mk
 # and scripts/package.sh read it -- and by the time this runs, `ctest -R
@@ -35,8 +44,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # correction here is red until it is made there too.
 #
 # Read it as a target, not as a result. Nothing in this repo has run on a
-# console: the M8-1 gate is what turns this line into a verified claim, and
-# until it passes the sentence below says so in the release itself. The range is
+# console: #44 and the launch gate after it (#305) are what turn this line into
+# a verified claim, and until they do the release says so (see --verified). The range is
 # what the sysmodule is built against -- libnx's service bindings and an
 # Atmosphère new enough to load an ExeFS sysmodule out of
 # atmosphere/contents/ -- not a set of versions anybody has booted it on.
@@ -78,16 +87,20 @@ usage: scripts/release-notes.sh [--checksums FILE]
   --checksums FILE  a SHA256SUMS to quote verbatim (default: none)
   --prerelease      print `true` or `false` for VERSION and exit, writing no
                     notes -- the flag the GitHub Release is created with
+  --verified        print `true` or `false`: has the launch gate recorded this
+                    build running on a console? -- and exit, writing no notes
 USAGE
 }
 
 CHECKSUMS=""
 PRERELEASE_ONLY=0
+VERIFIED_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --checksums)  [ $# -ge 2 ] || die "--checksums needs a path"; CHECKSUMS="$2"; shift 2 ;;
     --prerelease) PRERELEASE_ONLY=1; shift ;;
+    --verified)   VERIFIED_ONLY=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -101,11 +114,36 @@ VERSION="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' "$REPO_ROOT/VERSIO
 # job asks this script rather than repeating the rule, so `0.2.0-rc1` publishes
 # as a prerelease and `0.2.0` does not without the test for it needing a tag,
 # a token or a network -- `ctest -R release.prerelease` runs exactly this.
+case "$VERSION" in
+  *-*) PRERELEASE=true ;;
+  *)   PRERELEASE=false ;;
+esac
 if [ "$PRERELEASE_ONLY" -eq 1 ]; then
-  case "$VERSION" in
-    *-*) echo "true" ;;
-    *)   echo "false" ;;
-  esac
+  echo "$PRERELEASE"
+  exit 0
+fi
+
+# Has a console run this build? The launch gate's answer (#305): it lists its
+# rows as `id|kind|claim`, the way scripts/v1-gate.sh does, and a `console` row
+# is one HELD until a person records what a console did and changes its kind in
+# a reviewed edit. So the build is verified on hardware exactly when no console
+# row is left -- read off the rows rather than off the gate's exit code, which
+# also turns on repo rows (every M11 issue closed) that say nothing about a
+# console.
+#
+# No gate means no: #305 has not landed, and until something exists that can
+# say a console ran this, nothing has. A gate that fails to answer is an error,
+# never a "no console rows".
+verified() {
+  local gate="$REPO_ROOT/scripts/launch-gate.sh" rows
+  [ -f "$gate" ] || { echo false; return 0; }
+  rows="$(bash "$gate" --rows)" || die "scripts/launch-gate.sh --rows failed"
+  [ -n "$rows" ] || die "scripts/launch-gate.sh --rows listed no rows"
+  if grep -q '^[^|]*|console|' <<<"$rows"; then echo false; else echo true; fi
+}
+VERIFIED="$(verified)"
+if [ "$VERIFIED_ONLY" -eq 1 ]; then
+  echo "$VERIFIED"
   exit 0
 fi
 
@@ -170,9 +208,9 @@ PREVIOUS="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 \
             "${RELEASE_EXCLUDES[@]}" HEAD 2>/dev/null || true)"
 
 # What produced these bytes. dkp-pacman is how the devkitPro container records
-# it, so the line is derived where the release is built and degrades to the
-# image name anywhere else, rather than being a number typed here that nothing
-# checks.
+# it, so the line is derived in the pinned image the release job packages in --
+# the one switch-build built the artifacts in -- and degrades to the image name
+# anywhere else, rather than being a number typed here that nothing checks.
 toolchain() {
   local q
   if q="$(dkp-pacman -Q libnx devkitA64 2>/dev/null)" && [ -n "$q" ]; then
@@ -185,11 +223,24 @@ toolchain() {
 
 cat <<EOF
 ## rommsync-nx $VERSION
+EOF
+
+# A semver suffix is a release candidate, and the page says so in words as
+# well as with GitHub's badge: the badge does not survive a link to the asset.
+if [ "$PRERELEASE" = true ]; then
+  cat <<EOF
+
+**This is a pre-release** — a candidate for ${VERSION%%-*}, which may still
+change before it is final.
+EOF
+fi
+
+cat <<EOF
 
 Download **\`$ZIP\`** below and unzip it onto the **root** of your SD card.
 It merges with what is already there; it does not replace your
-\`config.ini\`, your pairing, your sync state or your save backups. It does
-replace a \`README.txt\` or \`LICENSE\` at the root of the card.
+\`config.ini\`, your pairing, your sync state or your save backups, and it
+puts nothing at the root of the card itself.
 
 You need Ultrahand (or Tesla), ovl-sysmodules, and a RomM 5.4.0 or later
 server. The sysmodule ships **disabled** — nothing runs until you enable it with
@@ -204,11 +255,34 @@ and when something does not sync, every log line and what to do about it:
 
 Built with $(toolchain), for $ATMOSPHERE_TARGET.
 
-> Not yet verified on hardware. Every guarantee this build carries was proven
-> against a real RomM server and a cross-compile, never on a console — see the
-> M8-1 gate before trusting it with a save you care about.
+**Licences and source.** The overlay statically links libultrahand and is
+distributed under the GPL, version 2; the sysmodule is MIT. The archive carries
+both texts and the notices for every library either binary links, under
+\`config/rommsync/\` (\`COPYING.GPL-2.0\`, \`LICENSE\`, \`THIRD_PARTY_NOTICES.txt\`).
+The complete corresponding source of this release, with the libultrahand
+commit it pins, is the tree at this tag:
+
+  $URL/tree/$TAG
+
+**Provenance.** The archive is the build CI checked, packaged in the same run,
+and both assets carry a signed build-provenance attestation. With the GitHub
+CLI, after downloading:
+
+  gh attestation verify $ZIP --repo ${URL#*://*/}
 
 EOF
+
+if [ "$VERIFIED" = false ]; then
+  cat <<EOF
+> Not yet verified on hardware. Every guarantee this build carries was proven
+> against a real RomM server and a cross-compile, never on a console. The
+> first console run is #44 — wait for it before trusting this with a save
+> you care about:
+>
+>   $URL/issues/44
+
+EOF
+fi
 
 if [ -n "$PREVIOUS" ]; then
   echo "## Changes since $PREVIOUS"

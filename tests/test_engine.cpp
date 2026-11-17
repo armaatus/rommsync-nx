@@ -86,6 +86,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -102,6 +103,7 @@
 #include "engine.hpp"
 #include "faulty_disk.hpp"
 #include "harness.hpp"
+#include "http/nifm_verdict.hpp"
 #include "power.hpp"
 #include "power_fake.hpp"
 #include "rig.hpp"
@@ -589,6 +591,59 @@ ipc::ConfigEdit Edit(std::string section, std::string key, std::string value) {
   ipc::ConfigEdit edit;
   edit.assignments.push_back({std::move(section), std::move(key), std::move(value), false});
   return edit;
+}
+
+/// #288: `[server] ca_file` reaches the transport. The engine hands the CA in
+/// force to `UseCaTrust` when it is installed, and again every time a
+/// configuration is adopted, so a hand edit picked up by the next `SetConfig`
+/// is trusted without a reboot -- and a file that is not a certificate is said
+/// on the settings screen the moment it is, not only at boot.
+void CaTrust(checks::Checks& c) {
+  Console console(c, "engine-ca-trust");
+  const std::string kPem =
+      "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ2Ff\n-----END CERTIFICATE-----\n";
+  c.Expect(console.sandbox.Write("/config/rommsync/ca.pem", kPem), "a CA is on the card");
+  const std::string pem = console.sandbox.Host("/config/rommsync/ca.pem");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\nca_file = " + pem +
+                                     "\n"),
+           "and config.ini names it");
+  console.Boot();
+
+  std::vector<std::string> trusted;
+  console.engine.UseCaTrust([&trusted](const std::string& path) { trusted.push_back(path); });
+  c.Expect(!trusted.empty() && trusted.back() == pem,
+           "installing the hook hands it the CA file already in force");
+  bool complained = false;
+  for (const config::Diagnostic& note : console.Configured().diagnostics) {
+    complained = complained || note.key == "ca_file";
+  }
+  c.Expect(!complained, "and a real certificate draws no complaint");
+
+  // A hand edit, then any press that writes the file: the file is re-read
+  // whole, so the new CA is what is in force -- and it is checked on the card,
+  // as boot would have.
+  const std::string missing = console.sandbox.Host("/config/rommsync/other.pem");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\nca_file = " +
+                                     missing + "\n"),
+           "config.ini is repointed by hand");
+  const ipc::ConfigResult applied = console.Set(Edit("sync", "interval_min", "45"));
+  c.Expect(applied.outcome == ipc::WriteOutcome::kApplied, "an unrelated edit is applied");
+  c.Expect(!trusted.empty() && trusted.back() == missing,
+           "and the transport is handed the CA the file now names");
+  complained = false;
+  for (const config::Diagnostic& note : console.Configured().diagnostics) {
+    complained = complained || (note.key == "ca_file" && note.severity == config::Severity::kError);
+  }
+  c.Expect(complained, "a CA file that is not there is an error on the settings screen");
+
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n"),
+           "and the line is removed by hand");
+  console.Set(Edit("sync", "interval_min", "30"));
+  c.Expect(!trusted.empty() && trusted.back().empty(),
+           "so the transport is told there is no CA file any more");
 }
 
 void ConfigWrites(checks::Checks& c) {
@@ -2843,6 +2898,187 @@ std::string Rendered(const ipc::LogTail& tail) {
   return out.empty() ? std::string(" (the log is empty)") : out;
 }
 
+// --- M11-5 (#289): a tick waits for the network, every time ------------------
+
+/// A server that answers nothing and counts what it was asked.
+///
+/// What a tick sent to a console nifm says is offline would reach: the request
+/// fails as the connector's own pre-check fails it. The count is the whole of
+/// what these scenarios read -- a tick held for the network sends nothing.
+class Unanswered final : public http::HttpClient {
+ public:
+  http::Result Send(const http::Request&) override {
+    ++requests_;
+    http::Result result;
+    result.error = http::Error::kConnectFailed;
+    result.message = "the console has no internet connection";
+    return result;
+  }
+  http::Result Download(const http::Request& request, const http::DownloadTarget&) override {
+    return Send(request);
+  }
+  int requests() const { return requests_.load(); }
+
+ private:
+  std::atomic<int> requests_{0};
+};
+
+/// A paired card with the boot tick as given and no interval, so every request
+/// these scenarios count is attributable to one tick.
+void SeedOfflineCard(checks::Checks& c, Console& console, bool on_boot) {
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 std::string("[server]\n"
+                                             "url = https://romm.example.com\n"
+                                             "\n"
+                                             "[sync]\n"
+                                             "enabled = true\n"
+                                             "interval_min = 0\n"
+                                             "on_boot = ") +
+                                     (on_boot ? "true" : "false") + "\n"),
+           "a configured card");
+  auth::StoredToken token;
+  token.server_url = "https://romm.example.com";
+  token.access_token = "not-a-real-token";
+  token.device_id = "console-offline";
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and a paired one, so nothing but the network stands in front of the tick");
+}
+
+bool AwaitRequests(const Unanswered& server, int above, std::chrono::milliseconds budget) {
+  const auto deadline = std::chrono::steady_clock::now() + budget;
+  while (server.requests() <= above && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  return server.requests() > above;
+}
+
+/// M11-5 (#289): what `ConsoleIsOnline` makes of nifm's answer. The probe
+/// failing is the console being offline -- libnx documents 0xd46ed for airplane
+/// mode and no network in range -- where it used to be read as online.
+void NifmVerdicts(checks::Checks& c) {
+  using rommsync::sysmodule::ClassifyNifm;
+  using rommsync::sysmodule::NifmVerdict;
+  c.Expect(ClassifyNifm(0, true) == NifmVerdict::kOnline, "connected is online");
+  c.Expect(ClassifyNifm(0, false) == NifmVerdict::kOffline,
+           "answered but not connected -- still associating -- is offline");
+  c.Expect(ClassifyNifm(0xd46ed, true) == NifmVerdict::kOffline,
+           "airplane mode or no network in range is offline, whatever the status left behind");
+  c.Expect(ClassifyNifm(0x2a2, true) == NifmVerdict::kOfflineUnexpected,
+           "any other failure is offline too, and the one worth a log line");
+}
+
+/// M11-5 (#289): a console that boots with no Wi-Fi does not spend its boot
+/// tick on it once the boot wait runs out.
+///
+/// Until this issue the boot wait was the only thing that ever asked the
+/// probe: when its budget ran out the boot tick ran anyway, failed offline and
+/// put the schedule on its backoff -- so the console that came into range a
+/// minute later waited out a retry it had earned by being in a bag. Now the
+/// tick is held for as long as the probe says no, sends nothing, records
+/// nothing, and runs the moment the probe says yes.
+void BootsOffline(checks::Checks& c) {
+  // Everything the worker reaches is declared before the console, so the
+  // engine's destructor joins the worker while all of it is still alive: the
+  // probe keeps polling and the held tick may still be sending at the return.
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<bool> online{false};
+  std::atomic<int> probes{0};
+  Console console(c, "engine-boots-offline");
+  SeedOfflineCard(c, console, /*on_boot=*/true);
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.UseNetworkProbe(
+      [&] {
+        ++probes;
+        return online.load();
+      },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.StartWorker();
+
+  // Well past the boot budget, and several re-checks after it.
+  std::this_thread::sleep_for(std::chrono::milliseconds{600});
+  c.Expect(probes.load() > 12, "the probe is asked after the boot wait gave up, not only during it");
+  c.ExpectEq(server.requests(), 0,
+             "and the boot tick sends nothing while the console is offline -- the boot wait "
+             "running out is not the network coming up");
+  const ipc::Status held = console.Status();
+  c.Expect(held.last_sync_result == ipc::SyncResult::kNever,
+           "nothing is recorded: a tick that never ran did not fail");
+  c.Expect(!held.sync_in_progress, "and nothing is drawn as running");
+  const ipc::LogTail tail = console.Log();
+  int said = 0;
+  for (const std::string& line : tail.lines) {
+    if (line.find(" net.offline ") != std::string::npos &&
+        line.find("waits for the network") != std::string::npos) {
+      ++said;
+    }
+  }
+  c.ExpectEq(said, 1,
+             "the hold says so once, in the line docs/TROUBLESHOOTING.md shows:" + Rendered(tail));
+
+  online = true;
+  c.Expect(AwaitRequests(server, 0, std::chrono::seconds{3}),
+           "and the held tick runs as soon as the probe says yes, on no backoff");
+}
+
+/// M11-5 (#289): a tick due at a wake waits for Wi-Fi to reassociate.
+///
+/// The boot wait is given again after a wake only when the boot tick never saw
+/// the network; a console that had was handed straight to the tick the wake
+/// made due, racing nifm, and earned an offline backoff for it. Here the press
+/// the console slept through is that tick: it sends nothing while the probe says
+/// no, and runs the moment it says yes.
+void WakesOffline(checks::Checks& c) {
+  // Everything the worker reaches is declared before the console, so the
+  // engine's destructor joins the worker while all of it is still alive: the
+  // probe keeps polling and the held tick may still be sending at the return.
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<bool> online{true};
+  std::atomic<int> probes{0};
+  Console console(c, "engine-wakes-offline");
+  SeedOfflineCard(c, console, /*on_boot=*/false);
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.UseNetworkProbe(
+      [&] {
+        ++probes;
+        return online.load();
+      },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.StartWorker();
+  for (int waited = 0; waited < 200 && probes.load() == 0; ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+  }
+  c.Expect(probes.load() > 0, "the boot wait saw the network");
+
+  power_fake::Scripted psc;
+  power_fake::Running watching(psc, console.engine);
+  psc.Deliver(power::State::kSleepReady);
+  c.Expect(psc.AwaitAcks(1, std::chrono::seconds{10}), "the console goes to sleep");
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "Sync now is pressed while asleep");
+  online = false;
+  psc.Deliver(power::State::kMinimumAwake);
+  c.Expect(psc.AwaitAcks(2, std::chrono::seconds{10}), "and it wakes with Wi-Fi not yet back");
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{400});
+  c.ExpectEq(server.requests(), 0,
+             "the tick the wake made due sends nothing while nifm says the console is offline");
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kNever,
+           "and records no failure, so the schedule earns no backoff for it");
+
+  online = true;
+  c.Expect(AwaitRequests(server, 0, std::chrono::seconds{3}),
+           "the tick runs once Wi-Fi is back, rather than having been spent on the race");
+}
+
 /// Every misconfiguration docs/TROUBLESHOOTING.md answers that needs no server.
 ///
 /// Three consoles, because each is a different section of the guide and a
@@ -3153,6 +3389,63 @@ int ServerDisabled(http::HttpClient& client, const std::string& base) {
 
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();
+}
+
+/// #304: Y on the log screen writes one file a bug report can carry -- through
+/// the table the console runs, against a card, with the platform's facts
+/// injected the way `main.cpp` injects them -- and no secret on the card is in
+/// it.
+void Diagnostics(checks::Checks& c) {
+  rlog::Reset();
+  Console console(c, "engine-diagnostics");
+  const std::string token = "tok3n-in-token-dat-SECRET";
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = https://romm.example.com\n"
+                                 "[sync]\nstates = true\n"),
+           "a configured console");
+  c.Expect(console.sandbox.Write("/config/rommsync/token.dat", token + "\n"),
+           "with a token on the card");
+  c.Expect(console.sandbox.Write("/config/rommsync/rommsync.log",
+                                 "1 info boot rommsync-nx/0.9.0\n2 info sync.tick ok\n"),
+           "and a log");
+  console.sandbox.MakeDirs("/atmosphere/crash_reports");
+  c.Expect(console.sandbox.Write("/atmosphere/crash_reports/01795000600_4200000000524d53.log",
+                                 "registers and a stack"),
+           "and a crash of ours");
+  c.Expect(console.sandbox.Write("/atmosphere/crash_reports/01795000700_0100000000001000.log",
+                                 "someone else's"),
+           "and one of someone else's");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  sysmodule::PlatformFacts facts;
+  facts.hos = "19.0.1";
+  facts.libnx = "4.10.0-1";
+  facts.atmosphere = "not read: sys-rommsync holds no spl: grant";
+  console.engine.UsePlatformFacts(facts);
+
+  std::string response;
+  c.Expect(console.Call(ipc::Command::kWriteDiagnostics,
+                        ipc::EncodeDiagnosticsRequest({"0.9.0", ipc::kVersion, "v2.5.4"}),
+                        &response) == ipc::Error::kOk,
+           "WriteDiagnostics writes the bundle");
+  const ipc::Decoded<ipc::DiagnosticsResult> answer = ipc::DecodeDiagnosticsResult(response);
+  c.Expect(answer.ok() && answer.value.sd_path.rfind("/config/rommsync/diagnostics-", 0) == 0,
+           "and answers where it is, as a card reader shows it: " + answer.value.sd_path);
+  const std::string bundle = console.sandbox.Read(answer.value.sd_path);
+  c.Expect(!bundle.empty(), "the file is there");
+  for (const char* expected :
+       {"overlay = 0.9.0", "libultrahand = v2.5.4", "hos = 19.0.1", "libnx = 4.10.0-1",
+        "spl: grant", "url = https://romm.example.com", "states = true", "sync.tick ok",
+        "01795000600_4200000000524d53.log", "measured = no"}) {
+    c.Expect(bundle.find(expected) != std::string::npos,
+             std::string("the bundle carries \"") + expected + "\"");
+  }
+  c.Expect(bundle.find(token) == std::string::npos && bundle.find("SECRET") == std::string::npos,
+           "token.dat's token is not in it");
+  c.Expect(bundle.find("0100000000001000") == std::string::npos,
+           "nor another program's crash");
 }
 
 void Commands(checks::Checks& c) {
@@ -4654,6 +4947,10 @@ class TickLines final : public rlog::Sink {
 /// What it stands for is a user launching a game while a tick is under way: the
 /// probe said no when the tick started, and says yes before the first save is
 /// placed. Also records every URL, for "nothing more went out".
+///
+/// The launch waits for `Answered`: `SyncNow` wakes the worker before it asks
+/// the probe, and a worker that reached the library first would have the press
+/// answered "held for the game" -- the test racing itself, not the engine.
 class LaunchesMidTick final : public http::HttpClient {
  public:
   LaunchesMidTick(http::HttpClient& inner, std::atomic<bool>& running)
@@ -4662,6 +4959,10 @@ class LaunchesMidTick final : public http::HttpClient {
   http::Result Send(const http::Request& request) override {
     Record(request.url);
     if (request.url.find("/api/roms") != std::string::npos && armed_.exchange(false)) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+      while (!answered_.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+      }
       running_ = true;
     }
     return inner_.Send(request);
@@ -4673,7 +4974,13 @@ class LaunchesMidTick final : public http::HttpClient {
     return inner_.Download(request, target);
   }
 
-  void Arm() { armed_ = true; }
+  void Arm() {
+    answered_ = false;
+    armed_ = true;
+  }
+
+  /// The press that started the armed tick has its answer; the game may start.
+  void Answered() { answered_ = true; }
 
   std::vector<std::string> urls() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -4689,6 +4996,7 @@ class LaunchesMidTick final : public http::HttpClient {
   http::HttpClient& inner_;
   std::atomic<bool>& running_;
   std::atomic<bool> armed_{false};
+  std::atomic<bool> answered_{false};
   mutable std::mutex mutex_;
   std::vector<std::string> urls_;
 };
@@ -4854,8 +5162,10 @@ int Foreground(http::HttpClient& client, const std::string& base) {
            "a second save the server does not have");
   const std::size_t asked_before = counted.urls().size();
   counted.Arm();
-  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
-           "with no game running, Sync now starts a tick");
+  const ipc::SyncOutcome pressed = console.SyncNow();
+  counted.Answered();
+  c.Expect(pressed == ipc::SyncOutcome::kAccepted,
+           std::string("with no game running, Sync now starts a tick: ") + ipc::ToString(pressed));
   const std::chrono::steady_clock::time_point launched_by =
       std::chrono::steady_clock::now() + std::chrono::seconds{30};
   while (!running.load() && std::chrono::steady_clock::now() < launched_by) {
@@ -5147,6 +5457,17 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
              "the one whose bytes are nowhere else stayed, untouched");
   c.ExpectEq(console.sandbox.Read(backup(100)), newest, "and so did the newest");
   c.Expect(Logged(log, "backup.pruned"), "the log says what was pruned:" + Rendered(log));
+
+  // And the status screen says the same numbers (#316): what is left, and the
+  // one kept because no other copy of its bytes exists.
+  const ipc::EngineSnapshot status = console.engine.Snapshot();
+  c.Expect(status.backup.measured, "the prune's report reaches the status");
+  c.ExpectEq(status.backup.backups, std::int64_t{2}, "two backups are left");
+  c.ExpectEq(status.backup.bytes, static_cast<std::int64_t>(unique.size() + newest.size()),
+             "and their bytes");
+  c.ExpectEq(status.backup.kept_unique, std::int64_t{1},
+             "one of them kept only because it is the only copy");
+  c.Expect(!status.backup.over_cap, "and with no cap, nothing is over it");
 
   harness::DeleteSave(client, base, fixture, uploaded.id);
   harness::DeleteDevice(client, base, fixture, device_id);
@@ -7434,6 +7755,262 @@ int KeepLocalOvertaken(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M11-17 (#301)'s acceptance, through the whole engine against RomM 5.4.0:
+/// with `[sync] play_sessions = off` every completion carries an empty
+/// `play_sessions[]` and `play.db` is never written -- not even stamped. Then
+/// the overlay's press turns it on, and play that straddled the switch is not
+/// reported (the window would open at a stamp from before it was off), while
+/// play after it is.
+///
+/// Every tick changes the save, so each one negotiates and completes: a
+/// completion is the request a session would ride on, and a tick that made
+/// none would pass the "carries nothing" checks by never asking.
+int PlaySessionsOff(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-play-off");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::vector<std::int64_t> before = SaveIdsFor(client, base, fixture, rom.id);
+  const std::string stamp = harness::UniqueSlot("play-off");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Intercepting wire(client);
+  std::mutex bodies_mutex;
+  std::vector<std::string> completions;
+  wire.Use([&bodies_mutex, &completions](const http::Request& request) -> std::optional<http::Result> {
+    if (request.method == http::Method::kPost &&
+        request.url.find("/api/sync/sessions/") != std::string::npos &&
+        request.url.find("/complete") != std::string::npos) {
+      std::lock_guard<std::mutex> lock(bodies_mutex);
+      completions.push_back(request.body);
+    }
+    return std::nullopt;
+  });
+  const auto taken = [&bodies_mutex, &completions]() {
+    std::lock_guard<std::mutex> lock(bodies_mutex);
+    std::vector<std::string> out;
+    out.swap(completions);
+    return out;
+  };
+
+  Console console(c, "engine-play-off");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 console.sandbox.Read("/config/rommsync/config.ini") +
+                                     "play_sessions = off\n"),
+           "play sessions are off in config.ini");
+  const std::string save = "/tico/saves/nes/nova.srm";
+  console.sandbox.MakeDirs("/tico/saves/nes");
+  console.sandbox.SeedSave(save, "nova, first synced " + stamp + "\n");
+
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&wire, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  c.Expect(!console.Configured().config.sync.play_sessions,
+           "the running engine reads play_sessions = off");
+
+  // Each completion a tick made, and whether any carried a session.
+  const auto carried = [](const std::vector<std::string>& bodies, std::string* rendered) {
+    bool any = false;
+    for (const std::string& body : bodies) {
+      any = any || body.find("\"play_sessions\":[]") == std::string::npos;
+      *rendered += "\n  " + body;
+    }
+    return any;
+  };
+  const auto play = [&console, &c, &save](const std::string& bytes) {
+    // Past a whole second, so the save's mtime is after any window edge the
+    // tick before it stamped.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1100});
+    c.Expect(console.sandbox.Reseed(save, bytes), "the game writes its save");
+  };
+
+  // 1-2. Off: the first sync, then play while off.
+  for (int n = 1; n <= 2; ++n) {
+    if (n == 2) {
+      play("nova, played while play sessions are off " + stamp + "\n");
+    }
+    const std::string what = "off, tick " + std::to_string(n);
+    if (!TickOnce(console, ticks, c, what)) {
+      break;
+    }
+    const std::vector<std::string> bodies = taken();
+    std::string rendered;
+    c.Expect(!bodies.empty(), what + ": the tick completed a sync session");
+    c.Expect(!carried(bodies, &rendered),
+             what + ": and no completion carried a play session:" + rendered);
+    c.Expect(!console.sandbox.Exists("/config/rommsync/play.db"),
+             what + ": and play.db was never written" + Rendered(console.Log()));
+  }
+
+  // 3. Played, then turned on from the settings screen: that play straddled the
+  // switch and is not reported, but the window now starts here.
+  play("nova, played across the switch " + stamp + "\n");
+  c.Expect(console.Set(Edit("sync", "play_sessions", "on")).outcome == ipc::WriteOutcome::kApplied,
+           "the settings screen's press turns play sessions on");
+  if (TickOnce(console, ticks, c, "on, tick 3")) {
+    std::string rendered;
+    c.Expect(!carried(taken(), &rendered),
+             "the tick after turning it on reports nothing played while it was off:" + rendered);
+    c.Expect(console.sandbox.Exists("/config/rommsync/play.db"),
+             "and stamps the window in play.db, now that it is on");
+  }
+
+  // 4. Played with it on: reported.
+  play("nova, played with play sessions on " + stamp + "\n");
+  if (TickOnce(console, ticks, c, "on, tick 4")) {
+    std::string rendered;
+    c.Expect(carried(taken(), &rendered),
+             "play with it on rides the completion, as before #301:" + rendered +
+                 Rendered(console.Log()));
+  }
+
+  for (const std::int64_t id : SaveIdsFor(client, base, fixture, rom.id)) {
+    if (std::find(before.begin(), before.end(), id) == before.end()) {
+      harness::DeleteSave(client, base, fixture, id);
+    }
+  }
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// A client whose trust can be repointed: the curl backend fixes its options
+/// at construction, so each `UseCaTrust` builds a fresh one with
+/// `ClientOptions::ca_bundle_path` set -- the field the sysmodule's own
+/// transport honours the same way (`ssl_http_client.cpp`).
+class Retrusting final : public http::HttpClient {
+ public:
+  Retrusting() : inner_(rig::MakeClient()) {}
+
+  void Trust(const std::string& path) {
+    http::ClientOptions options;
+    options.ca_bundle_path = path;
+    std::shared_ptr<http::HttpClient> next(rig::MakeClient(options));
+    std::lock_guard<std::mutex> lock(mutex_);
+    inner_ = std::move(next);
+  }
+
+  http::Result Send(const http::Request& request) override { return Current()->Send(request); }
+  http::Result Download(const http::Request& request,
+                        const http::DownloadTarget& target) override {
+    return Current()->Download(request, target);
+  }
+
+ private:
+  std::shared_ptr<http::HttpClient> Current() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return inner_;
+  }
+
+  std::mutex mutex_;
+  std::shared_ptr<http::HttpClient> inner_;
+};
+
+/// #288's acceptance, through the TLS terminator in front of the fixture RomM
+/// (`scripts/orca/tls-fixture.sh`, started by `test_tls_fixture.sh ca_file`):
+/// a console pointed at its `https://` origin pairs and syncs only with
+/// `[server] ca_file` naming the fixture's certificate. No CA file and the
+/// wrong one both fail the handshake, and neither leaves a token behind.
+int CaFile(http::HttpClient& plain, const std::string& base) {
+  rig::Checks c;
+  const char* tls_base = std::getenv("TLS_BASE_URL");
+  const char* right = std::getenv("ROMMSYNC_TLS_CA");
+  const char* wrong = std::getenv("ROMMSYNC_TLS_WRONG_CA");
+  if (tls_base == nullptr || right == nullptr || wrong == nullptr) {
+    std::cerr << "run through tests/test_tls_fixture.sh ca_file, which starts the terminator\n";
+    return 1;
+  }
+  const std::string origin = tls_base;
+
+  const auto boot = [&](Console& console, Retrusting& client, const std::string& ca_line) {
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + origin + "\n" + ca_line +
+                                       "\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                       "on_boot = false\nstates = false\n"),
+             "the console points at the TLS terminator" +
+                 (ca_line.empty() ? std::string() : " with " + ca_line));
+    console.engine.UsePairingBackend(Backend(client));
+    console.Boot();
+    console.engine.UseCaTrust([&client](const std::string& path) { client.Trust(path); });
+  };
+
+  // --- refused: no CA file, and somebody else's -----------------------------
+  for (const std::string& ca_line : {std::string(), "ca_file = " + std::string(wrong)}) {
+    const std::string what = ca_line.empty() ? "with no ca_file" : "with the wrong ca_file";
+    Retrusting client;
+    Console console(c, ca_line.empty() ? "engine-ca-none" : "engine-ca-wrong");
+    boot(console, client, ca_line);
+    auth::PairingStatus started;
+    c.Expect(console.StartPair(&started) == ipc::Error::kOk, what + ": StartPair is answered");
+    const auth::PairingStatus settled = Terminal(console, c);
+    c.Expect(settled.state == auth::PairingState::kFailed,
+             what + ": the attempt fails (" + auth::ToString(settled.state) + ": " +
+                 settled.message + ")");
+    c.Expect(settled.user_code.empty(), what + ": and never reaches a code");
+    c.Expect(!console.sandbox.Exists("/config/rommsync/token.dat"),
+             what + ": and writes no token");
+  }
+
+  // --- accepted: the fixture's own certificate --------------------------------
+  Retrusting client;
+  Console console(c, "engine-ca-right");
+  boot(console, client, "ca_file = " + std::string(right));
+  const auth::PairingStatus showing = BeginAndShow(console, c);
+  c.Expect(showing.state == auth::PairingState::kPending,
+           std::string("with the fixture's ca_file the attempt reaches a code (") +
+               auth::ToString(showing.state) + ": " + showing.message + ")");
+  if (showing.user_code.empty()) {
+    return c.failures();
+  }
+  // The approval is the user's browser, so it goes the plain way in.
+  const http::Result approved = rig::ApproveDeviceCode(plain, base, showing.user_code, Scopes());
+  c.Expect(approved.successful(),
+           "approving the code -- HTTP " + std::to_string(approved.response.status));
+  const auth::PairingStatus granted = Terminal(console, c);
+  c.Expect(granted.state == auth::PairingState::kApproved,
+           std::string("and it pairs over verified TLS (") + auth::ToString(granted.state) +
+               ": " + granted.message + ")");
+  if (granted.state != auth::PairingState::kApproved) {
+    return c.failures();
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UseServer(&client, "");
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  TickOnce(console, ticks, c, "a sync through the TLS terminator");
+
+  const auth::LoadedToken stored = auth::LoadToken(console.directory + auth::kTokenFileName);
+  if (stored.ok()) {
+    harness::Fixture fixture;
+    if (harness::LoadFixture(&fixture)) {
+      harness::DeleteDevice(plain, base, fixture, stored.value.device_id);
+    }
+  }
+  return c.failures();
+}
+
 /// The scenarios that need the docker RomM, by name. A table rather than a
 /// second `if` chain, so the list of them is written down once.
 struct RigScenario {
@@ -7476,6 +8053,8 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"keep_local", KeepLocalChoice},
       {"keep_local_overtaken", KeepLocalOvertaken},
       {"keep_local_switched", KeepLocalSwitched},
+      {"play_off", PlaySessionsOff},
+      {"ca_file", CaFile},
   };
   for (const RigScenario& scenario : kRigScenarios) {
     if (name == scenario.name) {
@@ -7507,6 +8086,8 @@ int main(int argc, char** argv) {
     Corrupt(checks);
   } else if (scenario == "config") {
     ConfigWrites(checks);
+  } else if (scenario == "ca_trust") {
+    CaTrust(checks);
   } else if (scenario == "commit") {
     InterruptedCommit(checks);
   } else if (scenario == "unpairs") {
@@ -7521,6 +8102,12 @@ int main(int argc, char** argv) {
     Reenable(checks);
   } else if (scenario == "sleeps") {
     Sleeps(checks);
+  } else if (scenario == "nifm_verdict") {
+    NifmVerdicts(checks);
+  } else if (scenario == "boots_offline") {
+    BootsOffline(checks);
+  } else if (scenario == "wakes_offline") {
+    WakesOffline(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
   } else if (scenario == "restore_polled") {
@@ -7533,6 +8120,8 @@ int main(int argc, char** argv) {
     KeepLocalServer(checks);
   } else if (scenario == "keep_local_cancel") {
     KeepLocalCancel(checks);
+  } else if (scenario == "diagnostics") {
+    Diagnostics(checks);
   } else if (scenario == "keep_local_cancel_race") {
     KeepLocalCancelRace(checks);
   } else if (scenario == "syncnow") {

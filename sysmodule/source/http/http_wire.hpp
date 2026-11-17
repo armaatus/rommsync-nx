@@ -88,11 +88,18 @@ class Connector {
 
   /// Open a connection, or explain why not. `error` is one of
   /// `http::Error::{kUnresolvedHost, kConnectFailed, kTls, kTimeout,
-  /// kTransport}` and `message` is for the log, never for a user.
+  /// kTransport, kCanceled}` and `message` is for the log, never for a user.
+  ///
+  /// `cancel` is the request's, possibly null. Every phase of an open -- the
+  /// name lookup, the connect and the handshake -- has to end soon after it
+  /// fires, because a console going to sleep waits `kQuiesceBudget` for this
+  /// call and no longer (M11-6, #290): a bsd or `ssl` call still in flight past
+  /// the acknowledgement is the crash #208 is about.
   virtual std::unique_ptr<Connection> Open(const Origin& origin,
                                            std::chrono::milliseconds connect_timeout,
                                            const http::ClientOptions& options,
-                                           http::Error* error, std::string* message) = 0;
+                                           const http::CancelToken* cancel, http::Error* error,
+                                           std::string* message) = 0;
 
  protected:
   Connector() = default;

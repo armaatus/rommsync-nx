@@ -1,5 +1,6 @@
 #include "rommsync/overlay_log_view.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -38,6 +39,35 @@ LogView RenderLog(const ipc::LogTail& tail) {
   // take it for the first thing that happened.
   view.headline = "The last " + shown + " of " + std::to_string(tail.total) + " lines";
   return view;
+}
+
+std::size_t ScrollLog(std::size_t back, int rows, std::size_t lines, std::size_t room) {
+  const std::size_t most = lines > room ? lines - room : 0;
+  std::size_t moved = back > most ? most : back;
+  if (rows < 0) {
+    const std::size_t up = static_cast<std::size_t>(-static_cast<long long>(rows));
+    moved = most - moved < up ? most : moved + up;
+  } else {
+    const std::size_t down = static_cast<std::size_t>(rows);
+    moved = moved < down ? 0 : moved - down;
+  }
+  return moved;
+}
+
+LogNotice RenderDiagnostics(DiagnosticsOutcome outcome, const std::string& sd_path) {
+  switch (outcome) {
+    case DiagnosticsOutcome::kWritten:
+      // The path a card reader shows, because the next thing the user does is
+      // find this file on a computer and drag it into a bug report.
+      return {"Wrote " + sd_path + " -- attach it to your bug report", Tone::kGood};
+    case DiagnosticsOutcome::kWriteFailed:
+      return {"Could not write diagnostics: the SD card refused the file", Tone::kBad};
+    case DiagnosticsOutcome::kOutdated:
+      return {"This sysmodule cannot write diagnostics; update sys-rommsync", Tone::kWarn};
+    case DiagnosticsOutcome::kNoAnswer:
+      break;
+  }
+  return {"The sysmodule did not answer; look in /config/rommsync/ in a moment", Tone::kWarn};
 }
 
 LogView RenderLogUnreachable(Link link, std::uint32_t sysmodule_interface) {

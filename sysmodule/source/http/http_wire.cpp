@@ -1072,7 +1072,8 @@ Result WireHttpClient::OneHop(const Request& request, const std::string& url, Bo
   Error open_error = Error::kNone;
   std::string open_message;
   std::unique_ptr<Connection> connection =
-      connector_.Open(parsed.origin, request.connect_timeout, options_, &open_error, &open_message);
+      connector_.Open(parsed.origin, request.connect_timeout, options_, request.cancel,
+                      &open_error, &open_message);
   if (connection == nullptr) {
     result.error = open_error == Error::kNone ? Error::kConnectFailed : open_error;
     result.message = std::move(open_message);

@@ -19,6 +19,13 @@
 #                                  pinned to TLS 1.2, which is the ceiling of
 #                                  libnx's SslVersion_Auto and therefore the only
 #                                  version the probe's handshake can rely on.
+#   test_tls_fixture.sh ca_file ENGINE
+#                                  #288: the engine pairs and syncs through the
+#                                  terminator only when `[server] ca_file` names
+#                                  its certificate -- not with none, and not with
+#                                  a second self-signed one that carries the same
+#                                  names. ENGINE is the test_engine binary; this
+#                                  starts the terminator and hands it the paths.
 #
 # `isolated` and `cert` need nothing but the checkout and openssl, so they never
 # skip. `serves` needs Docker and this worktree's RomM, so it skips without one.
@@ -136,9 +143,58 @@ phase_serves() {
   fail "the TLS fixture never answered: $out"
 }
 
+# Up and answering a verified 200, or skip: what `serves` waits for, shared.
+await_terminator() {
+  command -v docker >/dev/null 2>&1 || skip "no docker"
+  docker info >/dev/null 2>&1 || skip "docker daemon not running"
+  command -v curl >/dev/null 2>&1 || skip "no curl"
+  local started
+  if ! started="$("$FIXTURE" up 2>&1)"; then
+    echo "$started" >&2
+    skip "could not start the TLS fixture (is the rig up? compose.sh up -d)"
+  fi
+  local deadline=$((SECONDS + 60))
+  while [ $SECONDS -lt $deadline ]; do
+    "$FIXTURE" check >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  fail "the TLS fixture never answered: $("$FIXTURE" check 2>&1)"
+}
+
+phase_ca_file() {
+  local engine="${1:-}"
+  [ -x "$engine" ] || fail "usage: $0 ca_file <test_engine>"
+  command -v openssl >/dev/null 2>&1 || skip "no openssl"
+
+  [ -f "$REPO_ROOT/.env" ] || "$REPO_ROOT/scripts/orca/env.sh" >/dev/null
+  # shellcheck disable=SC1091
+  set -a; . "$REPO_ROOT/.env"; set +a
+  [ -n "${TLS_BASE_URL:-}" ] || fail "no TLS_BASE_URL in .env"
+  await_terminator
+
+  # Somebody else's certificate, with every name the real one carries: so the
+  # refusal it earns is the CA's, not a hostname mismatch.
+  local scratch
+  scratch="$(mktemp -d)"
+  # Expanded now: `scratch` is local, and gone by the time EXIT fires.
+  # shellcheck disable=SC2064
+  trap "rm -rf '$scratch'" EXIT
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$scratch/wrong.key" \
+      -out "$scratch/wrong.crt" -days 1 -subj "/CN=$CERT_NAME/O=not the fixture" \
+      -addext "subjectAltName=DNS:$CERT_NAME,DNS:localhost,IP:127.0.0.1" \
+      -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1 ||
+    fail "openssl could not mint the wrong certificate"
+
+  TLS_BASE_URL="$TLS_BASE_URL" \
+  ROMMSYNC_TLS_CA="$REPO_ROOT/server/testing/tls/generated/server.crt" \
+  ROMMSYNC_TLS_WRONG_CA="$scratch/wrong.crt" \
+    "$engine" ca_file
+}
+
 case "${1:-}" in
   isolated) phase_isolated ;;
   cert)     phase_cert ;;
   serves)   phase_serves ;;
-  *)        echo "usage: $0 {isolated|cert|serves}" >&2; exit 2 ;;
+  ca_file)  phase_ca_file "${2:-}" ;;
+  *)        echo "usage: $0 {isolated|cert|serves|ca_file ENGINE}" >&2; exit 2 ;;
 esac

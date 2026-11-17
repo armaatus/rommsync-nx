@@ -6,6 +6,7 @@
 // panel's width -- is here, where `ctest -R overlay.log` records it.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #include "draw_list.hpp"
@@ -13,8 +14,9 @@
 
 namespace rommsync::overlay {
 
-/// Draw `view` into the bounds a `CustomDrawer` was handed.
-void PaintLog(const LogView& view, const Palette& palette, DrawList& out, std::int32_t x,
+/// Draw `view` into the bounds a `CustomDrawer` was handed, and answer how many
+/// log lines the panel had room for -- what `ScrollLog` clamps to (#304).
+std::size_t PaintLog(const LogView& view, const Palette& palette, DrawList& out, std::int32_t x,
               std::int32_t y, std::int32_t width, std::int32_t height);
 
 }  // namespace rommsync::overlay

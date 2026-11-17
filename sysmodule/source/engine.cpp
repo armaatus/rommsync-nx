@@ -17,7 +17,9 @@
 #include "rommsync/config.hpp"
 #include "rommsync/conflict_log.hpp"
 #include "rommsync/conflict_record.hpp"
+#include "rommsync/core.hpp"
 #include "rommsync/device_identity.hpp"
+#include "rommsync/diagnostics.hpp"
 #include "rommsync/download.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/list_service.hpp"
@@ -163,14 +165,96 @@ void SdEngine::UseServer(http::HttpClient* client, std::string bearer_token) {
   lists_.UseAuthObserver([this](auth::Answer answer) { ObserveAnswer(answer); });
 }
 
-void SdEngine::UseNetworkProbe(NetworkProbe probe) {
+void SdEngine::UseNetworkProbe(NetworkProbe probe, std::chrono::milliseconds budget,
+                               std::chrono::milliseconds poll,
+                               std::chrono::milliseconds idle_poll) {
   std::lock_guard<std::mutex> lock(mutex_);
   network_probe_ = std::move(probe);
+  network_budget_ = budget;
+  network_poll_ = poll;
+  network_idle_poll_ = idle_poll;
 }
 
 void SdEngine::UseNetworkClock(NetworkClock clock) {
   std::lock_guard<std::mutex> lock(mutex_);
   network_clock_ = std::move(clock);
+}
+
+void SdEngine::UseCaTrust(CaTrust trust) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ca_trust_ = std::move(trust);
+  if (ca_trust_) {
+    ca_trust_(ConfigSnapshot()->server.ca_file);
+  }
+}
+
+void SdEngine::UsePlatformFacts(PlatformFacts facts) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  platform_facts_ = std::move(facts);
+}
+
+ipc::Error SdEngine::WriteDiagnostics(const ipc::DiagnosticsRequest& request,
+                                      ipc::DiagnosticsResult* result) {
+  diag::Bundle bundle;
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  bundle.written_at = now;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    bundle.versions.hos = platform_facts_.hos;
+    bundle.versions.libnx = platform_facts_.libnx;
+    bundle.versions.atmosphere = platform_facts_.atmosphere;
+    bundle.versions.emummc = platform_facts_.emummc;
+  }
+  bundle.versions.overlay = request.overlay;
+  bundle.versions.overlay_interface = request.overlay_interface;
+  bundle.versions.libultrahand = request.libultrahand;
+  bundle.versions.sysmodule = version();
+
+  // `GetStatus`' reading, so the bundle and the status screen cannot disagree
+  // about the console they describe -- and #316's backup numbers with it,
+  // never a second walk of `.backup/`.
+  bundle.engine = Snapshot();
+  const config::Config& settings = config();
+  bundle.enabled = settings.sync.enabled;
+  bundle.configured = settings.configured();
+  for (const config::Diagnostic& diagnostic : config_diagnostics()) {
+    if (diagnostic.severity == config::Severity::kError) {
+      ++bundle.config_errors;
+    }
+  }
+
+  bundle.config_path = PathTo(config::kConfigFileName);
+  bundle.state_path = PathTo(state::kStateFileName);
+  const std::string log_path = PathTo(log::kLogFileName);
+  bundle.log_paths = {log::PreviousLogPathFor(log_path), log_path};
+  std::vector<log::Line> tail;
+  log::Tail(log::kTailLines, &tail);
+  for (log::Line& line : tail) {
+    bundle.memory_tail.push_back(std::move(line.text));
+  }
+
+  if (card_ == nullptr) {
+    bundle.crash_note = "not listed: this build cannot open the SD card";
+  } else {
+    const fs::Listing listing = card_->List(diag::kCrashReportsSdDir);
+    if (listing.ok() || listing.error == fs::ListError::kTooManyEntries) {
+      bundle.crashes = diag::OurCrashReports(listing);
+    } else if (listing.error != fs::ListError::kMissing) {
+      bundle.crash_note = std::string("not listed: ") + fs::ToString(listing.error);
+    }
+  }
+
+  const std::string name = diag::FileName(now);
+  const io::WriteResult written = diag::Write(PathTo(name.c_str()), bundle);
+  if (!written.ok()) {
+    log::Warn(log::Event::kDiagnostics, "not written: " + written.message);
+    return ipc::Error::kWriteFailed;
+  }
+  result->sd_path = std::string(kConfigSdDir) + "/" + name;
+  log::Info(log::Event::kDiagnostics, "written: " + result->sd_path);
+  return ipc::Error::kOk;
 }
 
 sync::ClockCheck SdEngine::LocalClock() const {
@@ -551,6 +635,10 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
     config_ = std::make_shared<const config::Config>(std::move(loaded.value));
   }
   server_tag_ = binding::TagOf(binding::IdentityOf(ConfigSnapshot()->server.url));
+  // Before anything can send a request on this configuration (#288).
+  if (ca_trust_) {
+    ca_trust_(ConfigSnapshot()->server.ca_file);
+  }
   // In the same breath, so a changed interval takes effect with no reboot and a
   // changed `server.url` lifts a TLS park (`sync::Scheduler::Reconfigure`).
   scheduler_.Reconfigure(ScheduleFrom(*ConfigSnapshot()));
@@ -715,6 +803,7 @@ ipc::EngineSnapshot SdEngine::Snapshot() const {
     snapshot.server_supported = !server_too_old_;
     snapshot.clock_trusted = clock_check_.trusted();
     snapshot.clock_skew_seconds = clock_check_.skew_seconds;
+    snapshot.backup = backup_usage_;
   }
   // M3-2 (#19): these two come off the queue on the card rather than being the
   // zero a console with no engine reports. `pending()` counts what the worker
@@ -961,6 +1050,11 @@ ipc::Error SdEngine::ApplyConfigEdit(const ipc::ConfigEdit& edit,
   //
   // This is what makes the change take effect with no reboot: `GetStatus` and
   // `GetConfig` read `config_`, and it is now the new one.
+  //
+  // The CA file is checked as boot checks it (#288), outside the lock because
+  // it reads the card: `ParseConfig` is pure, and a `ca_file` that went missing
+  // since boot would otherwise vanish from the settings screen's complaints.
+  config::CheckCaFile(&parsed);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     AdoptConfigLocked(std::move(parsed));
@@ -1078,22 +1172,34 @@ void SdEngine::ObserveAnswer(auth::Answer answer) {
   auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
 }
 
+bool SdEngine::NetworkUp() const {
+  NetworkProbe probe;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    probe = network_probe_;
+  }
+  return !probe || probe();
+}
+
 bool SdEngine::AwaitNetwork() {
   // The wait for the network happens **here**, on this thread, and never in
   // `main`: a console that comes up with no Wi-Fi must not hold boot
   // (CLAUDE.md, docs/ARCHITECTURE.md §1). A null probe is "the network is up",
   // which is what every host build is.
   NetworkProbe probe;
+  std::chrono::milliseconds budget{0};
+  std::chrono::milliseconds poll{0};
   {
     std::lock_guard<std::mutex> lock(mutex_);
     probe = network_probe_;
+    budget = network_budget_;
+    poll = network_poll_;
   }
   if (!probe) {
     return true;
   }
 
-  const std::chrono::steady_clock::time_point deadline =
-      std::chrono::steady_clock::now() + kNetworkWaitBudget;
+  const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + budget;
   std::unique_lock<std::mutex> lock(mutex_);
   // `suspended_` as well as `stopping_`, and for the same reason: this runs
   // before the worker's loop, so a console that sleeps during the boot wait
@@ -1122,7 +1228,7 @@ bool SdEngine::AwaitNetwork() {
     }
     // `wait_for` rather than a sleep, so a shutdown cuts this short instead of
     // costing the destructor the rest of the poll interval.
-    wake_.wait_for(lock, kNetworkPollInterval,
+    wake_.wait_for(lock, poll,
                    [this] { return stopping_ || suspended_ || restore_pending_; });
   }
   // False when the budget ran out, the process is going away, or the console
@@ -1133,6 +1239,13 @@ bool SdEngine::AwaitNetwork() {
 
 void SdEngine::RunWorker() {
   bool network_seen = AwaitNetwork();
+  if (!network_seen) {
+    // The boot wait already spent the quick pace's budget, so a boot tick held
+    // after it goes straight to the slow one rather than polling two more
+    // minutes. A wait cut short by a sleep is reset at the wake below.
+    std::lock_guard<std::mutex> lock(mutex_);
+    offline_since_ = clock_->Steady() - network_budget_;
+  }
 
   std::unique_lock<std::mutex> lock(mutex_);
   while (!stopping_) {
@@ -1146,6 +1259,11 @@ void SdEngine::RunWorker() {
       quiesced_.notify_all();
       wake_.wait(lock, [this] { return stopping_ || !suspended_; });
       worker_parked_ = false;
+      // A tick held for the network before the sleep is held afresh after it,
+      // on the quick pace: Wi-Fi reassociating at a wake is the case that pace
+      // is for, and the hold says so again rather than going quiet (#289).
+      offline_since_.reset();
+      offline_said_ = false;
       if (!stopping_ && !network_seen) {
         // The boot wait was cut short by the sleep rather than satisfied
         // (`AwaitNetwork` returns which). A console that came up with Wi-Fi not
@@ -1217,6 +1335,44 @@ void SdEngine::RunWorker() {
     // lands while the lock is released below cannot be missed. See `wakes_`.
     const std::uint64_t decided_at = wakes_;
     sync::Decision decision = scheduler_.Poll();
+    if (decision.run()) {
+      // **Every tick waits for the network, not only the boot one** (M11-5,
+      // #289). The boot wait gives up after its budget, and after a wake from a
+      // console that had seen the network it is not given at all -- so a tick
+      // falling due then raced nifm, failed offline, and put the schedule on
+      // its backoff for being in a bag. Held instead, like a tick under a game:
+      // handed back, nothing sent, nothing recorded, and asked again every
+      // `network_poll_` for a budget and every `network_idle_poll_` after it,
+      // so the tick runs within seconds of Wi-Fi coming back. Ahead of the
+      // game check, which is a `pm` call a held tick need not spend.
+      lock.unlock();
+      const bool network_up = NetworkUp();
+      lock.lock();
+      if (!network_up) {
+        scheduler_.Defer(decision.trigger);
+        const std::chrono::steady_clock::time_point now = clock_->Steady();
+        if (!offline_since_) {
+          offline_since_ = now;
+        }
+        const std::chrono::milliseconds pace =
+            now - *offline_since_ < network_budget_ ? network_poll_ : network_idle_poll_;
+        if (!offline_said_) {
+          offline_said_ = true;
+          // Once per hold, as `sync.held` is: a console in a bag all day is one
+          // line, not one per re-check. Outside the lock: it is a card write.
+          lock.unlock();
+          log::Warn(log::Event::kNetOffline,
+                    std::string("the console has no internet connection; the ") +
+                        sync::ToString(decision.trigger) + " tick waits for the network");
+          lock.lock();
+        }
+        decision = sync::Decision{};
+        decision.sleep_for = pace;
+      } else {
+        offline_since_.reset();
+        offline_said_ = false;
+      }
+    }
     if (decision.run()) {
       // Asked only now, when a tick is actually due: a console with nothing to
       // run never asks `pm` anything (#242). And asked **first**, ahead of
@@ -1589,12 +1745,18 @@ void SdEngine::Quiesce() {
   // transport. There is no socket to close -- one is opened per request inside
   // `ssl_http_client.cpp` and closed when the request ends, and there is no
   // listening socket in this process at all, so the waits above are what make it
-  // true that none is open. And releasing the bsd transfer memory means
-  // `socketExit()`, which cannot be undone: `socketInitialize` is not refcounted
-  // and answers `0xF59 AlreadyInitialized` forever afterwards (`main.cpp`
-  // argues the same point about not retrying the transport). Doing it would buy
-  // 116 KiB the kernel keeps mapped either way and cost the network for the rest
-  // of the boot.
+  // true that none is open -- **when they end inside the budget**. That needs
+  // every phase of opening one to end at the cancel too: the name lookup, the
+  // connect and the TLS handshake each did not, until M11-6 (#290), and a sleep
+  // that landed in one was acknowledged with that call still running
+  // (`Connector::Open`). A worker that runs the budget out anyway still gets
+  // the acknowledgement, and the `power.sleep` line above.
+  //
+  // And releasing the bsd transfer memory means `socketExit()`, which cannot be
+  // undone: `socketInitialize` is not refcounted and answers `0xF59
+  // AlreadyInitialized` forever afterwards (`main.cpp` argues the same point
+  // about not retrying the transport). Doing it would buy 116 KiB the kernel
+  // keeps mapped either way and cost the network for the rest of the boot.
   //
   // **Last, and it is the piece parking the worker cannot buy.** A `log::Write`
   // from any thread opens the log file, appends and closes it, so a single line
@@ -1822,7 +1984,14 @@ void SdEngine::StampPlayWindow() {
   // What the foreground was seen doing goes with it: nothing seen before the
   // window opens can have written a save the next window finds (#261).
   static_cast<void>(TakeSightings());
+  if (!play_sessions_on_) {
+    // `[sync] play_sessions = off` (#301): `play.db` is not written at all, not
+    // even stamped, so the next tick with it on stamps instead of deriving.
+    play_window_stale_ = true;
+    return;
+  }
   LogPlayStore(play_.Record({}, std::chrono::system_clock::now()));
+  play_window_stale_ = false;
 }
 
 void SdEngine::LogPlayStore(const play::StoreResult& stored) {
@@ -2377,6 +2546,20 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   // A prune that could not read or remove something is asked again next tick,
   // rather than waiting for the next backup to be written.
   backups_pruned_ = report.warnings.empty();
+  // What the status screen draws (#316). A truncated listing measured only what
+  // it listed, which is still the best number there is: the card holds at
+  // least that, and the log says the listing was cut. A directory that could
+  // not be listed at all -- the one way to warn with no backup found -- measured
+  // nothing, and leaves the last measurement standing rather than a zero.
+  if (report.backups > 0 || report.warnings.empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    backup_usage_.measured = true;
+    backup_usage_.bytes = report.bytes_after;
+    backup_usage_.backups =
+        static_cast<std::int64_t>(report.backups) - static_cast<std::int64_t>(report.pruned);
+    backup_usage_.kept_unique = static_cast<std::int64_t>(report.kept_unique);
+    backup_usage_.over_cap = report.over_cap;
+  }
   log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
   if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap) {
     log::Info(log::Event::kBackupPruned, backup::Describe(report));
@@ -2385,6 +2568,7 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
 
 bool SdEngine::StartTick(TickInputs* inputs) {
   inputs->config = ConfigSnapshot();
+  play_sessions_on_ = inputs->config->sync.play_sessions;
   bool blocked = false;
   // This tick's cancel token, registered before anything is read so that a
   // shutdown or a sleep landing an instant later finds something to fire.
@@ -2673,7 +2857,7 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   // reach `TickOutcome`: the feature writes no save, and a sync tick lost to it
   // would be an optional extra taking hard rule 2's machinery down with it.
   const sync::Timestamp play_now = std::chrono::system_clock::now();
-  if (config.sync.enabled) {
+  if (config.sync.enabled && config.sync.play_sessions && !play_window_stale_) {
     play::Derivation played =
         play::DeriveSessions(ObservationsOf(found.loaded.value), ObservationsOf(found.scanned.saves),
                              play_.last_seen(), play_now);
@@ -2690,7 +2874,9 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
     // `[sync] enabled = false`: nothing is recorded and nothing is sent, because
     // a user who switched save sync off did not ask this console to keep
     // telling a server what they played. The window still moves -- see
-    // `StampPlayWindow`.
+    // `StampPlayWindow`. `[sync] play_sessions = off` (#301) records and sends
+    // nothing either, and leaves `play.db` untouched; the first tick after it
+    // is turned back on lands here too, so its window opens now (`play_window_stale_`).
     StampPlayWindow();
   }
   return found;

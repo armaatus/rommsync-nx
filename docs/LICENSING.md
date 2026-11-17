@@ -1,0 +1,105 @@
+# Licensing
+
+What the release zip is licensed under, and why. The short version:
+
+| Binary | Licence | Why |
+|---|---|---|
+| `ovl-rommsync.ovl` (the overlay) | **GPL-2.0** | it statically links libultrahand, which is GPL-2.0 |
+| `exefs.nsp` (sys-rommsync, the sysmodule) | **MIT** | it links nothing that reaches it under the GPL |
+| this repository's own source | **MIT** | [`LICENSE`](../LICENSE) |
+
+The zip ships all of it under `config/rommsync/`: `LICENSE` (MIT),
+`COPYING.GPL-2.0`, and `THIRD_PARTY_NOTICES.txt`, which
+[`scripts/notices.sh`](../scripts/notices.sh) generates from
+[`packaging/third_party.manifest`](../packaging/third_party.manifest) (#300).
+Nothing goes to the SD root: that directory belongs to every piece of homebrew
+on the card, and a `README.txt` or `LICENSE` there is somebody else's file.
+
+This is an engineering reading of the licences, written down so the next change
+to what is linked starts from it rather than re-deriving it. It is not legal
+advice.
+
+## What is linked, and under what
+
+Read off the linker's own map files (`sysmodule/build/sys-rommsync.map`,
+`overlay/build/ovl-rommsync.map`), not off the Makefiles alone: the specs file
+links libc, libstdc++ and libgcc without any `-l` naming them. Versions are the
+pinned image's (`devkitpro/devkita64:20260219`, [`scripts/toolchain.sh`](../scripts/toolchain.sh))
+and the submodule pointer's.
+
+| Component | Version | Licence | Taken as | In |
+|---|---|---|---|---|
+| libultrahand (libtesla, libultra) | v2.5.4 | GPLv2; libtesla GPL-2.0-or-later; libultra GPLv2 *and* CC-BY-4.0 | GPL-2.0-only | overlay |
+| cJSON (vendored in libultrahand) | 1.7.18 | MIT | MIT | overlay |
+| stb_truetype (vendored in libtesla) | 1.26 | MIT OR Unlicense | MIT | overlay |
+| Mbed TLS | 2.28.10 | Apache-2.0 OR GPL-2.0-or-later | **GPL-2.0-or-later** | overlay |
+| curl | 7.69.1 | curl (MIT-style) | curl | overlay |
+| zlib, minizip | 1.3.1 | Zlib | Zlib | overlay |
+| libnx | 4.12.0 | ISC | ISC | both |
+| newlib, libsysbase | 4.6.0.20260123 | newlib's collection (BSD-style) | as is | both |
+| libstdc++, libgcc | 15.2.0 | GPL-3.0-or-later WITH GCC-exception-3.1 | as is | both |
+
+The overlay links curl, zlib, minizip and Mbed TLS only because libultrahand's
+objects reference them (its updater and package handling); ovl-rommsync itself
+does no networking ([`switch.mk`](../switch.mk), the `ROMMSYNC_ULTRAHAND` block).
+
+## The conclusions
+
+**libultrahand is GPL-2.0, and the overlay binary with it.** Its top-level
+`LICENSE` is the GPL-2.0 text and its README says "Licensed under GPLv2", with
+no "or any later version" grant at that level. libtesla's header does grant
+"or later", and libultra's files say "Licensed under both GPLv2 and CC-BY-4.0";
+the narrowest common reading is GPL-2.0-only, and that is the one taken. A
+statically linked `.ovl` is one work, so the binary as a whole is distributed
+under GPL-2.0. Everything else in it has to be compatible with that, and is:
+
+- **Mbed TLS** is the one that needed a choice. Apache-2.0 is incompatible with
+  GPL-2.0 (its patent and indemnity terms are "further restrictions" under
+  GPL-2.0 §6). Mbed TLS 2.28 is dual-licensed — every header in the image says
+  `SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later` — so the overlay
+  takes it under GPL-2.0-or-later. The issue expected 3.x; the image ships
+  2.28.10, and the 2.28 branch carries the same dual licence.
+- **curl, zlib, minizip, libnx, cJSON, stb_truetype, newlib** are permissive
+  and GPL-2.0-compatible. What they ask is attribution: their copyright and
+  permission notices in the distribution. `THIRD_PARTY_NOTICES.txt` carries
+  each one in full.
+- **libstdc++ and libgcc** are GPL-3.0 with the GCC Runtime Library Exception,
+  which lets a program compiled by GCC link them under whatever terms it likes.
+  That exception is also why GPL-3.0 code inside a GPL-2.0-only binary is no
+  conflict: the runtime's licence does not reach the combined work at all. They
+  put no obligation on either binary; they are in the notices so the list is
+  complete.
+
+**The sysmodule is MIT.** It links libnx, newlib and the GCC runtime and
+nothing else — no libultrahand, no portlibs — so nothing makes it a GPL work.
+
+**The source offer is the tag.** GPL-2.0 §3 lets the source be offered "from
+the same place" as the binary. Every release's notes link
+`https://github.com/armaatus/rommsync-nx/tree/v<VERSION>`, which pins
+libultrahand by commit; the notices file names the source of every other
+component at its exact version.
+
+That last point is the weakest part of this, and worth knowing. GitHub's
+automatic "Source code" archives do not include submodules, and the Mbed TLS,
+curl and zlib sources are linked at their upstream tags rather than hosted
+here. The strict reading of §3 — "complete source code ... for all modules it
+contains" offered by the distributor — is better served by a source archive,
+submodules included, attached to each release. That is a follow-up, not part
+of #300.
+
+## Keeping it true
+
+- `ctest -R package.notices` refuses a `-l` in `switch.mk` or a target's
+  Makefile, or a `.gitmodules` submodule, with no manifest row — and checks
+  every row's licence text reaches the generated notices, the libultrahand row
+  names the pinned commit, and the shipped GPL text is libultrahand's own.
+- `ctest -R package.builds` does the same against the real link maps from a
+  devkitPro build, binary by binary: an archive the linker pulled in with no
+  row, or in a binary its row does not list, is red.
+- `scripts/package.sh` runs the static check before it packages anything, so a
+  release job cannot zip a build the manifest does not cover.
+
+Moving the image pin or the libultrahand submodule means revisiting the
+versions in the manifest; adding a library means a row and its text under
+`packaging/licenses/`. A new licence that is not GPL-2.0-compatible cannot go
+into the overlay at all.

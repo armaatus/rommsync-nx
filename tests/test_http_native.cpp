@@ -1087,9 +1087,10 @@ class RecordingConnector final : public rommsync::sysmodule::Connector {
  public:
   std::unique_ptr<rommsync::sysmodule::Connection> Open(
       const rommsync::sysmodule::Origin& origin, std::chrono::milliseconds connect_timeout,
-      const http::ClientOptions& options, http::Error* error, std::string* message) override {
+      const http::ClientOptions& options, const http::CancelToken* cancel, http::Error* error,
+      std::string* message) override {
     std::unique_ptr<rommsync::sysmodule::Connection> inner =
-        plain_.Open(origin, connect_timeout, options, error, message);
+        plain_.Open(origin, connect_timeout, options, cancel, error, message);
     if (inner == nullptr) return nullptr;
     return std::make_unique<RecordingConnection>(std::move(inner), &largest_asked,
                                                  &largest_filled);

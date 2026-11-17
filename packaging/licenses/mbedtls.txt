@@ -1,0 +1,6 @@
+  Copyright The Mbed TLS Contributors
+
+Mbed TLS 2.28 is dual-licensed: Apache-2.0 OR GPL-2.0-or-later. Apache-2.0 is
+incompatible with GPL-2.0, the licence the overlay binary it is linked into is
+distributed under, so ovl-rommsync takes it under GPL-2.0-or-later. That
+licence's full text ships beside this file as COPYING.GPL-2.0.

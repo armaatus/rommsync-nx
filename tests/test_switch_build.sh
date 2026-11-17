@@ -243,6 +243,18 @@ check_image_budget() {
   grep -q 'ovl-rommsync.ovl is .* past the' <<<"$out" ||
     { echo "$out" >&2; fail "a 4 KiB .ovl ceiling failed, but not on the .ovl's size"; }
 
+  # The resident footprint (#296), both ways: a recorded number under what the
+  # build costs fails, and so does one so far over it that it has stopped being
+  # the measurement the docs and the M12 co-resident run are given.
+  out="$(image_budget --footprint 4096 2>&1)" &&
+    { echo "$out" >&2; fail "a 4 KiB resident footprint passed; the footprint is not held"; }
+  grep -q 'resident footprint is .* past the' <<<"$out" ||
+    { echo "$out" >&2; fail "a 4 KiB resident footprint failed, but not on the footprint"; }
+  out="$(image_budget --footprint $(( 64 * 1024 * 1024 )) 2>&1)" &&
+    { echo "$out" >&2; fail "a 64 MiB resident footprint passed; a stale number is not caught"; }
+  grep -q 'recorded number is stale' <<<"$out" ||
+    { echo "$out" >&2; fail "a 64 MiB resident footprint failed, but not as a stale number"; }
+
   # The .bss tie, against a main.cpp that declares a 4 KiB heap over the one linked:
   # the check has to read the constant out of the source it was built from, or
   # a heap that grew without the constant moving would go unnoticed.

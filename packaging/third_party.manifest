@@ -1,0 +1,33 @@
+# Everything compiled or linked into the two shipped binaries that this repo
+# did not write. scripts/notices.sh turns it into THIRD_PARTY_NOTICES.txt, and
+# `scripts/notices.sh --check` refuses a build that links something without a
+# row here -- read off switch.mk's -l flags and .gitmodules always, and off the
+# real link maps in `ctest -R package.builds` (#300). docs/LICENSING.md is why
+# each licence is the one taken.
+#
+# One row per component, `|` separated, surrounding spaces ignored:
+#
+#   name | version | licence as taken (SPDX) | binaries | provides | source | text
+#
+#   binaries  the shipped binaries it ends up in: sysmodule, overlay, or both
+#   provides  what the check matches it by, space separated:
+#               lib:NAME        -lNAME, and libNAME.a in a link map
+#               submodule:PATH  a .gitmodules path
+#               vendored:PATH   a file inside a submodule, compiled in with it
+#   source    where the exact source of that version is. A vendored file is
+#             linked as the copy inside the pinned submodule, because that copy,
+#             not upstream's head, is what is compiled in
+#   text      its licence or notice, under packaging/licenses/
+#
+# The versions are what the pinned image (scripts/toolchain.sh) ships and what
+# the submodule pointer names. Moving either means revisiting these rows.
+
+libultrahand | v2.5.4 (f58503071976881ec8c9c4097a7681fe2343a747) | GPL-2.0-only | overlay | submodule:overlay/lib/libultrahand | https://github.com/ppkantorski/libultrahand/tree/f58503071976881ec8c9c4097a7681fe2343a747 | libultrahand.txt
+cJSON | 1.7.18 | MIT | overlay | vendored:overlay/lib/libultrahand/common/cJSON.c | https://github.com/ppkantorski/libultrahand/blob/f58503071976881ec8c9c4097a7681fe2343a747/common/cJSON.c | cjson.txt
+stb_truetype | 1.26 | MIT | overlay | vendored:overlay/lib/libultrahand/libtesla/include/stb_truetype.h | https://github.com/ppkantorski/libultrahand/blob/f58503071976881ec8c9c4097a7681fe2343a747/libtesla/include/stb_truetype.h | stb_truetype.txt
+Mbed TLS | 2.28.10 | GPL-2.0-or-later | overlay | lib:mbedtls lib:mbedx509 lib:mbedcrypto | https://github.com/Mbed-TLS/mbedtls/tree/v2.28.10 | mbedtls.txt
+curl | 7.69.1 | curl | overlay | lib:curl | https://github.com/curl/curl/tree/curl-7_69_1 | curl.txt
+zlib and minizip | 1.3.1 | Zlib | overlay | lib:z lib:minizip | https://github.com/madler/zlib/tree/v1.3.1 | zlib.txt
+libnx | 4.12.0 | ISC | sysmodule overlay | lib:nx | https://github.com/switchbrew/libnx/tree/v4.12.0 | libnx.txt
+newlib and libsysbase (devkitA64) | 4.6.0.20260123 | LicenseRef-newlib | sysmodule overlay | lib:c lib:g lib:m lib:sysbase | https://sourceware.org/pub/newlib/newlib-4.6.0.20260123.tar.gz, with devkitPro's patches from https://github.com/devkitPro/newlib | newlib.txt
+GCC runtime (libstdc++, libgcc) | 15.2.0 | GPL-3.0-or-later WITH GCC-exception-3.1 | sysmodule overlay | lib:stdc++ lib:gcc | https://gcc.gnu.org/git/?p=gcc.git;a=tree;h=refs/tags/releases/gcc-15.2.0 | gcc-runtime-exception.txt

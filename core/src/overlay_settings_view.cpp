@@ -116,6 +116,22 @@ SettingsRow SlotRow(const std::string& slot) {
   return row;
 }
 
+/// `[server] ca_file` (#288): shown, and **not offered**, like `slot`. The
+/// certificate has to be copied onto the card from a PC, so the line naming it
+/// is written there too -- and a console whose trust could be repointed from a
+/// menu is one more way to aim it at the wrong server. Shown either way, since
+/// "which certificates does this console trust" is what the row is read for
+/// when an https server will not answer.
+SettingsRow CaFileRow(const std::string& ca_file) {
+  SettingsRow row = Value("ca_file", ca_file.empty() ? "(none)" : ca_file);
+  row.editable = false;
+  row.note = ca_file.empty()
+                 ? "https is checked against the console's built-in certificates; set in "
+                   "config.ini"
+                 : "https is also checked against this certificate; set in config.ini";
+  return row;
+}
+
 /// `[sync] map_state_slots` (#239, #271). Offered: either value is safe to land
 /// on -- a state never touches a save, a local one is backed up before it is
 /// written over, and a renamed state that meets another's row is kept apart
@@ -127,6 +143,17 @@ SettingsRow MapStateSlotsRow(bool in_force) {
       {"On", "true", "Tico's states sync under RetroArch's slot names; set alike on every Switch"},
   };
   return Changeable("sync", "map_state_slots", kValues, in_force ? "true" : "false");
+}
+
+/// `[sync] play_sessions` (#301). Offered: neither value touches a save. Off
+/// stops recording and sending play time from the next tick; the notes say
+/// what each value sends, since this row is the opt-out docs/PRIVACY.md names.
+SettingsRow PlaySessionsRow(bool in_force) {
+  static constexpr Choice kValues[] = {
+      {"Off", "false", "play time is not recorded or sent; saves still sync"},
+      {"On", "true", "play time worked out from your saves is sent to your RomM"},
+  };
+  return Changeable("sync", "play_sessions", kValues, in_force ? "true" : "false");
 }
 
 /// `[tico] account` (#231, #271), and the accounts the last tick found under
@@ -328,6 +355,7 @@ SettingsSection ServerSection(const config::Config& config) {
     return section;
   }
   section.rows.push_back(Value("url", config.server.url));
+  section.rows.push_back(CaFileRow(config.server.ca_file));
   return section;
 }
 
@@ -341,6 +369,7 @@ SettingsSection SyncSection(const config::SyncConfig& sync) {
   section.rows.push_back(SlotRow(sync.slot));
   section.rows.push_back(Value("states", BoolText(sync.states)));
   section.rows.push_back(MapStateSlotsRow(sync.map_state_slots));
+  section.rows.push_back(PlaySessionsRow(sync.play_sessions));
   {
     // Said next to the value, because the value is the only explanation a user
     // gets for a menu row that is not there.

@@ -253,6 +253,11 @@ class IpcClient {
   /// the sysmodule dispatched with nothing here to send it.
   Result GetLog(std::int32_t lines, ipc::LogTail* tail);
 
+  /// Ask the sysmodule to write the diagnostics bundle (M11-20, #304), saying
+  /// which overlay is asking. Waits for it, within the budget, like every call
+  /// above: the bundle is streamed from small files on the card.
+  Result WriteDiagnostics(ipc::DiagnosticsResult* result);
+
   // --- the half that never waits (M11-15, #299) ------------------------------
   //
   // Every method above waits for its answer, for up to the budget -- which a

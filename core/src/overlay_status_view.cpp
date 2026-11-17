@@ -351,6 +351,33 @@ std::string ClockText(std::int64_t skew_seconds) {
          (skew_seconds > 0 ? " ahead" : " behind") + "; uploads held";
 }
 
+/// The Backups row (#316). Over the cap, the count gives way to the reason the
+/// prune could not get under it: backups that are the only copy of their bytes,
+/// or -- with none of those -- the newest of each save, which nothing removes.
+void AddBackups(StatusView* view, const ipc::BackupUsage& backup) {
+  if (!backup.measured) {
+    Add(&view->lines, "Backups", "Not measured yet");
+    return;
+  }
+  const std::string bytes = FormatBytes(backup.bytes);
+  if (!backup.over_cap) {
+    Add(&view->lines, "Backups",
+        bytes + ", " + std::to_string(backup.backups) +
+            (backup.backups == 1 ? " backup" : " backups"));
+    return;
+  }
+  Add(&view->lines, "Backups",
+      bytes + (backup.kept_unique > 0 ? "; " + std::to_string(backup.kept_unique) +
+                                            (backup.kept_unique == 1 ? " only copy" : " only copies")
+                                      : std::string("; over the cap")),
+      Tone::kWarn);
+  // The section says what each kind of kept backup is and what to do about it;
+  // the overlay has no room to, and a player has no other way to find it.
+  if (view->hint.empty()) {
+    view->hint = "See TROUBLESHOOTING.md: The SD card is full";
+  }
+}
+
 }  // namespace
 
 StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
@@ -416,6 +443,9 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
       view.hint = "Set the console's date and time";
     }
   }
+  // After the clock, so a held upload keeps the hint over a filling card: one
+  // costs a save now, the other a download later.
+  AddBackups(&view, status.backup);
   AddDownload(&view, status.download);
   // Last, because it is the line a user reads once and a support thread reads
   // first (`ipc::Status::build`).

@@ -117,11 +117,29 @@ inline constexpr const char* kConfigSdDir = "/config/rommsync";
 /// is what `Load` is *given* rather than something it derives.
 inline constexpr const char* kSdRoot = "sdmc:";
 
+/// What the diagnostics bundle says about the platform (M11-20, #304): read by
+/// `main.cpp` once at boot, because each is a libnx call and this file names no
+/// libnx type, and none of them changes while the console is up. Empty is
+/// "unknown"; a sentence saying why is better than empty.
+struct PlatformFacts {
+  std::string hos;         ///< `setsysGetFirmwareVersion`'s display version
+  std::string libnx;       ///< the libnx this image was built against
+  std::string atmosphere;  ///< Atmosphère's version, or why it was not read
+  std::string emummc;      ///< whether this is emuMMC, or why it was not read
+};
+
 /// How long the worker waits for the network before its first tick, and how
 /// often it asks (M7-2, #37). See `SdEngine::AwaitNetwork` for why it is bounded
 /// at all.
 inline constexpr std::chrono::seconds kNetworkWaitBudget{120};
 inline constexpr std::chrono::seconds kNetworkPollInterval{2};
+
+/// How often a tick held for the network asks again once it has been held for
+/// `kNetworkWaitBudget` (M11-5, #289). The schedule's backoff floor, which is
+/// what an offline console retried at before a tick was held rather than run:
+/// a console on a coffee table with no Wi-Fi asks nifm twice a minute and
+/// sends nothing.
+inline constexpr std::chrono::seconds kNetworkIdlePollInterval{30};
 
 /// How long the worker waits before trying a drain that did not get anywhere,
 /// and the ceiling that wait doubles up to (M9-5, #197).
@@ -368,8 +386,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// Called on the **worker thread**, never on the IPC one, and never while
   /// `mutex_` is held. Boot is not held either way: `main` starts this thread
   /// and returns.
+  ///
+  /// `budget` and `poll` are the boot wait's (`AwaitNetwork`) and the first
+  /// stretch of a held tick's; `idle_poll` is how often a tick held longer than
+  /// `budget` asks again. Parameters for the host suite, which cannot spend two
+  /// minutes finding out; `main.cpp` passes the defaults.
   using NetworkProbe = std::function<bool()>;
-  void UseNetworkProbe(NetworkProbe probe);
+  void UseNetworkProbe(NetworkProbe probe,
+                       std::chrono::milliseconds budget = kNetworkWaitBudget,
+                       std::chrono::milliseconds poll = kNetworkPollInterval,
+                       std::chrono::milliseconds idle_poll = kNetworkIdlePollInterval);
 
   /// Whether an application -- a retail game, Tico, RetroArch launched over a
   /// title -- is in the foreground right now (M10-16, #242).
@@ -418,6 +444,24 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// has. Called on the worker, never under `mutex_`.
   using NetworkClock = std::function<std::optional<std::chrono::system_clock::time_point>()>;
   void UseNetworkClock(NetworkClock clock);
+
+  /// Where `[server] ca_file` goes to be trusted (#288): `main.cpp` passes the
+  /// console transport's `TrustServerCa`, a host test a client it can rebuild.
+  /// Injected for `NetworkProbe`'s reason, and because the `http::HttpClient`
+  /// this engine is handed has no way to change its trust once built.
+  ///
+  /// Called once at install with the CA file in force (empty for none), then
+  /// with every configuration adopted -- boot, and each `SetConfig`, which
+  /// re-reads the whole file and so picks up a hand edit of the line. **Called
+  /// under `mutex_`**, so it may only record the path: the import happens on
+  /// the next request, on whichever thread makes it. Install it after `Load`
+  /// and before `UseServer`, so the first request already trusts the file.
+  using CaTrust = std::function<void(const std::string& ca_file)>;
+  void UseCaTrust(CaTrust trust);
+
+  /// The platform's half of the diagnostics bundle (#304). Install it before
+  /// the service starts answering; a build that never does writes "unknown".
+  void UsePlatformFacts(PlatformFacts facts);
 
   /// The probe's answer, now, noted as a sighting when it names an application.
   /// `ipc::ServiceCore::SyncNow` reads it to say a press is held rather than
@@ -680,6 +724,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   ipc::CancelKeepLocalResult CancelKeepLocal(std::int64_t entry_id) override;
   ipc::RestoreState restore_state() const override;
 
+  /// The diagnostics bundle (M11-20, #304), written beside `config.ini` and
+  /// answered with its SD-root path. On the IPC thread: `diag::Write` streams it
+  /// a line at a time from files of bounded size, and it opens no save.
+  ipc::Error WriteDiagnostics(const ipc::DiagnosticsRequest& request,
+                              ipc::DiagnosticsResult* result) override;
+
   /// Serialises `history_` -- the vector, and nothing else.
   ///
   /// M7-1 (#36) left `history_` under no lock and said exactly what would change
@@ -916,9 +966,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   ///
   /// Bounded rather than indefinite: a console that lives on a coffee table with
   /// no Wi-Fi would otherwise park this thread until it is next carried into
-  /// range. Giving up costs one tick, which fails `TickOutcome::kOffline` and is
-  /// rescheduled on the same backoff every other offline console is on. It also
-  /// gives up at once when the process is going away.
+  /// range. Giving up costs nothing since M11-5 (#289): the boot tick is then
+  /// held for the network in `RunWorker`, as every later tick is, rather than
+  /// run to fail offline and earn a backoff. It also gives up at once when the
+  /// process is going away.
   ///
   /// **True when the probe said yes, or when there is no probe.** False is the
   /// budget running out, a shutdown, or a sleep -- and the last of those is why
@@ -927,6 +978,10 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `RunWorker` gives it again on the wake rather than running the boot tick
   /// against a `nifm` that has not reassociated.
   bool AwaitNetwork();
+
+  /// One answer from `network_probe_`, asked outside `mutex_`. True when there
+  /// is no probe. Takes `mutex_` for the copy, so never called holding it.
+  bool NetworkUp() const;
 
   /// Tell the worker there is something to do. Safe from any thread; takes
   /// `mutex_` for the counter and notifies outside it.
@@ -1369,6 +1424,20 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// IPC surface reads it today -- play time is not on any screen.
   play::Buffer play_{std::string(play::kBufferSdPath)};
 
+  /// `[sync] play_sessions` as this tick's snapshot says (#301), set by
+  /// `StartTick` so `StampPlayWindow` -- called from paths that hold no config
+  /// -- leaves `play.db` alone when it is off. The worker's alone, like `play_`.
+  bool play_sessions_on_ = true;
+
+  /// A tick ran with play sessions off since the window last moved (#301).
+  /// The window's start is then a stamp from before the switch, and the first
+  /// session derived against it would claim play nobody agreed to report, up
+  /// to `play::kMaxWindowSeconds` of it. So the first tick back on stamps and
+  /// derives nothing, losing at most one interval's play: the safe direction.
+  /// In memory only, since `play.db` is not written while off; a reboot with
+  /// it switched on in between falls back to that window bound.
+  bool play_window_stale_ = false;
+
   /// The card, for a restore. The same pointer `UseCard` hands `lists_`, kept
   /// here too because a restore opens two files through it.
   ///
@@ -1613,8 +1682,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   http::HttpClient* server_ = nullptr;
   std::string list_token_;
 
-  /// Whether the console is on a network. Null means "up".
+  /// Whether the console is on a network. Null means "up". The three paces
+  /// `UseNetworkProbe` took with it. All guarded by `mutex_`.
   NetworkProbe network_probe_;
+  std::chrono::milliseconds network_budget_ = kNetworkWaitBudget;
+  std::chrono::milliseconds network_poll_ = kNetworkPollInterval;
+  std::chrono::milliseconds network_idle_poll_ = kNetworkIdlePollInterval;
 
   /// Whether a game is in the foreground, and how often to ask while a tick
   /// waits for it (#242). Null means "nothing is running". Both guarded by
@@ -1625,9 +1698,21 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `UseNetworkClock`'s. Guarded by `mutex_`, copied out and called outside it.
   NetworkClock network_clock_;
 
+  /// `UseCaTrust`'s. Guarded by `mutex_` and, unlike the probes, called under
+  /// it: it is handed each configuration as `AdoptConfigLocked` swaps it in.
+  CaTrust ca_trust_;
+
+  /// `UsePlatformFacts`'. Under `mutex_`.
+  PlatformFacts platform_facts_;
+
   /// What the last tick that negotiated made of the console's clock (#295):
   /// `Status::clock_trusted` and `clock_skew_seconds`. Guarded by `mutex_`.
   sync::ClockCheck clock_check_;
+
+  /// What the last prune left in `.backup/` (#316): `Status::backup`. Guarded
+  /// by `mutex_`. Kept from one prune to the next, since none runs over a
+  /// directory no tick has written to.
+  ipc::BackupUsage backup_usage_;
 
   /// What the probe named since the play window last moved (#261). Guarded by
   /// `mutex_`; `mutable` because `application_running` is the one place that
@@ -1638,6 +1723,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// A tick is being held for a running game. Only the worker touches it; it
   /// is what makes `sync.held` one line per game rather than one per re-check.
   bool holding_ = false;
+
+  /// When the tick now held for the network was first found offline, or empty
+  /// when none is, and whether the hold has said so (#289). Worker-only, like
+  /// `holding_`: the first picks the re-check pace, the second makes the
+  /// `net.offline` line one per hold.
+  std::optional<std::chrono::steady_clock::time_point> offline_since_;
+  bool offline_said_ = false;
 
   /// Bumped by every command that gives the worker something to do, under
   /// `mutex_`, and read by the worker as part of its wait predicate.

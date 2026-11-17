@@ -17,8 +17,11 @@
 
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -26,7 +29,10 @@
 #include <string>
 
 #include "http_wire.hpp"
+#include "nifm_verdict.hpp"
 #include "posix_connection.hpp"
+#include "rommsync/config.hpp"
+#include "rommsync/log.hpp"
 
 namespace rommsync::sysmodule {
 namespace {
@@ -37,6 +43,50 @@ namespace {
 bool g_socket_up = false;
 bool g_ssl_up = false;
 bool g_nifm_up = false;
+
+/// `[server] ca_file` as the engine last handed it over (`TrustServerCa`,
+/// #288). Process-wide for the reason the flags above are: there is one
+/// `SslContext`, made by the one client `main.cpp` builds. Its own lock, not
+/// the connector's, so the IPC thread recording a path never waits behind a
+/// request importing one.
+std::mutex g_trusted_ca_mutex;
+std::string g_trusted_ca;
+
+std::string TrustedCa() {
+  std::lock_guard<std::mutex> lock(g_trusted_ca_mutex);
+  return g_trusted_ca;
+}
+
+/// `ssl`'s ResultIoWouldBlock (module 123, description 204): a non-blocking
+/// `DoHandshake` that has sent what it can and is waiting on the server
+/// (switchbrew, Error codes). libnx names no constant for it.
+constexpr Result kSslResultWouldBlock = MAKERESULT(123, 204);
+
+void CancelLookup(void* handle) {
+  resolverCancel(static_cast<u32>(reinterpret_cast<std::uintptr_t>(handle)));
+}
+
+/// `getaddrinfo` with a way out (M11-6, #290). On the console a lookup is one
+/// IPC to `sfdnsres` that returns when the resolver does, which no slice on
+/// this thread can shorten -- so the handle `sfdnsres` cancels by is taken
+/// first and handed to the token, and a sleep that fires the token cancels the
+/// lookup from the quiescing thread. `ResolveBlocking` reads the token before
+/// it asks, which covers a cancel that landed before the hook was armed.
+///
+/// **What no console has confirmed** (#43's list): that a handle taken before
+/// the call cancels the call, which is what libnx documents
+/// (`resolverGetCancelHandle`, "the next resolver command on the current
+/// thread"), and that a cancel landing between the check and the IPC is not
+/// lost. A zero handle -- the request for one failed -- arms nothing, and the
+/// lookup is as cancellable as it was before #290: not at all.
+bool ResolveCancellable(const std::string& host, std::uint32_t* address,
+                        const http::CancelToken* cancel) {
+  const u32 handle = resolverGetCancelHandle();
+  const http::CancelToken::Abort abort(
+      handle != 0 ? cancel : nullptr, CancelLookup,
+      reinterpret_cast<void*>(static_cast<std::uintptr_t>(handle)));
+  return ResolveBlocking(host, address, cancel);
+}
 
 /// One `SslConnection`, and the socket it was handed.
 ///
@@ -114,7 +164,8 @@ class SslConnector final : public Connector {
 
   std::unique_ptr<Connection> Open(const Origin& origin,
                                    std::chrono::milliseconds connect_timeout,
-                                   const http::ClientOptions& options, http::Error* error,
+                                   const http::ClientOptions& options,
+                                   const http::CancelToken* cancel, http::Error* error,
                                    std::string* message) override {
     *error = http::Error::kNone;
     if (!g_socket_up) {
@@ -141,7 +192,8 @@ class SslConnector final : public Connector {
     // The handshake's own bound, and the socket's. Deliberately the connect
     // budget: a handshake that has not finished in as long as a connection took
     // to make is one that is not going to.
-    const int fd = ConnectTo(origin, connect_timeout, connect_timeout, error, message);
+    const int fd = ConnectTo(origin, connect_timeout, connect_timeout, error, message, cancel,
+                             ResolveCancellable);
     if (fd < 0) return nullptr;
 
     if (!origin.tls) {
@@ -156,7 +208,7 @@ class SslConnector final : public Connector {
     // has taken the descriptor it is the one `ssl` handed back that has to be
     // closed instead, and closing both would be a double close of a descriptor
     // another process is using.
-    return OpenTls(fd, origin, options, error, message);
+    return OpenTls(fd, origin, connect_timeout, options, cancel, error, message);
   }
 
  private:
@@ -164,7 +216,9 @@ class SslConnector final : public Connector {
   /// `socketSslConnectionSetSocketDescriptor` succeeds; after that the service
   /// owns it and the caller must not close it.
   std::unique_ptr<Connection> OpenTls(int fd, const Origin& origin,
-                                      const http::ClientOptions& options, http::Error* error,
+                                      std::chrono::milliseconds handshake_timeout,
+                                      const http::ClientOptions& options,
+                                      const http::CancelToken* cancel, http::Error* error,
                                       std::string* message) {
     // One context for the process, so a CA import is paid once rather than per
     // request -- and guarded, because a context is one `ssl` session and two
@@ -172,9 +226,10 @@ class SslConnector final : public Connector {
     // **Only the shared `SslContext` needs the lock**, and it is released
     // before the handshake. Holding it across `DoHandshake` would mean a
     // download's handshake to an unresponsive server blocking a sync tick's
-    // `Send` inside `Connector::Open` -- where neither the `CancelToken` nor
-    // the `Budget` is polled -- for the `ssl` service's own I/O ceiling. A
-    // shared client has to be safe for exactly that (`http.hpp`).
+    // `Send` inside `Connector::Open` -- waiting on a lock, where neither the
+    // `CancelToken` nor the `Budget` is read -- for the whole of another
+    // request's handshake. A shared client has to be safe for exactly that
+    // (`http.hpp`), and a sleep has to be able to end it (#290).
     SslConnection connection{};
     {
       std::lock_guard<std::mutex> held(mutex_);
@@ -245,18 +300,43 @@ class SslConnector final : public Connector {
     }
     if (R_FAILED(rc)) return fail(http::Error::kTls, "sslConnectionSetVerifyOption failed");
 
-    // Blocking, with the wait bounded from above: every read and write goes
-    // through `sslConnectionPoll` with the caller's slice first (`SslStream`),
-    // and on [16.0.0+] the service's own ceiling comes down from five minutes
-    // to something a sync tick can wait out.
-    rc = sslConnectionSetIoMode(&connection, SslIoMode_Blocking);
+    // **The handshake non-blocking, in slices** (M11-6, #290). One blocking
+    // `DoHandshake` waits for `SO_RCVTIMEO` -- the connect budget, ten seconds
+    // -- or the service's own I/O ceiling, and nothing a sleep does can end it:
+    // the descriptor is the service's now, so there is no socket left here to
+    // shut down under it. Non-blocking, each try returns `ResultIoWouldBlock`
+    // until the server has answered, and the wait between tries is a
+    // `sslConnectionPoll` of one slice, with the token read before each.
+    //
+    // Read only, not Write: past the ClientHello a handshake waits on the
+    // server, and a socket is nearly always writable, so polling for it would
+    // spin the tries with no wait between them. A handshake that does wait to
+    // write loses at most a slice per wait.
+    rc = sslConnectionSetIoMode(&connection, SslIoMode_NonBlocking);
     if (R_FAILED(rc)) return fail(http::Error::kTls, "sslConnectionSetIoMode failed");
-    if (hosversionAtLeast(16, 0, 0)) {
-      sslConnectionSetIoTimeout(&connection, kIoTimeoutMs);
+    const Sliced shook = RunInSlices(
+        [&connection, &rc](std::chrono::milliseconds slice) {
+          rc = sslConnectionDoHandshake(&connection, nullptr, nullptr, nullptr, 0);
+          if (R_SUCCEEDED(rc)) return Step::kDone;
+          if (rc != kSslResultWouldBlock) return Step::kFailed;
+          // A poll that fails is the end, not another try: it fails at once,
+          // so retrying would spin `DoHandshake` with no wait until the timeout.
+          u32 signalled = 0;
+          const Result polled =
+              sslConnectionPoll(&connection, SslPollEvent_Read | SslPollEvent_Except, &signalled,
+                                static_cast<u32>(slice.count()));
+          return R_FAILED(polled) ? Step::kFailed : Step::kPending;
+        },
+        cancel, handshake_timeout);
+    if (shook == Sliced::kCanceled) {
+      return fail(http::Error::kCanceled, "canceled during the TLS handshake");
     }
-
-    rc = sslConnectionDoHandshake(&connection, nullptr, nullptr, nullptr, 0);
-    if (R_FAILED(rc)) {
+    if (shook == Sliced::kTimedOut) {
+      // `kTls`, as a handshake that outlived the socket's timeout always was:
+      // what a caller makes of the error is not this change's to move.
+      return fail(http::Error::kTls, "the TLS handshake did not finish in time");
+    }
+    if (shook == Sliced::kFailed) {
       // Why it was refused, if the service will say. The cmd clears the stored
       // value as it reads it, so this is the only chance to ask -- and "the
       // handshake failed" and "the certificate was rejected, for this reason"
@@ -264,6 +344,16 @@ class SslConnector final : public Connector {
       const Result verify = sslConnectionGetVerifyCertError(&connection);
       return fail(http::Error::kTls, R_FAILED(verify) ? "the server's certificate was refused"
                                                       : "the TLS handshake failed");
+    }
+
+    // Then blocking, with the wait bounded from above: every read and write
+    // goes through `sslConnectionPoll` with the caller's slice first
+    // (`SslStream`), and on [16.0.0+] the service's own ceiling comes down from
+    // five minutes to something a sync tick can wait out.
+    rc = sslConnectionSetIoMode(&connection, SslIoMode_Blocking);
+    if (R_FAILED(rc)) return fail(http::Error::kTls, "sslConnectionSetIoMode failed");
+    if (hosversionAtLeast(16, 0, 0)) {
+      sslConnectionSetIoTimeout(&connection, kIoTimeoutMs);
     }
 
     std::unique_ptr<Connection> stream(new (std::nothrow) SslStream(connection, returned));
@@ -286,13 +376,19 @@ class SslConnector final : public Connector {
       }
       context_open_ = true;
     }
-    if (options.ca_bundle_path.empty() || imported_ca_ == options.ca_bundle_path) return true;
-    if (!ImportCa(options.ca_bundle_path)) {
+    // The client's own option first, then what `config.ini` names. A path that
+    // changes is imported on the next request; one that is cleared or replaced
+    // stays imported until the process restarts, since a context cannot forget
+    // a CA and connections may still be open on this one.
+    const std::string wanted =
+        options.ca_bundle_path.empty() ? TrustedCa() : options.ca_bundle_path;
+    if (wanted.empty() || imported_ca_ == wanted) return true;
+    if (!ImportCa(wanted)) {
       *error = http::Error::kTls;
-      *message = "could not import " + options.ca_bundle_path;
+      *message = "could not import the CA file " + wanted;
       return false;
     }
-    imported_ca_ = options.ca_bundle_path;
+    imported_ca_ = wanted;
     return true;
   }
 
@@ -306,8 +402,9 @@ class SslConnector final : public Connector {
     const long size = std::ftell(file);
     std::fseek(file, 0, SEEK_SET);
     // A PEM this big is a mistake rather than a CA bundle, and
-    // `ImportServerPki` takes a u32 size.
-    if (size <= 0 || size > 256 * 1024) {
+    // `ImportServerPki` takes a u32 size. The bound `LoadConfig` checks the
+    // file against, so the settings screen and this agree.
+    if (size <= 0 || static_cast<unsigned long>(size) > config::kMaxCaFileBytes) {
       std::fclose(file);
       return false;
     }
@@ -425,10 +522,37 @@ bool ConsoleIsOnline() {
   NifmInternetConnectionType type{};
   u32 strength = 0;
   NifmInternetConnectionStatus status{};
-  if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status))) {
-    return true;
+  const Result rc = nifmGetInternetConnectionStatus(&type, &strength, &status);
+  // **A failure is offline** (M11-5, #289): libnx documents this call failing
+  // in airplane mode and with no known network in range, so reading a failure
+  // as "nifm was busy" skipped the boot wait and the connector's pre-check on
+  // exactly the consoles they exist for (`nifm_verdict.hpp`).
+  switch (ClassifyNifm(R_FAILED(rc) ? rc : 0, status == NifmInternetConnectionStatus_Connected)) {
+    case NifmVerdict::kOnline:
+      return true;
+    case NifmVerdict::kOffline:
+      return false;
+    case NifmVerdict::kOfflineUnexpected:
+      break;
   }
-  return status == NifmInternetConnectionStatus_Connected;
+  // Said once per change of code rather than once per two-second probe: the
+  // worker asks every poll while a tick is held.
+  static std::atomic<Result> last_said{0};
+  if (last_said.exchange(rc) != rc) {
+    // `std::to_chars` rather than `snprintf`, which would link newlib's whole
+    // `_svfprintf_r` into the sysmodule (`switch.builds`).
+    char hex[16];
+    const std::to_chars_result end =
+        std::to_chars(hex, hex + sizeof(hex), static_cast<std::uint32_t>(rc), 16);
+    log::Warn(log::Event::kNetOffline, "nifm answered 0x" + std::string(hex, end.ptr) +
+                                           "; read as no internet connection");
+  }
+  return false;
+}
+
+void TrustServerCa(const std::string& path) {
+  std::lock_guard<std::mutex> lock(g_trusted_ca_mutex);
+  g_trusted_ca = path;
 }
 
 std::unique_ptr<http::HttpClient> MakeHorizonHttpClient(const http::ClientOptions& options) {

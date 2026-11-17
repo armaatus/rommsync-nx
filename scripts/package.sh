@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the release zip: the two Switch artifacts, renamed and filed where
-# Horizon expects them, plus the two files a user reads.
+# Horizon expects them, plus what a user reads and what their licences require.
 #
 #   scripts/package.sh                    -> dist/rommsync-nx-<VERSION>.zip
 #   scripts/package.sh --list             -> the entry paths, without packaging
@@ -33,6 +33,15 @@
 # the id is still unconfirmed against the installed homebrew set
 # (sysmodule/README.md), so it will move, and a second copy of it is how a move
 # lands in one place only.
+#
+# Beside config.ini.example in config/rommsync/ go README.txt, the project's
+# LICENSE, THIRD_PARTY_NOTICES.txt and COPYING.GPL-2.0 (#300). The overlay
+# statically links GPL-2.0 libultrahand, so it is distributed under GPL-2.0
+# and the zip must carry that text and the notices of everything linked into
+# either binary (docs/LICENSING.md); scripts/notices.sh generates the notices
+# from packaging/third_party.manifest, and its --check refuses to package a
+# build that links a library with no row there. None of them is at the SD root,
+# where they would replace another homebrew's README.txt or LICENSE.
 #
 # What is deliberately NOT in the archive:
 #
@@ -149,10 +158,14 @@ NSP_ENTRY="atmosphere/contents/$TITLE_ID/exefs.nsp"
 TOOLBOX_ENTRY="atmosphere/contents/$TITLE_ID/toolbox.json"
 OVL_ENTRY="switch/.overlays/ovl-rommsync.ovl"
 CONFIG_ENTRY="config/rommsync/config.ini.example"
+README_ENTRY="config/rommsync/README.txt"
+LICENSE_ENTRY="config/rommsync/LICENSE"
+NOTICES_ENTRY="config/rommsync/THIRD_PARTY_NOTICES.txt"
+GPL_ENTRY="config/rommsync/COPYING.GPL-2.0"
 # The trailing slash is what makes it a directory entry, to zip and to unzip.
 FLAGS_ENTRY="atmosphere/contents/$TITLE_ID/flags/"
-ENTRIES=("README.txt" "LICENSE" "$NSP_ENTRY" "$TOOLBOX_ENTRY" "$FLAGS_ENTRY"
-         "$CONFIG_ENTRY" "$OVL_ENTRY")
+ENTRIES=("$README_ENTRY" "$LICENSE_ENTRY" "$NOTICES_ENTRY" "$GPL_ENTRY"
+         "$NSP_ENTRY" "$TOOLBOX_ENTRY" "$FLAGS_ENTRY" "$CONFIG_ENTRY" "$OVL_ENTRY")
 
 if [ "$LIST_ONLY" -eq 1 ]; then
   printf '%s\n' "${ENTRIES[@]}"
@@ -195,9 +208,17 @@ TEMPLATE="$REPO_ROOT/packaging/README.txt.in"
 TOOLBOX_TEMPLATE="$REPO_ROOT/packaging/toolbox.json.in"
 CONFIG_EXAMPLE="$REPO_ROOT/packaging/config.ini.example"
 LICENSE="$REPO_ROOT/LICENSE"
-for f in "$TEMPLATE" "$TOOLBOX_TEMPLATE" "$CONFIG_EXAMPLE" "$LICENSE"; do
+GPL_TEXT="$REPO_ROOT/packaging/licenses/GPL-2.0.txt"
+NOTICES="$REPO_ROOT/scripts/notices.sh"
+RELEASE_NOTES="$REPO_ROOT/scripts/release-notes.sh"
+for f in "$TEMPLATE" "$TOOLBOX_TEMPLATE" "$CONFIG_EXAMPLE" "$LICENSE" "$GPL_TEXT" "$NOTICES" \
+         "$RELEASE_NOTES"; do
   [ -f "$f" ] || die "missing $f"
 done
+
+# A library linked without a notice is a release that breaks its licence, and
+# nothing on a console or in a review of the zip would say so.
+bash "$NOTICES" --check || die "refusing to package: a linked library has no notice"
 
 # --- stage the tree, then zip it ----------------------------------------------
 
@@ -212,12 +233,40 @@ mkdir -p "$STAGE/$FLAGS_ENTRY" \
 cp "$NSP" "$STAGE/$NSP_ENTRY"
 cp "$OVL" "$STAGE/$OVL_ENTRY"
 cp "$CONFIG_EXAMPLE" "$STAGE/$CONFIG_ENTRY"
-cp "$LICENSE" "$STAGE/LICENSE"
+cp "$LICENSE" "$STAGE/$LICENSE_ENTRY"
+cp "$GPL_TEXT" "$STAGE/$GPL_ENTRY"
+bash "$NOTICES" > "$STAGE/$NOTICES_ENTRY" || die "could not generate the notices"
 
-# The version and the title id a user reads are the ones the archive was built
-# with, substituted the way switch.mk substitutes version.hpp.in.
-sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
-  "$TEMPLATE" > "$STAGE/README.txt"
+# What the README says about the build is asked of release-notes.sh, which the
+# release page is written by, so the two cannot disagree (#303): PRE-RELEASE
+# only when VERSION is one, and "not yet run on a real console" only while the
+# launch gate still holds a console row. Every README used to say both.
+PRERELEASE="$(bash "$RELEASE_NOTES" --prerelease)" || die "release-notes.sh --prerelease failed"
+VERIFIED="$(bash "$RELEASE_NOTES" --verified)" || die "release-notes.sh --verified failed"
+
+# The template's paragraphs that hold only sometimes sit between an
+# `@IF <condition>@` line and an `@ENDIF@` line; the markers never ship, and a
+# condition this does not know is refused rather than read as false.
+# Then the version and the title id a user reads are the ones the archive was
+# built with, substituted the way switch.mk substitutes version.hpp.in.
+awk -v prerelease="$PRERELEASE" -v verified="$VERIFIED" '
+  /^@IF [a-z]+@$/ {
+    if (inblock) { print "nested @IF at line " NR > "/dev/stderr"; failed = 1; exit 1 }
+    cond = substr($2, 1, length($2) - 1)
+    if      (cond == "prerelease") keep = (prerelease == "true")
+    else if (cond == "unverified") keep = (verified == "false")
+    else { print "unknown condition @IF " cond "@ at line " NR > "/dev/stderr"; failed = 1; exit 1 }
+    inblock = 1; next
+  }
+  /^@ENDIF@$/ { inblock = 0; next }
+  !inblock || keep
+  END { if (inblock && !failed) { print "@IF without @ENDIF" > "/dev/stderr"; exit 1 } }
+' "$TEMPLATE" |
+  sed -e "s/@VERSION@/$VERSION/g" -e "s/@TITLE_ID@/$TITLE_ID/g" \
+  > "$STAGE/$README_ENTRY" || die "could not render $TEMPLATE"
+if grep -qE '^@|@[A-Z_]+@' "$STAGE/$README_ENTRY"; then
+  die "README.txt still holds a template marker"
+fi
 
 # ovl-sysmodules parses this one, so a substitution that did not happen is not a
 # cosmetic bug: `@TITLE_ID@` is not hex, `strtoul` reads it as 0, and the module

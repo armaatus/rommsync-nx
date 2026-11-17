@@ -738,14 +738,18 @@ OperationError BackupIsReported(fs::FileSystem& files, const std::string& sd_pat
                " was left as it is" + (kept.message.empty() ? "" : ": " + kept.message);
     return OperationError::kUnreadableCard;
   }
-  if (kept.content_hash == expected) {
+  if (!expected.empty() && kept.content_hash == expected) {
     return OperationError::kNone;
   }
   // Dropped only while the save still holds these bytes. One written again
   // since leaves this the sole copy of the write before -- kept, and named.
-  *message = sd_path +
-             " is not the bytes this tick reported, so the server's ruling is not about it; it "
-             "was left as it is";
+  *message = expected.empty()
+                 ? sd_path +
+                       " was written after the scan found it empty, so nothing was ruled on "
+                       "there; it was left as it is"
+                 : sd_path +
+                       " is not the bytes this tick reported, so the server's ruling is not "
+                       "about it; it was left as it is";
   const std::string source = files.Resolve(sd_path);
   const state::HashOutcome now =
       source.empty() ? state::HashOutcome{} : state::HashFile(source);
@@ -1239,7 +1243,8 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
     // at that path": a save the scan skipped, or one it read in another slot,
     // still sits there, and writing over it on the strength of a row this
     // console has no history for is not a restore. Asked before anything is
-    // fetched; the backup below still covers a file that appears meanwhile.
+    // fetched; a file that appears meanwhile is the backup's to find, and the
+    // placement stands down over it (#318, `BackupIsReported`).
     const std::string resolved = files.Resolve(sd_path);
     if (resolved.empty()) {
       return Fail(operation, OperationError::kUnreadableCard,
@@ -1398,7 +1403,9 @@ OperationResult Fetch(http::HttpClient& client, fs::FileSystem& files,
   // The save the game wrote between the scan and the backup is not the one the
   // ruling was about (#286). Before the archival upload, which would otherwise
   // keep it on the server as the losing side of a ruling that never saw it.
-  if (!ruled_on.empty()) {
+  // A placement was ruled on against nothing at its path, so any file the
+  // backup found there is one the game wrote since the scan (#318).
+  if (!ruled_on.empty() || !matched) {
     if (const OperationError held = BackupIsReported(files, target->sd_path, ruled_on,
                                                      &result.backup_sd_path, &message);
         held != OperationError::kNone) {

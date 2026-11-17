@@ -15,6 +15,7 @@
 // libultrahand type.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -41,7 +42,42 @@ struct LogView {
   /// newest when the panel is short, because the end of a log is the part
   /// that says why the last tick failed.
   std::vector<std::string> lines;
+
+  /// How many of the newest lines are scrolled off the bottom (#304). Zero is
+  /// the end of the log, which is where the screen opens. The painter clamps it
+  /// to what the panel can show; `ScrollLog` is how it moves.
+  std::size_t back = 0;
+
+  /// What the last "Write diagnostics" press came to, drawn under the hint.
+  /// Empty until one is pressed. Set by the screen, not by `RenderLog`, so a
+  /// poll that redraws the lines does not take it away.
+  std::string notice;
+  Tone notice_tone = Tone::kNeutral;
 };
+
+/// `back` after a held key worth `rows` rows (`ScrollRepeat::Update`; negative
+/// is up, towards older lines). Clamped so the panel is always full: never past
+/// the oldest line, never below the newest. `room` is how many lines the panel
+/// holds, which `PaintLog` answers.
+std::size_t ScrollLog(std::size_t back, int rows, std::size_t lines, std::size_t room);
+
+/// How a "Write diagnostics" press ended, in the terms the screen has a
+/// sentence for. The overlay reads a `Result`; this names no libnx type.
+enum class DiagnosticsOutcome {
+  kWritten,      ///< the bundle is on the card
+  kWriteFailed,  ///< the sysmodule tried, and the card refused it
+  kOutdated,     ///< the sysmodule predates `WriteDiagnostics` (`kUnknownCommand`)
+  kNoAnswer,     ///< anything else: not running, not answering, a payload this build cannot read
+};
+
+/// One sentence and its tone.
+struct LogNotice {
+  std::string text;
+  Tone tone = Tone::kNeutral;
+};
+
+/// What the screen says after a press. `sd_path` is the bundle's, on `kWritten`.
+LogNotice RenderDiagnostics(DiagnosticsOutcome outcome, const std::string& sd_path);
 
 /// What `GetLog` answered, as a screen.
 LogView RenderLog(const ipc::LogTail& tail);

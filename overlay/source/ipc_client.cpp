@@ -14,6 +14,7 @@
 
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
+#include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 
 namespace rommsync::overlay {
@@ -433,6 +434,21 @@ Result IpcClient::CancelKeepLocal(std::int64_t entry_id, ipc::CancelKeepLocalRes
 Result IpcClient::GetRestoreState(ipc::RestoreState* state) {
   return CallAndDecode(ipc::Command::kGetRestoreState, ipc::EncodeEmpty(),
                        ipc::DecodeRestoreState, state);
+}
+
+Result IpcClient::WriteDiagnostics(ipc::DiagnosticsResult* result) {
+  // The overlay's half of the versions: the sysmodule cannot know which overlay
+  // is on the card, and a mismatched pair is the first thing triage checks.
+  // `ROMMSYNC_LIBULTRAHAND` is switch.mk's, read off .gitmodules' pin line; a
+  // host build has no libultrahand and sends it empty.
+#ifdef ROMMSYNC_LIBULTRAHAND
+  const char* libultrahand = ROMMSYNC_LIBULTRAHAND;
+#else
+  const char* libultrahand = "";
+#endif
+  const ipc::DiagnosticsRequest request{rommsync::version(), ipc::kVersion, libultrahand};
+  return CallAndDecode(ipc::Command::kWriteDiagnostics, ipc::EncodeDiagnosticsRequest(request),
+                       ipc::DecodeDiagnosticsResult, result);
 }
 
 Result IpcClient::GetLog(std::int32_t lines, ipc::LogTail* tail) {

@@ -880,6 +880,13 @@ save's newest backup, which [pruning](#backups) never removes.
 `execute.stale_fetch` and `states.stale_write` write the save before the backup
 and, in a second case each, again after it.
 
+A placement — a save or state fetched onto a path the scan found empty — is held
+to the same rule with *nothing* as the reported digest (#318): the decision to
+place was made against an empty path, so any backup at all is of a file the game
+wrote since (its first save, while the download ran). It stands down the same
+way, with the same rule for the backup. `execute.stale_place` and
+`states.stale_place` force it, in the same two cases.
+
 **`state.db` keeps the same rename protocol, and gets no A/B slots — decided,
 not deferred.** A flying write (a sector written whole, to the wrong place) can
 corrupt a file nothing opened, and A/B copies with a generation counter and a
@@ -1192,6 +1199,16 @@ does not lose it.
 They ride out on the completion the tick is making anyway, so a console on
 battery spends no extra request. `POST /api/play-sessions` is the other route,
 for flushing without a sync (`play::Flush`).
+
+**`[sync] play_sessions = false` turns all of it off** (#301; on by default,
+[PRIVACY.md](PRIVACY.md#play-sessions)). Nothing is derived, `play.db` is not
+written -- not even the window stamp -- and every completion carries
+`"play_sessions": []`. What `play.db` already holds stays there unsent. Because
+the window was not stamped while it was off, the first tick after it is turned
+back on stamps and derives nothing (`SdEngine::play_window_stale_`): its window
+would open before the switch and report play nobody agreed to send. That memory
+is the running sysmodule's; across a reboot in between, the twelve-hour bound is
+the backstop.
 
 An answer this build cannot read is a **warning**, not an error: it leaves
 `play_session_ingest` absent, which already means "keep them buffered", and the

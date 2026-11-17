@@ -255,6 +255,7 @@ SAVE_SITE_CENSUS='core/src/auth_gate.cpp|0|0|1||not a save: the auth backoff rec
 core/src/conflict_log.cpp|0|0|1||not a save: the conflict log M7-1 writes
 core/src/conflict_record.cpp|1|0|0|io::CommitStaged|SAVE (M7-1 restore): putting a backup back IS an overwrite, so sync::BackUpFirst runs first; staged with io::CopyStaged so the #270 check sits between the copy and the commit
 core/src/device_identity.cpp|0|0|2||not a save: device.dat
+core/src/diagnostics.cpp|0|0|1||not a save: the diagnostics bundle M11-20 writes on a press, a new file each time
 core/src/download.cpp|1|0|1||not a save: rom bytes, and the queue record
 core/src/play_sessions.cpp|0|0|1||not a save: the play-session buffer M7-4 writes
 core/src/server_binding.cpp|0|0|1||not a save: server.id, which server the queue and play sessions belong to (#294); records it sets aside are renamed, never written over

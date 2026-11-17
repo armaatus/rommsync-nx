@@ -317,6 +317,79 @@ newlib's `printf` formatter went with #252's `snprintf` cut, and libstdc++'s
 fast_float with #253's integer-only JSON numbers; `switch.builds` refuses either
 coming back.
 
+### What the process costs the pool
+
+The image is not the whole bill, and until M11-12 (#296) nothing put the two
+beside the pool they come out of. What `sys-rommsync` holds resident, for its
+whole life, measured off the linked image in `devkitpro/devkita64:20260219`:
+
+| term | bytes | where it comes from |
+|---|---:|---|
+| code: the text and rodata segments, paged | 663,552 | the link (`scripts/image-budget.sh`) |
+| data and `.bss`, paged | 1,617,920 | of it, the 1.5 MiB inner heap (`kInnerHeapSize`) |
+| ...inside the heap: three thread stacks | 319,488 | `kHeapThreadStacks` + `kHeapWatcherStack` (`main.cpp`) |
+| ...inside the heap: bsd transfer memory | 118,784 | `kHeapSocketMemory`, `SocketBudget` |
+| the main thread's stack | 32,768 | `main_thread_stack_size` in `sys-rommsync.json` |
+| the TLS page its four threads share | 4,096 | `TLS_BYTES` |
+| `ssl` | 0 | the `ssl` sysmodule's own process ([M0-1](#m0-1-the-measurement-and-the-decision)) |
+
+**The resident footprint is 2,342,912 bytes (2.23 MiB), recorded 24 KiB over
+what this build measures.** It is one number, and it is held: `switch.builds`
+fails when the linked image plus the stack and the TLS page is over it, or more
+than 64 KiB under it -- a number that stopped being a measurement -- and
+`heap.footprint` fails when this page or INSTALL quotes any other. Moving it is
+an edit to `RESIDENT_FOOTPRINT` in `scripts/image-budget.sh` and to both
+documents, in one change.
+
+Against the pool that number is about a third of the 7 MB Atmosphere adds on
+HOS 21 and 22, and about a seventh of the experimental 16 MB 1.12.x settled on
+for 23.0.0 ([above](#what-the-image-costs)). That pool is shared: nx-ovlloader's
+overlay heap alone defaults to 4 MB on HOS 21-22 and 6 MB on 23+, and sys-clk,
+MissionControl, ldn_mitm, emuiibo and SaltyNX are each a tenant beside it. What
+this does not count: the kernel's own objects for the process (page tables, the
+`KProcess` and its threads), which are not this build's to size. Whether the
+whole set fits is a reading of `svcGetResourceLimitCurrentValue` on the System
+limit with the set running, and that is the M12 co-resident run's
+([#309](https://github.com/armaatus/rommsync-nx/issues/309)).
+
+**Cuts looked for, and none taken.** The total is over the ~2 MiB #296 named as
+the line to look below. What was looked at: the inner heap leaves 4 KiB over
+its peak, and every term of it is a bound something else enforces; the main
+thread's stack is sized against the deepest JSON it parses (#216); `-Os`, LTO
+and the dropped formatter and float parser are already taken (#200, #252, #253);
+the prebuilt libraries' `.eh_frame` (~25 KiB) needs a fork of libnx's
+`switch.ld`, declined above. Anything further is a smaller bound -- fewer saves
+a tick, a shorter rom index -- and that is a product decision, not a build one.
+
+**Sockets stay up for the life of the process; they are not brought up per
+tick.** #296 asked whether to, and the answer is no, for now:
+
+- **It frees nothing from the pool.** The bsd transfer memory is allocated out
+  of `g_inner_heap`, a `.bss` array whose pages the loader maps and the pool
+  pays for at launch. `socketExit` hands those 116 KiB back to newlib, not to
+  the system. Shrinking `kInnerHeapSize` by them is the only way to cash the
+  saving, and then the next tick's `socketInitialize` needs 116 KiB of
+  page-aligned contiguous heap left free by everything that ran in between --
+  a new way to fail, on every tick instead of once at boot.
+- **What it would free is `bsd:u` sessions**, three of them
+  (`SocketBudget::num_bsd_sessions`' two and the monitor; `kBsd` in
+  `handle_budget.hpp` adds the transfer memory's handle), of the fifteen `bsd:u`
+  allows system-wide since 18.0.0. That is real, and it is why libultrahand
+  brings sockets up per download. But the worker, the pairing thread and the
+  overlay's list paging each reach the network at times of their own, so a
+  per-tick lifetime is a reference count under a lock across two threads, and
+  the boot-time failure the overlay can report becomes a mid-tick one.
+- **The re-init cost has no host prototype.** `socketInitialize` and
+  `sslInitialize` are IPC to `bsd:u`, `sfdnsres` and `ssl`, and the desktop
+  backend has nothing comparable to time. Its cost is a console measurement,
+  behind the M8-1 gate.
+
+The open risk this leaves is the session count: a co-resident set that already
+holds `bsd:u` full at boot leaves this process without a transport until the
+next boot, since `NetworkInitialize` is not retried (`main.cpp` records why).
+The M12 co-resident run is where that is seen; a lazy retry of the transport is
+the follow-up if it is.
+
 ## Repo build layout
 
 ```
@@ -345,7 +418,10 @@ tlsprobe/
 packaging/           # what the release zip ships beside the two artifacts
   README.txt.in      # substituted with VERSION and the title id by package.sh
   config.ini.example
+  third_party.manifest  # every linked library -> THIRD_PARTY_NOTICES.txt (#300)
+  licenses/          # each one's licence text, and the GPL-2.0 the overlay ships
 scripts/package.sh   # the two build outputs -> dist/rommsync-nx-<VERSION>.zip
+scripts/notices.sh   # the manifest -> THIRD_PARTY_NOTICES.txt; --check its coverage
 scripts/release-notes.sh  # the body a `v*` tag's GitHub Release carries
 ```
 
@@ -360,8 +436,10 @@ atmosphere/contents/<TID>/exefs.nsp    the sysmodule, RENAMED
 atmosphere/contents/<TID>/toolbox.json what ovl-sysmodules lists it by
 switch/.overlays/ovl-rommsync.ovl      the overlay
 config/rommsync/config.ini.example     a starting configuration
-README.txt
-LICENSE
+config/rommsync/README.txt
+config/rommsync/LICENSE                MIT: the sysmodule, and the project's code
+config/rommsync/THIRD_PARTY_NOTICES.txt  scripts/notices.sh's output
+config/rommsync/COPYING.GPL-2.0        the overlay's licence (docs/LICENSING.md)
 ```
 
 ```bash
@@ -370,7 +448,7 @@ make -C sysmodule && make -C overlay
 ./scripts/package.sh --list       # the entry paths, without building anything
 ```
 
-Five things about it are load-bearing, and every one of them fails silently on a
+Six things about it are load-bearing, and every one of them fails silently on a
 console rather than loudly here:
 
 - **`exefs.nsp`, not `sys-rommsync.nsp`.** Atmosphère loads the former. The
@@ -397,8 +475,15 @@ console rather than loudly here:
 - **The archive is byte-deterministic** — fixed entry order, timestamps and
   permissions — so the checksums a release publishes describe the build and not
   one upload.
+- **Every linked library has a notice** (#300). The overlay is GPL-2.0 because
+  it links libultrahand, so the zip carries `COPYING.GPL-2.0` and
+  `THIRD_PARTY_NOTICES.txt`, generated by `scripts/notices.sh` from
+  `packaging/third_party.manifest`. `package.sh` runs `notices.sh --check`
+  first and refuses a `-l` or a submodule with no row; `package.builds` runs it
+  again over the real link maps. Adding a library means a manifest row and its
+  licence under `packaging/licenses/` — see [LICENSING.md](LICENSING.md).
 
-`ctest -R package` is what holds all of it: five scenarios that need no
+`ctest -R package` is what holds all of it: six scenarios that need no
 toolchain, plus `package.builds`, which packages a real devkitPro build inside
 the same container. `switch-build` runs the script on every push as well, and
 `package.builds` with it (see [the toolchain's ctest entries](#the-toolchains-ctest-entries)),
@@ -557,8 +642,13 @@ Push the tag and the `release` job in
 for `static`, `host-tests` and `switch-build`, checks the tag and `VERSION` agree
 and that the tagged commit is an ancestor of `main` — the three jobs say the
 commit is *good*, nothing else says it was *reviewed*, and a tag can be pushed at
-any branch head — then builds the three Switch targets in `devkitpro/devkita64`,
-runs `scripts/package.sh`, and writes a `SHA256SUMS` beside the archive.
+any branch head — then takes the three artifacts `switch-build` built and
+checked in the same run, re-reads them with `scripts/artifact-check.py`, runs
+`scripts/package.sh` on them in `devkitpro/devkita64`, writes a `SHA256SUMS`
+beside the archive, and attests both with `actions/attest` (signed build
+provenance; `gh attestation verify <zip> --repo <owner>/<repo>` checks it). It
+builds nothing itself: what ships is the build `switch-build`'s checks read
+(#303).
 
 It publishes in that order too: the release is created as a **draft**, the two
 assets are uploaded, both are pulled back *out* of the release through the API
@@ -568,7 +658,7 @@ page advertising a truncated download whenever an upload failed. The body is
 `scripts/release-notes.sh`: the install lines, what the build targets, the
 commits since the previous tag, and those checksums.
 
-Eight things are worth knowing before you do it:
+Nine things are worth knowing before you do it:
 
 - **That pull request is an ordinary one.** It needs the required checks green
   and no review thread left open (`required_conversation_resolution` is on);
@@ -585,7 +675,17 @@ Eight things are worth knowing before you do it:
 - **The checksums are computed beside the build.** The archive is
   byte-deterministic for one `zip` build, which is what makes a published
   checksum a statement about these bytes — one recomputed on another host is a
-  checksum of something else.
+  checksum of something else. The binaries inside it are reproducible across
+  checkout paths: `switch.mk` maps the tree's absolute path out of `__FILE__`
+  and the debug info, and `ctest -R package.reproducible` (in `switch-build`,
+  through `tests/toolchain_suite.sh`) builds the tree at two paths and compares.
+- **What the release says about itself follows two facts.** "Pre-release", in
+  the notes and in the archive's `README.txt`, follows `VERSION`
+  (`release-notes.sh --prerelease`). "Not yet verified on hardware" follows the
+  launch gate (#305, `scripts/launch-gate.sh`): `release-notes.sh --verified`
+  is `true` only once that script exists and lists no `console` row, so every
+  release says it until a console has run the build and the gate records it.
+  `ctest -R 'release.wording|package.wording'` holds both.
 - **A stable release's notes start at the last stable release**, not at the last
   release candidate. `v0.2.0` cut after a `v0.2.0-rc1` lists everything since
   `v0.1.0`; `v0.2.0-rc2` lists everything since `rc1`. `ctest -R release.history`
@@ -601,7 +701,7 @@ Eight things are worth knowing before you do it:
   `ctest -R release.compatibility` holds those two together and refuses a third
   copy, so the fix is still that one constant and a guide edit in the same
   commit. Nothing here has run on a console — the notes say so in the release
-  itself. Confirming or correcting the numbers is part of the M8-1 gate (#43),
+  itself, until the launch gate says otherwise. Confirming or correcting the numbers is part of the M8-1 gate (#43),
   on the `media` row, which prints them beside the NAND backup because the same
   first boot settles both.
 - **Both halves of that line were corrected, not confirmed, by M6-4 (#142)** —
@@ -948,6 +1048,14 @@ A removed command leaves a hole.
 | 17 | `GetRestoreState` | - -> `RestoreState` (`idle \| running \| done` + the `RestoreReport` when done) | never fails; the outcome is `restored \| no_such_entry \| nothing_to_restore \| backup_missing \| backup_failed \| write_failed \| not_a_conflict \| changed_since_backup \| superseded \| keep_local_full \| held` |
 | 18 | `KeepLocal` | `entry_id` -> `RestoreState` | never fails; `RestoreBackup` for a save conflict, and the next upload of it goes with `overwrite=true`; refused, nothing written, when superseded or with `sync::kMaxKeepLocal` waiting; `held`, nothing written yet, under a running game -- it lands when the game closes |
 | 19 | `CancelKeepLocal` | `entry_id` -> outcome (`cancelled \| landed \| not_held`) + the row's `keep_local` | never fails; withdraws a `held` Keep local with nothing written; one that already landed is `landed` and stands |
+| 20 | `WriteDiagnostics` | `DiagnosticsRequest` (the overlay's version, `kVersion` and libultrahand tag) -> `DiagnosticsResult` (the bundle's SD path) | `kWriteFailed`; writes `/config/rommsync/diagnostics-<time>.txt`, redacted, streamed a line at a time |
+
+`WriteDiagnostics` (M11-20, #304) is the log screen's Y. It adds a command and
+nothing an older overlay decodes, so it does not move `ipc::kVersion`: an older
+sysmodule answers `kUnknownCommand`, which the log screen draws as "update the
+sysmodule". What goes into the bundle is `core/include/rommsync/diagnostics.hpp`'s
+to say, and [TROUBLESHOOTING.md](TROUBLESHOOTING.md#what-to-attach-to-a-bug-report)
+is where a user is told about it.
 
 `RestoreBackup` and `GetRestoreState` are one restore in two calls, since M9-6
 (#209). A restore copies a whole save, and a save is as large as a game makes
@@ -970,7 +1078,9 @@ tick found, and each platform's `play_with` (M10-31, #271) made it 11, and Keep
 local's refusals `superseded`, `game_running` and `keep_local_full` (M10-33,
 #273) made it 12, and `held` in place of `game_running` with a conflict row's
 `keep_local` (M10-34, #275) made it 13, and `CancelKeepLocal` -- a held Keep
-local withdrawn before the game closes (M10-35, #279) -- made it 14.
+local withdrawn before the game closes (M10-35, #279) -- made it 14, and
+`Status` carrying the clock check (M11-11, #295) made it 15, and `GetConfig`
+carrying `[sync] play_sessions` (M11-17, #301) made it 16.
 
 `KeepLocal` is the conflicts screen's Keep local (#249): a restore of a save
 conflict's backup, polled the same way, after which the sysmodule arms that
@@ -1070,7 +1180,8 @@ state (paired / unauthenticated / never paired), configured, online, the last
 sync's time, result and counts, whether a tick is running right now
 (`sync_in_progress`), the queue depth, the RomM version the last heartbeat
 read and whether this build syncs with it (`server_version`,
-`server_supported`, #228), and the **current download**
+`server_supported`, #228), what the last prune left in `.backup/` and whether
+it is still over `max_mib` (`backup`, #316), and the **current download**
 (`rom_id`, `fs_name`, `bytes_done`, `bytes_total`, state). That last field is how
 M3-5 is served: one poll per frame, not a second round trip. Per-item queue
 progress rides on the `queue` list kind (M5-4).

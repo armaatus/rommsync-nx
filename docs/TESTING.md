@@ -1053,8 +1053,13 @@ ctest --test-dir build --output-on-failure
   container, holds the archive to the same layout `package.layout` does and
   `toolbox.json`'s `tid` to the built NPDM's program id, and skips on the same
   missing image `switch.builds` does — and, like that one, runs in the
-  `switch-build` job, where it cannot skip (#211). The `release` job runs the
-  script again on a tag (#34).
+  `switch-build` job, where it cannot skip (#211). `package.reproducible`
+  builds the three targets twice, at two different paths, and holds the
+  binaries and the zip to the same bytes (#303) -- what lets the `release` job,
+  which runs the script again on a tag (#34), package `switch-build`'s
+  artifacts rather than a build of its own. `package.wording` holds README.txt's
+  "PRE-RELEASE" and "not yet run on a real console" to the two facts they are
+  about.
 - The `release.*` group and `version.tag` cover what turns a `v*` tag into a
   downloadable release, and none of them needs Docker, a network or a tag:
   `version.tag` refuses a tag that disagrees with `VERSION` (it reads
@@ -1063,7 +1068,9 @@ ctest --test-dir build --output-on-failure
   `release.notes` and `release.history` run `scripts/release-notes.sh`, the
   second against a throwaway repo with real tags in it, because this one has
   none; `release.prerelease` checks the semver rule the release is created by;
-  and `release.compatibility` holds the one compatibility sentence a release
+  `release.wording` holds the body's "pre-release" to that rule and its
+  "not yet verified on hardware" -- pointing at #44 -- to the launch gate
+  (#305), through `release-notes.sh --verified`; and `release.compatibility` holds the one compatibility sentence a release
   makes to one copy — `ATMOSPHERE_TARGET` and the guide line in
   [INSTALL.md](INSTALL.md) that quotes it — and derives its Horizon number from
   the `hosversionAtLeast` gates in `sysmodule/source` and `overlay/source`

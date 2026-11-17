@@ -6,15 +6,16 @@ This document is about **reporting vulnerabilities in this project**. For how to
 *deploy and expose RomM safely* and how the client handles tokens on-device, see
 [`docs/SECURITY.md`](docs/SECURITY.md).
 
-## Project status
+## Supported versions
 
-rommsync-nx is in **pre-release**. The Switch components (sysmodule + overlay)
-are specced but not yet implemented, so there are no released binaries to pin a
-version to yet. Once releases exist, the table below will list which are
-supported.
+rommsync-nx ships as a release zip holding the sysmodule (`sys-rommsync`) and
+the overlay (`ovl-rommsync`); its version is the first line of
+`rommsync.log` and the **Build** row of the overlay's status screen. Fixes land
+on `main` and go out in the next release of the current series.
 
 | Version | Supported |
 |---------|-----------|
+| `1.0.x` (release candidates included) | ✅ |
 | `main` (unreleased) | ✅ |
 
 ## Reporting a vulnerability
@@ -68,7 +69,10 @@ Out of scope:
 
 ## Our security commitments
 
-- No inbound listeners on the Switch — the client only calls *out* over HTTPS.
+- No inbound listeners on the Switch — the client only ever calls *out* to
+  your RomM. `https://` is the recommended scheme; plain `http://` works, sends
+  the token in the clear, and is meant for a trusted LAN only (see
+  [`docs/INSTALL.md`](docs/INSTALL.md)).
 - No third-party services and no telemetry.
-- Secrets (`config.ini`, `token.dat`) are never committed; see
+- Secrets (`config.ini`, `token.dat`, `device.dat`) are never committed; see
   [`.gitignore`](.gitignore).

@@ -111,6 +111,7 @@ Status ServiceCore::GetStatus() const {
   status.server_supported = snapshot.server_supported;
   status.clock_trusted = snapshot.clock_trusted;
   status.clock_skew_seconds = snapshot.clock_skew_seconds;
+  status.backup = snapshot.backup;
   status.download = snapshot.download;
   // A `fs_name` comes off a RomM library, so its length is not ours to assume,
   // and `GetStatus` is documented never to fail. A truncated label costs a few
@@ -146,6 +147,13 @@ ConfigView ServiceCore::GetConfig() const {
     diagnostics.push_back(Note(config::Severity::kError, "server", "url",
                                "the configured server URL is too long to send over IPC; "
                                "edit config.ini directly"));
+  }
+  // The same for the CA path (#288), which `ParseConfig` already bounds; this is
+  // for a `Config` that reached here some other way.
+  if (view.config.server.ca_file.size() > config::kMaxPathLength) {
+    view.config.server.ca_file.clear();
+    diagnostics.push_back(Note(config::Severity::kError, "server", "ca_file",
+                               "the configured CA file path is too long to send over IPC"));
   }
 
   view.diagnostics = TrimDiagnostics(diagnostics);
@@ -351,6 +359,7 @@ bool TakesRequest(Command command) {
     case Command::kGetLog:
     case Command::kKeepLocal:
     case Command::kCancelKeepLocal:
+    case Command::kWriteDiagnostics:
       return true;
     case Command::kGetInterfaceVersion:
     case Command::kGetStatus:
@@ -420,6 +429,11 @@ CancelKeepLocalResult ServiceCore::CancelKeepLocal(std::int64_t entry_id) {
 }
 
 RestoreState ServiceCore::GetRestoreState() const { return Bounded(engine_.restore_state()); }
+
+Error ServiceCore::WriteDiagnostics(const DiagnosticsRequest& request,
+                                    DiagnosticsResult* result) {
+  return engine_.WriteDiagnostics(request, result);
+}
 
 LogTail ServiceCore::GetLog(std::int32_t lines) const {
   // Clamped here rather than at the decoder, so an over-large ask is a smaller
@@ -645,6 +659,19 @@ Error Dispatch(ServiceCore& core, std::uint32_t command_id, std::string_view req
         return Error::kMalformedRequest;
       }
       payload = EncodeLogTail(core.GetLog(lines.value));
+      break;
+    }
+
+    case Command::kWriteDiagnostics: {
+      const Decoded<DiagnosticsRequest> asked = DecodeDiagnosticsRequest(request);
+      if (!asked.ok()) {
+        return Error::kMalformedRequest;
+      }
+      DiagnosticsResult result;
+      error = core.WriteDiagnostics(asked.value, &result);
+      if (error == Error::kOk) {
+        payload = EncodeDiagnosticsResult(result);
+      }
       break;
     }
   }
