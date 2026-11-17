@@ -4947,6 +4947,10 @@ class TickLines final : public rlog::Sink {
 /// What it stands for is a user launching a game while a tick is under way: the
 /// probe said no when the tick started, and says yes before the first save is
 /// placed. Also records every URL, for "nothing more went out".
+///
+/// The launch waits for `Answered`: `SyncNow` wakes the worker before it asks
+/// the probe, and a worker that reached the library first would have the press
+/// answered "held for the game" -- the test racing itself, not the engine.
 class LaunchesMidTick final : public http::HttpClient {
  public:
   LaunchesMidTick(http::HttpClient& inner, std::atomic<bool>& running)
@@ -4955,6 +4959,10 @@ class LaunchesMidTick final : public http::HttpClient {
   http::Result Send(const http::Request& request) override {
     Record(request.url);
     if (request.url.find("/api/roms") != std::string::npos && armed_.exchange(false)) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+      while (!answered_.load() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+      }
       running_ = true;
     }
     return inner_.Send(request);
@@ -4966,7 +4974,13 @@ class LaunchesMidTick final : public http::HttpClient {
     return inner_.Download(request, target);
   }
 
-  void Arm() { armed_ = true; }
+  void Arm() {
+    answered_ = false;
+    armed_ = true;
+  }
+
+  /// The press that started the armed tick has its answer; the game may start.
+  void Answered() { answered_ = true; }
 
   std::vector<std::string> urls() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -4982,6 +4996,7 @@ class LaunchesMidTick final : public http::HttpClient {
   http::HttpClient& inner_;
   std::atomic<bool>& running_;
   std::atomic<bool> armed_{false};
+  std::atomic<bool> answered_{false};
   mutable std::mutex mutex_;
   std::vector<std::string> urls_;
 };
@@ -5147,8 +5162,10 @@ int Foreground(http::HttpClient& client, const std::string& base) {
            "a second save the server does not have");
   const std::size_t asked_before = counted.urls().size();
   counted.Arm();
-  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted,
-           "with no game running, Sync now starts a tick");
+  const ipc::SyncOutcome pressed = console.SyncNow();
+  counted.Answered();
+  c.Expect(pressed == ipc::SyncOutcome::kAccepted,
+           std::string("with no game running, Sync now starts a tick: ") + ipc::ToString(pressed));
   const std::chrono::steady_clock::time_point launched_by =
       std::chrono::steady_clock::now() + std::chrono::seconds{30};
   while (!running.load() && std::chrono::steady_clock::now() < launched_by) {
