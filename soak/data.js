@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794828282590,
+  "lastUpdate": 1794916859282,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "soak": [
@@ -815,6 +815,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "soak: allocations a round",
             "value": 3528,
+            "unit": "allocations"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "998c576de65f3e5ed255ebc0a18b863cca58a793",
+          "message": "Merge pull request #324 from armaatus/fleet/m11c\n\nM11: sysmodule hardening, release packaging, diagnostics bundle (13 tickets)",
+          "timestamp": "2026-11-17T10:49:18Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/998c576de65f3e5ed255ebc0a18b863cca58a793"
+        },
+        "date": 1794916858410,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "soak: held between rounds",
+            "value": 67750,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: a round's peak over that",
+            "value": 51800,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: allocations a round",
+            "value": 3614,
             "unit": "allocations"
           }
         ]
