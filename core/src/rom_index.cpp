@@ -463,9 +463,10 @@ FetchResult FetchRomIndex(http::HttpClient& client, const FetchOptions& options)
       // unmatched with nothing anywhere saying why.
       if (page.total > 0 && offset < page.total) {
         result.index.set_truncated(true);
-        result.message = "the rom index ran out at " + std::to_string(offset) + " of " +
-                         std::to_string(page.total) +
-                         " roms; the library changed mid-fetch and the rest are not matched";
+        result.message += std::string(result.message.empty() ? "" : "; ") +
+                          "the rom index ran out at " + std::to_string(offset) + " of " +
+                          std::to_string(page.total) +
+                          " roms; the library changed mid-fetch and the rest are not matched";
       }
       return finished();
     }

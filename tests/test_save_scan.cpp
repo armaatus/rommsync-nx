@@ -2209,8 +2209,9 @@ void Shrunk(::checks::Checks& checks) {
                          R"({"items":[],"total":2,"limit":1,"offset":2})"});
   const roms::FetchResult short_tail = roms::FetchRomIndex(ended, options);
   checks.ExpectEq(short_tail.index.size(), std::size_t{2}, "an empty page ends the fetch");
-  checks.Expect(short_tail.index.truncated(),
-                "and one past a shrunken end still says the index is short: " +
+  checks.Expect(short_tail.index.truncated() &&
+                    short_tail.message.find("shrank") != std::string::npos,
+                "and one past a shrunken end still says the index is short, and why: " +
                     short_tail.message);
 
   // The control: a library that did not change is read whole.

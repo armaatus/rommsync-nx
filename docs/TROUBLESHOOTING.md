@@ -1049,10 +1049,11 @@ so a sync holds a bounded amount of everything
   RomM ids. A save of any other game is *unmatched*, with the index named as
   the likely reason. Past this bound a save is matched only by its exact name
   in a folder that names one platform, such as Tico's per-platform folders:
-  never in RetroArch's shared `saves/` folder, which names none, and never by its name without `(USA)`-style tags. A rom the index
-  never read may share the name, and a save synced into the wrong game is
-  worse than one not synced, so those are *unmatched* too, with the rom it
-  would have matched named.
+  never in RetroArch's shared `saves/` folder, which names none, and never by
+  its name without `(USA)`-style tags. A rom the index never read may share
+  the name, and a save synced into the wrong game is worse than one not
+  synced, so those are *unmatched* too, with the rom it would have matched
+  named.
 - **A game with more than 128 saves on the server** — one plan's worth — is
   left out of the sync whole: none of its saves is offered and nothing of it is
   touched. The `sync.refused` line names it on every sync, and the sync reads
