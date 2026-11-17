@@ -2206,6 +2206,27 @@ foreach(scenario
   set_tests_properties(docs.community_${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# --- the hardware test plan: docs/HARDWARE_TEST_PLAN.md (M12-2, #307) --------
+# The script whoever holds a console runs, and the template each run is written
+# into. Hard rule 1 keeps anyone here from running it, so it is held to what a
+# reader past the gate relies on: ids that stay stable and are all cited -- by
+# the results template and by M12-0's launch-gate rows (#305) -- and log lines,
+# paths and result codes that are the code's. Reads files only; never skips.
+set(DOCS_HARDWARE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_docs_hardware.py")
+
+foreach(scenario
+        ids        # unique AREA-NN ids, each with steps and pass criteria
+        results    # the template lists every scenario and #307's console fields
+        cited      # every id cited by a launch-gate row; #44's checklists folded
+        events     # every quoted log line's tag is in log::kAllEvents
+        facts      # title id, paths, ssl's would-block code, repo paths, README steps
+        links)     # every relative link and anchor resolves
+  add_test(NAME docs.hardware_${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${DOCS_HARDWARE_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(docs.hardware_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M6-3: turning a tag into a release --------------------------------------
 # Three files decide whether a `v*` tag publishes something a user can install:
 # VERSION, the release job in .github/workflows/ci.yml, and the notes generator.

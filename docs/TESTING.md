@@ -1407,6 +1407,13 @@ Then **M8-2** (#44): on a spare/backup SD or emuMMC, run the NRO first, install
 the sysmodule **disabled**, and only sync against a **disposable** collection
 with `.backup/` populated before ever pointing at the real library.
 
+Every console check from there on -- #44's own and the M11/M12 ones -- is one
+script, [HARDWARE_TEST_PLAN.md](HARDWARE_TEST_PLAN.md), with a stable id per
+scenario; each run is recorded in
+[HARDWARE_RESULTS.md](HARDWARE_RESULTS.md) in one shape (M12-2, #307).
+`ctest -R docs.hardware` keeps the ids unique and cited, and the plan's log
+lines, paths and result codes the code's.
+
 ## What can and can't be tested off-console — honest limits
 
 - **Fully off-console:** auth flow, sync negotiate/execute/complete, conflict
