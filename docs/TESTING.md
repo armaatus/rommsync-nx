@@ -1440,7 +1440,7 @@ which the script prints rather than restates.
 | `servers` | console | M12-5: the server and TLS matrix is filled. |
 | `beta` | console | M12-7: the closed beta's exit criteria are met. |
 | `tid` | repo | The title id is recorded as final (M12-6). |
-| `notes` | repo | INSTALL and TROUBLESHOOTING carry no "not yet validated on hardware" note. |
+| `notes` | repo | INSTALL, TROUBLESHOOTING and INTEROP carry no "not yet validated on hardware" note. |
 
 ```bash
 scripts/launch-gate.sh          # judge every row: runs scripts/v1-gate.sh, asks GitHub about M11
@@ -1454,7 +1454,7 @@ but a row is held. The repo rows: `v1gate` is the v1 gate's own exit code (its
 3 is held here too); `m11` asks GitHub for the M11 milestone's open count,
 bounded by a timeout, and is held when it cannot ask; `tid` reads
 `sysmodule/README.md` for a line declaring the id in `sys-rommsync.json` *is
-final*, which M12-6 (#308) writes; `notes` greps the two guides.
+final*, which M12-6 (#308) writes; `notes` greps the three guides.
 
 **`--rows` is a contract.** `scripts/release-notes.sh --verified`, and through it
 `scripts/package.sh`, read it, and drop "not yet verified on hardware" from the

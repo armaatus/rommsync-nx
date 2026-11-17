@@ -94,7 +94,7 @@ matrix|console|M12-4: the compatibility matrix is filled.
 servers|console|M12-5: the server and TLS matrix is filled.
 beta|console|M12-7: the closed beta's exit criteria are met.
 tid|repo|The title id is recorded as final (M12-6).
-notes|repo|INSTALL and TROUBLESHOOTING carry no "not yet validated on hardware" note.
+notes|repo|INSTALL, TROUBLESHOOTING and INTEROP carry no "not yet validated on hardware" note.
 ROWS
 }
 
@@ -106,7 +106,7 @@ row_inputs() {
     v1gate)   echo scripts/v1-gate.sh ;;
     overlay)  echo overlay/README.md ;;
     tid)      printf '%s\n' sysmodule/sys-rommsync.json sysmodule/README.md ;;
-    notes)    printf '%s\n' docs/INSTALL.md docs/TROUBLESHOOTING.md ;;
+    notes)    printf '%s\n' docs/INSTALL.md docs/TROUBLESHOOTING.md docs/INTEROP.md ;;
   esac
   return 0
 }
@@ -253,13 +253,13 @@ repo_tid() {
 
 repo_notes() {
   local doc ok=0
-  for doc in docs/INSTALL.md docs/TROUBLESHOOTING.md; do
+  for doc in docs/INSTALL.md docs/TROUBLESHOOTING.md docs/INTEROP.md; do
     if grep -qi "not yet validated on hardware" "$REPO_ROOT/$doc" 2>/dev/null; then
       echo "    $doc still says it is not yet validated on hardware"
       ok=1
     fi
   done
-  [ "$ok" -eq 0 ] && echo "    neither guide says it is unvalidated on hardware"
+  [ "$ok" -eq 0 ] && echo "    no guide says it is unvalidated on hardware"
   return "$ok"
 }
 
