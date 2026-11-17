@@ -2641,6 +2641,7 @@ set(ENGINE_RIG_SCENARIOS
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
   backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
+  backup_truncated  # #323: a .backup/ past one listing draws its Backups row as a floor
   server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload

@@ -5468,8 +5468,107 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(status.backup.kept_unique, std::int64_t{1},
              "one of them kept only because it is the only copy");
   c.Expect(!status.backup.over_cap, "and with no cap, nothing is over it");
+  c.Expect(!status.backup.truncated, "and one listing held the whole directory (#323)");
 
   harness::DeleteSave(client, base, fixture, uploaded.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// M11-22 (#323): a `.backup/` holding more than one listing returns. The prune
+/// measures only what it listed, and the status screen's Backups row says so --
+/// `≥` -- rather than drawing a floor as the total.
+int BackupTruncated(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-backup-truncated");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-backup-truncated");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\nstates = false\n\n"
+                                     "[backup]\nkeep = 1\nkeep_days = 0\nmax_mib = 0\n"),
+           "the console points at the rig");
+
+  // More than a listing holds: 400 of nova's backups, then a rom whose name
+  // sorts after it, which the listing cuts part way. The cut rom sits the prune
+  // out (`backup_prune.cpp`), so the count is exactly nova's -- each the only
+  // copy of its bytes, so none of them goes either.
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  constexpr int kListed = 400;
+  const auto seed = [&console, now](std::int64_t rom_id, int count) {
+    bool written = true;
+    for (int i = 0; i < count; ++i) {
+      const std::int64_t at = now - 100 * 24 * 60 * 60 + i;
+      written = console.sandbox.Write(std::string(harness::kBackupDir) + "/" +
+                                          rommsync::sync::BackupNameFor(rom_id, "autosave",
+                                                                        "nova.srm", at),
+                                      "backup " + std::to_string(rom_id) + " " +
+                                          std::to_string(i)) &&
+                written;
+    }
+    return written;
+  };
+  c.Expect(seed(rom.id, kListed) && seed(999999999, 200), "the card holds 600 backups");
+  console.sandbox.Write("/config/rommsync/state.db", "rommsync-state 3\n");
+
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(), "paired");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 1 && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks.ticks(), 1, "and it ran");
+
+  ipc::Status status;
+  status.backup = console.engine.Snapshot().backup;
+  c.Expect(status.backup.measured, "the prune's report reaches the status");
+  c.Expect(status.backup.truncated, "saying the listing was cut:" + Rendered(console.Log()));
+  c.ExpectEq(status.backup.backups, std::int64_t{kListed},
+             "having counted only the roms one listing held whole");
+  const rommsync::overlay::StatusView view = rommsync::overlay::Render(status, now);
+  bool drawn = false;
+  for (const rommsync::overlay::Line& line : view.lines) {
+    if (line.label == "Backups") {
+      drawn = true;
+      c.Expect(line.value.rfind("\xE2\x89\xA5 ", 0) == 0,
+               "and the Backups row says it is a floor, not a total: " + line.value);
+    }
+  }
+  c.Expect(drawn, "the status screen draws a Backups row");
+
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();
 }
@@ -8041,6 +8140,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"download_restores", DownloadRestores},
       {"server_deleted", ServerDeleted},
       {"backup_pruned", BackupPruned},
+      {"backup_truncated", BackupTruncated},
       {"server_switched", ServerSwitched},
       {"interop", Interop},
       {"upgrade", Upgrade},

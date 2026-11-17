@@ -190,7 +190,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **18** since M11-21 (#316), which added `backup` to `Status` -- a required
 /// object, so a v17 overlay reading a v18 sysmodule's `Status` fails to decode
 /// it.
-inline constexpr std::uint32_t kVersion = 18;
+///
+/// **19** since M11-22 (#323), which added `truncated` to `Status`'s `backup`
+/// -- a required field, so a v19 overlay reading a v18 sysmodule's `Status`
+/// fails to decode it.
+inline constexpr std::uint32_t kVersion = 19;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -472,6 +476,12 @@ struct BackupUsage {
 
   /// Still over `[backup] max_mib` after everything provable went.
   bool over_cap = false;
+
+  /// The prune's listing was cut (`PruneReport::truncated`, #323): `.backup/`
+  /// holds more than one listing returns, so every number above is a floor --
+  /// what was listed -- and the status screen leads its row with `≥` rather
+  /// than drawing it as the total.
+  bool truncated = false;
 };
 
 /// Everything the status screen needs, in one call.
