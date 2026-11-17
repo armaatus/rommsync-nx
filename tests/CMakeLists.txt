@@ -1090,6 +1090,7 @@ target_compile_definitions(test_save_scan PRIVATE
 set(SCAN_UNIT_SCENARIOS
   names        # base names, emulators, slots, and which folder implies a platform
   ambiguous    # one name on two platforms, in a hintless folder, is skipped
+  short_index  # #287: a truncated index matches only an exact name under a platform's folder
   walked_once  # RetroArch's flat saves/, listed under a dozen platforms
   unusable     # a record sync::Validate refuses costs one file, not the tick
   truncated    # a directory past kMaxDirectoryEntries keeps a set that does not move

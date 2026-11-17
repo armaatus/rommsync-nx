@@ -16,6 +16,8 @@
 //
 //   names        -- base names, emulators, slots, and which folder implies what
 //   ambiguous    -- one name on two platforms, in a hintless folder, is skipped
+//   short_index  -- #287: a truncated index matches only an exact name under a
+//                   platform's folder; never hintless, never tag-stripped
 //   walked_once  -- RetroArch's flat saves/, listed under a dozen platforms
 //   unusable     -- a file sync::Validate would refuse costs one file, not the tick
 //   truncated    -- a directory past the bound keeps a set that does not move
@@ -376,6 +378,83 @@ void Ambiguous(::checks::Checks& checks) {
                     short_index.skipped.front().message.find("index is incomplete") !=
                         std::string::npos,
                 "and says so in the reason an unmatched file carries");
+}
+
+// --- short_index --------------------------------------------------------------
+
+/// #287: an index cut at `kMaxIndexRoms` sees only the roms it read, so "one rom
+/// carries this name" is no longer "one rom does". `Pac-Man (USA).srm` in the
+/// flat RetroArch folder belongs to an NES rom past the bound; the GBA rom of
+/// that name was read. A full index matching it uniquely is right; a short one
+/// doing so uploads one game's save into another's slot. Only an exact name
+/// under a folder that names its platform still matches -- one platform's folder
+/// holds one rom of a name -- and the tag-stripped fallback never runs.
+void ShortIndex(::checks::Checks& checks) {
+  roms::Rom fallback = MakeRom(41, "Rampart (USA)", "nes");
+  fallback.fs_name_no_tags = "Rampart";
+  const auto library = [&fallback](bool truncated) {
+    roms::RomIndex index;
+    index.Add(MakeRom(40, "Pac-Man (USA)", "gba"));
+    index.Add(MakeRom(43, "Tetris", "gba"));
+    index.Add(fallback);
+    index.set_truncated(truncated);
+    return index;
+  };
+
+  const config::Config config = config::Defaults();
+  FakeFileSystem files("short");
+  files.AddFile("/retroarch/saves", "Pac-Man (USA).srm", 32768, kMtime);
+  files.AddFile("/tico/saves/nes", "Rampart.srm", 8192, kMtime);
+  files.AddFile("/tico/saves/gba", "Tetris.srm", 32768, kMtime);
+
+  // The control: the same card against a whole library matches all three.
+  const roms::RomIndex whole = library(false);
+  const scan::ScanResult matched = scan::ScanSaves(config, kRetroArchDefaults, whole, files, kFirstTick);
+  checks.ExpectEq(matched.saves.size(), std::size_t{3},
+                  "a whole index matches by name, hintless and tag-stripped: " +
+                      matched.DescribeSkipped());
+
+  const roms::RomIndex partial = library(true);
+  const scan::ScanResult result = scan::ScanSaves(config, kRetroArchDefaults, partial, files, kFirstTick);
+  checks.Expect(SkippedFor(result, "/retroarch/saves/Pac-Man (USA).srm", scan::SkipReason::kUnmatched),
+                "a short index does not match a hintless save to the one rom it read of that name");
+  checks.Expect(SkippedFor(result, "/tico/saves/nes/Rampart.srm",
+                           scan::SkipReason::kUnmatched),
+                "nor by a tag-stripped name, even under a platform's folder");
+  const scan::SaveFile* scoped = nullptr;
+  for (const scan::SaveFile& save : result.saves) {
+    if (save.sd_path == "/tico/saves/gba/Tetris.srm") {
+      scoped = &save;
+    }
+  }
+  checks.Expect(scoped != nullptr && scoped->rom_id == 43,
+                "an exact name under a platform's folder still matches: " + result.DescribeSkipped());
+  checks.ExpectEq(result.saves.size(), std::size_t{1}, "and nothing else does");
+
+  // The reason is the index's, so every caller of `Find` carries it -- and says
+  // what would let the save match, since nothing on the server is wrong.
+  const roms::Match hintless = partial.Find("Pac-Man (USA)", "");
+  checks.Expect(hintless.outcome == roms::MatchOutcome::kUnmatched && hintless.rom == nullptr,
+                "Find answers unmatched");
+  checks.Expect(hintless.reason.find("index is incomplete") != std::string::npos &&
+                    hintless.reason.find("rom 40") != std::string::npos,
+                "naming the rom it declined and why: " + hintless.reason);
+  const roms::Match stripped = partial.Find("Rampart", "nes");
+  checks.Expect(stripped.outcome == roms::MatchOutcome::kUnmatched &&
+                    stripped.reason.find("index is incomplete") != std::string::npos,
+                "a fallback declined says so too: " + stripped.reason);
+  for (const scan::Skip& skip : result.skipped) {
+    checks.Expect(skip.message.find("index is incomplete") ==
+                      skip.message.rfind("index is incomplete"),
+                  "and says it once: " + skip.message);
+  }
+  checks.Expect(partial.Find("Rampart", "").outcome == roms::MatchOutcome::kUnmatched,
+                "a name only the fallback key carries is not matched hintless either");
+  roms::RomIndex twice = library(true);
+  twice.Add(MakeRom(42, "Pac-Man (USA)", "nes"));
+  twice.set_truncated(true);
+  checks.Expect(twice.Find("Pac-Man (USA)", "").outcome == roms::MatchOutcome::kAmbiguous,
+                "an ambiguity it can see is still an ambiguity");
 }
 
 // --- walked_once --------------------------------------------------------------
@@ -2194,7 +2273,8 @@ int main(int argc, char** argv) {
   // out: a `Sandbox` reports its teardown audit into it.
   rig::Checks checks;
 
-  if (scenario == "names" || scenario == "ambiguous" || scenario == "walked_once" ||
+  if (scenario == "names" || scenario == "ambiguous" || scenario == "short_index" ||
+      scenario == "walked_once" ||
       scenario == "unusable" || scenario == "truncated" || scenario == "hashing" ||
       scenario == "sources" || scenario == "grown" || scenario == "retroarch" ||
       scenario == "tico" || scenario == "isolated" || scenario == "contest") {
@@ -2202,6 +2282,8 @@ int main(int argc, char** argv) {
       Names(checks);
     } else if (scenario == "ambiguous") {
       Ambiguous(checks);
+    } else if (scenario == "short_index") {
+      ShortIndex(checks);
     } else if (scenario == "walked_once") {
       WalkedOnce(checks);
     } else if (scenario == "truncated") {
