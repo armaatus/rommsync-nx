@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794828291949,
+  "lastUpdate": 1794916862383,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "image": [
@@ -1012,6 +1012,52 @@ window.BENCHMARK_DATA = {
           {
             "name": "overlay .ovl",
             "value": 610364,
+            "unit": "bytes",
+            "extra": "budget 1048576"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "998c576de65f3e5ed255ebc0a18b863cca58a793",
+          "message": "Merge pull request #324 from armaatus/fleet/m11c\n\nM11: sysmodule hardening, release packaging, diagnostics bundle (13 tickets)",
+          "timestamp": "2026-11-17T10:49:18Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/998c576de65f3e5ed255ebc0a18b863cca58a793"
+        },
+        "date": 1794916861735,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sysmodule mapped image",
+            "value": 2297856,
+            "unit": "bytes",
+            "extra": "budget 2359296"
+          },
+          {
+            "name": "sysmodule .bss",
+            "value": 1590416,
+            "unit": "bytes",
+            "extra": "heap 1572864"
+          },
+          {
+            "name": "sysmodule .text",
+            "value": 584784,
+            "unit": "bytes",
+            "extra": "ceiling 655360"
+          },
+          {
+            "name": "overlay .ovl",
+            "value": 626748,
             "unit": "bytes",
             "extra": "budget 1048576"
           }
