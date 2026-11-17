@@ -674,7 +674,7 @@ phase_doc() {
   # gate. Two copies of eight rows drift; this is what stops them. The doc rows
   # are the leading `| `id` |` cells of the table under the v1 gate heading.
   local doc_ids script_ids
-  doc_ids="$(awk '/^## Rung 3/,/^## What can/' "$doc" \
+  doc_ids="$(awk '/^## Rung 3/,/^## Rung 4/' "$doc" \
              | sed -n 's/^| `\([a-z]*\)` *|.*/\1/p')"
   script_ids="$("$GATE" --rows | cut -d'|' -f1)"
   [ -n "$doc_ids" ] || fail "docs/TESTING.md publishes no gate table under Rung 3"
@@ -692,7 +692,7 @@ $script_ids"
   # a claim head that happens to appear elsewhere on the page would otherwise
   # satisfy this while the table said something else.
   local section id claim head
-  section="$(awk '/^## Rung 3/,/^## What can/' "$doc")"
+  section="$(awk '/^## Rung 3/,/^## Rung 4/' "$doc")"
   while IFS='|' read -r id _ claim; do
     [ -n "$id" ] || continue
     # The first few words are enough, and are what survives a table cell being

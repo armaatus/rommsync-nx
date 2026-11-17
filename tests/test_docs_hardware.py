@@ -24,6 +24,7 @@ test holds them to is what a reader on the far side of that gate relies on:
 import argparse
 import os
 import re
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,8 +49,13 @@ RUN_FIELDS = (
     "Build sha",
 )
 
-# M12-0's console rows (#305), the only rows a hardware scenario can be evidence for.
-GATE_ROWS = {"selftest", "smoke", "overlay", "soak", "matrix", "servers", "beta"}
+
+def gate_rows(repo: str) -> dict:
+    """M12-0's rows (#305), id -> kind, read from `scripts/launch-gate.sh --rows`:
+    the script owns them, so the plan's table cannot drift from a copy here."""
+    out = subprocess.run(["bash", os.path.join(repo, "scripts", "launch-gate.sh"), "--rows"],
+                         capture_output=True, text=True, check=True).stdout
+    return {line.split("|")[0]: line.split("|")[1] for line in out.splitlines() if line}
 
 
 def fail(msg: str) -> int:
@@ -159,12 +165,19 @@ def phase_cited(args) -> int:
             return fail(f"{rel} cites {unknown}, which no scenario heading defines")
 
     rows = table_rows(section(text, "What the launch gate cites"))
-    cited = set()
+    gate = gate_rows(args.repo)
+    cited, named = set(), set()
     for row in rows:
         name = row[0].strip("`")
-        if name not in GATE_ROWS:
-            return fail(f"launch-gate row {name!r} is not one of M12-0's console rows {sorted(GATE_ROWS)}")
+        if name not in gate:
+            return fail(f"{name!r} is not a row of scripts/launch-gate.sh {sorted(gate)}")
+        named.add(name)
         cited |= set(ID.findall(row[-1]))
+    # Every console row cites its evidence. A row a person has since flipped to
+    # `repo` keeps its line here, so the check runs one way only.
+    unnamed = sorted(r for r, kind in gate.items() if kind == "console" and r not in named)
+    if unnamed:
+        return fail(f"the launch gate's console rows {unnamed} cite no scenarios in {PLAN}")
     uncited = sorted(ids - cited)
     if uncited:
         return fail(f"no launch-gate row cites {uncited}")

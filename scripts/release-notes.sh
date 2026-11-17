@@ -4,6 +4,7 @@
 #   scripts/release-notes.sh [--checksums FILE]
 #   scripts/release-notes.sh --prerelease
 #   scripts/release-notes.sh --verified
+#   scripts/release-notes.sh --may-publish
 #
 # Three parts, in this order:
 #
@@ -89,18 +90,22 @@ usage: scripts/release-notes.sh [--checksums FILE]
                     notes -- the flag the GitHub Release is created with
   --verified        print `true` or `false`: has the launch gate recorded this
                     build running on a console? -- and exit, writing no notes
+  --may-publish     exit 0 if this VERSION may be published, 1 (saying why)
+                    if it is stable and the launch gate holds a console row
 USAGE
 }
 
 CHECKSUMS=""
 PRERELEASE_ONLY=0
 VERIFIED_ONLY=0
+MAY_PUBLISH_ONLY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --checksums)  [ $# -ge 2 ] || die "--checksums needs a path"; CHECKSUMS="$2"; shift 2 ;;
     --prerelease) PRERELEASE_ONLY=1; shift ;;
     --verified)   VERIFIED_ONLY=1; shift ;;
+    --may-publish) MAY_PUBLISH_ONLY=1; shift ;;
     -h|--help)    usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $1" ;;
   esac
@@ -144,6 +149,17 @@ verified() {
 VERIFIED="$(verified)"
 if [ "$VERIFIED_ONLY" -eq 1 ]; then
   echo "$VERIFIED"
+  exit 0
+fi
+
+# A stable release refuses to publish unverified (#305, decided 2026-11-16). A
+# pre-release publishes either way and carries the note; a stable one is marked
+# Latest, and "Latest" is a claim a console has to have backed. The release job
+# asks this before it builds anything, so a refused tag publishes nothing.
+if [ "$MAY_PUBLISH_ONLY" -eq 1 ]; then
+  if [ "$PRERELEASE" = false ] && [ "$VERIFIED" = false ]; then
+    die "$VERSION is a stable version and scripts/launch-gate.sh still holds a console row (or does not exist) -- a stable release is not published unverified on hardware. Cut a pre-release (-rcN, -betaN), or record the console runs the launch gate asks for."
+  fi
   exit 0
 fi
 

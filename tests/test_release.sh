@@ -34,6 +34,9 @@
 #                             a prerelease VERSION, and "not yet verified on
 #                             hardware" -- pointing at #44 -- only while the
 #                             launch gate (#305) holds a console row.
+#   test_release.sh refuse    ...and a stable VERSION refuses to publish at all
+#                             while it does (#305): `--may-publish`, asked by the
+#                             release job before anything is built.
 #   test_release.sh history   ...and it picks the right previous tag, against a
 #                             throwaway repo with real tags in it. This repo has
 #                             none before VERSION's own, which the notes skip,
@@ -725,6 +728,48 @@ phase_wording() {
   echo "ok: 'pre-release' follows VERSION, 'unverified on hardware' follows the launch gate"
 }
 
+# --- a stable release refuses to publish unverified (#305) -------------------
+
+# Decided on #305 (maintainer, 2026-11-16): a stable VERSION does not publish
+# while the launch gate still holds a console row; a pre-release does, with the
+# "not yet verified on hardware" note. `--may-publish` is the rule, here so it
+# can be run against fake gates, and the release job asks it before it builds
+# anything -- a rule nothing calls refuses nothing.
+phase_refuse() {
+  [ -x "$NOTES" ] || fail "no executable $NOTES"
+  SCRATCH="$(mktemp -d)"
+  mkdir -p "$SCRATCH/scripts"
+  cp "$NOTES" "$SCRATCH/scripts/"
+  local notes="$SCRATCH/scripts/release-notes.sh" case version gate want out
+  for case in "1.0.0:none:no" "1.0.0:held:no" "1.0.0:passed:yes" \
+              "1.0.0-rc3:none:yes" "1.0.0-rc3:held:yes" "1.0.0-beta.1:held:yes" \
+              "1.0.0:broken:no" "1.0.0-rc3:broken:no"; do
+    IFS=: read -r version gate want <<<"$case"
+    echo "$version" > "$SCRATCH/VERSION"
+    rm -f "$SCRATCH/scripts/launch-gate.sh"
+    [ "$gate" = none ] || fake_gate "$SCRATCH" "$gate"
+    if out="$("$notes" --may-publish 2>&1)"; then
+      [ "$want" = yes ] || fail "$version with the launch gate $gate may publish; a stable release must be verified"
+    else
+      [ "$want" = no ] || fail "$version with the launch gate $gate was refused: $out"
+      # Refused for the reason, not for a typo in the flag.
+      [ "$gate" = broken ] || grep -q 'launch-gate' <<<"$out" ||
+        fail "$version, gate $gate: the refusal does not name the launch gate: $out"
+    fi
+  done
+
+  # ...and the release job asks, before the step that publishes.
+  local job ask publish
+  job="$(release_job)"
+  ask="$(grep -n 'release-notes.sh --may-publish' <<<"$job" | head -1 | cut -d: -f1)"
+  publish="$(grep -n 'name: Publish' <<<"$job" | head -1 | cut -d: -f1)"
+  [ -n "$ask" ] || fail "the release job never asks release-notes.sh --may-publish"
+  [ -n "$publish" ] || fail "the release job has no Publish step to hold back"
+  [ "$ask" -lt "$publish" ] || fail "the release job asks --may-publish after it publishes"
+
+  echo "ok: a stable VERSION refuses to publish while the launch gate holds a console row; a pre-release does not"
+}
+
 # --- which tag the changes are counted from -----------------------------------
 
 # A throwaway repo: one commit per tag, so "which commits are listed" and "which
@@ -804,6 +849,7 @@ case "${1:-}" in
   history)    phase_history ;;
   wording)    phase_wording ;;
   compatibility) phase_compatibility ;;
-  *)          echo "usage: $0 {version|ci|notes|prerelease|history|compatibility|wording}" >&2
+  refuse)     phase_refuse ;;
+  *)          echo "usage: $0 {version|ci|notes|prerelease|history|compatibility|wording|refuse}" >&2
               exit 2 ;;
 esac
