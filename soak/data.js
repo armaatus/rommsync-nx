@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794916859282,
+  "lastUpdate": 1795002659172,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "soak": [
@@ -852,6 +852,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "soak: allocations a round",
             "value": 3614,
+            "unit": "allocations"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "1d4b74ddb92171be3d611b3b2935496686becd6d",
+          "message": "Merge pull request #327 from armaatus/fleet/m11f\n\nM11/M12: Backups floor (#323), spl: facts (#322), on-console selftest (#306), title id final (#308)",
+          "timestamp": "2026-11-18T08:37:43Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/1d4b74ddb92171be3d611b3b2935496686becd6d"
+        },
+        "date": 1795002658762,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "soak: held between rounds",
+            "value": 67750,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: a round's peak over that",
+            "value": 51800,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: allocations a round",
+            "value": 3617,
             "unit": "allocations"
           }
         ]
