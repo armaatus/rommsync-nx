@@ -217,6 +217,7 @@ Climb it in order. You do not go up a rung until the one below is green.
 | 1 | **Host build + real docker RomM (+ fault proxy)** | Engine logic against a genuine RomM, plus every forced edge case: 401, conflict, partial failure, `Range` resume, multi-file skip. Runs in CI. | No |
 | 2 | **NRO + docker RomM, in an emulator** | The real Horizon path (`ssl`/`fs`/`socket`) via a manually-launched NRO — [`tlsprobe/`](../tlsprobe/README.md). The only pre-hardware place Horizon code actually runs, and the one rung this environment cannot climb: see [rung 2](#rung-2--the-manually-launched-nro). | No (emulator) |
 | 3 | **Real hardware (M8)** | Final bring-up, on a backup SD/emuMMC, NRO first then a disabled sysmodule. | Yes — last, gated |
+| 4 | **The launch gate (M12)** | That a stable release has been run where users will run it: the hardware test plan, a soak, the matrices, a beta. [Rung 4](#rung-4--the-launch-gate-m12-0). | Yes — evidence committed, not run here |
 
 Rung 1 is the day-to-day loop. Rung 2 is where the M0-1 `ssl` question was
 *meant* to be answered without hardware; M0-1 built the NRO and the TLS fixture
@@ -1406,6 +1407,61 @@ them in full; in short:
 Then **M8-2** (#44): on a spare/backup SD or emuMMC, run the NRO first, install
 the sysmodule **disabled**, and only sync against a **disposable** collection
 with `.backup/` populated before ever pointing at the real library.
+
+Every console check from there on -- #44's own and the M11/M12 ones -- is one
+script, [HARDWARE_TEST_PLAN.md](HARDWARE_TEST_PLAN.md), with a stable id per
+scenario; each run is recorded in
+[HARDWARE_RESULTS.md](HARDWARE_RESULTS.md) in one shape (M12-2, #307).
+`ctest -R docs.hardware` keeps the ids unique and cited, and the plan's log
+lines, paths and result codes the code's.
+
+## Rung 4 — the launch gate (M12-0)
+
+**[`scripts/launch-gate.sh`](../scripts/launch-gate.sh) decides whether a stable
+`v1.0.0` may be published** (#305), the way the v1 gate decides whether hardware
+may start. Passing the v1 gate opens the first console run; it says nothing
+about a soak, a second console or a stranger's. This gate is where those are
+asked, and it is built the same way: the script owns the rows, this table is
+checked against it by `gate.launch_doc`, and a `console` row is HELD until a
+reviewed edit records its run in [HARDWARE_RESULTS.md](HARDWARE_RESULTS.md) and
+changes its kind. The scenarios each console row cites are the plan's table,
+[*What the launch gate cites*](HARDWARE_TEST_PLAN.md#what-the-launch-gate-cites),
+which the script prints rather than restates.
+
+| id | kind | The claim |
+|---|---|---|
+| `v1gate` | repo | scripts/v1-gate.sh exits 0: the v1 gate (M8-1, #43) passes. |
+| `m11` | repo | Every M11 issue is closed: the launch blockers found off-console. |
+| `selftest` | console | The on-console selftest (M12-1) passes on at least two HOS/Atmosphere pairs, and its reports are committed. |
+| `smoke` | console | #44 (M8-2) is complete: the first console run, on a spare SD or emuMMC. |
+| `overlay` | console | The overlay README's manual verification run end to end, every screen, handheld and docked, at a 4 MB overlay heap. |
+| `soak` | console | M12-3: a 72 h soak and lifecycle stress, with zero fatal errors and zero data loss. |
+| `matrix` | console | M12-4: the compatibility matrix is filled. |
+| `servers` | console | M12-5: the server and TLS matrix is filled. |
+| `beta` | console | M12-7: the closed beta's exit criteria are met. |
+| `tid` | repo | The title id is recorded as final (M12-6). |
+| `notes` | repo | INSTALL, TROUBLESHOOTING and INTEROP carry no "not yet validated on hardware" note. |
+
+```bash
+scripts/launch-gate.sh          # judge every row: runs scripts/v1-gate.sh, asks GitHub about M11
+scripts/launch-gate.sh --dry    # the tree alone: no suite run, no network
+scripts/launch-gate.sh --audit  # is the gate itself well formed? (ctest -R '^gate\.launch')
+```
+
+The exit codes are the v1 gate's: **0** every row holds and `v1.0.0` may be
+published, **1** a row this machine can decide is failing, **3** nothing failing
+but a row is held. The repo rows: `v1gate` is the v1 gate's own exit code (its
+3 is held here too); `m11` asks GitHub for the M11 milestone's open count,
+bounded by a timeout, and is held when it cannot ask; `tid` reads
+`sysmodule/README.md` for a line declaring the id in `sys-rommsync.json` *is
+final*, which M12-6 (#308) writes; `notes` greps the three guides.
+
+**`--rows` is a contract.** `scripts/release-notes.sh --verified`, and through it
+`scripts/package.sh`, read it, and drop "not yet verified on hardware" from the
+release notes and the archive's `README.txt` only once no row is `console`. A
+stable `VERSION` refuses to publish until then: the release job asks
+`release-notes.sh --may-publish` before it builds anything, and a pre-release
+publishes with the note (`ctest -R 'release.wording|release.refuse|package.wording'`).
 
 ## What can and can't be tested off-console — honest limits
 

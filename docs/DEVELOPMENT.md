@@ -690,6 +690,12 @@ Nine things are worth knowing before you do it:
   is `true` only once that script exists and lists no `console` row, so every
   release says it until a console has run the build and the gate records it.
   `ctest -R 'release.wording|package.wording'` holds both.
+- **A stable release refuses to publish unverified.** A `VERSION` with no
+  semver suffix fails the release job while `release-notes.sh --verified` is
+  `false` -- the job runs `release-notes.sh --may-publish` before it builds
+  anything. Cut `-rcN` or `-betaN` until the launch gate
+  ([TESTING.md, rung 4](TESTING.md#rung-4--the-launch-gate-m12-0)) holds no
+  `console` row. `ctest -R release.refuse` holds it.
 - **A stable release's notes start at the last stable release**, not at the last
   release candidate. `v0.2.0` cut after a `v0.2.0-rc1` lists everything since
   `v0.1.0`; `v0.2.0-rc2` lists everything since `rc1`. `ctest -R release.history`

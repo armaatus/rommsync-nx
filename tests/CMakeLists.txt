@@ -2206,6 +2206,27 @@ foreach(scenario
   set_tests_properties(docs.community_${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
 
+# --- the hardware test plan: docs/HARDWARE_TEST_PLAN.md (M12-2, #307) --------
+# The script whoever holds a console runs, and the template each run is written
+# into. Hard rule 1 keeps anyone here from running it, so it is held to what a
+# reader past the gate relies on: ids that stay stable and are all cited -- by
+# the results template and by M12-0's launch-gate rows (#305) -- and log lines,
+# paths and result codes that are the code's. Reads files only; never skips.
+set(DOCS_HARDWARE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_docs_hardware.py")
+
+foreach(scenario
+        ids        # unique AREA-NN ids, each with steps and pass criteria
+        results    # the template lists every scenario and #307's console fields
+        cited      # every id cited by a launch-gate row; #44's checklists folded
+        events     # every quoted log line's tag is in log::kAllEvents
+        facts      # title id, paths, ssl's would-block code, repo paths, README steps
+        links)     # every relative link and anchor resolves
+  add_test(NAME docs.hardware_${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${DOCS_HARDWARE_TEST}" ${scenario}
+                   --repo "${CMAKE_SOURCE_DIR}")
+  set_tests_properties(docs.hardware_${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
+
 # --- M6-3: turning a tag into a release --------------------------------------
 # Three files decide whether a `v*` tag publishes something a user can install:
 # VERSION, the release job in .github/workflows/ci.yml, and the notes generator.
@@ -2260,6 +2281,13 @@ set_tests_properties(release.history PROPERTIES TIMEOUT 120)
 add_test(NAME release.wording
          COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" wording)
 set_tests_properties(release.wording PROPERTIES TIMEOUT 60)
+
+# ...and a stable release does not publish while that is still true (#305,
+# decided 2026-11-16): `release-notes.sh --may-publish`, and the release job
+# asking it before it publishes. A pre-release still publishes, with the note.
+add_test(NAME release.refuse
+         COMMAND "${BASH_PROGRAM}" "${RELEASE_TEST}" refuse)
+set_tests_properties(release.refuse PROPERTIES TIMEOUT 60)
 
 # The one compatibility statement a release makes, and the fact that there is
 # only one of it. `ATMOSPHERE_TARGET` is restated in docs/INSTALL.md's "Before
@@ -2333,6 +2361,24 @@ set_tests_properties(gate.release PROPERTIES TIMEOUT 120)
 # owns it; this is what stops them disagreeing.
 add_test(NAME gate.doc COMMAND "${BASH_PROGRAM}" "${GATE_TEST}" doc)
 set_tests_properties(gate.doc PROPERTIES TIMEOUT 60)
+
+# --- M12-0: the launch gate ---------------------------------------------------
+# scripts/launch-gate.sh decides whether a stable v1.0.0 may be published (#305),
+# the way v1-gate.sh decides whether hardware may start. Like those above, these
+# check its machinery and never its verdict, which stays held until a console
+# has run the plan. `--rows` is also read by release-notes.sh --verified, which
+# `release.wording` and `release.refuse` hold from the reader's side.
+set(LAUNCH_GATE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_launch_gate.sh")
+
+foreach(scenario
+        audit   # every row points at something that exists; --rows' contract
+        rows    # ...and the audit can fail
+        repo    # the repo rows and the 0/1/3 verdict, against stubbed trees
+        doc)    # docs/TESTING.md's Rung 4 table is the script's rows
+  add_test(NAME gate.launch_${scenario}
+           COMMAND "${BASH_PROGRAM}" "${LAUNCH_GATE_TEST}" ${scenario})
+  set_tests_properties(gate.launch_${scenario} PROPERTIES TIMEOUT 120)
+endforeach()
 
 # --- the TLS terminator the M0-1 probe aims at -------------------------------
 # The rig is plain HTTP because the host suite reaches it over loopback; the

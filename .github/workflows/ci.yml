@@ -471,6 +471,13 @@ jobs:
             echo "PRERELEASE=$prerelease"
           } >> "$GITHUB_ENV"
 
+      # A stable release is marked Latest, and refuses to publish while the
+      # launch gate (#305, scripts/launch-gate.sh) still holds a console row. A
+      # pre-release publishes with the "not yet verified on hardware" note. The
+      # rule is in release-notes.sh so `ctest -R release.refuse` can run it.
+      - name: A stable release is verified on hardware
+        run: ./scripts/release-notes.sh --may-publish
+
       # switch-build's three artifacts, from this run and so from this commit.
       # tlsprobe's comes along and is never packaged -- it is a spike, never
       # installed (tlsprobe/README.md) -- but switch-build had to build it for
