@@ -26,13 +26,15 @@
 #                                  lands the real backend, and retiring it
 #                                  should not touch the assertions about the two
 #                                  targets that ship (tlsprobe/README.md).
+#   test_switch_build.sh selftest  ...and the M12-1 selftest builds as a real NRO
+#                                  linking core/ and the sysmodule's backends.
 #   test_switch_build.sh suite CTEST BUILD_DIR
 #                                  tests/toolchain_suite.sh, which switch-build
 #                                  runs, is exactly `ctest -L toolchain`, and
 #                                  fails on an entry that skips (#211).
 #
 # `ci` and `suite` need nothing but the checkout, so they run everywhere.
-# `builds` and `tlsprobe` need the devkitpro/devkita64 image: through Docker on
+# `builds`, `tlsprobe` and `selftest` need the devkitpro/devkita64 image: through Docker on
 # a workstation, where they skip rather than pulling 2.7GB unasked, and in place
 # inside the `switch-build` job, which runs them with the rest of the
 # `toolchain` label and fails on a skip (scripts/toolchain.sh, toolchain_run).
@@ -70,14 +72,14 @@ phase_ci() {
   job="$(switch_build_job)"
   [ -n "$job" ] || fail "no switch-build job in .github/workflows/ci.yml"
 
-  for target in sysmodule overlay tlsprobe; do
+  for target in sysmodule overlay tlsprobe selftest; do
     [ -f "$REPO_ROOT/$target/Makefile" ] || fail "$target/Makefile is missing"
     grep -q -- "make -C $target" <<<"$job" || fail "switch-build does not build $target"
   done
 
   # The guard, in any of the shapes it could come back as: a conditional on the
   # Makefile's existence, or the ::notice:: that stood in for a real build.
-  if grep -qE '\[ *-f +(sysmodule|overlay|tlsprobe)/Makefile' <<<"$job"; then
+  if grep -qE '\[ *-f +(sysmodule|overlay|tlsprobe|selftest)/Makefile' <<<"$job"; then
     fail "switch-build still guards the build on the Makefile existing"
   fi
   if grep -q '::notice::' <<<"$job"; then
@@ -87,11 +89,11 @@ phase_ci() {
   # M9-29 (#256): the uploaded artifacts are read by scripts/artifact-check.py,
   # the parser the toolchain entries use, and not by a second, hand-kept one in
   # YAML -- `head -c 4` for PFS0, `tail -c 4` for ULTR, `dd skip=16` for NRO0.
-  # Each of the three files is named to it, so none can be dropped quietly.
+  # Each of the four files is named to it, so none can be dropped quietly.
   local artifact
   for artifact in sysmodule/sys-rommsync.nsp overlay/ovl-rommsync.ovl \
-                  tlsprobe/rommsync-tlsprobe.nro; do
-    grep -A4 'scripts/artifact-check.py container' <<<"$job" | grep -q "$artifact" ||
+                  tlsprobe/rommsync-tlsprobe.nro selftest/rommsync-selftest.nro; do
+    grep -A5 'scripts/artifact-check.py container' <<<"$job" | grep -q "$artifact" ||
       fail "switch-build does not hold $artifact to its container with scripts/artifact-check.py (#256)"
   done
   if grep -qE 'head -c|tail -c|dd if=' <<<"$job"; then
@@ -100,6 +102,11 @@ phase_ci() {
 
   # A green job that uploaded nothing is the same failure wearing a different
   # hat, so the upload has to be the thing that goes red.
+  # The selftest is uploaded as well as checked: PRE-02 tells whoever holds
+  # the console to copy switch-build's artifact (#306).
+  grep -A8 'actions/upload-artifact' <<<"$job" | grep -q 'selftest/rommsync-selftest.nro' ||
+    fail "switch-build does not upload selftest/rommsync-selftest.nro (#306)"
+
   grep -q 'if-no-files-found: error' <<<"$job" ||
     fail "switch-build would publish an empty artifact set"
 
@@ -127,7 +134,7 @@ phase_ci() {
   grep -q 'tests/toolchain_suite.sh --here' <<<"$job" ||
     fail "switch-build does not run the toolchain's ctest entries; they would run nowhere in CI (#211)"
 
-  echo "ok: switch-build builds all three targets, packages them, requires the artifacts,\
+  echo "ok: switch-build builds all four targets, packages them, requires the artifacts,\
  holds the image to its budget, and runs the toolchain's ctest entries"
 }
 
@@ -546,6 +553,67 @@ phase_tlsprobe() {
   echo "ok: the M0-1 probe builds as an NRO carrying $version, without core/"
 }
 
+# --- the M12-1 selftest ----------------------------------------------------------
+
+# The on-console selftest (#306, selftest/README.md) builds as a real NRO, and
+# links what it claims to test: core/'s engine, and the sysmodule's own `ssl`
+# transport and SD card backend rather than copies of them. Its rows are
+# judged by scripts/selftest-judge.py, which `selftest.*` holds on the host.
+#
+# What #306 asks of "the npdm/stack/image checks", applied to an NRO: there is
+# no NPDM (hbloader runs it under hbloader's own), and the stack it runs on is
+# hbloader's main thread, not one of the sysmodule's SizedThreads whose frames
+# stack.measured walks. The image checks that apply are these: the container,
+# the LNY2 stamp, the NACP and VERSION, no unwind tables of ours, no warnings.
+phase_selftest() {
+  local missing
+  missing="$(toolchain_missing)" && skip "$missing"
+
+  SCRATCH="$(mktemp -d)"
+  cp "$REPO_ROOT/VERSION" "$REPO_ROOT/switch.mk" "$SCRATCH/"
+  cp -R "$REPO_ROOT/core" "$REPO_ROOT/sysmodule" "$REPO_ROOT/selftest" "$SCRATCH/"
+  # By extension, for the reason phase_builds gives.
+  local ext
+  rm -rf "$SCRATCH/selftest/build"
+  for ext in nsp nso npdm ovl nro nacp elf map lst; do
+    rm -f "$SCRATCH/selftest/rommsync-selftest.$ext"
+  done
+
+  local log="$SCRATCH/build.log"
+  if ! toolchain_run "$SCRATCH" 'make -C selftest -j"$(nproc)"' >"$log" 2>&1; then
+    cat "$log" >&2
+    fail "the selftest build failed"
+  fi
+  check_no_warnings "$log"
+
+  local nro="$SCRATCH/selftest/rommsync-selftest.nro" version
+  version="$(cat "$REPO_ROOT/VERSION")"
+  [ -s "$nro" ] || fail "no rommsync-selftest.nro"
+  local check="$REPO_ROOT/scripts/artifact-check.py"
+  "${PYTHON:-python3}" "$check" container "$nro" || fail "rommsync-selftest.nro is not an NRO"
+  "${PYTHON:-python3}" "$check" lny2 "$nro" || fail "the selftest lacks libnx's LNY2 stamp"
+  "${PYTHON:-python3}" "$check" nacp "$nro" --title "rommsync selftest" --version "$version" ||
+    fail "the selftest's NACP is not one hbmenu would list as rommsync selftest $version"
+  "${PYTHON:-python3}" "$check" version "$nro" --version "$version" ||
+    fail "the selftest does not say it is $version"
+
+  # What it tests is what it links. Named by what LTO cannot inline away
+  # (#253): libnx's own calls the sysmodule's backends make, and core/
+  # functions with many callers or a body too large to fold.
+  local lst="$SCRATCH/selftest/build/rommsync-selftest.lst" symbol
+  [ -s "$lst" ] || fail "no symbol listing at $lst; the checks below would pass vacuously"
+  for symbol in 'sslConnectionDoHandshake' 'fsdevCommitDevice' 'rommsync::sysmodule::MakeSdCard' \
+                'rommsync::sysmodule::ConsoleIsOnline' 'rommsync::sync::RunTick(' \
+                'rommsync::sync::BackUpFirst(' 'rommsync::json::Parse('; do
+    grep -qF "$symbol" "$lst" || fail "the selftest does not link $symbol"
+  done
+
+  check_unwind_tables selftest
+  toolchain_run "$SCRATCH" \
+    '"$DEVKITPRO"/devkitA64/bin/aarch64-none-elf-size selftest/rommsync-selftest.elf'
+  echo "ok: the selftest builds as an NRO carrying $version, linking core/ and the sysmodule's backends"
+}
+
 # --- the footprint measurement's flags -------------------------------------------
 
 # The same for LDFLAGS: its literal flags, leaving out any that spells a make
@@ -689,7 +757,8 @@ case "${1:-}" in
   ci)        phase_ci ;;
   builds)    phase_builds ;;
   tlsprobe)  phase_tlsprobe ;;
+  selftest)  phase_selftest ;;
   footprint) phase_footprint ;;
   suite)     shift; phase_suite "$@" ;;
-  *)         echo "usage: $0 {ci|builds|tlsprobe|footprint|suite CTEST BUILD_DIR}" >&2; exit 2 ;;
+  *)         echo "usage: $0 {ci|builds|tlsprobe|selftest|footprint|suite CTEST BUILD_DIR}" >&2; exit 2 ;;
 esac

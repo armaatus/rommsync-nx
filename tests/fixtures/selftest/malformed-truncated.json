@@ -1,0 +1,65 @@
+{
+  "schema": 1,
+  "tool": "rommsync-selftest",
+  "version": "0.9.0",
+  "started": "2026-12-01T10:00:00Z",
+  "console": {
+    "hos": "21.0.0",
+    "ams": "1.10.1",
+    "emummc": true,
+    "sd_format": "fat32"
+  },
+  "server": "https://romm.fixture.local:25000",
+  "rows": [
+    {
+      "id": "platform.hos",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.ams",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.emummc",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.sd_format",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.free_space",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.clock",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "platform.mtime_utc",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.atomic_write",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.commit_device",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.backup_then_commit",
+      "result": "pass",
+      "detail": "canned"
+    },
+    {
+      "id": "card.fat32_ce

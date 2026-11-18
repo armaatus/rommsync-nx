@@ -2559,9 +2559,12 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
         static_cast<std::int64_t>(report.backups) - static_cast<std::int64_t>(report.pruned);
     backup_usage_.kept_unique = static_cast<std::int64_t>(report.kept_unique);
     backup_usage_.over_cap = report.over_cap;
+    backup_usage_.truncated = report.truncated;
   }
   log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
-  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap) {
+  // A cut listing is logged even with nothing else to say: it is what explains
+  // the status screen's `≥` (#323).
+  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap || report.truncated) {
     log::Info(log::Event::kBackupPruned, backup::Describe(report));
   }
 }

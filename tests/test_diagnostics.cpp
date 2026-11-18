@@ -158,6 +158,19 @@ void Sections(checks::Checks& checks) {
     checks.Expect(text.find(expected) != std::string::npos,
                   std::string("backup usage is #316's numbers: \"") + expected + "\"");
   }
+  checks.Expect(text.find("at least") == std::string::npos,
+                "a whole listing's numbers are not called a floor");
+
+  // #323: a `.backup/` past one listing measured only what it listed.
+  bundle.engine.backup.truncated = true;
+  bundle.written_at += 1;
+  text = WriteAndRead(checks, dir, bundle);
+  for (const char* expected : {"bytes = at least 5242880", "backups = at least 12",
+                               "kept_unique = at least 2", "truncated = yes"}) {
+    checks.Expect(text.find(expected) != std::string::npos,
+                  std::string("a listing cut short says its numbers are a floor: \"") + expected +
+                      "\"");
+  }
 }
 
 void Log(checks::Checks& checks) {

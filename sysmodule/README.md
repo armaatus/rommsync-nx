@@ -172,13 +172,50 @@ The **M8-1** gate is still what confirms any of this on a console. Two of the
 three items that used to be listed here as "wrong to guess at now" stopped being
 guesses with M1-7 (#126), which gave this process a transport and so made its
 heap and its capabilities things somebody had to add up. M9-11 (#210) settled
-the three fields devkitPro's template had chosen. The title id is still a
-guess, and is still wrong to make now.
+the three fields devkitPro's template had chosen. M12-6 (#308) froze the title
+id, after checking it against what is published.
 
-- **Title id `0x4200000000524D53`.** The `0x42…` range is where homebrew
-  sysmodules live by convention (ldn_mitm, sys-ftpd, sys-con); the low bytes
-  spell `RMS`. Nothing verifies it is unused. Confirm it against the installed
-  set before anything is loaded on real hardware.
+- **Title id `0x4200000000524D53` is final**, checked 2026-11-17 (M12-6, #308).
+  The `0x42…` range is where homebrew sysmodules live by convention (ldn_mitm,
+  sys-ftpd, nx-ovlloader); the low bytes spell `RMS`. It already shipped in rc1
+  and rc2, and changing it now would leave two `atmosphere/contents/` folders
+  both registering `rommsync`, so it does not change. What was read, on
+  2026-11-17, and what each said:
+  - **Switchbrew's [Title list](https://switchbrew.org/wiki/Title_list)**
+    (rendered page and `?action=raw` wikitext). It lists Nintendo's own system
+    modules, data archives, applets and applications, all in `0100…` and
+    `1000…`; it carries no `0x42…` id, and not this one.
+  - **hb-appstore's catalogue**,
+    [`repo.json`](https://switch.cdn.fortheusers.org/repo.json) (513 packages),
+    and every package's `packages/<name>/manifest.install` on the same CDN, all
+    513 read. Their installs name 49 distinct `atmosphere/contents/<id>/`
+    folders; this id is not one. The `0x42…` ones: `4200000000000000`
+    (MenuMusicNX, sys-tune), `420000000000000E` (sys-ftpd-light),
+    `4200000000000010` (ldn_mitm), `4200000000000811` (bitmap-printer),
+    `4200000000001312` (sys-hidplus), `420000000000E311` (Emulanders),
+    `420000000007E51A` (nx-ovlloader, Ultrahand), `420000000007E51B`
+    (Ultrahand), `42000062616B6101` (sys-screenuploader).
+  - **The ids #308 names**, each from its own source: sys-clk
+    `00FF0000636C6BFF`, nx-ovlloader `420000000007E51A`, ldn_mitm
+    `4200000000000010`, MissionControl `010000000000BD00` and SaltyNX
+    `0000000000534C56` from their hb-appstore manifests; emuiibo
+    `0100000000000352` from
+    [XorTroll/emuiibo](https://github.com/XorTroll/emuiibo)'s
+    `emuiibo/toolbox.json`; sys-ftpd `420000000000000E` from
+    [cathery/sys-ftpd](https://github.com/cathery/sys-ftpd)'s
+    `sd_card/atmosphere/contents/`; sys-con `690000000000000D` from
+    [o0Zz/sys-con](https://github.com/o0Zz/sys-con)'s `src/app/sys-con.json`
+    (outside `0x42…`, whatever this README used to say). QuickNTP
+    ([nedex/QuickNTP](https://github.com/nedex/QuickNTP)) is an overlay with
+    no sysmodule and so no title id.
+  - **GitHub code search** for `4200000000524D53` and `0x4200000000524D53`:
+    every hit is in this repository.
+  - **A web search** for `"4200000000524D53"`: nothing Switch-related.
+
+  What none of that sees: homebrew published neither on hb-appstore nor in
+  GitHub's code-search index, and private builds. On a given SD, an
+  `atmosphere/contents/4200000000524D53/` that this project did not install is
+  that collision, and is worth one look before the first install.
 - **Filesystem access: `SdCard` and nothing else** (`0x0000000000200000`,
   M9-11, #210). It was `0xffffffffffffffff`, devkitPro's template, which grants
   `FormatSdCard`, `CorruptSaveData`, `BisAllRaw`, `FillBis` and
@@ -271,7 +308,10 @@ guess, and is still wrong to make now.
   says so, so taking it would make every game launch wait on this process.
   M10-26 (#261) asks the same session which application it is
   (`pmdmntGetProgramId`), so a play session names the title seen writing its
-  save, at no new grant or handle.
+  save, at no new grant or handle. M11-23 (#322) added `spl:`: Atmosphère's
+  version and the emuMMC flag are `splGetConfig` items, read once in
+  `__appInit` for the diagnostics bundle and closed again before `fsp-srv` is
+  opened, so — like `set:sys` — it is no term in the handle count above.
 
 ## Where the work is
 

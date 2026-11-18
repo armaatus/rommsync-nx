@@ -50,6 +50,7 @@
 #include "http/ssl_http_client.hpp"
 #include "ipc/server.hpp"
 #include "last_words.hpp"
+#include "platform_facts.hpp"
 #include "power.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/conflict_log.hpp"
@@ -1115,6 +1116,13 @@ char g_serial[0x18] = {};
 /// (#304). Read in `__appInit` beside the serial, for the serial's reason.
 char g_firmware[0x18] = {};
 
+/// Atmosphère's version and the emuMMC flag, as `spl:` answered them (#322).
+/// Read in `__appInit`, which is the only place `spl:` is open; turned into the
+/// bundle's sentences in `main` (`platform_facts.hpp`). Zero is "never asked",
+/// which is what a console whose `spl:` did not register within the wait gets.
+rommsync::sysmodule::platform::ConfigRead g_atmosphere{};
+rommsync::sysmodule::platform::ConfigRead g_emummc{};
+
 /// The one `http::HttpClient` this process has: the Horizon `ssl` backend
 /// (M1-7, #126). File scope because it outlives every caller and because there
 /// is only ever one -- the download worker and the sync engine share it, which
@@ -1482,6 +1490,21 @@ void __libnx_initheap(void) {
 // the grant together (M9-1, #195).
 TimeServiceType __nx_time_service_type = TimeServiceType_System;
 
+/// One of Exosphère's `GetConfig` items, off the `spl:` session `__appInit`
+/// opened (#322).
+///
+/// **Dispatched here rather than through `splGetConfig`**, which takes libnx's
+/// `SplConfigItem`: that enum stops at Nintendo's 17, and casting 65000 into an
+/// enum with no fixed underlying type is undefined. The command is the same one
+/// -- `GetConfig`, 0, a `u32` in and a `u64` out -- as `SmWaiter` dispatches sm's
+/// 65100 itself for the same kind of reason.
+rommsync::sysmodule::platform::ConfigRead AskExosphere(std::uint32_t item) {
+  u64 value = 0;
+  const Result rc = serviceDispatchInOut(splGetServiceSession(), 0, item, value);
+  if (R_FAILED(rc)) return {"splGetConfig", rc, 0, false};
+  return {nullptr, 0, value, true};
+}
+
 void __appInit(void) {
   Result rc = smInitialize();
   if (R_FAILED(rc)) {
@@ -1544,6 +1567,29 @@ void __appInit(void) {
     rommsync::sysmodule::boot::Append(g_serial, sizeof(g_serial), 0, serial.number);
   }
   setsysExit();
+
+  // Atmosphère's version and whether this is emuMMC, for the diagnostics bundle
+  // (M11-23, #322): two `splGetConfig` items only Exosphère answers, and the
+  // two lines of a bug report a user most often gets wrong by hand.
+  //
+  // Here, and closed again before `fsp-srv` is opened, for `set:sys`'s reason:
+  // a session that is never open beside the others is not in the handle budget's
+  // peak (`handle_budget.hpp`), and `boot.spl` holds the order. Not fatal, and
+  // not even noted unless the open fails: a read that did not work is a sentence
+  // in the bundle saying which call answered what, and nothing else here depends
+  // on it.
+  if (WaitForService("spl:")) {
+    rc = splInitialize();
+    if (R_FAILED(rc)) {
+      g_atmosphere = {"splInitialize", rc, 0, false};
+      g_emummc = g_atmosphere;
+      rommsync::sysmodule::boot::Note(g_boot, "rommsync: splInitialize", rc);
+    } else {
+      g_atmosphere = AskExosphere(rommsync::sysmodule::platform::kExosphereApiVersion);
+      g_emummc = AskExosphere(rommsync::sysmodule::platform::kExosphereEmummcType);
+      splExit();
+    }
+  }
 
   // config.ini, token.dat, save staging and the download destinations all live
   // on the SD card, so fs is not optional for this process.
@@ -1834,18 +1880,16 @@ int main(int, char**) {
 
   // The platform's half of the diagnostics bundle (#304), read once: none of it
   // changes while the console is up. Atmosphère's version and the emuMMC flag
-  // are `splGetConfig` items, and `spl:` is not a grant this process holds --
-  // a new service is a boot wait, a handle and an npdm line of its own -- so
-  // the bundle says why rather than leaving them blank.
+  // are what `__appInit` got out of `spl:` (#322) -- or the sentence saying
+  // which call answered what, when it got nothing.
   {
     rommsync::sysmodule::PlatformFacts facts;
     facts.hos = g_firmware;
 #ifdef ROMMSYNC_LIBNX
     facts.libnx = ROMMSYNC_LIBNX;
 #endif
-    const char* const no_spl = "not read: sys-rommsync holds no spl: grant";
-    facts.atmosphere = no_spl;
-    facts.emummc = no_spl;
+    facts.atmosphere = rommsync::sysmodule::platform::AtmosphereVersion(g_atmosphere);
+    facts.emummc = rommsync::sysmodule::platform::Emummc(g_emummc);
     engine.UsePlatformFacts(std::move(facts));
   }
 

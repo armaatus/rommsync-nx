@@ -376,7 +376,8 @@ is unverified. If it does not, a console at UTC+X reports every save X hours
 newer than it is — inside the day this check allows, so a first sync's
 arbitration would lean that way unseen. The measurement — write a save at a
 known UTC instant on a console set to a non-UTC zone, read its `st_mtime` back —
-needs hardware, and is a step of the M12 hardware test plan (#307). Its answer
+needs hardware, and is a step of the M12 hardware test plan (#307); the
+selftest NRO (#306) makes it as its `platform.mtime_utc` row. Its answer
 belongs here.
 
 ## Step 2 — execute the plan

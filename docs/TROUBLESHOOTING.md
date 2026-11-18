@@ -544,7 +544,13 @@ prune left. While the directory is still over `max_mib` the row turns to a
 warning and says why — *612.0 MiB; 9 only copies* counts the backups described
 above, and *612.0 MiB; over the cap* means what is left is the newest backup of
 each save, which is never pruned — and the screen points here. *Not measured
-yet* is a console that has not finished a sync since it started.
+yet* is a console that has not finished a sync since it started. A row that
+starts with *≥* — *≥ 41.2 MiB, 512 backups* — is a `.backup/` holding more
+files than one listing returns (512): the numbers are at least what is there,
+counting only what was listed, and `backup.pruned` ends with "the directory
+holds more than one listing shows". The diagnostics bundle says the same:
+*at least* before each count, and `truncated = yes`.
+Clearing out old backups by hand, as above, brings it back under.
 
 ---
 
@@ -1170,7 +1176,8 @@ the log says so:
 Attach that file. It holds everything below in one place:
 
 - the versions of the overlay, the sysmodule and the IPC contract each speaks,
-  libultrahand, libnx and the console's firmware;
+  libultrahand, libnx and the console's firmware, Atmosphère's version, and
+  whether the console booted emuMMC or sysMMC;
 - the status screen's numbers, `state.db`'s row count, and how much `.backup/`
   holds (or that no prune has measured it since boot);
 - `config.ini`, with any value whose key names a token, code, password or secret
@@ -1182,9 +1189,8 @@ Attach that file. It holds everything below in one place:
 It is redacted line by line as it is written — no token, no pairing code and no
 password in a URL reaches it — and `token.dat` and `device.dat` are never read.
 It stays on the card; nothing sends it anywhere ([PRIVACY.md](PRIVACY.md)).
-Atmosphère's own version and whether this is emuMMC are not in it yet: reading
-them needs a system service the sysmodule does not hold, so give those in the
-bug report form.
+If its `atmosphere` or `emummc` line starts with `not read:`, the sysmodule
+could not ask the console; give those two in the bug report form instead.
 
 If the overlay cannot reach the sysmodule, or you would rather pick the lines
 yourself, attach the log instead. Five things, and the log has four of them:

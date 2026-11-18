@@ -775,6 +775,27 @@ void CheckBackups(Checks& checks) {
                   std::string("612.0 MiB; over the cap"),
                   "over the cap with no only-copies -- the newest of each save -- says so");
 
+  // #323: a `.backup/` past one listing measured only what it listed, so the
+  // row leads with `≥` rather than drawing its numbers as the total.
+  ipc::Status cut = measured;
+  cut.backup.truncated = true;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, cut), "Backups"),
+                  std::string("\xE2\x89\xA5 41.2 MiB, 12 backups"),
+                  "a listing cut short says its numbers are a floor");
+  checks.Expect(ValueOf(under, "Backups").find("\xE2\x89\xA5") == std::string::npos,
+                "and an ordinary one does not");
+  ipc::Status cut_over = over;
+  cut_over.backup.truncated = true;
+  const overlay::StatusView cut_full = RenderOverWire(checks, cut_over);
+  checks.ExpectEq(ValueOf(cut_full, "Backups"), std::string("\xE2\x89\xA5 612.0 MiB; 9 only copies"),
+                  "over the cap too, the widest the row gets");
+  checks.Expect(ToneOf(cut_full, "Backups") == overlay::Tone::kWarn, "still in the warning tone");
+  ipc::Status cut_newest = newest;
+  cut_newest.backup.truncated = true;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, cut_newest), "Backups"),
+                  std::string("\xE2\x89\xA5 612.0 MiB; over the cap"),
+                  "and over the cap with no only-copies");
+
   // A worse problem keeps the hint: a held upload outranks a filling card.
   ipc::Status clock = over;
   clock.clock_trusted = false;

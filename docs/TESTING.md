@@ -816,7 +816,10 @@ ctest --test-dir build --output-on-failure
   is the fifth static reader (M9-4, #208): `psc:m` granted in the SAC,
   `pscmInitialize` called with a bound in front of it, and a module registered
   with `PscPmModuleId_Fs` as its dependency -- which is what decides whether this
-  process is told about a sleep early enough to matter. None of the
+  process is told about a sleep early enough to matter. `boot.spl` (#322) holds
+  `spl:` granted, waited for without aborting, asked for Exosphère's version and
+  emuMMC items, and closed before `fsp-srv` opens -- the order that keeps it out
+  of the handle budget; `engine.platform_facts` decodes those items. None of the
   eight needs Docker, a rig, or a resolver, so none of them ever skips.
 - The `overlay.card`, `overlay.wire`, `overlay.roundtrip`, `overlay.version`,
   `overlay.errors`, `overlay.timeout`, `overlay.restore`, `overlay.frames`, `overlay.cycles`,

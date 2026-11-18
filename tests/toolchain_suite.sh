@@ -25,6 +25,7 @@ ENTRIES='
 toolchain.libnx    test_toolchain.sh     libnx
 switch.builds      test_switch_build.sh  builds
 switch.tlsprobe    test_switch_build.sh  tlsprobe
+switch.selftest    test_switch_build.sh  selftest
 npdm.svcs          test_npdm.sh          svcs
 package.builds     test_package.sh       builds
 package.reproducible test_package.sh     reproducible

@@ -36,10 +36,10 @@ cmake -S . -B build && cmake --build build      # build
 ctest --test-dir build --output-on-failure       # test
 ctest --test-dir build -R sync --output-on-failure   # one group
 
-# the three Switch targets, built by devkitPro rather than CMake. Nothing built
+# the four Switch targets, built by devkitPro rather than CMake. Nothing built
 # here runs anywhere before the M8-1 gate; see switch.mk.
 docker run --rm -v "$PWD:/work" -w /work devkitpro/devkita64:20260219 \
-  bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe'
+  bash -lc 'make -C sysmodule && make -C overlay && make -C tlsprobe && make -C selftest'
 
 ./scripts/orca/env.sh                            # regenerate .env
 ./scripts/orca/compose.sh up -d                  # start RomM  (logs -f to follow)
@@ -134,7 +134,7 @@ Your job ends at a commit on your worktree's branch.
 1. `ctest --test-dir build --output-on-failure` is green, and your change has a
    test that would have failed before it — run it and read the output before
    reporting complete. For a bug fix, commit the failing test before the fix.
-   A change under `sysmodule/`, `overlay/` or `tlsprobe/` is built with devkitPro
+   A change under `sysmodule/`, `overlay/`, `tlsprobe/` or `selftest/` is built with devkitPro
    too (the docker line above); `switch-build` is a required check and CI will
    not merge a red one.
 2. Any issue your work invalidated is edited; your commit message says which and why.
@@ -181,6 +181,7 @@ put it there as part of the work, not in a note to yourself.
 | `sysmodule/` | `sys-rommsync`, the background engine. devkitPro Makefile. |
 | `overlay/` | `ovl-rommsync`, the libultrahand overlay. devkitPro Makefile. |
 | `tlsprobe/` | The M0-1 TLS spike: a manually-launched `.nro`, never installed. |
+| `selftest/` | The M12-1 on-console selftest: a manually-launched `.nro` that runs the real backends against a disposable RomM; `scripts/selftest-judge.py` judges its reports. |
 | `server/` | Pinned RomM API snapshot, contract probe, and the Docker test fixture. |
 | `tests/` | CTest suites. |
 | `packaging/` | What the release zip ships beside the two artifacts; `scripts/package.sh` builds it. |

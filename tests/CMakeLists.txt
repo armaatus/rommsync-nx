@@ -1915,9 +1915,9 @@ set_tests_properties(ci.static_python PROPERTIES TIMEOUT 60)
 # wrapped in if(NOT ROMMSYNC_REQUIRE_RIG). Every other skippable test flips to a
 # failure under that option precisely so CI cannot go green on a skip -- and
 # that is the right default, so each exception needs its reason recorded rather
-# than inferred. There are six, all with this one's reason, and all carrying
-# the `toolchain` label: `switch.builds`, `switch.tlsprobe`, `toolchain.libnx`,
-# `npdm.svcs`, `package.builds` and `stack.measured`.
+# than inferred. Each has this one's reason, and each carries the `toolchain`
+# label: `switch.builds`, `switch.tlsprobe`, `switch.selftest`, `toolchain.libnx`,
+# `npdm.svcs`, the `package.*` builds and `stack.measured`.
 #
 # They skip in host-tests and run in `switch-build` instead. That job is inside
 # the pinned image already, and it runs tests/toolchain_suite.sh --here, which
@@ -1943,6 +1943,29 @@ add_test(NAME switch.tlsprobe
 set_tests_properties(switch.tlsprobe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
                      RUN_SERIAL TRUE
                      ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# The M12-1 selftest (#306, selftest/README.md): an NRO linking core/ and the
+# sysmodule's own backends. Same image, same skip, same enforcement in
+# switch-build. Its report's judge needs no image: `selftest.*` below.
+add_test(NAME switch.selftest
+         COMMAND "${BASH_PROGRAM}" "${SWITCH_BUILD_TEST}" selftest)
+set_tests_properties(switch.selftest PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 LABELS toolchain
+                     RUN_SERIAL TRUE
+                     ENVIRONMENT "PYTHON=${Python3_EXECUTABLE}")
+
+# scripts/selftest-judge.py against canned reports, and the selftest's sources
+# held to it. None of them needs the image or a console, so none skips.
+set(SELFTEST_JUDGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_selftest_judge.py")
+foreach(scenario
+        judge   # pass, fail, missing and skipped rows; malformed reports refused
+        pairs   # --pairs N counts distinct HOS/Atmosphere pairs among passing reports
+        rows    # the NRO writes exactly the judged rows; its heap budget is the sysmodule's
+        roots   # the NRO writes only under sdmc:/config/rommsync-selftest/
+        gate)   # the launch gate's note, the plan's PRE-02 and the judge cite each other
+  add_test(NAME selftest.${scenario}
+           COMMAND ${Python3_EXECUTABLE} "${SELFTEST_JUDGE_TEST}" ${scenario})
+  set_tests_properties(selftest.${scenario} PROPERTIES TIMEOUT 60)
+endforeach()
 
 # tlsprobe/measure-footprint.sh reads its compile flags from switch.mk rather
 # than carrying a copy (#256). This reads the script only, so it never skips;
@@ -2583,6 +2606,7 @@ set(ENGINE_SCENARIOS
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   diagnostics  # #304: Y on the log screen writes a redacted bundle beside config.ini
+  platform_facts  # #322: spl:'s Atmosphère version and emuMMC flag, decoded into the bundle
   log       # M7-3: the misconfigurations docs/TROUBLESHOOTING.md answers, on the record
   stale_active  # M9-5: an `active` row a power cut left is work, not a live transfer
   sleeps    # M9-4: the console sleeps mid-tick, and the acknowledgement waits for the save write
@@ -2641,6 +2665,7 @@ set(ENGINE_RIG_SCENARIOS
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
   backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
+  backup_truncated  # #323: a .backup/ past one listing draws its Backups row as a floor
   server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
@@ -2793,7 +2818,7 @@ add_test(NAME boot.journal COMMAND test_boot_services journal)
 set_tests_properties(boot.resolve boot.wait boot.journal PROPERTIES TIMEOUT 60)
 
 set(SYSMODULE_BOOT_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_sysmodule_boot.py")
-foreach(scenario IN ITEMS dns clock bounded comments psc foreground)
+foreach(scenario IN ITEMS dns clock bounded comments psc foreground spl)
   add_test(NAME boot.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${SYSMODULE_BOOT_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")

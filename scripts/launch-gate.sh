@@ -104,6 +104,7 @@ ROWS
 row_inputs() {
   case "$1" in
     v1gate)   echo scripts/v1-gate.sh ;;
+    selftest) echo scripts/selftest-judge.py ;;
     overlay)  echo overlay/README.md ;;
     tid)      printf '%s\n' sysmodule/sys-rommsync.json sysmodule/README.md ;;
     notes)    printf '%s\n' docs/INSTALL.md docs/TROUBLESHOOTING.md docs/INTEROP.md ;;
@@ -289,8 +290,9 @@ row_repo() {
 row_note() {
   case "$1" in
     selftest) cat <<'NOTE'
-    Run the selftest NRO (M12-1, #306) on at least two HOS/Atmosphere pairs and
-    commit both machine-readable reports beside the run.
+    Run the selftest NRO (M12-1, #306) on at least two HOS/Atmosphere pairs,
+    commit the reports under docs/selftest/, and judge them:
+    scripts/selftest-judge.py --pairs 2 docs/selftest/report-*.json
 NOTE
       ;;
     smoke) cat <<'NOTE'

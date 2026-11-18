@@ -104,6 +104,7 @@
 #include "faulty_disk.hpp"
 #include "harness.hpp"
 #include "http/nifm_verdict.hpp"
+#include "platform_facts.hpp"
 #include "power.hpp"
 #include "power_fake.hpp"
 #include "rig.hpp"
@@ -3448,6 +3449,86 @@ void Diagnostics(checks::Checks& c) {
            "nor another program's crash");
 }
 
+/// #322: Atmosphère's version and the emuMMC flag, as `__appInit` reads them
+/// out of `spl:`, decoded the way `main.cpp` decodes them and carried into the
+/// bundle through `UsePlatformFacts`. `spl:` itself is a console's to answer;
+/// what can be wrong off one is the decoding and the sentence a failed read
+/// leaves, and those are what this pins.
+void PlatformFactsFromSpl(checks::Checks& c) {
+  namespace platform = sysmodule::platform;
+
+  // Exosphere's packing of item 65000 (`secmon_smc_info.cpp`): major, minor and
+  // micro in the top three bytes, then the key generation, then the target
+  // firmware. A release 1.8.0 on firmware 19.0.1, and 1.10.2 so a two-digit minor is
+  // read as a byte and not a nibble.
+  platform::ConfigRead version{};
+  version.read = true;
+  version.value = 0x0108001313000100ULL;
+  c.Expect(platform::AtmosphereVersion(version) == "1.8.0",
+           "65000 decodes to major.minor.micro: " + platform::AtmosphereVersion(version));
+  version.value = 0x010A021313000100ULL;
+  c.Expect(platform::AtmosphereVersion(version) == "1.10.2",
+           "a two-digit minor: " + platform::AtmosphereVersion(version));
+
+  // Item 65007 is the emuMMC configuration's type: none, partition or file.
+  platform::ConfigRead emummc{};
+  emummc.read = true;
+  for (const auto& [type, expected] :
+       std::vector<std::pair<std::uint64_t, std::string>>{{0, "no (sysMMC)"},
+                                                          {1, "yes (partition)"},
+                                                          {2, "yes (file)"},
+                                                          {7, "yes (type 7)"}}) {
+    emummc.value = type;
+    c.Expect(platform::Emummc(emummc) == expected,
+             "emuMMC type " + std::to_string(type) + " reads \"" + expected +
+                 "\": " + platform::Emummc(emummc));
+  }
+
+  // A read that never happened, and one that failed, keep saying why -- and a
+  // failed call never reads as a version or as sysMMC.
+  const platform::ConfigRead not_asked{};
+  c.Expect(platform::AtmosphereVersion(not_asked) == "not read: spl: was not available at boot",
+           "spl: never opened: " + platform::AtmosphereVersion(not_asked));
+  platform::ConfigRead failed{};
+  failed.failed = "splGetConfig";
+  failed.result = 0xE01A;
+  c.Expect(platform::Emummc(failed) == "not read: splGetConfig answered 0xe01a",
+           "a failed call names itself and its result: " + platform::Emummc(failed));
+  failed.failed = "splInitialize";
+  c.Expect(platform::AtmosphereVersion(failed) == "not read: splInitialize answered 0xe01a",
+           "so does a failed open: " + platform::AtmosphereVersion(failed));
+
+  // And into the bundle, the way `main.cpp` hands them over: one read that
+  // worked and one that did not, side by side.
+  Console console(c, "engine-platform-facts");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseCard(card.get());
+  platform::ConfigRead atmosphere{};
+  atmosphere.read = true;
+  atmosphere.value = 0x0108001313000100ULL;
+  platform::ConfigRead unanswered{};
+  unanswered.failed = "splGetConfig";
+  unanswered.result = 0xE01A;
+  sysmodule::PlatformFacts facts;
+  facts.atmosphere = platform::AtmosphereVersion(atmosphere);
+  facts.emummc = platform::Emummc(unanswered);
+  console.engine.UsePlatformFacts(facts);
+
+  std::string response;
+  c.Expect(console.Call(ipc::Command::kWriteDiagnostics,
+                        ipc::EncodeDiagnosticsRequest({"0.9.0", ipc::kVersion, "v2.5.4"}),
+                        &response) == ipc::Error::kOk,
+           "WriteDiagnostics writes the bundle");
+  const ipc::Decoded<ipc::DiagnosticsResult> answer = ipc::DecodeDiagnosticsResult(response);
+  const std::string bundle = answer.ok() ? console.sandbox.Read(answer.value.sd_path) : "";
+  c.Expect(bundle.find("atmosphere = 1.8.0\n") != std::string::npos,
+           "the bundle's atmosphere line carries the version:\n" + bundle);
+  c.Expect(bundle.find("emummc = not read: splGetConfig answered 0xe01a\n") != std::string::npos,
+           "and its emummc line says why it has none");
+}
+
 void Commands(checks::Checks& c) {
   Console console(c, "engine-commands");
   console.Boot();
@@ -5468,8 +5549,107 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(status.backup.kept_unique, std::int64_t{1},
              "one of them kept only because it is the only copy");
   c.Expect(!status.backup.over_cap, "and with no cap, nothing is over it");
+  c.Expect(!status.backup.truncated, "and one listing held the whole directory (#323)");
 
   harness::DeleteSave(client, base, fixture, uploaded.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// M11-22 (#323): a `.backup/` holding more than one listing returns. The prune
+/// measures only what it listed, and the status screen's Backups row says so --
+/// `≥` -- rather than drawing a floor as the total.
+int BackupTruncated(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-backup-truncated");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-backup-truncated");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\nstates = false\n\n"
+                                     "[backup]\nkeep = 1\nkeep_days = 0\nmax_mib = 0\n"),
+           "the console points at the rig");
+
+  // More than a listing holds: 400 of nova's backups, then a rom whose name
+  // sorts after it, which the listing cuts part way. The cut rom sits the prune
+  // out (`backup_prune.cpp`), so the count is exactly nova's -- each the only
+  // copy of its bytes, so none of them goes either.
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  constexpr int kListed = 400;
+  const auto seed = [&console, now](std::int64_t rom_id, int count) {
+    bool written = true;
+    for (int i = 0; i < count; ++i) {
+      const std::int64_t at = now - 100 * 24 * 60 * 60 + i;
+      written = console.sandbox.Write(std::string(harness::kBackupDir) + "/" +
+                                          rommsync::sync::BackupNameFor(rom_id, "autosave",
+                                                                        "nova.srm", at),
+                                      "backup " + std::to_string(rom_id) + " " +
+                                          std::to_string(i)) &&
+                written;
+    }
+    return written;
+  };
+  c.Expect(seed(rom.id, kListed) && seed(999999999, 200), "the card holds 600 backups");
+  console.sandbox.Write("/config/rommsync/state.db", "rommsync-state 3\n");
+
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(), "paired");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 1 && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks.ticks(), 1, "and it ran");
+
+  ipc::Status status;
+  status.backup = console.engine.Snapshot().backup;
+  c.Expect(status.backup.measured, "the prune's report reaches the status");
+  c.Expect(status.backup.truncated, "saying the listing was cut:" + Rendered(console.Log()));
+  c.ExpectEq(status.backup.backups, std::int64_t{kListed},
+             "having counted only the roms one listing held whole");
+  const rommsync::overlay::StatusView view = rommsync::overlay::Render(status, now);
+  bool drawn = false;
+  for (const rommsync::overlay::Line& line : view.lines) {
+    if (line.label == "Backups") {
+      drawn = true;
+      c.Expect(line.value.rfind("\xE2\x89\xA5 ", 0) == 0,
+               "and the Backups row says it is a floor, not a total: " + line.value);
+    }
+  }
+  c.Expect(drawn, "the status screen draws a Backups row");
+
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();
 }
@@ -8041,6 +8221,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"download_restores", DownloadRestores},
       {"server_deleted", ServerDeleted},
       {"backup_pruned", BackupPruned},
+      {"backup_truncated", BackupTruncated},
       {"server_switched", ServerSwitched},
       {"interop", Interop},
       {"upgrade", Upgrade},
@@ -8122,6 +8303,8 @@ int main(int argc, char** argv) {
     KeepLocalCancel(checks);
   } else if (scenario == "diagnostics") {
     Diagnostics(checks);
+  } else if (scenario == "platform_facts") {
+    PlatformFactsFromSpl(checks);
   } else if (scenario == "keep_local_cancel_race") {
     KeepLocalCancelRace(checks);
   } else if (scenario == "syncnow") {
