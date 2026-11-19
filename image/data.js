@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795002661338,
+  "lastUpdate": 1795088936712,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "image": [
@@ -1081,6 +1081,52 @@ window.BENCHMARK_DATA = {
           "url": "https://github.com/armaatus/rommsync-nx/commit/1d4b74ddb92171be3d611b3b2935496686becd6d"
         },
         "date": 1795002661034,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "sysmodule mapped image",
+            "value": 2301952,
+            "unit": "bytes",
+            "extra": "budget 2359296"
+          },
+          {
+            "name": "sysmodule .bss",
+            "value": 1590592,
+            "unit": "bytes",
+            "extra": "heap 1572864"
+          },
+          {
+            "name": "sysmodule .text",
+            "value": 587344,
+            "unit": "bytes",
+            "extra": "ceiling 655360"
+          },
+          {
+            "name": "overlay .ovl",
+            "value": 626748,
+            "unit": "bytes",
+            "extra": "budget 1048576"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "1d4b74ddb92171be3d611b3b2935496686becd6d",
+          "message": "Merge pull request #327 from armaatus/fleet/m11f\n\nM11/M12: Backups floor (#323), spl: facts (#322), on-console selftest (#306), title id final (#308)",
+          "timestamp": "2026-11-18T08:37:43Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/1d4b74ddb92171be3d611b3b2935496686becd6d"
+        },
+        "date": 1795088936157,
         "tool": "customSmallerIsBetter",
         "benches": [
           {
