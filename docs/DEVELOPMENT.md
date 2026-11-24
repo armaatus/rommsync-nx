@@ -1054,7 +1054,7 @@ A removed command leaves a hole.
 | 9 | `Enqueue` | `rom_id` -> position | `kUnknownRom`, `kQueueFull`, `kDuplicate`, `kMultiFile` |
 | 10 | `Dequeue` | `rom_id` -> - | `kNotQueued` |
 | 11 | `ListBegin` | `ListRequest` (kind, filter, page size, starting `offset`) -> cursor | never fails; an `offset` past the end opens a list whose first page is empty and the last |
-| 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
+| 12 | `ListNext` | cursor -> `ListPage` (items, `has_more`, `pending`, and the `start` row of its first item, a rom stepped past counted) | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` (each row with `backup_present` and `keep_local`: `open \| held \| waiting`) | never fails; an empty history is a page |
 | 15 | `RestoreBackup` | `entry_id` -> `RestoreState` (phase + which entry) | never fails, never waits for the copy; a press while one runs answers that one |

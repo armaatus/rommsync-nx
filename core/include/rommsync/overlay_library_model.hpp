@@ -369,7 +369,8 @@ class LibraryBrowserModel {
   /// (where it replaces the row it is a fresher copy of), or at its end. A
   /// reclaimed cursor is re-opened the same way -- at the window, gathering
   /// nothing -- which is why a page off a fresh cursor cannot double the rows
-  /// already drawn. A level that dropped an item it could not read opens at
+  /// already drawn. A level that dropped an item it could not read, or was
+  /// handed a page that did not start where its places said (#341), opens at
   /// row 0 instead and reads down (`StartOf`).
   struct Level {
     LibraryLevel kind = LibraryLevel::kPlatforms;
@@ -398,6 +399,18 @@ class LibraryBrowserModel {
 
     /// The rows the cursor has handed over: the place of the next one.
     int consumed = 0;
+
+    /// The sysmodule's row of the next item the cursor hands over (#341).
+    /// Not `consumed`: an item this build cannot read is a row there and no
+    /// place here. A page whose `start` is not this is one the sysmodule
+    /// counted rows ahead of -- it stepped past a rom too large to send (#248)
+    /// -- and from there down the places here are not its rows.
+    std::int64_t served = 0;
+
+    /// A page has started somewhere other than `served`. Kept for the life of
+    /// the level, as `unreadable_items` is, and for its reason: every later
+    /// cursor opens at row 0, where places count what was handed over.
+    bool drifted = false;
 
     /// The cursor would hand over more. True until a page says otherwise, so a
     /// level that has loaded nothing yet still asks for its first page.

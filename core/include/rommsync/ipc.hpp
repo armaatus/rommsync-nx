@@ -199,7 +199,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// field, so a v19 overlay's `ListBegin` is refused by a v20 sysmodule, and a
 /// v19 sysmodule would serve a v20 overlay's rewind from row 0 into rows it
 /// routes as though they started further down.
-inline constexpr std::uint32_t kVersion = 20;
+///
+/// **21** since #341, which added `start` to `ListPage` -- a required field,
+/// so a v21 overlay refuses a v20 sysmodule's pages rather than place rows
+/// after a rom it stepped past one place off.
+inline constexpr std::uint32_t kVersion = 21;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

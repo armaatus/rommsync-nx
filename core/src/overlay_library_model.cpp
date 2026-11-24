@@ -330,10 +330,9 @@ std::int64_t LibraryBrowserModel::StartOf(const Level& level) {
   // this build could read, and the sysmodule's offset counts every row, so the
   // two would disagree by however many were dropped above. From row 0 they
   // agree, which is what the list did before the offset existed. A rom the
-  // sysmodule steps past as too large to send even alone (#248) is the same
-  // disagreement, and invisible from here; it takes a rom whose own record
-  // is over the transport's 200 KiB ceiling, and #339 records it as open.
-  if (level.first == 0 || level.unreadable_items > 0) {
+  // sysmodule stepped past as too large to send even alone (#248) is the same
+  // disagreement, seen as a page that started late (`drifted`, #341).
+  if (level.first == 0 || level.unreadable_items > 0 || level.drifted) {
     return 0;
   }
   return level.rewind_from;
@@ -577,6 +576,7 @@ void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
   // is what routes the second telling onto the rows it repeats rather than
   // after them (`Level`).
   level.consumed = static_cast<int>(level.request.offset);
+  level.served = level.request.offset;
   level.has_more = true;
 }
 
@@ -604,6 +604,24 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
     level.loading = true;
     return;
   }
+
+  if (page.start != level.served) {
+    // The sysmodule counts rows this level was never handed: it stepped past a
+    // rom too large to send (#248). Places here count what was handed over, so
+    // from this page down they are a row behind its rows (#341).
+    level.drifted = true;
+    if (level.request.offset > 0) {
+      // And this cursor took its offset for a place, so its rows would land
+      // that far off -- A on one of them enqueuing the rom beside it. Ended,
+      // and the level read again from row 0 (`StartOf`). A cursor opened at
+      // row 0 has nothing to correct: its places are its own count, as they
+      // were before #339, and ending it would only meet the step again.
+      closing_.push_back(level.cursor);
+      Reopen(level);
+      return;
+    }
+  }
+  level.served = page.start + static_cast<std::int64_t>(page.items.size());
 
   // Was the selection resting on the `kMore` row? `MoveSelection` lets it,
   // because that row is how a user reaches "Loading..." and "press A to try

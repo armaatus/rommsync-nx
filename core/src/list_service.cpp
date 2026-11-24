@@ -501,6 +501,9 @@ ipc::ListPage Service::BuildRomPage(const RomPage& fetched, std::int64_t offset,
                                     std::int32_t page_size, fs::FileSystem* card,
                                     const config::Config& config) const {
   ipc::ListPage page;
+  // The row the first rom is, the ones stepped past counted (#341): the
+  // overlay cannot see a step, and places what it is handed.
+  page.start = offset;
   std::size_t appended = 0;
   for (const RomRow& rom : fetched.roms) {
     if (static_cast<std::int32_t>(page.items.size()) >= page_size) {
@@ -565,6 +568,10 @@ ipc::Error Service::ListNext(ipc::Cursor cursor, ipc::ListPage* page) {
   // does -- would otherwise accumulate rows on the two kinds served out of
   // memory and carry a stale `pending` from an earlier fetch into them.
   *page = ipc::ListPage{};
+  // Where the page starts by this side's count, before it is filled (#341). A
+  // built rom page carries its own, past any rom `Pump` stepped over -- which
+  // `entry->offset` already is by the time it is handed over.
+  page->start = entry->offset;
 
   if (entry->request.kind == ipc::ListKind::kQueue) {
     return FillFromQueueLocked(*entry, page);

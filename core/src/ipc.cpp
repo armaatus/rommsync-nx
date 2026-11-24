@@ -1293,6 +1293,11 @@ void WriteListPage(Out& out, const ListPage& page) {
     out += json::Quote(name);
     out += ':';
   };
+  const auto integer = [&out](std::int64_t value) {
+    char digits[24];
+    const std::to_chars_result written = std::to_chars(digits, digits + sizeof(digits), value);
+    out += std::string_view(digits, static_cast<std::size_t>(written.ptr - digits));
+  };
   out += '{';
   key("items", /*first=*/true);
   out += '[';
@@ -1311,13 +1316,9 @@ void WriteListPage(Out& out, const ListPage& page) {
         case ListValue::Type::kString:
           out += json::Quote(field.value.text);
           break;
-        case ListValue::Type::kInteger: {
-          char digits[24];
-          const std::to_chars_result written =
-              std::to_chars(digits, digits + sizeof(digits), field.value.number);
-          out += std::string_view(digits, static_cast<std::size_t>(written.ptr - digits));
+        case ListValue::Type::kInteger:
+          integer(field.value.number);
           break;
-        }
         case ListValue::Type::kBool:
           out += field.value.flag ? "true" : "false";
           break;
@@ -1331,9 +1332,7 @@ void WriteListPage(Out& out, const ListPage& page) {
   key("pending", false);
   out += page.pending ? "true" : "false";
   key("start", false);
-  char start[24];
-  const std::to_chars_result written = std::to_chars(start, start + sizeof(start), page.start);
-  out += std::string_view(start, static_cast<std::size_t>(written.ptr - start));
+  integer(page.start);
   out += '}';
 }
 
