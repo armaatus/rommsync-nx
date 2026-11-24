@@ -1116,6 +1116,42 @@ int Library(checks::Checks& c) {
     }
   }
 
+  // --- a cursor opened partway down (#339): the library climbs back above its
+  // window by asking for the rows it dropped, not by reading down to them.
+  if (first_order.size() > 3) {
+    ipc::ListRequest from;
+    from.kind = ipc::ListKind::kRoms;
+    from.page_size = 2;
+    from.offset = 3;
+    const Walk walk = WalkList(rig_.console, from);
+    std::vector<std::int64_t> order;
+    for (const ipc::ListItem& item : walk.items) {
+      order.push_back(Number(item, keys::kRomId));
+    }
+    c.Expect(order == std::vector<std::int64_t>(first_order.begin() + 3, first_order.end()),
+             "a cursor opened at row 3 starts at the fourth rom and ends where the list does");
+  }
+  {
+    ipc::ListRequest past;
+    past.kind = ipc::ListKind::kRoms;
+    past.offset = total + 10;
+    const Walk walk = WalkList(rig_.console, past);
+    c.ExpectEq(static_cast<int>(walk.error), static_cast<int>(ipc::Error::kOk),
+               "a cursor opened past the end is not an error");
+    c.Expect(walk.items.empty(), "and hands over nothing");
+  }
+  if (paged.items.size() > 2) {
+    platforms.page_size = 1;
+    platforms.offset = 2;
+    const Walk walk = WalkList(rig_.console, platforms);
+    c.ExpectEq(walk.items.size(), paged.items.size() - 2,
+               "the platform list starts at its third platform at offset 2");
+    if (!walk.items.empty()) {
+      c.ExpectEq(Number(walk.items.front(), keys::kPlatformId),
+                 Number(paged.items[2], keys::kPlatformId), "which is the third platform");
+    }
+  }
+
   // --- the filter, and the id that opens it.
   const auto gba = platform_ids.find("gba");
   c.Expect(gba != platform_ids.end(), "the fixture has a gba platform");

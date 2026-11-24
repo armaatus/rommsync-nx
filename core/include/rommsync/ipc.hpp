@@ -847,6 +847,13 @@ struct ListRequest {
   /// What the client would like. **Clamped** to `[1, kMaxPageSize]` by the
   /// sysmodule; the page says how many it actually holds.
   std::int32_t page_size = kMaxPageSize;
+
+  /// The row the cursor starts at, 0-based (#339). What lets the library climb
+  /// back above its window by reading the rows it dropped rather than the whole
+  /// list down to them: the sysmodule pages RomM by offset already, so a
+  /// cursor opened at row 1500 costs one page, not 1500 rows of them. Past the
+  /// end of the list is not an error -- the first page is empty and the last.
+  std::int64_t offset = 0;
 };
 
 /// One field of one list item.

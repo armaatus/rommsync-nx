@@ -233,9 +233,10 @@ int Version() {
   // `clock_trusted` and `clock_skew_seconds`. 16 since M11-17 (#301):
   // `ConfigView` gained `play_sessions`. 17 since M11-4 (#288): and
   // `server.ca_file`. 18 since M11-21 (#316): `Status` gained `backup`. 19
-  // since M11-22 (#323): and `backup.truncated`. What is frozen is command 0's
+  // since M11-22 (#323): and `backup.truncated`. 20 since #339: a
+  // `ListRequest` gained a required `offset`. What is frozen is command 0's
   // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{19},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{20},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -548,13 +549,14 @@ int RoundTrip() {
   }
 
   {
-    const ipc::ListRequest sent{ipc::ListKind::kRoms, 3, "zelda", 12};
+    const ipc::ListRequest sent{ipc::ListKind::kRoms, 3, "zelda", 12, 1488};
     const ipc::Decoded<ipc::ListRequest> back =
         ipc::DecodeListRequest(ipc::EncodeListRequest(sent));
     checks.Expect(back.ok(), "a list request round trips: " + back.error.Describe());
     checks.ExpectEq(back.value.platform_id, sent.platform_id, "the platform filter survives");
     checks.ExpectEq(back.value.search, sent.search, "the search term survives");
     checks.ExpectEq(back.value.page_size, sent.page_size, "the page size survives");
+    checks.ExpectEq(back.value.offset, sent.offset, "the starting row survives (#339)");
   }
 
   {
@@ -1111,6 +1113,14 @@ int Refuses() {
                      R"({"kind":"roms","platform_id":0,"search":"","page_size":0})")
                      .ok(),
                 "a page size of zero is the one value that cannot mean anything");
+  checks.Expect(!ipc::DecodeListRequest(
+                     R"({"kind":"roms","platform_id":0,"search":"","page_size":8,"offset":-1})")
+                     .ok(),
+                "a starting row above the first is refused (#339)");
+  checks.Expect(!ipc::DecodeListRequest(
+                     R"({"kind":"roms","platform_id":0,"search":"","page_size":8})")
+                     .ok(),
+                "and a request without one is a v19 overlay's, refused rather than read as 0");
 
   // A NUL inside a string is legal JSON and stops every C API downstream, so the
   // value that got used would not be the value that was checked.
@@ -1852,6 +1862,12 @@ int DispatchTable() {
                     "and a platform filter on it is dropped rather than half-honoured");
     checks.ExpectEq(engine.last_list.search, std::string(""), "along with the search term");
     checks.ExpectEq(engine.last_list.page_size, 8, "what the client asked for is kept");
+
+    checks.Expect(core.ListBegin({ipc::ListKind::kRoms, 3, "", 8, 1488}, &cursor) ==
+                      ipc::Error::kOk,
+                  "a list may start anywhere in it (#339)");
+    checks.ExpectEq(engine.last_list.offset, std::int64_t{1488},
+                    "and the engine is told where");
   }
 
   // A cursor of zero never addresses a live list.

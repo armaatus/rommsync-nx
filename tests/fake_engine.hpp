@@ -128,12 +128,17 @@ class FakeEngine : public ipc::Engine {
   int library_roms = 0;
   /// The cursors such a library has open, by id: kind and offset.
   std::map<ipc::Cursor, std::pair<ipc::ListKind, int>> library_cursors;
+  /// The list commands such a library has answered, so a test can say what a
+  /// scroll cost (#339).
+  int library_begins = 0;
+  int library_nexts = 0;
 
   ipc::Error ListBegin(const ipc::ListRequest& request, ipc::Cursor* cursor) override {
     last_list = request;
     if (library_roms > 0) {
       *cursor = issued_cursor++;
-      library_cursors[*cursor] = {request.kind, 0};
+      ++library_begins;
+      library_cursors[*cursor] = {request.kind, static_cast<int>(request.offset)};
       return ipc::Error::kOk;
     }
     if (list_begin_error == ipc::Error::kOk) {
@@ -145,6 +150,7 @@ class FakeEngine : public ipc::Engine {
   ipc::Error ListNext(ipc::Cursor cursor, ipc::ListPage* out) override {
     last_cursor = cursor;
     if (library_roms > 0) {
+      ++library_nexts;
       return LibraryPage(cursor, out);
     }
     if (list_next_error == ipc::Error::kOk) {

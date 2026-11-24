@@ -1936,6 +1936,11 @@ struct LibraryOnScreen {
 /// Before #298 the level stopped at row 512 with "Too many to list here", a
 /// held key moved one row per press, and every frame copied every loaded row
 /// into the view.
+/// The pages a held L may read from row 2000 back to row 1 (#339). A page of
+/// these rows is ~30 of them, so ~2000 rows read once is ~70 pages; read again
+/// from row 0 by every rewind, it was ~170.
+constexpr int kClimbPages = 100;
+
 int RunScroll(Checks& checks) {
   using ScrollClock = overlay::ScrollRepeat::Clock;
   Console console;
@@ -2023,11 +2028,23 @@ int RunScroll(Checks& checks) {
     library.Frame(overlay::ScrollKey::kNone, at());
   }
   const int up_from = frame;
+  const int begins_before = console.engine().library_begins;
+  const int nexts_before = console.engine().library_nexts;
   for (; frame < up_from + 1800 && library.model.selected_position() != 0; ++frame) {
     library.Frame(overlay::ScrollKey::kPageUp, at());
   }
   checks.ExpectEq(library.model.selected_position(), 0, "a held L gets back to row 1");
   checks.ExpectEq(library.SelectedRom(), std::int64_t{1}, "which is the first rom");
+  // Each rewind opens its cursor where the rows it gathers start (#339), so
+  // the climb reads each dropped row about once. From row 0 every time, it
+  // read ~5000 rows for these ~1500.
+  const int rewinds = console.engine().library_begins - begins_before;
+  const int climbed_pages = console.engine().library_nexts - nexts_before;
+  std::cerr << "climb back: " << rewinds << " ListBegin, " << climbed_pages << " ListNext\n";
+  checks.Expect(climbed_pages <= kClimbPages,
+                "a held L reads the rows it dropped, not the list down to them each time: " +
+                    std::to_string(climbed_pages) + " pages over " + std::to_string(rewinds) +
+                    " rewinds");
   checks.Expect(console.engine().library_cursors.size() <= 2,
                 "every cursor a rewind replaced was ended: " +
                     std::to_string(console.engine().library_cursors.size()) + " open");

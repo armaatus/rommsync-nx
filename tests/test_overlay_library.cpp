@@ -1501,17 +1501,25 @@ struct LongLibrary {
   ipc::Cursor next_cursor = 1000;
   std::map<ipc::Cursor, Open> cursors;
 
+  /// What the browser has asked for, so a test can say what a scroll cost.
+  int begins = 0;
+  int nexts = 0;
+  std::int64_t last_offset = -1;
+
   /// Answer whatever the model asks for this frame, through the codec.
   void Answer(Checks& checks, overlay::LibraryBrowserModel& model) {
     const Command command = model.Next();
     switch (command.kind) {
       case Command::Kind::kListBegin: {
         const ipc::Cursor cursor = next_cursor++;
-        cursors[cursor] = Open{command.request.kind, 0};
+        ++begins;
+        last_offset = command.request.offset;
+        cursors[cursor] = Open{command.request.kind, static_cast<int>(command.request.offset)};
         model.OnCursor(cursor);
         return;
       }
       case Command::Kind::kListNext: {
+        ++nexts;
         const auto found = cursors.find(command.cursor);
         if (found == cursors.end()) {
           model.OnRefused(ipc::Error::kBadCursor);
@@ -1633,6 +1641,62 @@ void CheckRow2000IsReachable(Checks& checks) {
     library.Answer(checks, model);
   }
   checks.Expect(library.cursors.empty(), "no cursor is left open on the server");
+}
+
+/// Climbing back above the window from row 2000 costs the rows it dropped, not
+/// the list down to them (#339).
+///
+/// Before, every rewind re-opened the list at row 0 and read its way down to
+/// the window -- ~1500 rows at row 2000, a RomM page per 64 of them on a
+/// console -- because a cursor only goes forward.
+void CheckClimbingBackIsOnePage(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  LongLibrary library;
+  library.roms = 2500;
+  for (int frame = 0; frame < 8 && ListRows(model.Render()).empty(); ++frame) {
+    library.Answer(checks, model);
+  }
+  model.Activate();
+  const int step = overlay::kPageRows * overlay::kMaxRepeatStep;
+  for (int frame = 0; frame < 400 && model.selected_position() < 1999; ++frame) {
+    library.Answer(checks, model);
+    model.MoveSelection(std::min(step, 1999 - std::max(model.selected_position(), 0)));
+  }
+  for (int settle = 0; settle < 8; ++settle) {
+    library.Answer(checks, model);
+  }
+  checks.ExpectEq(model.selected_position(), 1999, "the selection is on row 2000");
+
+  // The window's first row, which is where the rows dropped above it end.
+  const std::vector<overlay::LibraryRow> window = ListRows(model.Render());
+  const std::int64_t first = window.empty() ? 0 : window.front().rom_id - 1;
+  checks.Expect(first > overlay::kRewindRows,
+                "rows were dropped above the window on the way down: it starts at " +
+                    std::to_string(first));
+
+  // Up a row a frame, past the window's top and through the rows gathered
+  // above it -- a climb of kRewindRows.
+  library.begins = 0;
+  library.nexts = 0;
+  bool consistent = true;
+  const int target = static_cast<int>(first) - overlay::kRewindRows + overlay::kPrefetchRows;
+  for (int frame = 0; frame < 4000 && model.selected_position() != target; ++frame) {
+    library.Answer(checks, model);
+    if (model.selected_position() > target) {
+      model.MoveSelection(-1);
+    }
+    consistent = consistent && SelectionIsConsistent(model);
+  }
+  checks.ExpectEq(model.selected_position(), target, "the selection climbed above the window");
+  checks.Expect(consistent, "and every row it stood on was the rom at its place");
+  checks.ExpectEq(library.begins, 1, "one ListBegin for the rows dropped above the window");
+  checks.ExpectEq(library.last_offset, first - overlay::kRewindRows,
+                  "at the first row of the rows it gathers, not at row 0");
+  const int pages = overlay::kRewindRows / ipc::kMaxPageSize;
+  checks.Expect(library.nexts <= pages + 2,
+                "and a ListNext per page of them, not ~" +
+                    std::to_string(first / ipc::kMaxPageSize) + " from the top: " +
+                    std::to_string(library.nexts));
 }
 
 /// What a screen renders is the rows around the selection, and only when
@@ -1843,6 +1907,7 @@ int main() {
   CheckHeldKeyRepeats(checks);
   CheckHeldScrollKey(checks);
   CheckRow2000IsReachable(checks);
+  CheckClimbingBackIsOnePage(checks);
   CheckRenderIsASliceOnChange(checks);
   CheckQueueRowUsesEveryPinnedField(checks);
   CheckLibraryScreenWritesNothing(checks);
