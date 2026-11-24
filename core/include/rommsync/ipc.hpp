@@ -203,7 +203,11 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **21** since #341, which added `start` to `ListPage` -- a required field,
 /// so a v21 overlay refuses a v20 sysmodule's pages rather than place rows
 /// after a rom it stepped past one place off.
-inline constexpr std::uint32_t kVersion = 21;
+///
+/// **22** since M11-26 (#340), which added `state_budget_pruned` to `Status`'s
+/// `backup` -- a required field, so a v22 overlay reading a v21 sysmodule's
+/// `Status` fails to decode it.
+inline constexpr std::uint32_t kVersion = 22;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

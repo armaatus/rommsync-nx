@@ -728,11 +728,11 @@ void StateBudget(checks::Checks& c) {
     c.ExpectEq(sandbox.Read(save.sd_path), save.bytes, "no save backup is touched");
   }
   c.ExpectEq(report.state_bytes_after, 256 * kMiB, "the state backups are down to the budget");
-  c.Expect(!report.over_state_budget, "which the report says");
-  c.Expect(backup::DescribeStateBudget(report).rfind("6 ", 0) == 0,
+  c.Expect(backup::DescribeStateBudget(report).find("max_state_mib with no other copy known: 6;") !=
+               std::string::npos,
            "and a log line of its own says so: " + backup::DescribeStateBudget(report));
-  c.Expect(backup::Describe(report).find("budget") != std::string::npos,
-           "as does the prune's own: " + backup::Describe(report));
+  c.Expect(backup::Describe(report).rfind("6 of 34 backups pruned", 0) == 0,
+           "and the prune's own line counts them with the rest: " + backup::Describe(report));
 }
 
 /// With the budget off -- or nothing known to be a state -- a sole copy is
@@ -836,7 +836,8 @@ void StateBudgetNames(checks::Checks& c) {
   c.ExpectEq(left(unknown), unknown.size(), "nor a state state.db does not know");
   c.ExpectEq(left(before), before.size(), "nor one from before this server");
   c.ExpectEq(report.budget_pruned, std::size_t{4}, "four in all");
-  c.Expect(report.over_state_budget, "and what is left is still over a 1-byte budget");
+  c.Expect(report.state_bytes_after > 1,
+           "and what is left stays over a 1-byte budget: a state's newest is never taken");
 
   // The predicate itself, at its edges.
   const backup::IsStateBackup is_state = backup::StateBackupsOf(baseline);

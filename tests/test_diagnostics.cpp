@@ -151,9 +151,9 @@ void Sections(checks::Checks& checks) {
   bundle.engine.backup.backups = 12;
   bundle.engine.backup.kept_unique = 2;
   bundle.engine.backup.over_cap = true;
+  bundle.engine.backup.state_budget_pruned = 3;
   bundle.written_at += 1;
   text = WriteAndRead(checks, dir, bundle);
-  bundle.engine.backup.state_budget_pruned = 3;
   for (const char* expected : {"measured = yes", "bytes = 5242880", "backups = 12",
                                "kept_unique = 2", "over_cap = yes",
                                "state_budget_pruned = 3"}) {

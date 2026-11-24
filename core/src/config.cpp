@@ -456,7 +456,7 @@ void ApplyTico(const ParseState& state, int line, std::string_view key, std::str
   config->tico = std::move(*tico);
 }
 
-/// `[backup]` (#292): three whole numbers, each with a floor and a ceiling.
+/// `[backup]` (#292, #340): whole numbers, each with a floor and a ceiling.
 void ApplyBackup(const ParseState& state, int line, std::string_view key, std::string_view value,
                  Config* config, Diagnostics* diags) {
   int* target = nullptr;
@@ -474,6 +474,16 @@ void ApplyBackup(const ParseState& state, int line, std::string_view key, std::s
   } else if (key == "max_mib") {
     target = &config->backup.max_mib;
     ceiling = kMaxBackupMaxMib;
+  } else if (key == "max_state_mib") {
+    // #340: zero is off -- the one key that turns a removal without a second
+    // copy on or off, so it takes the same zero `max_mib` does.
+    target = &config->backup.max_state_mib;
+    ceiling = kMaxBackupMaxMib;
+  } else if (key == "keep_states") {
+    // One, for `keep`'s reason: the newest backup of a state always stays.
+    target = &config->backup.keep_states;
+    floor = 1;
+    ceiling = kMaxBackupKeep;
   } else {
     diags->Add(Severity::kWarning, line, state.section, key, "unknown key, ignored");
     return;

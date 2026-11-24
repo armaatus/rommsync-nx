@@ -2730,9 +2730,17 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   // half confirmed, against a server row the prune then finds unmoved (#330).
   // Read back rather than carried, as the states half reads it, after that
   // half stored it.
+  //
+  // The whole of it also says which backups are a state's, for the state
+  // budget (#340): the one removal without a proof, so what it counts is what
+  // `state.db` names, never a name that only looks like a state's. Read
+  // whether or not the states half ran -- a state traded last week is still a
+  // state's backup with `[sync] states` turned off since.
+  const state::Baseline stored = state::LoadBaseline(baseline_path).value;
+  options.is_state_backup = backup::StateBackupsOf(stored);
   state::Baseline proven;
   if (states.ran) {
-    proven = backup::ProvenStates(state::LoadBaseline(baseline_path).value, states);
+    proven = backup::ProvenStates(stored, states);
   }
   const state::Baseline* proven_states = proven.state_rows().empty() ? nullptr : &proven;
   options.server_digests = [client, token, policy, proven_states](std::int64_t rom_id) {
@@ -2759,6 +2767,9 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
     backup_usage_.kept_unique = static_cast<std::int64_t>(report.kept_unique);
     backup_usage_.over_cap = report.over_cap;
     backup_usage_.truncated = report.truncated;
+    // Since boot rather than this prune's (#340). A removal means a backup was
+    // found, so it never misses this branch.
+    backup_usage_.state_budget_pruned += static_cast<std::int64_t>(report.budget_pruned);
   }
   log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
   // A cut listing is logged even with nothing else to say: it is what explains
@@ -2766,6 +2777,10 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap || report.truncated) {
     log::Info(log::Event::kBackupPruned, backup::Describe(report));
   }
+  // A line of its own, so a reader of the log can tell the one removal that is
+  // not a proof from all the ones that are (#340).
+  const std::string budget = backup::DescribeStateBudget(report);
+  if (!budget.empty()) log::Info(log::Event::kBackupPruned, budget);
 }
 
 bool SdEngine::StartTick(TickInputs* inputs) {

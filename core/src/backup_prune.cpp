@@ -55,6 +55,9 @@ struct Backup {
   bool removed = false;
   /// Examined and kept as the only copy; not offered a second time.
   bool kept = false;
+  /// Position among its group's backups the state budget counts, newest
+  /// first and from 1; 0 is one it does not count (#340).
+  std::size_t state_rank = 0;
   std::optional<std::string> digest;  ///< computed once, empty string = unreadable
 };
 
@@ -112,8 +115,10 @@ class Pruner {
         if (backup.removed || backup.kept || backup.rank == 0) continue;
         Offer(at);
       }
-      report_->over_cap = total_ > keep.max_bytes;
     }
+    // Last, and only over states: the one pass that removes without a proof.
+    if (keep.max_state_bytes > 0 && options_.is_state_backup) Budget(order, keep);
+    report_->over_cap = keep.max_bytes > 0 && total_ > keep.max_bytes;
     report_->bytes_after = total_;
   }
 
@@ -173,6 +178,45 @@ class Pruner {
     }
   }
 
+  /// The state budget (#340): while the state backups `is_state_backup` names
+  /// hold more than `max_state_bytes`, the oldest of them beyond the newest
+  /// `keep_states` of their state go -- by proof when there is one, and
+  /// without one when there is not. See the header.
+  void Budget(const std::vector<std::size_t>& order, const Retention& keep) {
+    const std::size_t keep_states = static_cast<std::size_t>(std::max(keep.keep_states, 1));
+    // A state's own rank, counted over what is still on the card and what the
+    // budget counts: a save backup that happens to share a group, or one from
+    // before this server, must not stand in for one of a state's newest.
+    std::int64_t state_total = 0;
+    for (const std::vector<std::size_t>& members : members_) {
+      std::size_t next = 0;
+      for (const std::size_t at : members) {
+        Backup& backup = backups_[at];
+        if (backup.removed || backup.parsed.unix_seconds < options_.server_since ||
+            !options_.is_state_backup(backup.parsed, sync::ExtensionOf(backup.name))) {
+          continue;
+        }
+        backup.state_rank = ++next;
+        state_total += backup.size;
+      }
+    }
+    for (const std::size_t at : order) {
+      if (state_total <= keep.max_state_bytes) break;
+      Backup& backup = backups_[at];
+      if (backup.removed || backup.state_rank <= keep_states) continue;
+      // A copy that is provably elsewhere goes as one: only what is left --
+      // which `Offer` has counted as kept -- is the budget's to answer for.
+      if (!backup.kept) Offer(at);
+      if (!backup.removed) {
+        if (!Remove(at)) continue;
+        --report_->kept_unique;
+        ++report_->budget_pruned;
+      }
+      state_total -= backup.size;
+    }
+    report_->state_bytes_after = state_total;
+  }
+
   /// Remove `at` if its bytes are provably somewhere else; otherwise keep it.
   void Offer(std::size_t at) {
     Backup& backup = backups_[at];
@@ -186,16 +230,24 @@ class Pruner {
       ++report_->kept_unique;
       return;
     }
+    if (!Remove(at)) ++report_->kept_unique;
+  }
+
+  /// One `remove()`, accounted. False, with the backup marked kept and a
+  /// warning, when the card would not.
+  bool Remove(std::size_t at) {
+    Backup& backup = backups_[at];
     const std::string resolved = files_.Resolve(backup.sd_path);
     if (resolved.empty() || io::Remove(resolved) != 0) {
       backup.kept = true;
-      ++report_->kept_unique;
       Warn(backup.sd_path + " could not be removed");
-      return;
+      return false;
     }
     backup.removed = true;
+    backup.kept = false;
     total_ -= backup.size;
     ++report_->pruned;
+    return true;
   }
 
   const std::string& DigestOf(std::size_t at) {
@@ -294,12 +346,66 @@ Retention RetentionFor(const config::BackupConfig& backup) {
   retention.keep = backup.keep;
   retention.keep_days = backup.keep_days;
   retention.max_bytes = std::int64_t{backup.max_mib} * 1024 * 1024;
+  retention.max_state_bytes = std::int64_t{backup.max_state_mib} * 1024 * 1024;
+  retention.keep_states = backup.keep_states;
   return retention;
 }
 
-IsStateBackup StateBackupsOf(const state::Baseline&) { return nullptr; }
+namespace {
 
-std::string DescribeStateBudget(const PruneReport&) { return {}; }
+/// `<rom>/<discriminator>/<extension>`: one string per group, so the lookup is
+/// a sorted vector's rather than a set of tuples' -- the sysmodule's image is
+/// budgeted by the page (scripts/image-budget.sh). A discriminator is
+/// sanitised and an extension is part of a single file name, so neither holds
+/// a `/`.
+std::string GroupKey(std::int64_t rom_id, std::string_view discriminator,
+                     std::string_view extension) {
+  std::string key = std::to_string(rom_id);
+  key += '/';
+  key += discriminator;
+  key += '/';
+  key += extension;
+  return key;
+}
+
+}  // namespace
+
+IsStateBackup StateBackupsOf(const state::Baseline& baseline) {
+  // What a state download (`state_sync.cpp`) and a state restore
+  // (`conflict_record.cpp`) name a backup: the row's rom, the discriminator of
+  // its name, and its name's extension.
+  std::vector<std::string> states;
+  for (const auto& [key, row] : baseline.state_rows()) {
+    states.push_back(GroupKey(row.rom_id, sync::StateBackupDiscriminator(row.file_name),
+                              sync::ExtensionOf(row.file_name)));
+  }
+  if (states.empty()) return nullptr;
+  // A save's slot is whatever some client chose, so one can be spelled
+  // `state-Game` (sync_execute.hpp). A group a save row of the same rom could
+  // also have written is not known to be a state's, and stays out.
+  std::vector<std::string> saves;
+  for (const auto& [key, row] : baseline.rows()) {
+    saves.push_back(GroupKey(row.rom_id, sync::SlotBackupDiscriminator(row.slot), {}));
+  }
+  std::sort(states.begin(), states.end());
+  std::sort(saves.begin(), saves.end());
+  return [states = std::move(states), saves = std::move(saves)](const BackupName& name,
+                                                                std::string_view extension) {
+    return !std::binary_search(saves.begin(), saves.end(),
+                               GroupKey(name.rom_id, name.discriminator, {})) &&
+           std::binary_search(states.begin(), states.end(),
+                              GroupKey(name.rom_id, name.discriminator, extension));
+  };
+}
+
+std::string DescribeStateBudget(const PruneReport& report) {
+  if (report.budget_pruned == 0) return {};
+  // One shape for every count: the sysmodule's image is budgeted by the page.
+  return "save-state backups removed by [backup] max_state_mib with no other copy known: " +
+         std::to_string(report.budget_pruned) + "; state backups now hold " +
+         std::to_string(report.state_bytes_after) +
+         " bytes. Never a save backup, nor the newest of a state";
+}
 
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options) {
   PruneReport report;

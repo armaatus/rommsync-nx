@@ -369,6 +369,14 @@ void AddBackups(StatusView* view, const ipc::BackupUsage& backup) {
     Add(&view->lines, "Backups", "Not measured yet");
     return;
   }
+  // #340: the state budget is the one rule that removes a backup no other copy
+  // of is known, so when it has, a row says so -- and only then. Neutral: it is
+  // doing what it is for, and a player trading states should still see it.
+  if (backup.state_budget_pruned > 0) {
+    Add(&view->lines, "State budget",
+        std::to_string(backup.state_budget_pruned) +
+            (backup.state_budget_pruned == 1 ? " only copy removed" : " only copies removed"));
+  }
   const std::string bytes =
       (backup.truncated ? std::string(kAtLeast) : std::string()) + FormatBytes(backup.bytes);
   if (!backup.over_cap) {

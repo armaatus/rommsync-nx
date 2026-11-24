@@ -1,5 +1,5 @@
-// Keeping `.backup/` bounded without ever deleting the only copy of anything
-// (M11-8, #292).
+// Keeping `.backup/` bounded without ever deleting the only copy of a save
+// (M11-8, #292), and a save state's only past an explicit budget (#340).
 //
 // Hard rule 2 writes a backup before every overwrite, and until this nothing
 // removed one. Two devices alternating on one game make a backup per download,
@@ -65,10 +65,30 @@
 // What that does **not** do is bound a state traded between consoles. `POST
 // /api/states` replaces its row in place, so the bytes a state download backed
 // up are by construction the ones the server no longer holds: that backup is
-// the only copy, and stays. The rule reaches a state backup whose bytes the
-// server holds again or still -- the live state a restore from the Conflicts
-// screen set aside, a copy of another state of the same game -- and nothing
-// else, because nothing else is provably anywhere.
+// the only copy. The proof reaches a state backup whose bytes the server holds
+// again or still -- the live state a restore from the Conflicts screen set
+// aside, a copy of another state of the same game -- and nothing else, because
+// nothing else is provably anywhere.
+//
+// ## The state budget: the one removal without a proof (#340)
+//
+// Two consoles trading a state would add one sole copy per download until the
+// card filled. So last, after both passes above, `max_state_bytes` bounds the
+// state backups: while those it counts hold more, the oldest of them beyond
+// the newest `keep_states` of their state go, oldest first -- by proof when
+// `Offer` finds one, and otherwise **without one**, counted apart as
+// `budget_pruned`. `keep` and `keep_days` do not shield a state backup from it
+// (a day of trading would fill a month's allowance); `keep_states` does, so a
+// state's newest always stays and the budget can be left over.
+//
+// **A save backup is never subject to it**: hard rule 2 holds for saves without
+// exception. The budget counts only what `is_state_backup` names, and the
+// engine builds that from `state.db` (`StateBackupsOf`) rather than from the
+// name's `state-` prefix, because a save's slot is whatever some client chose
+// and can be spelled `state-Game` (sync_execute.hpp). A backup from before
+// `server_since` is never counted: its rom id is another server's. Each removal
+// is still one `remove()`, so a power cut leaves a subset of what the whole
+// prune removes.
 //
 // ## When it runs, and what a power cut does to it
 //
@@ -76,8 +96,9 @@
 // operation: `Prune` is the only thing here that removes a backup, and nothing
 // else is writing to `.backup/` while it runs (the engine holds its save-write
 // lock). Each removal is one `remove()` of a file whose bytes were proven to be
-// elsewhere *before* the call, so a cut at any point leaves a subset of the
-// removals done and nothing else; a removal that does not survive the cut
+// elsewhere *before* the call -- or, for the state budget alone, chosen before
+// it -- so a cut at any point leaves a subset of the removals done and nothing
+// else; a removal that does not survive the cut
 // brings back a backup, which is harmless. `prune.crash` replays it.
 //
 // Hard rule 4: no libnx header. The server is asked through an injected
@@ -227,10 +248,10 @@ struct PruneReport {
   /// their bytes shown: the one removal that is not a proof (#340).
   std::size_t budget_pruned = 0;
 
-  /// What state backups held after the prune, and whether that is still over
-  /// the budget -- the newest `keep_states` of each are never removed.
+  /// What the state backups the budget counts held after the prune; zero when
+  /// it did not run. It can stay over the budget: the newest `keep_states` of
+  /// each state are never removed.
   std::int64_t state_bytes_after = 0;
-  bool over_state_budget = false;
 };
 
 /// Apply the retention rule to `options.backup_dir`. See the header.

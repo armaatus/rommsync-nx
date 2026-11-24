@@ -819,6 +819,30 @@ them.
 Each removal is one `remove()` of bytes already proven elsewhere, so a power cut
 leaves a subset of the removals and nothing else; `prune.crash` replays it.
 
+**The state budget is the one removal without a proof (#340).** Two consoles
+trading a state would otherwise grow `.backup/` by one sole copy per download
+until the card filled and every download failed `backup_failed`. So, last in
+the prune and over state backups only, `[backup] max_state_mib` (256 MiB by
+default, `0` off) bounds them: while the state backups it counts hold more than
+that, the oldest of them beyond the newest `keep_states` (3) of each state go
+oldest first — one with a proof as one, the rest without, counted apart as
+`PruneReport::budget_pruned`. `keep` and `keep_days` do not shield them; the
+newest `keep_states` of a state are never taken, so the budget can be left
+over.
+
+**It never touches a save backup**, and hard rule 2's guarantee for saves is
+unchanged. What it counts is what `state.db` names, not what a name looks like
+(`backup::StateBackupsOf`): a backup under a state row's rom, spelled with
+`sync::StateBackupDiscriminator` of the row's name and carrying that name's
+extension — what a state download and a state restore write — and under no save
+row's slot of the same rom, since a save's slot is whatever some client chose
+and could read `state-Game`. A backup from before `server_since` (#294), or of
+a state `state.db` no longer lists, is not counted and stays. Each removal is
+one `remove()`, so a power cut leaves a subset of what the whole prune removes
+(`prune.state_budget_crash`). Each prune that used it logs a second
+`backup.pruned` line naming `max_state_mib`, and `Status.backup.state_budget_pruned`
+counts the removals since boot for the overlay's **State budget** row.
+
 #### A write after the backup (#263)
 
 A backup is a copy of the save *as it was when copied*. A game that writes the

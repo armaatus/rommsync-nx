@@ -109,7 +109,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
-| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists | [The SD card is full](#the-sd-card-is-full) |
+| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; a second line naming `max_state_mib` when the state budget removed save-state backups that were the only copy | [The SD card is full](#the-sd-card-is-full) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
@@ -594,22 +594,42 @@ keep syncing throughout.
   overwritten — what the overlay's **Conflicts** screen restores from. After
   every sync that completed it is pruned to `[backup]`'s limits
   ([CONFIG.md](CONFIG.md#backup-how-much-of-backup-is-kept)): the newest ten of
-  each save, everything from the last thirty days, toward 512 MiB in all.
+  each save, everything from the last thirty days, toward 512 MiB in all; and
+  save-state backups to a 256 MiB budget of their own.
 
 ```
 31 info backup.pruned 14 of 52 backups pruned, 9437184 bytes freed; 402653184 bytes in 38 left; 6 kept past the retention rule because no other copy of their bytes could be found
 ```
 
-**A backup whose bytes exist nowhere else is never pruned**, which is what the
-last clause counts — save states mostly. RomM keeps one copy of a state and no
-digest of it, so the client remembers the MD5 of each state it last synced and
-prunes a state backup holding those bytes while RomM still lists that state
-unchanged; but a backup a state *download* wrote holds the bytes that download
-replaced, which RomM no longer has. Two consoles trading a state leave one of
-those per download. If the card is still full, those are what is left: copy any
-you want to keep to a computer, then delete them by hand (they are the files
-named `<rom id>-state-…` in `.backup/`); that is safe and is the fastest space
-you will find. Lowering `max_mib` does not remove them, by design.
+**A save backup whose bytes exist nowhere else is never pruned**, which is
+what the last clause counts. RomM keeps one copy of a state and no digest of
+it, so the client remembers the MD5 of each state it last synced and prunes a
+state backup holding those bytes while RomM still lists that state unchanged;
+but a backup a state *download* wrote holds the bytes that download replaced,
+which RomM no longer has. Two consoles trading a state leave one of those per
+download.
+
+**Save-state backups are the one exception: they have a budget.** Once the
+state backups hold more than `[backup] max_state_mib` (256 MiB unless you
+changed it), the oldest of them are deleted even though they are the only copy
+— never the newest three of each state (`keep_states`), and never a save
+backup. It is the one place this client deletes a backup without a second copy,
+so it says so on a line of its own:
+
+```
+31 info backup.pruned save-state backups removed by [backup] max_state_mib with no other copy known: 2; state backups now hold 268435456 bytes. Never a save backup, nor the newest of a state
+```
+
+The status screen shows a **State budget** row — *6 only copies removed* —
+once it has happened since the console started. If you would rather keep every
+state backup and clear them yourself, set `max_state_mib = 0`.
+
+If the card is still full, the unique save backups and the newest state backups
+of each state are what is left: copy any you want to keep to a computer, then
+delete them by hand (state backups are the files named `<rom id>-state-…` in
+`.backup/`); that is safe and is the fastest space you will find. Lowering
+`max_mib` does not remove them, by design; lowering `max_state_mib` or
+`keep_states` removes more state backups at the next sync that writes one.
 
 The overlay's status screen shows the same numbers on its **Backups** row, so
 you need not read the log for them: *41.2 MiB, 12 backups* is what the last
