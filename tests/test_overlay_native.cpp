@@ -1938,7 +1938,7 @@ struct LibraryOnScreen {
 /// into the view.
 /// The pages a held L may read from row 2000 back to row 1 (#339). A page of
 /// these rows is ~30 of them, so ~2000 rows read once is ~70 pages; read again
-/// from row 0 by every rewind, it was ~170.
+/// from row 0 by every rewind, it was ~300.
 constexpr int kClimbPages = 100;
 
 int RunScroll(Checks& checks) {
@@ -2037,7 +2037,7 @@ int RunScroll(Checks& checks) {
   checks.ExpectEq(library.SelectedRom(), std::int64_t{1}, "which is the first rom");
   // Each rewind opens its cursor where the rows it gathers start (#339), so
   // the climb reads each dropped row about once. From row 0 every time, it
-  // read ~5000 rows for these ~1500.
+  // read ~300 pages where ~70 will do.
   const int rewinds = console.engine().library_begins - begins_before;
   const int climbed_pages = console.engine().library_nexts - nexts_before;
   std::cerr << "climb back: " << rewinds << " ListBegin, " << climbed_pages << " ListNext\n";

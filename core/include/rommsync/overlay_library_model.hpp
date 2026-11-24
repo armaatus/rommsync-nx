@@ -362,14 +362,15 @@ class LibraryBrowserModel {
   /// them reads them again.
   ///
   /// A cursor only goes forward (`list_service.hpp`), so reading them again is
-  /// a **rewind**: the cursor is ended, a new one is opened, and the rows up to
-  /// `rewind_from` are read and dropped on the way, the ones from there to
-  /// `first` gathered into `above`, which is put in front of the window when it
-  /// is complete. Every row the new cursor hands over is routed by its place:
-  /// above the window, inside it (where it replaces the row it is a fresher
-  /// copy of), or at its end. A reclaimed cursor is re-opened the same way --
-  /// up to the window, gathering nothing -- which is why a page off a fresh
-  /// cursor cannot double the rows already drawn.
+  /// a **rewind**: the cursor is ended, a new one is opened at `rewind_from`
+  /// (#339), and the rows from there to `first` are gathered into `above`,
+  /// which is put in front of the window when it is complete. Every row the new
+  /// cursor hands over is routed by its place: above the window, inside it
+  /// (where it replaces the row it is a fresher copy of), or at its end. A
+  /// reclaimed cursor is re-opened the same way -- at the window, gathering
+  /// nothing -- which is why a page off a fresh cursor cannot double the rows
+  /// already drawn. A level that dropped an item it could not read opens at
+  /// row 0 instead and reads down (`StartOf`).
   struct Level {
     LibraryLevel kind = LibraryLevel::kPlatforms;
 
@@ -379,7 +380,9 @@ class LibraryBrowserModel {
     std::uint64_t id = 0;
 
     /// How it was opened, kept so a reclaimed cursor can be re-opened with the
-    /// same filter rather than with a guess.
+    /// same filter rather than with a guess. `offset` is the last cursor's
+    /// start, set as each `ListBegin` is handed out, which is where `OnCursor`
+    /// counts the new one's places from.
     ipc::ListRequest request;
 
     /// Zero before `ListBegin` answers, and after a `kBadCursor` retires one.
@@ -450,6 +453,11 @@ class LibraryBrowserModel {
   /// Re-open `level` from the start of the list, catching up to its window
   /// rather than redrawing it: what a reclaimed cursor and a lost page share.
   static void Reopen(Level& level);
+
+  /// The row a fresh cursor for `level` should start at (#339): the first one
+  /// it has a use for, so a rewind reads the rows it dropped rather than the
+  /// list down to them.
+  static std::int64_t StartOf(const Level& level);
 
   /// Whether this level draws the `kMore` row under its loaded ones.
   ///

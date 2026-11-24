@@ -194,7 +194,12 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **19** since M11-22 (#323), which added `truncated` to `Status`'s `backup`
 /// -- a required field, so a v19 overlay reading a v18 sysmodule's `Status`
 /// fails to decode it.
-inline constexpr std::uint32_t kVersion = 19;
+///
+/// **20** since #339, which added `offset` to `ListRequest` -- a required
+/// field, so a v19 overlay's `ListBegin` is refused by a v20 sysmodule, and a
+/// v19 sysmodule would serve a v20 overlay's rewind from row 0 into rows it
+/// routes as though they started further down.
+inline constexpr std::uint32_t kVersion = 20;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

@@ -1219,6 +1219,7 @@ std::string EncodeListRequest(const ListRequest& request) {
   AppendInteger(&out, "platform_id", request.platform_id);
   AppendText(&out, "search", request.search);
   AppendInteger(&out, "page_size", request.page_size);
+  AppendInteger(&out, "offset", request.offset);
   out += '}';
   return out;
 }
@@ -1234,7 +1235,10 @@ Decoded<ListRequest> DecodeListRequest(std::string_view text) {
             // Clamped by `ServiceCore::ListBegin`, not here: what the client
             // wanted is a legitimate thing to say, and a page size of zero is
             // the one value that cannot mean anything.
-            !ReadInteger(object, "page_size", &page_size, 1, kMaxRequestedPageSize, error)) {
+            !ReadInteger(object, "page_size", &page_size, 1, kMaxRequestedPageSize, error) ||
+            // Required, not defaulted to 0: a v19 overlay that sent none is
+            // refused by the interface check before it gets here (#339).
+            !ReadInteger(object, "offset", &out->offset, 0, kMaxId, error)) {
           return;
         }
         out->page_size = static_cast<std::int32_t>(page_size);

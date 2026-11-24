@@ -238,10 +238,13 @@ production RomM or a real library.
     the list in seconds, riding *"Loading..."* while pages arrive. Tap Up and
     Down: one row each, never two. Then hold L back to the top, and expect a
     *"Loading..."* above the first row now and then while rows the browser
-    dropped are read again -- slower than going down, never a wrong rom under
-    the selection. Do the same with L/R and Down on the conflicts screen. Before
-    M11-14 (#298) every press was one row and nothing past row 512 of a
-    platform could be reached.
+    dropped are read again -- a few pages each time, about as long as the same
+    distance going down, and never a wrong rom under the selection. Do the same
+    with L/R and Down on the conflicts screen. Before M11-14 (#298) every press
+    was one row and nothing past row 512 of a platform could be reached; before
+    #339 each of those re-reads started again at row 0, so the climb back got
+    slower the further down it started -- ~300 pages from row 2000 rather than
+    ~70.
     **What a slow page looks like now** (M11-24, #329): while a page is out the
     panel keeps drawing and R keeps moving through the rows already loaded,
     then rests on *"Loading..."* at their edge until the page lands -- never a

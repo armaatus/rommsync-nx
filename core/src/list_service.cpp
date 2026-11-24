@@ -337,6 +337,12 @@ ipc::Error Service::ListBegin(const ipc::ListRequest& request, ipc::Cursor* curs
     entry.request.platform_id = 0;
     entry.request.search.clear();
   }
+  // Where the first page starts (#339). Every kind honours it the same way --
+  // the two served out of memory index their rows by it, and a rom page is
+  // `GET /api/roms?offset=` -- so a cursor opened past the end is an empty last
+  // page rather than a refusal, exactly as one paged there would be.
+  entry.request.offset = std::max<std::int64_t>(0, request.offset);
+  entry.offset = entry.request.offset;
   entry.touched = now;
   *cursor = entry.id;
   cursors_.push_back(std::move(entry));

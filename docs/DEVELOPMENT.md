@@ -1049,7 +1049,7 @@ A removed command leaves a hole.
 | 8 | `Unpair` | - -> - | `kWriteFailed` |
 | 9 | `Enqueue` | `rom_id` -> position | `kUnknownRom`, `kQueueFull`, `kDuplicate`, `kMultiFile` |
 | 10 | `Dequeue` | `rom_id` -> - | `kNotQueued` |
-| 11 | `ListBegin` | `ListRequest` -> cursor | never fails |
+| 11 | `ListBegin` | `ListRequest` (kind, filter, page size, starting `offset`) -> cursor | never fails; an `offset` past the end opens a list whose first page is empty and the last |
 | 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` (each row with `backup_present` and `keep_local`: `open \| held \| waiting`) | never fails; an empty history is a page |

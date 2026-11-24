@@ -320,6 +320,25 @@ void LibraryBrowserModel::Reopen(Level& level) {
   level.page_error = ipc::Error::kOk;
 }
 
+std::int64_t LibraryBrowserModel::StartOf(const Level& level) {
+  // A rewind, or a reclaimed cursor catching up to its window, opens at the
+  // first row it has a use for: `rewind_from` (which `Reopen` sets to `first`
+  // when nothing is being gathered). Reading down to it from row 0 was ~1500
+  // rows at row 2000 of a platform, a RomM page per 64 of them.
+  //
+  // Not once an item was dropped unread, though: places here count the rows
+  // this build could read, and the sysmodule's offset counts every row, so the
+  // two would disagree by however many were dropped above. From row 0 they
+  // agree, which is what the list did before the offset existed. A rom the
+  // sysmodule steps past as too large to send even alone (#248) is the same
+  // disagreement, and invisible from here; it takes a rom whose own record
+  // is over the transport's 200 KiB ceiling, and #339 records it as open.
+  if (level.first == 0 || level.unreadable_items > 0) {
+    return 0;
+  }
+  return level.rewind_from;
+}
+
 bool LibraryBrowserModel::HasMoreRow(const Level& level) {
   // A failure while rewinding is drawn above the window, where the selection
   // is, rather than here.
@@ -486,6 +505,7 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
       return command;
     }
     command.kind = Command::Kind::kListBegin;
+    level.request.offset = StartOf(level);
     command.request = level.request;
     level.loading = true;
     issued_ = command.kind;
@@ -497,9 +517,9 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
   if (level.first > 0 && level.page_error == ipc::Error::kOk && level.consumed >= level.first &&
       level.selected - level.first < kPrefetchRows) {
     // The selection is coming up to rows that were dropped (#298). A cursor
-    // only goes forward, so this one is ended and the list read again from the
-    // top, gathering `kRewindRows` above the window on the way. Ended first:
-    // #31 caps how many may be open.
+    // only goes forward, so this one is ended and a new one opened `kRewindRows`
+    // above the window (`StartOf`, #339), gathering them on its way down to it.
+    // Ended first: #31 caps how many may be open.
     closing_.push_back(level.cursor);
     level.cursor = 0;
     level.consumed = 0;
@@ -552,10 +572,11 @@ void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
   level.cursor = cursor;
   level.page_error = ipc::Error::kOk;
   level.empty_pages = 0;
-  // A fresh cursor starts at the beginning of the list, so whatever is on
-  // screen is about to be said again. Counting from zero is what routes the
-  // second telling onto the rows it repeats rather than after them (`Level`).
-  level.consumed = 0;
+  // A fresh cursor starts where it was asked to (#339), so whatever is on
+  // screen from there down is about to be said again. Counting from that place
+  // is what routes the second telling onto the rows it repeats rather than
+  // after them (`Level`).
+  level.consumed = static_cast<int>(level.request.offset);
   level.has_more = true;
 }
 
