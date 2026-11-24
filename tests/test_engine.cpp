@@ -3392,6 +3392,78 @@ int ServerDisabled(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #328: a console whose nifm has a network up but never says `Connected` --
+/// emuMMC's DNS block, 90DNS, a LAN with no internet -- still syncs when RomM
+/// answers.
+///
+/// nifm's internet status is the verdict of Nintendo's own connection test, so
+/// a console that blocks Nintendo on purpose may never pass it while the RomM
+/// on its LAN is a request away. Until this issue that console held every tick
+/// forever, one `net.offline` line and nothing else. Now, once the hold has
+/// outlasted the network budget, RomM is asked directly, and an answer runs the
+/// tick.
+int NifmUnsure(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  rommsync::log::Reset();
+  Console console(c, "engine-nifm-unsure");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = true\nstates = false\n"),
+           "the console points at the rig and syncs at boot");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = fixture.device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and is paired with it");
+
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  // nifm answers the call -- rc 0 -- with a status that is not `Connected`,
+  // for as long as the console is up.
+  console.engine.UseNetworkProbe(
+      [] {
+        return rommsync::sysmodule::ClassifyNifm(0, false) ==
+               rommsync::sysmodule::NifmVerdict::kOnline;
+      },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.StartWorker();
+
+  ipc::Status status = console.Status();
+  for (int waited = 0; waited < 400 && status.last_sync_result == ipc::SyncResult::kNever;
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    status = console.Status();
+  }
+  c.Expect(status.last_sync_result == ipc::SyncResult::kOk,
+           std::string("the boot tick runs against the RomM that answers, rather than waiting "
+                       "for a nifm that never says Connected: ") +
+               ipc::ToString(status.last_sync_result));
+  c.Expect(status.online, "and the console is drawn as online");
+
+  const ipc::LogTail tail = console.Log();
+  bool said = false;
+  for (const std::string& line : tail.lines) {
+    said = said || (line.find(" net.offline ") != std::string::npos &&
+                    line.find("nifm") != std::string::npos);
+  }
+  c.Expect(said,
+           "the hold said it was nifm's internet status, not a missing network, it waited "
+           "on:" + Rendered(tail));
+  return c.failures();
+}
+
 /// #304: Y on the log screen writes one file a bug report can carry -- through
 /// the table the console runs, against a card, with the platform's facts
 /// injected the way `main.cpp` injects them -- and no secret on the card is in
@@ -8207,6 +8279,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"pair_commit", PairCommit},
       {"log_faults", LogsTransportFailures},
       {"server_disabled", ServerDisabled},
+      {"nifm_unsure", NifmUnsure},
       {"drains", Drains},
       {"downloading", DrainProgress},
       {"preempts", DrainPreempted},

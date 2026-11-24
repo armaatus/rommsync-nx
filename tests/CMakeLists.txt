@@ -2658,7 +2658,8 @@ set(ENGINE_RIG_SCENARIOS
   pair_commit  # `kApproved` only once token.dat is committed; a refused commit keeps the old one
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
   server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
-  drains       # M9-5: a rom queued over IPC becomes a file on the card
+  nifm_unsure  # #328: nifm up but never Connected, RomM answering: the held tick runs anyway
+  drains      # M9-5: a rom queued over IPC becomes a file on the card
   romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
   clock        # #295: a console clock a month off the network clock is logged and drawn, then trusted again
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
