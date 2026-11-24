@@ -175,6 +175,11 @@ void SdEngine::UseNetworkProbe(NetworkProbe probe, std::chrono::milliseconds bud
   network_idle_poll_ = idle_poll;
 }
 
+void SdEngine::UseRommTrust(RommTrust trust) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  romm_trust_ = std::move(trust);
+}
+
 void SdEngine::UseNetworkClock(NetworkClock clock) {
   std::lock_guard<std::mutex> lock(mutex_);
   network_clock_ = std::move(clock);
@@ -1172,13 +1177,83 @@ void SdEngine::ObserveAnswer(auth::Answer answer) {
   auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
 }
 
-bool SdEngine::NetworkUp() const {
+NifmVerdict SdEngine::NetworkVerdict() const {
   NetworkProbe probe;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     probe = network_probe_;
   }
-  return !probe || probe();
+  return probe ? probe() : NifmVerdict::kOnline;
+}
+
+bool SdEngine::RommAnswers(std::chrono::steady_clock::time_point now) {
+  const std::shared_ptr<http::CancelToken> cancel = std::make_shared<http::CancelToken>();
+  http::HttpClient* client = nullptr;
+  std::chrono::milliseconds budget{0};
+  RommTrust trust;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    budget = network_budget_;
+    trust = romm_trust_;
+    client = server_;
+  }
+  // `offline_since_` and the two `romm_` members are the worker's alone, so
+  // they are read here without `mutex_`.
+  if (romm_answered_ != true &&
+      (now - offline_since_.value_or(now) < budget || now < romm_ask_due_)) {
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Registered as the tick's, so a shutdown or a sleep landing during the
+    // ask cuts it short exactly as it would the tick's own heartbeat.
+    tick_cancel_ = cancel;
+    if (stopping_ || suspended_) {
+      cancel->Cancel();
+    }
+  }
+  const std::shared_ptr<const config::Config> config = ConfigSnapshot();
+  if (client == nullptr || !config->configured()) {
+    // Nothing to ask, and nothing for the hold to protect: the tick runs and
+    // says what is missing, as it would on a console nifm vouched for.
+    return true;
+  }
+  // One attempt rather than the retries every other call gets: the retry is
+  // the next ask, a budget later, and a console that really is offline should
+  // not spend a backoff's worth of attempts finding out each time.
+  sync::CallPolicy policy = PolicyFor(cancel.get());
+  policy.timeout = kRommAskTimeout;
+  policy.max_attempts = 1;
+  // The connector refuses nifm's "no internet" unless told otherwise, and this
+  // heartbeat is the one request that has to get past it to find out.
+  if (trust) trust(true);
+  const server::Probe probe = server::ReadServer(*client, config->server.url, policy);
+  if (probe.transport == http::Error::kCanceled) {
+    if (trust) trust(romm_answered_ == true);
+    return false;
+  }
+  // A heartbeat, and not merely an answer: a captive portal answers every
+  // plain-http URL, and a tick run against one sends it the library fetch and
+  // the token (NET-04). A RomM too old still reads as a heartbeat, and the tick
+  // is what says so.
+  const bool answered = probe.ok();
+  if (trust) trust(answered);
+  if (!answered) {
+    romm_ask_due_ = clock_->Steady() + budget;
+  }
+  if (romm_answered_ != answered) {
+    romm_answered_ = answered;
+    if (answered) {
+      log::Info(log::Event::kNetOffline,
+                "nifm says the console has no internet connection, but RomM answered; "
+                "syncing without nifm");
+    } else {
+      log::Warn(log::Event::kNetOffline,
+                "nifm says the console has no internet connection, and RomM did not answer "
+                "either: " + probe.message);
+    }
+  }
+  return answered;
 }
 
 bool SdEngine::AwaitNetwork() {
@@ -1221,7 +1296,7 @@ bool SdEngine::AwaitNetwork() {
     lock.unlock();
     // Outside the lock: `nifm` is a service call and `mutex_` guards state the
     // frame-polled commands read.
-    const bool up = probe();
+    const bool up = probe() == NifmVerdict::kOnline;
     lock.lock();
     if (up) {
       return true;
@@ -1345,8 +1420,17 @@ void SdEngine::RunWorker() {
       // `network_poll_` for a budget and every `network_idle_poll_` after it,
       // so the tick runs within seconds of Wi-Fi coming back. Ahead of the
       // game check, which is a `pm` call a held tick need not spend.
+      //
+      // **Only nifm's "no network" holds for good** (#328). "No internet" is
+      // also what a console that blocks Nintendo on purpose may say forever,
+      // and its RomM is on the LAN: once the hold has outlasted the budget --
+      // Wi-Fi reassociating is long done by then -- RomM is asked directly.
       lock.unlock();
-      const bool network_up = NetworkUp();
+      const NifmVerdict nifm = NetworkVerdict();
+      bool network_up = nifm == NifmVerdict::kOnline;
+      if (!network_up && nifm != NifmVerdict::kOffline) {
+        network_up = RommAnswers(clock_->Steady());
+      }
       lock.lock();
       if (!network_up) {
         scheduler_.Defer(decision.trigger);
@@ -1360,10 +1444,21 @@ void SdEngine::RunWorker() {
           offline_said_ = true;
           // Once per hold, as `sync.held` is: a console in a bag all day is one
           // line, not one per re-check. Outside the lock: it is a card write.
+          // Which of the two it is, because only one has a fix (#328).
+          const std::string tick = sync::ToString(decision.trigger);
+          const std::string seconds = std::to_string(
+              std::chrono::duration_cast<std::chrono::seconds>(network_budget_).count());
           lock.unlock();
-          log::Warn(log::Event::kNetOffline,
-                    std::string("the console has no internet connection; the ") +
-                        sync::ToString(decision.trigger) + " tick waits for the network");
+          if (nifm == NifmVerdict::kOffline) {
+            log::Warn(log::Event::kNetOffline,
+                      "the console has no network (airplane mode, or none in range); the " +
+                          tick + " tick waits for the network");
+          } else {
+            log::Warn(log::Event::kNetOffline,
+                      "nifm says the console has no internet connection; the " + tick +
+                          " tick waits for the network, and asks RomM directly after " +
+                          seconds + " s");
+          }
           lock.lock();
         }
         decision = sync::Decision{};

@@ -273,14 +273,16 @@ the overlay keeps answering.
 **Steps.** Join a network with a captive portal (a hotel or a guest network)
 without signing in. Let a tick fall due, then sign in.
 
-**Expect.** nifm reports no internet, and the tick waits:
+**Expect.** nifm reports no internet, and the tick waits; after two minutes
+RomM's heartbeat is asked directly, and the portal's answer is not one (#328):
 
 ```
-2 warn net.offline the console has no internet connection; the interval tick waits for the network
+2 warn net.offline nifm says the console has no internet connection; the interval tick waits for the network, and asks RomM directly after 120 s
+3 warn net.offline nifm says the console has no internet connection, and RomM did not answer either: the heartbeat was refused with status 302
 ```
 
-**Pass.** No request sent to the portal as if it were RomM, no `auth.rejected`
-from the portal's page; after sign-in a tick completes.
+**Pass.** No request but `GET /api/heartbeat` sent to the portal, no
+`auth.rejected` from the portal's page; after sign-in a tick completes.
 
 ### NET-05: Certificate variants
 
@@ -335,6 +337,29 @@ of every cell and the probe's *reads N, the largest M bytes*.
 **Pass.** No `rommsync: NetworkInitialize` line in the boot log, and `hid`
 keeps working the whole time (#44's `sslInitialize` session-count question:
 2 is safe).
+
+### NET-09: A console that blocks Nintendo
+
+**Steps.** Three cells, each a cold boot with RomM on the LAN by IP address and
+a short `[sync] interval`: emuMMC with Atmosphère's default DNS block (no
+hosts file of your own, `add_defaults_to_dns_hosts` left on), the same console
+with 90DNS set as its DNS servers, and a network with no internet at all. In
+each, note what System Settings -> Internet -> Connection Status says, and run
+the selftest (PRE-02) for its nifm row.
+
+**Expect.** Either nifm says Connected and the boot tick runs at once, or it
+does not, and the tick runs once the boot wait's two minutes are out (#328):
+
+```
+2 info net.offline nifm says the console has no internet connection, but RomM answered; syncing without nifm
+```
+
+**Pass.** Saves sync in every cell; the second tick after a boot starts on time
+rather than two minutes late.
+
+**Answers.** What nifm reports with Nintendo blocked -- the selftest's nifm
+row, its `rc` and `status`, in each cell -- which #328 could not know. Written
+into #328 and into the cell's row of #310's matrix.
 
 ---
 
@@ -740,7 +765,7 @@ least one row.
 | `smoke` | PRE-01, PRE-02, PRE-03, INST-01, INST-02, INST-03, INST-04, INST-05, BOOT-01, BOOT-02, BOOT-03, NET-07, NET-08, LIFE-08, LIFE-09, LIFE-10, SAVE-01, SAVE-02, SAVE-03, SAVE-04, SAVE-05, SAVE-06, SAVE-07, SAVE-08, SAVE-09, SAVE-10, SAVE-11, DBG-01 |
 | `overlay` | OVL-01, OVL-02, INST-06, LIFE-05, LIFE-06, LIFE-07, MEM-03 |
 | `soak` | LIFE-01, LIFE-02, LIFE-03, LIFE-04, LIFE-05, LIFE-06, NET-01, NET-02, NET-03, NET-04, MEM-01, MEM-02, CLK-01, CLK-02, CLK-03, SAVE-05, DBG-01, DBG-02 |
-| `matrix` | PRE-02, INST-01, INST-02, INST-03, BOOT-01, NET-06, MEM-03, OVL-01 |
+| `matrix` | PRE-02, INST-01, INST-02, INST-03, BOOT-01, NET-06, NET-09, MEM-03, OVL-01 |
 | `servers` | NET-05, NET-06, CLK-03 |
 | `beta` | INST-01, INST-02, INST-03, SAVE-01, SAVE-03, SAVE-04, OVL-02, DBG-01 |
 

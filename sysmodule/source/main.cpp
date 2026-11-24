@@ -1708,7 +1708,7 @@ void __appInit(void) {
   // `bool`s that the worker and the pairing thread both read. A console missing
   // a service Nintendo's own boot registers is not the case to add a lock for.
   //
-  // `ConsoleIsOnline` is not the thing that suffers: it answers **true** when
+  // `ConsoleNetwork` is not the thing that suffers: it answers **online** when
   // nifm was never opened, deliberately, so the worker still ticks and every
   // request logs the transport error a user can act on rather than waiting
   // silently on a probe that will never say yes (`ssl_http_client.hpp`).
@@ -1914,7 +1914,8 @@ int main(int, char**) {
   // it when a pairing commits (`SdEngine::UseServer`).
   engine.UseServer(g_http.get(), "");
   engine.UseCard(g_card.get());
-  engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleIsOnline);
+  engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleNetwork);
+  engine.UseRommTrust(&rommsync::sysmodule::TrustRommPastNifm);
   // The reference a wrong console clock is caught against before it decides a
   // first sync (#295). With no clock service there is no reference to read;
   // the server's `Date` header and the floor still hold.

@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <memory>
 
+#include "nifm_verdict.hpp"
 #include "rommsync/http.hpp"
 
 namespace rommsync::sysmodule {
@@ -98,18 +99,22 @@ void NetworkExit();
 /// than leaving a silently transportless console.
 bool NetworkReady();
 
-/// Whether the console has an internet connection, asked before a connect
-/// rather than after a ten-second timeout.
+/// What nifm says of the console's connection, asked before a connect rather
+/// than after a ten-second timeout.
 ///
 /// This is what "offline-safe" costs on a console (CLAUDE.md): a sync tick on a
 /// Switch in a bag would otherwise spend `connect_timeout` per request finding
 /// out what nifm can answer in one IPC call. **A nifm that was never opened is
-/// not treated as offline** -- the transport is bsd and ssl, and refusing to try
-/// because a diagnostic service is missing would be the worse mistake. **A nifm
-/// that answers with a failure is** (M11-5, #289): libnx documents the call
-/// failing with 0xd46ed in airplane mode and with no known network in range, so
-/// a failure is the offline answer rather than a busy service; any other code
-/// is read the same way and logged as `net.offline` (`nifm_verdict.hpp`).
+/// read as online** -- the transport is bsd and ssl, and refusing to try
+/// because a diagnostic service is missing would be the worse mistake. **0xd46ed
+/// is offline** (M11-5, #289): libnx documents the call failing with it in
+/// airplane mode and with no known network in range, and the connector never
+/// connects past it. **Anything else short of `Connected` is `kNoInternet`**
+/// (#328), which the connector connects past only while `TrustRommPastNifm`
+/// says RomM answered through it, and the engine holds a tick on only until it
+/// has asked: it is also what a console that blocks Nintendo may say for good.
+/// An undocumented failure code is logged as `net.offline` once per change
+/// (`nifm_verdict.hpp`).
 ///
 /// The never-opened guard is also why it is safe to call when
 /// `NetworkInitialize` was skipped entirely:
@@ -124,7 +129,15 @@ bool NetworkReady();
 /// `SdEngine::AwaitNetwork`'s, where `stopping_` is visible and a host test can
 /// drive it. Called from the worker thread, never from `main` before its service
 /// loop -- CLAUDE.md's "never block boot".
-bool ConsoleIsOnline();
+NifmVerdict ConsoleNetwork();
+
+/// Whether the connector may connect while nifm says `kNoInternet` (#328).
+/// Off until the engine's heartbeat ask is under way (`SdEngine::RommAnswers`,
+/// which `main.cpp` hands this as its `UseRommTrust`), and then whatever that
+/// ask found: RomM answering is the evidence that the network nifm will not
+/// vouch for reaches it, rather than a captive portal that answers every URL.
+/// Safe from any thread.
+void TrustRommPastNifm(bool trusted);
 
 /// The console's `http::HttpClient`: `http_wire.cpp`'s framing over the `ssl`
 /// transport. Never null -- a build whose network did not come up still answers,

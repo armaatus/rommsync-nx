@@ -2613,6 +2613,7 @@ set(ENGINE_SCENARIOS
   nifm_verdict   # #289: a nifm probe that fails is the console offline, not online
   boots_offline  # #289: a boot with no Wi-Fi holds its tick for the network, past the boot wait
   wakes_offline  # #289: a tick due at a wake waits for Wi-Fi to reassociate, and earns no backoff
+  nifm_unsure_unanswered  # #328: nifm says no internet, RomM silent: held, one heartbeat per budget
   romm_forgotten  # M10-2: a heartbeat answered after the engine forgot the server is not recorded
   index_canceled  # #251: a sleep in the library fetch's backoff is a cancelled tick, not an offline one
 )

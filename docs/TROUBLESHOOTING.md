@@ -138,7 +138,7 @@ in RomM and never come back from it. Nothing changes on the card.
 3 warn net.offline GET /api/roms: body ended early; the rom index could not be fetched: body ended early (transfer closed with 14822 bytes remaining to read)
 3 warn net.offline negotiate: connection failed; the negotiation did not complete: connection failed
 2 warn net.offline tick skipped: this build has no transport
-2 warn net.offline the console has no internet connection; the interval tick waits for the network
+2 warn net.offline the console has no network (airplane mode, or none in range); the interval tick waits for the network
 2 warn net.offline nifm answered 0x123456; read as no internet connection
 ```
 
@@ -165,22 +165,83 @@ harmless; the next one picks up where this one would have.
 4. If the detail says **host could not be resolved**, it is DNS: try the
    server's IP address in `[server] url` to confirm, then fix the name.
 
-`the console has no internet connection; the … tick waits for the network`
-is the console itself saying it is offline — airplane mode, Wi-Fi off, no
-known network in range, or a wake before Wi-Fi has reassociated. Nothing was
-sent and nothing failed: the tick (`boot`, `interval` or `on_demand`) is held,
-the console asks again every two seconds for two minutes and every thirty seconds
-after that, and the tick runs the moment Wi-Fi is
-back, with no backoff to wait out. It is written once per hold, so a console
-that sat in a bag all afternoon shows one line. If it keeps appearing while the
-console's own settings show a working connection, run the connection test under
-System Settings → Internet and include what it says in a bug report.
-`nifm answered 0x…` is the same verdict reached from an answer this client did
-not expect, and worth including in a bug report too.
+`the console has no network (…); the … tick waits for the network` is the
+console itself saying it is offline — airplane mode, Wi-Fi off, or no known
+network in range. Nothing was sent and nothing failed: the tick (`boot`,
+`interval` or `on_demand`) is held, the console asks again every two seconds
+for two minutes and every thirty seconds after that, and the tick runs the
+moment Wi-Fi is back, with no backoff to wait out. It is written once per hold,
+so a console that sat in a bag all afternoon shows one line, and nothing at all
+is sent while it holds.
+
+`nifm says the console has no internet connection; …` is a different hold: the
+console has a network, but Nintendo's connection test has not passed. That is
+also a wake before Wi-Fi has reassociated, which is why the tick waits — but it
+asks RomM directly once the hold has lasted two minutes, so a console that
+blocks Nintendo still syncs. If it keeps appearing, see
+[Sync never runs on a console that blocks Nintendo](#sync-never-runs-on-a-console-that-blocks-nintendo).
+`nifm answered 0x…` is an answer this client did not expect, read the same way;
+it is worth including in a bug report.
 
 `tick skipped: this build has no transport` is a different sentence and is not
 a network problem — it is a build with no HTTP client wired in, which is not
 something a release does. If you see it on a console, that is worth reporting.
+
+---
+
+## Sync never runs on a console that blocks Nintendo
+
+**Symptom.** The console's Wi-Fi works and RomM is reachable from it — the
+browser on another device on the same network opens it — but nothing syncs, or
+every sync starts about two minutes late. The console blocks Nintendo's servers
+on purpose: Atmosphère's default emuMMC DNS block, 90DNS, a Pi-hole, or a
+network with RomM on it and no internet at all.
+
+**Log line.**
+
+```
+2 warn net.offline nifm says the console has no internet connection; the boot tick waits for the network, and asks RomM directly after 120 s
+2 info net.offline nifm says the console has no internet connection, but RomM answered; syncing without nifm
+2 warn net.offline nifm says the console has no internet connection, and RomM did not answer either: the server's version could not be read: connection failed (Connection refused)
+```
+
+**What is happening.** Before each sync the client asks the console's network
+service, nifm, whether it is online. nifm's "online" means Nintendo's own
+connection test passed, and on a console that blocks Nintendo it may never
+pass. Waiting for it would mean never syncing, so a sync held on that answer
+waits two minutes — long enough for Wi-Fi to finish reassociating after a wake
+— and then asks RomM's `/api/heartbeat` directly, once, with a five-second
+limit:
+
+- **RomM answered**: the sync runs, and the second line above is written once.
+  Later syncs ask RomM straight away rather than waiting the two minutes again,
+  for as long as it keeps answering.
+- **RomM did not answer** — or something answered that was not RomM's
+  heartbeat, such as a captive portal's sign-in page: the sync stays held and
+  nothing is recorded as a failure. RomM is asked again every two minutes, and
+  the third line is written once, with the reason, until the answer changes.
+
+Until RomM has answered, the Library screen, downloads and pairing are refused
+on such a console as they are on one that is offline; once it has, they reach
+RomM too.
+
+Airplane mode and "no network in range" are never treated this way: there
+nothing is sent at all, as
+[Nothing syncs, and nothing is reachable](#nothing-syncs-and-nothing-is-reachable)
+describes.
+
+**The fix.**
+
+1. If the second line is there, nothing is wrong: the two minutes is a one-off
+   per boot.
+2. If the third line is there, it is RomM that is unreachable, and the detail
+   after the `:` says how — the same causes as
+   [Nothing syncs, and nothing is reachable](#nothing-syncs-and-nothing-is-reachable),
+   step 2 onwards. A DNS block list that also blocks RomM's name is one: try
+   RomM's IP address in `[server] url`.
+3. If only the first line is there and it repeats after every boot, include the
+   log in a bug report together with what System Settings → Internet →
+   Connection Status says.
 
 ---
 

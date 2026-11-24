@@ -59,7 +59,9 @@ void RunNetwork(Run& run) {
   u32 strength = 0;
   NifmInternetConnectionStatus status = {};
   const ::Result nifm = nifmGetInternetConnectionStatus(&type, &strength, &status);
-  const bool online = rommsync::sysmodule::NetworkReady() && rommsync::sysmodule::ConsoleIsOnline();
+  using rommsync::sysmodule::NifmVerdict;
+  const bool online = rommsync::sysmodule::NetworkReady() &&
+                      rommsync::sysmodule::ConsoleNetwork() == NifmVerdict::kOnline;
   char text[160];
   std::snprintf(text, sizeof(text), "%s: rc=0x%08x, type %d, strength %u, status %d",
                 online ? "online" : "offline", nifm, static_cast<int>(type), strength,

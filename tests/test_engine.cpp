@@ -2082,7 +2082,7 @@ void RestoreDuringBootWait(checks::Checks& c) {
   // whole of this scenario unless something gets it out.
   console.engine.UseNetworkProbe([&probes] {
     ++probes;
-    return false;
+    return rommsync::sysmodule::NifmVerdict::kOffline;
   });
   console.engine.StartWorker();
   for (int waited = 0; waited < 200 && probes.load() == 0; ++waited) {
@@ -2908,8 +2908,11 @@ std::string Rendered(const ipc::LogTail& tail) {
 /// what these scenarios read -- a tick held for the network sends nothing.
 class Unanswered final : public http::HttpClient {
  public:
-  http::Result Send(const http::Request&) override {
+  http::Result Send(const http::Request& request) override {
     ++requests_;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      ++heartbeats_;
+    }
     http::Result result;
     result.error = http::Error::kConnectFailed;
     result.message = "the console has no internet connection";
@@ -2919,9 +2922,11 @@ class Unanswered final : public http::HttpClient {
     return Send(request);
   }
   int requests() const { return requests_.load(); }
+  int heartbeats() const { return heartbeats_.load(); }
 
  private:
   std::atomic<int> requests_{0};
+  std::atomic<int> heartbeats_{0};
 };
 
 /// A paired card with the boot tick as given and no interval, so every request
@@ -2960,12 +2965,14 @@ void NifmVerdicts(checks::Checks& c) {
   using rommsync::sysmodule::ClassifyNifm;
   using rommsync::sysmodule::NifmVerdict;
   c.Expect(ClassifyNifm(0, true) == NifmVerdict::kOnline, "connected is online");
-  c.Expect(ClassifyNifm(0, false) == NifmVerdict::kOffline,
-           "answered but not connected -- still associating -- is offline");
+  c.Expect(ClassifyNifm(0, false) == NifmVerdict::kNoInternet,
+           "answered but not connected -- still associating, or a console that blocks "
+           "Nintendo (#328) -- is no internet, not no network");
   c.Expect(ClassifyNifm(0xd46ed, true) == NifmVerdict::kOffline,
            "airplane mode or no network in range is offline, whatever the status left behind");
-  c.Expect(ClassifyNifm(0x2a2, true) == NifmVerdict::kOfflineUnexpected,
-           "any other failure is offline too, and the one worth a log line");
+  c.Expect(ClassifyNifm(0x2a2, true) == NifmVerdict::kUnexpected,
+           "any other failure is not offline -- only 0xd46ed is documented to mean that -- and "
+           "is the one worth a log line");
 }
 
 /// M11-5 (#289): a console that boots with no Wi-Fi does not spend its boot
@@ -2994,7 +3001,8 @@ void BootsOffline(checks::Checks& c) {
   console.engine.UseNetworkProbe(
       [&] {
         ++probes;
-        return online.load();
+        return online.load() ? rommsync::sysmodule::NifmVerdict::kOnline
+                             : rommsync::sysmodule::NifmVerdict::kOffline;
       },
       /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
       /*idle_poll=*/std::chrono::milliseconds{50});
@@ -3050,7 +3058,8 @@ void WakesOffline(checks::Checks& c) {
   console.engine.UseNetworkProbe(
       [&] {
         ++probes;
-        return online.load();
+        return online.load() ? rommsync::sysmodule::NifmVerdict::kOnline
+                             : rommsync::sysmodule::NifmVerdict::kOffline;
       },
       /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
       /*idle_poll=*/std::chrono::milliseconds{50});
@@ -3078,6 +3087,66 @@ void WakesOffline(checks::Checks& c) {
   online = true;
   c.Expect(AwaitRequests(server, 0, std::chrono::seconds{3}),
            "the tick runs once Wi-Fi is back, rather than having been spent on the race");
+}
+
+/// #328: a console whose nifm says "no internet" and whose RomM does not answer
+/// either stays held, and what it spends finding out is one heartbeat per
+/// budget -- never a tick, never a backoff.
+///
+/// The other half of `engine.nifm_unsure`, which is the console RomM answers:
+/// asking RomM is only worth it if a console that really is offline pays for
+/// it in heartbeats it can count, rather than in failed ticks.
+void NifmUnsureUnanswered(checks::Checks& c) {
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<int> probes{0};
+  std::atomic<int> opened{0};
+  std::atomic<bool> trusted{false};
+  rommsync::log::Reset();
+  Console console(c, "engine-nifm-unsure-unanswered");
+  SeedOfflineCard(c, console, /*on_boot=*/true);
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.UseNetworkProbe(
+      [&] {
+        ++probes;
+        return rommsync::sysmodule::ClassifyNifm(0, false);
+      },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.UseRommTrust([&](bool trust) {
+    opened += trust ? 1 : 0;
+    trusted = trust;
+  });
+  console.engine.StartWorker();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{800});
+  c.Expect(opened.load() > 0, "the connector is opened for the ask, which has to get past it");
+  c.Expect(!trusted.load(),
+           "and closed again after it: a drain or a list page on this console would reach "
+           "whatever answered in RomM's place");
+  c.Expect(server.heartbeats() > 0, "RomM is asked once the hold outlasts the budget");
+  c.ExpectEq(server.requests(), server.heartbeats(), "and asked nothing but its heartbeat");
+  c.Expect(server.requests() <= 8,
+           "at most one ask per budget, not one per nifm poll: " +
+               std::to_string(server.requests()) + " in 800 ms against a 100 ms budget");
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kNever,
+           "nothing is recorded: the asks were not the tick, which is still held");
+
+  const ipc::LogTail tail = console.Log();
+  int held = 0;
+  int unanswered = 0;
+  for (const std::string& line : tail.lines) {
+    if (line.find(" net.offline ") == std::string::npos) continue;
+    held += line.find("nifm says the console has no internet connection; the boot tick waits") !=
+            std::string::npos;
+    unanswered += line.find("RomM did not answer either") != std::string::npos;
+  }
+  c.ExpectEq(held, 1, "the hold names nifm's internet status, once:" + Rendered(tail));
+  c.ExpectEq(unanswered, 1,
+             "and RomM not answering is said once, not once per ask:" + Rendered(tail));
 }
 
 /// Every misconfiguration docs/TROUBLESHOOTING.md answers that needs no server.
@@ -3410,6 +3479,8 @@ int NifmUnsure(http::HttpClient& client, const std::string& base) {
     return 1;
   }
   rommsync::log::Reset();
+  // Before the console, so the worker that calls it is joined first.
+  std::atomic<bool> trusted{false};
   Console console(c, "engine-nifm-unsure");
   c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
                                  "[server]\nurl = " + base +
@@ -3432,12 +3503,10 @@ int NifmUnsure(http::HttpClient& client, const std::string& base) {
   // nifm answers the call -- rc 0 -- with a status that is not `Connected`,
   // for as long as the console is up.
   console.engine.UseNetworkProbe(
-      [] {
-        return rommsync::sysmodule::ClassifyNifm(0, false) ==
-               rommsync::sysmodule::NifmVerdict::kOnline;
-      },
+      [] { return rommsync::sysmodule::ClassifyNifm(0, false); },
       /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
       /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.UseRommTrust([&trusted](bool trust) { trusted = trust; });
   console.engine.StartWorker();
 
   ipc::Status status = console.Status();
@@ -3451,6 +3520,9 @@ int NifmUnsure(http::HttpClient& client, const std::string& base) {
                        "for a nifm that never says Connected: ") +
                ipc::ToString(status.last_sync_result));
   c.Expect(status.online, "and the console is drawn as online");
+  c.Expect(trusted.load(),
+           "and the connector is left open past nifm, so a drain or a list page reaches the "
+           "RomM that answered");
 
   const ipc::LogTail tail = console.Log();
   bool said = false;
@@ -8362,6 +8434,8 @@ int main(int argc, char** argv) {
     BootsOffline(checks);
   } else if (scenario == "wakes_offline") {
     WakesOffline(checks);
+  } else if (scenario == "nifm_unsure_unanswered") {
+    NifmUnsureUnanswered(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
   } else if (scenario == "restore_polled") {

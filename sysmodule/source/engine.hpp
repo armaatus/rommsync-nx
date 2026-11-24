@@ -58,6 +58,7 @@
 #include <utility>
 #include <vector>
 
+#include "http/nifm_verdict.hpp"
 #include "power.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
@@ -140,6 +141,12 @@ inline constexpr std::chrono::seconds kNetworkPollInterval{2};
 /// a console on a coffee table with no Wi-Fi asks nifm twice a minute and
 /// sends nothing.
 inline constexpr std::chrono::seconds kNetworkIdlePollInterval{30};
+
+/// The ceiling on the one heartbeat a tick held on nifm's "no internet" asks
+/// RomM directly (#328, `SdEngine::RommAnswers`). Short, because the console it
+/// is wrong about is the one that really is offline; a LAN RomM answers in far
+/// less.
+inline constexpr std::chrono::seconds kRommAskTimeout{5};
 
 /// How long the worker waits before trying a drain that did not get anywhere,
 /// and the ceiling that wait doubles up to (M9-5, #197).
@@ -371,12 +378,19 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// (`-fno-exceptions`, `switch.mk`; `sized_thread.hpp`).
   void StartWorker();
 
-  /// Whether the console has an internet connection right now.
+  /// What nifm says of the console's connection right now.
   ///
   /// **Injected, because `nifm` is libnx and this file names no libnx type.**
-  /// `main.cpp` passes one line asking `nifmGetInternetConnectionStatus`; a
-  /// build that passes nothing is treated as connected, which is what a laptop
-  /// is.
+  /// `main.cpp` passes `ConsoleNetwork`, which asks
+  /// `nifmGetInternetConnectionStatus`; a build that passes nothing is treated
+  /// as connected, which is what a laptop is.
+  ///
+  /// **Three answers, not two** (#328). `kOffline` -- airplane mode, no network
+  /// in range -- holds a tick and nothing is ever sent past it. `kNoInternet`
+  /// and `kUnexpected` hold it too, but only until the hold has lasted `budget`:
+  /// then RomM's heartbeat is asked directly (`RommAnswers`), and an answer runs
+  /// the tick. nifm's internet status is Nintendo's connection test, which a
+  /// console blocking Nintendo on purpose may never pass.
   ///
   /// A *probe* rather than a wait, so the waiting -- the budget, the poll
   /// interval, and noticing that the process is going away -- happens on this
@@ -391,11 +405,20 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// stretch of a held tick's; `idle_poll` is how often a tick held longer than
   /// `budget` asks again. Parameters for the host suite, which cannot spend two
   /// minutes finding out; `main.cpp` passes the defaults.
-  using NetworkProbe = std::function<bool()>;
+  using NetworkProbe = std::function<NifmVerdict()>;
   void UseNetworkProbe(NetworkProbe probe,
                        std::chrono::milliseconds budget = kNetworkWaitBudget,
                        std::chrono::milliseconds poll = kNetworkPollInterval,
                        std::chrono::milliseconds idle_poll = kNetworkIdlePollInterval);
+
+  /// Told whether a connection may be made past nifm's "no internet" (#328):
+  /// true while `RommAnswers` asks, then whether RomM answered. `main.cpp`
+  /// passes `TrustRommPastNifm`, so a drain, a list page or a pairing on such a
+  /// console reaches RomM only once RomM has answered a heartbeat -- never a
+  /// captive portal that answers every URL. Called on the worker, outside
+  /// `mutex_`. Null is a build whose transport does not gate on nifm.
+  using RommTrust = std::function<void(bool)>;
+  void UseRommTrust(RommTrust trust);
 
   /// Whether an application -- a retail game, Tico, RetroArch launched over a
   /// title -- is in the foreground right now (M10-16, #242).
@@ -962,7 +985,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// One line for a drain that is over. Nothing for one that did nothing.
   static void LogDrain(const download::DrainResult& result);
 
-  /// Wait for `network_probe_` to say yes, or for the budget to run out.
+  /// Wait for `network_probe_` to say `kOnline`, or for the budget to run out.
   ///
   /// Bounded rather than indefinite: a console that lives on a coffee table with
   /// no Wi-Fi would otherwise park this thread until it is next carried into
@@ -979,9 +1002,22 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// against a `nifm` that has not reassociated.
   bool AwaitNetwork();
 
-  /// One answer from `network_probe_`, asked outside `mutex_`. True when there
-  /// is no probe. Takes `mutex_` for the copy, so never called holding it.
-  bool NetworkUp() const;
+  /// One answer from `network_probe_`, asked outside `mutex_`. `kOnline` when
+  /// there is no probe. Takes `mutex_` for the copy, so never called holding it.
+  NifmVerdict NetworkVerdict() const;
+
+  /// Whether RomM answers although nifm will not say `Connected` (#328): one
+  /// unauthenticated heartbeat, one attempt, `kRommAskTimeout`. Only an answer
+  /// that reads as a heartbeat counts, so a captive portal answering every URL
+  /// does not run a tick against itself; anything else is logged, once per
+  /// change, with what came back.
+  ///
+  /// **Not asked while Wi-Fi may still be associating**: only once the hold has
+  /// lasted `network_budget_`, and after an ask nobody answered, not again for
+  /// another one. Once RomM has answered, though, the next hold asks at once,
+  /// so a console that blocks Nintendo pays the budget once per boot rather
+  /// than once per tick. Worker thread only; never called holding `mutex_`.
+  bool RommAnswers(std::chrono::steady_clock::time_point now);
 
   /// Tell the worker there is something to do. Safe from any thread; takes
   /// `mutex_` for the counter and notifies outside it.
@@ -1685,6 +1721,7 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// Whether the console is on a network. Null means "up". The three paces
   /// `UseNetworkProbe` took with it. All guarded by `mutex_`.
   NetworkProbe network_probe_;
+  RommTrust romm_trust_;
   std::chrono::milliseconds network_budget_ = kNetworkWaitBudget;
   std::chrono::milliseconds network_poll_ = kNetworkPollInterval;
   std::chrono::milliseconds network_idle_poll_ = kNetworkIdlePollInterval;
@@ -1730,6 +1767,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `net.offline` line one per hold.
   std::optional<std::chrono::steady_clock::time_point> offline_since_;
   bool offline_said_ = false;
+
+  /// What RomM made of the last ask nifm's "no internet" earned (#328), empty
+  /// before the first, and when the next is due after one nobody answered.
+  /// Worker-only. The first is what lets the next hold ask at once; a change in
+  /// it is what makes the log line one per change rather than one per ask.
+  std::optional<bool> romm_answered_;
+  std::chrono::steady_clock::time_point romm_ask_due_{};
 
   /// Bumped by every command that gives the worker something to do, under
   /// `mutex_`, and read by the worker as part of its wait predicate.
