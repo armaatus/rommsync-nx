@@ -317,13 +317,17 @@ std::string Describe(const PruneReport& report) {
   return line;
 }
 
-std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& client,
-                                                              const auth::StoredToken& token,
-                                                              std::int64_t rom_id,
-                                                              const sync::CallPolicy& policy) {
+namespace {
+
+/// `GET <path>?rom_id=<rom_id>`'s body, retried with backoff on a transient
+/// failure; nullopt for anything that is not a clean 2xx of at most `max_bytes`.
+/// The listings the prune proves a backup with, which an unread one never does.
+std::optional<std::string> GetRomListing(http::HttpClient& client, const auth::StoredToken& token,
+                                         const char* path, std::int64_t rom_id,
+                                         std::size_t max_bytes, const sync::CallPolicy& policy) {
   http::Request request;
   request.method = http::Method::kGet;
-  request.url = http::JoinUrl(token.server_url, "/api/saves") + "?rom_id=" + std::to_string(rom_id);
+  request.url = http::JoinUrl(token.server_url, path) + "?rom_id=" + std::to_string(rom_id);
   request.headers.push_back({"Accept", "application/json"});
   request.headers.push_back({"Authorization", "Bearer " + token.access_token});
   request.timeout = policy.timeout;
@@ -333,23 +337,10 @@ std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& 
   retry::Backoff backoff = sync::BackoffFor(policy);
   for (int attempt = 1;; ++attempt) {
     if (policy.cancel != nullptr && policy.cancel->canceled()) return std::nullopt;
-    const http::Result result = client.Send(request);
+    http::Result result = client.Send(request);
     if (result.successful()) {
-      if (result.response.body.size() > http::kMaxResponseBytes) return std::nullopt;
-      std::vector<std::string> digests;
-      static constexpr std::string_view kKeep[] = {"content_hash"};
-      const json::ParseResult parsed = json::ParseEach(
-          result.response.body, "", kKeep,
-          [&digests](const json::Value& row, std::size_t) {
-            const json::Value* hash = row.Find("content_hash");
-            if (hash != nullptr && hash->is_string() && sync::IsContentHash(hash->string())) {
-              digests.push_back(config::text::LowerAscii(hash->string()));
-            }
-            return json::Error{};
-          },
-          "the save listing");
-      if (!parsed.ok()) return std::nullopt;
-      return digests;
+      if (result.response.body.size() > max_bytes) return std::nullopt;
+      return std::move(result.response.body);
     }
     const bool transient = result.ok() ? http::TransientStatus(result.response.status)
                                        : result.error != http::Error::kCanceled;
@@ -358,25 +349,99 @@ std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& 
   }
 }
 
-std::vector<std::string> StateDigestsOnServer(const state::Baseline&, std::int64_t,
-                                              const std::vector<sync::ServerState>&) {
-  return {};
+}  // namespace
+
+std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& client,
+                                                              const auth::StoredToken& token,
+                                                              std::int64_t rom_id,
+                                                              const sync::CallPolicy& policy) {
+  const std::optional<std::string> body =
+      GetRomListing(client, token, "/api/saves", rom_id, http::kMaxResponseBytes, policy);
+  if (!body) return std::nullopt;
+  std::vector<std::string> digests;
+  static constexpr std::string_view kKeep[] = {"content_hash"};
+  const json::ParseResult parsed = json::ParseEach(
+      *body, "", kKeep,
+      [&digests](const json::Value& row, std::size_t) {
+        const json::Value* hash = row.Find("content_hash");
+        if (hash != nullptr && hash->is_string() && sync::IsContentHash(hash->string())) {
+          digests.push_back(config::text::LowerAscii(hash->string()));
+        }
+        return json::Error{};
+      },
+      "the save listing");
+  if (!parsed.ok()) return std::nullopt;
+  return digests;
 }
 
-std::optional<std::vector<std::string>> ListServerStateDigests(http::HttpClient&,
-                                                               const auth::StoredToken&,
-                                                               std::int64_t,
-                                                               const state::Baseline&,
-                                                               const sync::CallPolicy&) {
-  return std::nullopt;
+state::Baseline ProvenStates(const state::Baseline& baseline,
+                             const sync::StateSyncReport& report) {
+  state::Baseline proven;
+  if (!report.ran) return proven;
+  for (const sync::StateOperationResult& operation : report.operations) {
+    if (operation.outcome != sync::StateOutcome::kNoOp &&
+        operation.outcome != sync::StateOutcome::kDownloaded) {
+      continue;
+    }
+    if (const state::StateRecord* row =
+            baseline.FindState(operation.rom_id, operation.file_name)) {
+      proven.SetState(*row);
+    }
+  }
+  return proven;
 }
 
-std::optional<std::vector<std::string>> ListServerDigests(http::HttpClient& client,
-                                                          const auth::StoredToken& token,
-                                                          std::int64_t rom_id,
-                                                          const state::Baseline*,
-                                                          const sync::CallPolicy& policy) {
-  return ListServerSaveDigests(client, token, rom_id, policy);
+std::vector<std::string> StateDigestsOnServer(const state::Baseline& baseline, std::int64_t rom_id,
+                                              const std::vector<sync::ServerState>& listed) {
+  std::vector<std::string> digests;
+  for (const auto& [key, row] : baseline.state_rows()) {
+    if (key.first != rom_id || !sync::IsContentHash(row.content_hash) ||
+        row.file_size_bytes != row.server_file_size_bytes) {
+      continue;
+    }
+    for (const sync::ServerState& server : listed) {
+      if (server.rom_id == rom_id && sync::ServerUnmoved(row, server)) {
+        digests.push_back(config::text::LowerAscii(row.content_hash));
+        break;
+      }
+    }
+  }
+  return digests;
+}
+
+std::optional<std::vector<std::string>> ListServerStateDigests(http::HttpClient& client,
+                                                               const auth::StoredToken& token,
+                                                               std::int64_t rom_id,
+                                                               const state::Baseline& baseline,
+                                                               const sync::CallPolicy& policy) {
+  const bool has_state_rows =
+      std::any_of(baseline.state_rows().begin(), baseline.state_rows().end(),
+                  [rom_id](const auto& row) { return row.first.first == rom_id; });
+  if (!has_state_rows) return std::vector<std::string>{};
+  const std::optional<std::string> body =
+      GetRomListing(client, token, "/api/states", rom_id, sync::kMaxStateListBytes, policy);
+  if (!body) return std::nullopt;
+  // Strict, as the states half reads it: a row it cannot read is no listing,
+  // never a listing missing a row.
+  const auth::Parsed<std::vector<sync::ServerState>> listed = sync::ParseStateList(*body);
+  if (!listed.ok()) return std::nullopt;
+  return StateDigestsOnServer(baseline, rom_id, listed.value);
+}
+
+std::optional<std::vector<std::string>> ListProvenServerDigests(http::HttpClient& client,
+                                                                const auth::StoredToken& token,
+                                                                std::int64_t rom_id,
+                                                                const state::Baseline* proven_states,
+                                                                const sync::CallPolicy& policy) {
+  std::optional<std::vector<std::string>> digests =
+      ListServerSaveDigests(client, token, rom_id, policy);
+  if (proven_states == nullptr) return digests;
+  std::optional<std::vector<std::string>> of_states =
+      ListServerStateDigests(client, token, rom_id, *proven_states, policy);
+  if (!of_states) return digests;
+  if (!digests) return of_states;
+  digests->insert(digests->end(), of_states->begin(), of_states->end());
+  return digests;
 }
 
 }  // namespace rommsync::backup

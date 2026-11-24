@@ -593,11 +593,15 @@ keep syncing throughout.
 ```
 
 **A backup whose bytes exist nowhere else is never pruned**, which is what the
-last clause counts — save states mostly, since RomM keeps one copy of a state
-and no digest to compare. If the card is still full, those are what is left:
-copy any you want to keep to a computer, then delete them by hand; that is safe
-and is the fastest space you will find. Lowering `max_mib` does not remove them,
-by design.
+last clause counts — save states mostly. RomM keeps one copy of a state and no
+digest of it, so the client remembers the MD5 of each state it last synced and
+prunes a state backup holding those bytes while RomM still lists that state
+unchanged; but a backup a state *download* wrote holds the bytes that download
+replaced, which RomM no longer has. Two consoles trading a state leave one of
+those per download. If the card is still full, those are what is left: copy any
+you want to keep to a computer, then delete them by hand (they are the files
+named `<rom id>-state-…` in `.backup/`); that is safe and is the fastest space
+you will find. Lowering `max_mib` does not remove them, by design.
 
 The overlay's status screen shows the same numbers on its **Backups** row, so
 you need not read the log for them: *41.2 MiB, 12 backups* is what the last

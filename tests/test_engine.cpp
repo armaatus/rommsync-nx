@@ -100,6 +100,8 @@
 #include <thread>
 #include <vector>
 
+#include <utime.h>
+
 #include "engine.hpp"
 #include "faulty_disk.hpp"
 #include "harness.hpp"
@@ -5701,8 +5703,9 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
 }
 
 /// M11-25 (#330): a state backup whose bytes `state.db` pairs with a server row
-/// that has not moved is pruned like a save's -- the engine hands the prune the
-/// states' proof as well as the saves'. One whose bytes are nowhere else stays.
+/// that has not moved -- a row this tick's states half found settled -- is
+/// pruned like a save's: the engine hands the prune the states' proof as well
+/// as the saves'. One whose bytes are nowhere else stays.
 int StateBackupPruned(http::HttpClient& client, const std::string& base) {
   rig::Checks c;
   harness::Fixture fixture;
@@ -5728,21 +5731,32 @@ int StateBackupPruned(http::HttpClient& client, const std::string& base) {
   c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
                                  "[server]\nurl = " + base +
                                      "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
-                                     "on_boot = false\nstates = false\n\n"
+                                     "on_boot = false\nstates = true\n\n"
                                      "[backup]\nkeep = 1\nkeep_days = 0\nmax_mib = 0\n"),
-           "the console points at the rig, keeping one backup of each state");
+           "the console points at the rig, syncing states, keeping one backup of each");
 
-  // A state this console last synced, which RomM still holds unmoved.
-  const std::string name = harness::UniqueSlot("engine-state-pruned") + ".state";
-  const std::string held = "a state backup whose bytes RomM still holds " + name;
-  const std::string unique = "a state backup whose bytes are nowhere else " + name;
-  const std::string newest = "the newest backup of the state " + name;
-  const std::string staged = console.sandbox.Host("/held.state");
-  rig::WriteFile(staged, held);
+  // A state this console last synced, which neither it nor RomM has moved
+  // since: the tick finds it settled, which is what makes its row a proof.
+  const std::string name = "nova.state";
+  const std::string tag = harness::UniqueSlot("engine-state-pruned");
+  const std::string held = "a state whose bytes RomM still holds " + tag;
+  const std::string unique = "a state backup whose bytes are nowhere else " + tag;
+  const std::string newest = "the newest backup of the state " + tag;
+  const std::string live = harness::StatePath(name);
+  c.Expect(console.sandbox.Write(live, held), "the state is on the card");
   rommsync::sync::ServerState row;
-  if (!harness::UploadState(c, client, base, fixture, rom.id, "retroarch", staged, name, &row)) {
+  if (!harness::UploadState(c, client, base, fixture, rom.id, "retroarch",
+                            console.sandbox.Host(live), name, &row)) {
     harness::DeleteDevice(client, base, fixture, device_id);
     return c.failures();
+  }
+  // A whole second the row can name, as the scan reads it.
+  const std::int64_t synced_at = 1'760'000'000;
+  {
+    struct utimbuf times;
+    times.actime = synced_at;
+    times.modtime = synced_at;
+    c.Expect(utime(console.sandbox.Host(live).c_str(), &times) == 0, "the state's mtime is set");
   }
   rommsync::state::Baseline baseline;
   rommsync::state::StateRecord paired;
@@ -5750,7 +5764,7 @@ int StateBackupPruned(http::HttpClient& client, const std::string& base) {
   paired.file_name = name;
   paired.emulator = "retroarch";
   paired.content_hash = rommsync::crypto::Md5Hex(held);
-  paired.mtime = row.updated_at;
+  paired.mtime = rommsync::sync::Timestamp{std::chrono::seconds{synced_at}};
   paired.file_size_bytes = static_cast<std::int64_t>(held.size());
   paired.server_state_id = row.id;
   paired.server_updated_at = row.updated_at;
@@ -5795,6 +5809,7 @@ int StateBackupPruned(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(ticks.ticks(), 1, "and it ran");
 
   const ipc::LogTail log = console.Log();
+  c.ExpectEq(console.sandbox.Read(live), held, "the live state was left as it was");
   c.Expect(!console.sandbox.Exists(backup(300)),
            "the state backup past the count whose bytes RomM holds was pruned:" + Rendered(log));
   c.ExpectEq(console.sandbox.Read(backup(200)), unique,

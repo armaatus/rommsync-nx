@@ -2579,7 +2579,8 @@ SdEngine::TickRun SdEngine::RunOneTick() {
   bool states_held = false;
   const sync::StateSyncReport states =
       RunStatesHalf(inputs, library, found, &placer, record, tick.outcome, &states_held);
-  PruneBackups(inputs, tick, states, tally, states_held, found.bound_since);
+  PruneBackups(inputs, tick, states, tally, states_held, found.baseline_path,
+               found.bound_since);
   writing.unlock();
   // The states half's requests went out on the same token, so what they were
   // answered counts towards the one verdict, as the saves half's did.
@@ -2605,7 +2606,8 @@ SdEngine::TickRun SdEngine::RunOneTick() {
 
 void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
                             const sync::StateSyncReport& states, const SavesTally& tally,
-                            bool states_held, std::int64_t bound_since) {
+                            bool states_held, const std::string& baseline_path,
+                            std::int64_t bound_since) {
   // Only at the end of a tick that did everything it set out to: a backup an
   // operation that failed half way wrote is the one most likely to be wanted,
   // and the retention rule is not the place to second-guess that tick.
@@ -2631,8 +2633,18 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   const auth::StoredToken* token = &inputs.token;
   sync::CallPolicy policy;
   policy.cancel = inputs.cancel.get();
-  options.server_digests = [client, token, policy](std::int64_t rom_id) {
-    return backup::ListServerSaveDigests(*client, *token, rom_id, policy);
+  // RomM keeps no digest of a state, so a state's proof is `state.db`'s: the
+  // MD5 of the bytes the last transfer moved, for the rows this tick's states
+  // half confirmed, against a server row the prune then finds unmoved (#330).
+  // Read back rather than carried, as the states half reads it, after that
+  // half stored it.
+  state::Baseline proven;
+  if (states.ran) {
+    proven = backup::ProvenStates(state::LoadBaseline(baseline_path).value, states);
+  }
+  const state::Baseline* proven_states = proven.state_rows().empty() ? nullptr : &proven;
+  options.server_digests = [client, token, policy, proven_states](std::int64_t rom_id) {
+    return backup::ListProvenServerDigests(*client, *token, rom_id, proven_states, policy);
   };
   // A backup from before this console synced with this server names another
   // server's rom id, so this one's digests are not its proof (#294).

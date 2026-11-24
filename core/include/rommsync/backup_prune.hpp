@@ -44,11 +44,23 @@
 // state row is written only after a transfer that landed, and pairs the MD5 of
 // the bytes that crossed -- the scan's digest of an upload, the read-back of a
 // download -- with the server row's id, `updated_at` and size at that moment.
-// While a fresh `GET /api/states?rom_id=` still lists that row unmoved -- the
-// same id, second and size `ServerUnmoved` holds a download to -- the server
-// still holds those bytes, and the row's MD5 is as good a proof as a save's
-// `content_hash` (`StateDigestsOnServer`). A row that moved, vanished, or
-// cannot be listed proves nothing, and the backup stays.
+//
+// **Only a row this tick's states half confirmed is a proof** (`ProvenStates`):
+// one it found unmoved on both sides, or one a download just wrote. An upload's
+// row carries the *scan's* digest, and a state rewritten at the same size
+// between the scan and the upload's read went up as other bytes than the row
+// names; the next tick sees the file moved and uploads again, so the row is
+// trusted from the tick that finds it settled, never the one that wrote it.
+// That also holds the rows to this server: the states half just checked them
+// against its listing.
+//
+// And then only while a fresh `GET /api/states?rom_id=` still lists that row
+// unmoved -- `ServerUnmoved`, the test a download is held to -- does the row's
+// MD5 stand in for a save's `content_hash` (`StateDigestsOnServer`). A row that
+// moved, vanished, or cannot be listed proves nothing, and the backup stays.
+// The proof is exactly as strong as that test, which is the states half's own:
+// a second console's rewrite in the same second at the same size is invisible
+// to both, and a download is checked against its length only.
 //
 // What that does **not** do is bound a state traded between consoles. `POST
 // /api/states` replaces its row in place, so the bytes a state download backed
@@ -203,8 +215,8 @@ std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& 
 
 /// The MD5s of `rom_id`'s states that `listed` -- `GET /api/states?rom_id=`'s
 /// rows -- proves the server still holds: each state row of `baseline` for the
-/// rom whose server row `listed` carries unmoved, by id, `updated_at` (whole
-/// seconds) and size. See the header.
+/// rom whose server row `listed` carries unmoved (`sync::ServerUnmoved`). See
+/// the header.
 ///
 /// A row whose local size is not the server's is no proof either: the bytes
 /// that crossed are not the bytes it hashed -- a state written between the
@@ -223,14 +235,18 @@ std::optional<std::vector<std::string>> ListServerStateDigests(http::HttpClient&
                                                                const state::Baseline& baseline,
                                                                const sync::CallPolicy& policy = {});
 
+/// The state rows of `baseline` that `report` -- the states half of the tick
+/// that wrote it -- confirmed: unmoved on both sides (`kNoOp`), or just written
+/// by a download or a placement (`kDownloaded`). Nothing when it did not run.
+/// See the header for why an upload's row waits a tick.
+state::Baseline ProvenStates(const state::Baseline& baseline, const sync::StateSyncReport& report);
+
 /// What the engine hands `PruneOptions::server_digests`: a rom's save digests
-/// and, against `states` when it is not null, its states'. Each listing proves
-/// what it lists, so one that answered is used though the other did not;
-/// nullopt only when neither did.
-std::optional<std::vector<std::string>> ListServerDigests(http::HttpClient& client,
-                                                          const auth::StoredToken& token,
-                                                          std::int64_t rom_id,
-                                                          const state::Baseline* states,
-                                                          const sync::CallPolicy& policy = {});
+/// and, against `proven_states` when it is not null, its states'. Each listing
+/// proves what it lists, so one that answered is used though the other did
+/// not; nullopt only when neither did.
+std::optional<std::vector<std::string>> ListProvenServerDigests(
+    http::HttpClient& client, const auth::StoredToken& token, std::int64_t rom_id,
+    const state::Baseline* proven_states, const sync::CallPolicy& policy = {});
 
 }  // namespace rommsync::backup

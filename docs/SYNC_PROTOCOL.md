@@ -794,7 +794,28 @@ answer is keep unless its MD5 is a `content_hash` RomM holds for that rom
 (`GET /api/saves?rom_id=`, asked only for roms that have a candidate) or a newer
 backup of the same save holds the same bytes. That is hard rule 3 applied to
 retention: the server is what makes deleting a local copy safe. The live save is
-not a second copy, and a state, with no server digest, goes only as a duplicate.
+not a second copy.
+
+A state has no server digest, so its proof is the client's own (#330):
+`state.db`'s row for it pairs the MD5 of the bytes its last transfer moved — the
+scan's digest of an upload, the read-back of a download — with the server row's
+id, `updated_at` and size at that moment. Only a row the same tick's states half
+confirmed is a proof — found unmoved on both sides, or just written by a
+download (`backup::ProvenStates`). An upload's row carries the scan's digest,
+and a state rewritten at the same size between the scan and the upload went up
+as other bytes; the next tick sees the file moved and uploads again, so that row
+waits for the tick that finds it settled. A state backup with a proven row's MD5
+goes when a fresh `GET /api/states?rom_id=` lists the row with the same id,
+second and size (`sync::ServerUnmoved`, the test a state download is held to),
+and the row's local size is the server's. A row that moved, vanished, became
+another row, or could not be listed proves nothing. The proof is as strong as
+that test and no stronger: a second console's same-second, same-size rewrite is
+invisible to it, as it is to the states half, and a download is checked against
+its length only. Because `POST /api/states` replaces its row
+in place, the bytes a state download backed up are no longer on the server by
+construction: those backups go only as duplicates, and the rule bounds the rest —
+a restore's set-aside live state, a copy of another state of the game — and not
+them.
 Each removal is one `remove()` of bytes already proven elsewhere, so a power cut
 leaves a subset of the removals and nothing else; `prune.crash` replays it.
 

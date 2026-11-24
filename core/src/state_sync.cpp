@@ -284,6 +284,12 @@ auth::Parsed<ServerState> ParseState(std::string_view body) {
   return parsed;
 }
 
+bool ServerUnmoved(const state::StateRecord& row, const ServerState& state) {
+  return state.id == row.server_state_id &&
+         UnixSeconds(state.updated_at) == UnixSeconds(row.server_updated_at) &&
+         state.file_size_bytes == row.server_file_size_bytes;
+}
+
 auth::Parsed<std::vector<ServerState>> ParseStateList(std::string_view body) {
   auth::Parsed<std::vector<ServerState>> parsed;
   // A row at a time (`json::ParseEach`): held as one document the listing was
@@ -369,17 +375,6 @@ const ServerState* FindServerState(const std::vector<ServerState>& states, std::
     }
   }
   return nullptr;
-}
-
-/// Whether the server row is still the one the baseline agreed on.
-///
-/// Id, timestamp and size together. The id alone would miss a replacement; the
-/// timestamp alone misses a same-second rewrite, which is exactly what a second
-/// console syncing in the same second produces.
-bool ServerUnmoved(const state::StateRecord& row, const ServerState& state) {
-  return state.id == row.server_state_id &&
-         UnixSeconds(state.updated_at) == UnixSeconds(row.server_updated_at) &&
-         state.file_size_bytes == row.server_file_size_bytes;
 }
 
 /// Whether the local file is still the one the baseline hashed.

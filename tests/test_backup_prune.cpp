@@ -20,6 +20,8 @@
 //   state_moved  a state row the server has moved, replaced or dropped since,
 //              or one it could not list, proves nothing
 //   state_crash  `crash`, over state backups proven by `state.db`
+//   state_proven only the rows this tick's states half confirmed are a proof:
+//              never one an upload just wrote
 //   server     against the real RomM: a save's digest is listed for its rom,
 //              and a state's is while its row has not moved
 #include <algorithm>
@@ -623,6 +625,45 @@ void StateCrash(checks::Checks& c) {
              "no power cut loses a state backup's bytes: " + verdict.first);
 }
 
+void StateProven(checks::Checks& c) {
+  state::Baseline baseline;
+  const auto row = [&baseline](std::int64_t rom_id, const std::string& name) {
+    baseline.SetState(Paired(Listed(rom_id, rom_id, name, 64, kNow), Bytes(int(rom_id))));
+  };
+  const auto did = [](std::int64_t rom_id, const std::string& name, sync::StateOutcome outcome) {
+    sync::StateOperationResult operation;
+    operation.rom_id = rom_id;
+    operation.file_name = name;
+    operation.outcome = outcome;
+    return operation;
+  };
+  row(1, "settled.state");
+  row(2, "downloaded.state");
+  row(3, "uploaded.state");
+  row(4, "kept.state");
+  row(5, "untouched.state");
+  sync::StateSyncReport report;
+  report.ran = true;
+  report.operations = {did(1, "settled.state", sync::StateOutcome::kNoOp),
+                       did(2, "downloaded.state", sync::StateOutcome::kDownloaded),
+                       did(3, "uploaded.state", sync::StateOutcome::kUploaded),
+                       did(4, "kept.state", sync::StateOutcome::kKeptBoth),
+                       did(9, "never.state", sync::StateOutcome::kNoOp)};
+
+  const state::Baseline proven = backup::ProvenStates(baseline, report);
+  c.Expect(proven.FindState(1, "settled.state") != nullptr, "a row found settled is a proof");
+  c.Expect(proven.FindState(2, "downloaded.state") != nullptr, "and one a download just wrote");
+  c.Expect(proven.FindState(3, "uploaded.state") == nullptr,
+           "an upload's row is not, until a tick finds it settled");
+  c.Expect(proven.FindState(4, "kept.state") == nullptr, "nor a kept-both one");
+  c.Expect(proven.FindState(5, "untouched.state") == nullptr, "nor one this tick never saw");
+  c.ExpectEq(proven.size(), std::size_t{2}, "and nothing else");
+
+  report.ran = false;
+  c.Expect(backup::ProvenStates(baseline, report).empty(),
+           "a states half that did not run confirms nothing");
+}
+
 void Server(rig::Checks& c, http::HttpClient& client, const std::string& base) {
   harness::Fixture fixture;
   if (!harness::LoadFixture(&fixture)) {
@@ -709,9 +750,9 @@ void StateServer(rig::Checks& c, http::HttpClient& client, const std::string& ba
   baseline.SetState(Paired(row, bytes));
   c.Expect(lists(backup::ListServerStateDigests(client, token, rom.id, baseline, policy)),
            "the uploaded state's MD5 is proven by its unmoved row");
-  c.Expect(lists(backup::ListServerDigests(client, token, rom.id, &baseline, policy)),
+  c.Expect(lists(backup::ListProvenServerDigests(client, token, rom.id, &baseline, policy)),
            "and is among the digests the engine hands the prune");
-  c.Expect(!lists(backup::ListServerDigests(client, token, rom.id, nullptr, policy)),
+  c.Expect(!lists(backup::ListProvenServerDigests(client, token, rom.id, nullptr, policy)),
            "which the save listing alone does not prove");
 
   // A truncated listing proves nothing.
@@ -763,6 +804,8 @@ int main(int argc, char** argv) {
       StateMoved(checks);
     } else if (scenario == "state_crash") {
       StateCrash(checks);
+    } else if (scenario == "state_proven") {
+      StateProven(checks);
     } else {
       std::cerr << "unknown scenario " << scenario << "\n";
       return 2;

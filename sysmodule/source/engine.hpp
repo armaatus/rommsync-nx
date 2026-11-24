@@ -1129,9 +1129,11 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `.backup/` held to `[backup]` (#292), at the end of a tick that completed,
   /// once after boot and then after any tick that wrote a backup. Under
   /// `save_write_mutex_`, so a restore never reads a backup this removes.
+  /// `baseline_path` is read again for the states' proof (#330).
   void PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
                     const sync::StateSyncReport& states, const SavesTally& tally,
-                    bool states_held, std::int64_t bound_since);
+                    bool states_held, const std::string& baseline_path,
+                    std::int64_t bound_since);
 
   /// The tick's outcome and counts, under `mutex_`, for `Snapshot` and the
   /// scheduler.

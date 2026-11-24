@@ -1356,6 +1356,7 @@ set(PRUNE_UNIT_SCENARIOS
   states     # #330: state backups the server provably holds (state.db + an unmoved row) go to the cap
   state_moved  # #330: a state row the server moved, replaced or dropped, or could not list, proves nothing
   state_crash  # #330: a power cut at every call of a state prune loses no backup's bytes
+  state_proven  # #330: only a state row this tick confirmed is a proof, never an upload's own
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})

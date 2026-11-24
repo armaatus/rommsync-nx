@@ -527,12 +527,25 @@ At the end of every sync that completed, the sysmodule prunes it:
 
 **A backup is only ever deleted when its bytes are somewhere else**, and no
 setting changes that: RomM holds a save with the same MD5 for that game (every
-upload is kept there as a version), or a newer backup of the same save holds the
-same bytes. A backup of progress that exists nowhere else — a state, which RomM
-keeps one copy of and computes no digest for; a save whose old versions RomM has
-since pruned; any game while RomM cannot be asked — stays however old it is or
-however far over `max_mib` the directory is. The `backup.pruned` line says how
-many were kept for that reason ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-sd-card-is-full)).
+upload is kept there as a version), RomM still holds a state this console last
+synced with the same MD5, or a newer backup of the same save or state holds the
+same bytes. A backup of progress that exists nowhere else — a save whose old
+versions RomM has since pruned; any game while RomM cannot be asked; and most
+state backups — stays however old it is or however far over `max_mib` the
+directory is. The `backup.pruned` line says how many were kept for that reason
+([TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-sd-card-is-full)).
+
+**States are the case to know about.** RomM computes no digest for a state, so
+the client remembers one itself: the MD5 of the bytes it last uploaded or
+downloaded for each state, beside the server row's id, time and size in
+`state.db`. A state backup holding those bytes goes while RomM still lists that
+row unchanged and the sync that prunes found the state settled on both sides
+(or had just downloaded it) — never in the sync that uploaded it, and never with
+`[sync] states` off. But RomM keeps **one** copy of each state, replaced in place by
+every upload, so the bytes a state download backed up are, by then, gone from
+the server: that backup is the only copy, and stays. A console that trades
+states with another every session grows `.backup/` by one state per download,
+and only clearing them by hand brings it down.
 
 The live save on the card is deliberately not counted as a second copy: it is
 the file the game writes next. A file in `.backup/` this client did not name —

@@ -148,6 +148,13 @@ auth::Parsed<std::vector<ServerState>> ParseStateList(std::string_view body);
 /// The same for the single `StateSchema` `POST /api/states` answers with.
 auth::Parsed<ServerState> ParseState(std::string_view body);
 
+/// Whether `state` is still the server row `row` agreed on: id, timestamp (whole
+/// seconds) and size together. The id alone would miss a replacement; the
+/// timestamp alone misses a same-second rewrite, which is exactly what a second
+/// console syncing in the same second produces. What a download is held to, and
+/// what proves a state backup's bytes are still the server's (#330).
+bool ServerUnmoved(const state::StateRecord& row, const ServerState& state);
+
 /// What one state was found to need, before anything was done about it.
 ///
 /// Exposed because it is the decision worth testing directly: everything below
