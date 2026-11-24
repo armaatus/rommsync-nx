@@ -1353,6 +1353,9 @@ set(PRUNE_UNIT_SCENARIOS
   truncated  # past one listing, the rom it cuts sits the prune out, all its groups
   crash      # a power cut at every call of a prune loses no backup's bytes
   other_server  # #294: a backup from before a server switch is never pruned on the new one's word
+  states     # #330: state backups the server provably holds (state.db + an unmoved row) go to the cap
+  state_moved  # #330: a state row the server moved, replaced or dropped, or could not list, proves nothing
+  state_crash  # #330: a power cut at every call of a state prune loses no backup's bytes
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})
@@ -2670,6 +2673,7 @@ set(ENGINE_RIG_SCENARIOS
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
   backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
+  state_backup_pruned  # #330: a state backup state.db proves RomM holds is pruned; a unique one stays
   backup_truncated  # #323: a .backup/ past one listing draws its Backups row as a floor
   server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch

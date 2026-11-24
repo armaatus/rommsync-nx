@@ -35,11 +35,28 @@
 //
 // **The live save is deliberately not a second copy.** It is the one file the
 // game writes next, so bytes that are "also in the live save" at prune time can
-// be gone a minute later with nothing left anywhere. A state has no digest on
-// the server at all (RomM computes none, state_sync.hpp) and a state upload
-// replaces its row, so a state backup is pruned only as a duplicate: the bytes
-// it holds are usually progress no other place has, and this module does not
-// get to decide they are worthless.
+// be gone a minute later with nothing left anywhere.
+//
+// ## A state's digest is this client's, not RomM's (#330)
+//
+// RomM computes no digest for a state (state_sync.hpp), so for a state "on the
+// server" is a claim this client proves itself. `state.db` already holds it: a
+// state row is written only after a transfer that landed, and pairs the MD5 of
+// the bytes that crossed -- the scan's digest of an upload, the read-back of a
+// download -- with the server row's id, `updated_at` and size at that moment.
+// While a fresh `GET /api/states?rom_id=` still lists that row unmoved -- the
+// same id, second and size `ServerUnmoved` holds a download to -- the server
+// still holds those bytes, and the row's MD5 is as good a proof as a save's
+// `content_hash` (`StateDigestsOnServer`). A row that moved, vanished, or
+// cannot be listed proves nothing, and the backup stays.
+//
+// What that does **not** do is bound a state traded between consoles. `POST
+// /api/states` replaces its row in place, so the bytes a state download backed
+// up are by construction the ones the server no longer holds: that backup is
+// the only copy, and stays. The rule reaches a state backup whose bytes the
+// server holds again or still -- the live state a restore from the Conflicts
+// screen set aside, a copy of another state of the same game -- and nothing
+// else, because nothing else is provably anywhere.
 //
 // ## When it runs, and what a power cut does to it
 //
@@ -68,6 +85,8 @@
 #include "rommsync/config.hpp"
 #include "rommsync/file_system.hpp"
 #include "rommsync/http.hpp"
+#include "rommsync/state_db.hpp"
+#include "rommsync/state_sync.hpp"
 #include "rommsync/sync.hpp"
 #include "rommsync/sync_execute.hpp"
 
@@ -181,5 +200,37 @@ std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& 
                                                               const auth::StoredToken& token,
                                                               std::int64_t rom_id,
                                                               const sync::CallPolicy& policy = {});
+
+/// The MD5s of `rom_id`'s states that `listed` -- `GET /api/states?rom_id=`'s
+/// rows -- proves the server still holds: each state row of `baseline` for the
+/// rom whose server row `listed` carries unmoved, by id, `updated_at` (whole
+/// seconds) and size. See the header.
+///
+/// A row whose local size is not the server's is no proof either: the bytes
+/// that crossed are not the bytes it hashed -- a state written between the
+/// scan and the upload's read.
+std::vector<std::string> StateDigestsOnServer(const state::Baseline& baseline, std::int64_t rom_id,
+                                              const std::vector<sync::ServerState>& listed);
+
+/// `GET /api/states?rom_id=<rom_id>`, reduced by `StateDigestsOnServer`.
+///
+/// Not sent at all, and an empty list, when `baseline` has no state row for
+/// the rom: there is nothing it could prove. Otherwise `ListServerSaveDigests`'
+/// retry and refusals, at `sync::kMaxStateListBytes`.
+std::optional<std::vector<std::string>> ListServerStateDigests(http::HttpClient& client,
+                                                               const auth::StoredToken& token,
+                                                               std::int64_t rom_id,
+                                                               const state::Baseline& baseline,
+                                                               const sync::CallPolicy& policy = {});
+
+/// What the engine hands `PruneOptions::server_digests`: a rom's save digests
+/// and, against `states` when it is not null, its states'. Each listing proves
+/// what it lists, so one that answered is used though the other did not;
+/// nullopt only when neither did.
+std::optional<std::vector<std::string>> ListServerDigests(http::HttpClient& client,
+                                                          const auth::StoredToken& token,
+                                                          std::int64_t rom_id,
+                                                          const state::Baseline* states,
+                                                          const sync::CallPolicy& policy = {});
 
 }  // namespace rommsync::backup

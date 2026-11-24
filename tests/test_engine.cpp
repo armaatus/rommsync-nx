@@ -5700,6 +5700,116 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// M11-25 (#330): a state backup whose bytes `state.db` pairs with a server row
+/// that has not moved is pruned like a save's -- the engine hands the prune the
+/// states' proof as well as the saves'. One whose bytes are nowhere else stays.
+int StateBackupPruned(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-state-pruned");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-state-pruned");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\nstates = false\n\n"
+                                     "[backup]\nkeep = 1\nkeep_days = 0\nmax_mib = 0\n"),
+           "the console points at the rig, keeping one backup of each state");
+
+  // A state this console last synced, which RomM still holds unmoved.
+  const std::string name = harness::UniqueSlot("engine-state-pruned") + ".state";
+  const std::string held = "a state backup whose bytes RomM still holds " + name;
+  const std::string unique = "a state backup whose bytes are nowhere else " + name;
+  const std::string newest = "the newest backup of the state " + name;
+  const std::string staged = console.sandbox.Host("/held.state");
+  rig::WriteFile(staged, held);
+  rommsync::sync::ServerState row;
+  if (!harness::UploadState(c, client, base, fixture, rom.id, "retroarch", staged, name, &row)) {
+    harness::DeleteDevice(client, base, fixture, device_id);
+    return c.failures();
+  }
+  rommsync::state::Baseline baseline;
+  rommsync::state::StateRecord paired;
+  paired.rom_id = rom.id;
+  paired.file_name = name;
+  paired.emulator = "retroarch";
+  paired.content_hash = rommsync::crypto::Md5Hex(held);
+  paired.mtime = row.updated_at;
+  paired.file_size_bytes = static_cast<std::int64_t>(held.size());
+  paired.server_state_id = row.id;
+  paired.server_updated_at = row.updated_at;
+  paired.server_file_size_bytes = row.file_size_bytes;
+  baseline.SetState(paired);
+  // Unbound, so adopted by this server from the epoch, as an upgraded card's is
+  // (#294): the backups below are older than any binding this tick would make.
+  console.sandbox.Write("/config/rommsync/state.db", rommsync::state::SerializeBaseline(baseline));
+
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  const std::string discriminator = rommsync::sync::StateBackupDiscriminator(name);
+  const auto backup = [&rom, &name, &discriminator, now](std::int64_t days_ago) {
+    return std::string(harness::kBackupDir) + "/" +
+           rommsync::sync::BackupNameFor(rom.id, discriminator, name,
+                                         now - days_ago * 24 * 60 * 60);
+  };
+  console.sandbox.Write(backup(300), held);
+  console.sandbox.Write(backup(200), unique);
+  console.sandbox.Write(backup(100), newest);
+
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(), "paired");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 1 && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks.ticks(), 1, "and it ran");
+
+  const ipc::LogTail log = console.Log();
+  c.Expect(!console.sandbox.Exists(backup(300)),
+           "the state backup past the count whose bytes RomM holds was pruned:" + Rendered(log));
+  c.ExpectEq(console.sandbox.Read(backup(200)), unique,
+             "the one whose bytes are nowhere else stayed, untouched");
+  c.ExpectEq(console.sandbox.Read(backup(100)), newest, "and so did the newest");
+  const ipc::EngineSnapshot status = console.engine.Snapshot();
+  c.ExpectEq(status.backup.backups, std::int64_t{2}, "two backups are left");
+  c.ExpectEq(status.backup.kept_unique, std::int64_t{1},
+             "one of them kept only because it is the only copy");
+
+  harness::DeleteState(client, base, fixture, row.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// M11-22 (#323): a `.backup/` holding more than one listing returns. The prune
 /// measures only what it listed, and the status screen's Backups row says so --
 /// `≥` -- rather than drawing a floor as the total.
@@ -8366,6 +8476,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"download_restores", DownloadRestores},
       {"server_deleted", ServerDeleted},
       {"backup_pruned", BackupPruned},
+      {"state_backup_pruned", StateBackupPruned},
       {"backup_truncated", BackupTruncated},
       {"server_switched", ServerSwitched},
       {"interop", Interop},

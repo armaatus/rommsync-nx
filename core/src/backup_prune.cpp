@@ -358,4 +358,25 @@ std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& 
   }
 }
 
+std::vector<std::string> StateDigestsOnServer(const state::Baseline&, std::int64_t,
+                                              const std::vector<sync::ServerState>&) {
+  return {};
+}
+
+std::optional<std::vector<std::string>> ListServerStateDigests(http::HttpClient&,
+                                                               const auth::StoredToken&,
+                                                               std::int64_t,
+                                                               const state::Baseline&,
+                                                               const sync::CallPolicy&) {
+  return std::nullopt;
+}
+
+std::optional<std::vector<std::string>> ListServerDigests(http::HttpClient& client,
+                                                          const auth::StoredToken& token,
+                                                          std::int64_t rom_id,
+                                                          const state::Baseline*,
+                                                          const sync::CallPolicy& policy) {
+  return ListServerSaveDigests(client, token, rom_id, policy);
+}
+
 }  // namespace rommsync::backup
