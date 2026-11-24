@@ -40,11 +40,17 @@ namespace {
 /// Process-wide, because `socketInitialize` and `sslInitialize` are: both take
 /// an `sm` session, and a sysmodule has one only inside `__appInit`
 /// (`ipc/server.hpp` says the same thing about its port).
-bool g_socket_up = false;
-bool g_ssl_up = false;
-bool g_nifm_up = false;
-// Atomic, unlike the three above: the worker writes it while the IPC and
-// pairing threads connect.
+///
+/// Atomic since #333: a transport that did not come up in `__appInit` is
+/// brought up later by the worker, while the IPC and pairing threads read
+/// these to decide whether to connect. Only `__appInit`, the worker and
+/// `__appExit` write them, never two at once -- the worker is joined before
+/// `main` returns -- so a flag is the whole of the guard: each is set only
+/// after its service is up.
+std::atomic<bool> g_socket_up{false};
+std::atomic<bool> g_ssl_up{false};
+std::atomic<bool> g_nifm_up{false};
+// The worker writes this one while the IPC and pairing threads connect.
 std::atomic<bool> g_romm_trusted{false};
 
 /// `[server] ca_file` as the engine last handed it over (`TrustServerCa`,
@@ -526,6 +532,8 @@ void NetworkExit() {
 }
 
 bool NetworkReady() { return g_socket_up && g_ssl_up; }
+
+bool SocketsReady() { return g_socket_up; }
 
 NifmVerdict ConsoleNetwork() {
   if (!g_nifm_up) return NifmVerdict::kOnline;

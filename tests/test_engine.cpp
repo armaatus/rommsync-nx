@@ -3186,6 +3186,8 @@ void TransportRetried(checks::Checks& c) {
         }
         sent_before_up += server.requests();
         // 0x1E61: a made-up code, so the log line can be held to naming it.
+        // `__appInit`'s own try failed before this: `main.cpp` installs the
+        // hook only then.
         return ++tries <= 2 ? 0x1E61u : 0u;
       },
       /*first_retry=*/std::chrono::milliseconds{100},
@@ -3224,6 +3226,7 @@ void TransportRetried(checks::Checks& c) {
   }
   c.ExpectEq(down, 1, "the failure streak is said once, naming the code:" + Rendered(tail));
   c.ExpectEq(up, 1, "and its end once:" + Rendered(tail));
+  c.Expect(Logged(tail, "came up on retry 3"), "counting the tries:" + Rendered(tail));
 }
 
 /// Every misconfiguration docs/TROUBLESHOOTING.md answers that needs no server.

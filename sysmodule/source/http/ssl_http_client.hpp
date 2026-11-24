@@ -82,9 +82,13 @@ inline constexpr u32 kSslSessions = 2;
 
 /// Bring up the socket driver and the `ssl` service.
 ///
-/// **Call it from `__appInit`, while `sm` is still open.** Both are `sm`
-/// lookups, and a sysmodule closes `sm` before it starts serving -- a later
-/// attempt would fail with nothing able to explain why.
+/// **Call it first from `__appInit`**, behind the `WaitForService`s that make
+/// its `sm` lookups unable to park. Since #195 the process holds `sm` for
+/// life, so it may be called again later -- and is, from the worker, while it
+/// has not succeeded (#333, `SdEngine::UseTransport`): a co-resident set
+/// holding every `bsd:u` session at boot is otherwise a console without a
+/// transport until the next boot. Each half already up is skipped, so a retry
+/// tries only what failed. Never call it from two threads at once.
 ///
 /// A failure is not fatal to the process and must not be treated as one: a
 /// console with no network is a console the overlay still has to be able to
@@ -98,6 +102,11 @@ void NetworkExit();
 /// Whether `NetworkInitialize` succeeded, so `main` can say so in the log rather
 /// than leaving a silently transportless console.
 bool NetworkReady();
+
+/// Whether the socket half of `NetworkInitialize` is up, whatever `ssl` did:
+/// what a plain `http://` request needs, and what the worker's retry of a
+/// failed boot holds ticks for (#333, `main.cpp`).
+bool SocketsReady();
 
 /// What nifm says of the console's connection, asked before a connect rather
 /// than after a ten-second timeout.

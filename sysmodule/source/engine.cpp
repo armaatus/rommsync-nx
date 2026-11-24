@@ -1,7 +1,9 @@
 #include "engine.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1264,6 +1266,66 @@ bool SdEngine::RommAnswers(std::chrono::steady_clock::time_point now) {
   return answered;
 }
 
+std::optional<std::uint32_t> SdEngine::TransportDown(std::chrono::steady_clock::time_point now) {
+  // The `transport_` members are the worker's alone, so they are read here
+  // without `mutex_`.
+  if (transport_up_) {
+    return std::nullopt;
+  }
+  TransportInit init;
+  std::chrono::milliseconds first{0};
+  std::chrono::milliseconds max_retry{0};
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    init = transport_init_;
+    first = transport_first_retry_;
+    max_retry = std::max(first, transport_max_retry_);
+  }
+  if (!init) {
+    return std::nullopt;
+  }
+  if (transport_failures_ > 0 && now < transport_retry_due_) {
+    return transport_code_;
+  }
+  // Outside the lock: on a console this is `socketInitialize` and
+  // `sslInitialize`, IPC to three services.
+  const std::uint32_t code = init();
+  if (code == 0) {
+    transport_up_ = true;
+    // Every call is a retry of `__appInit`'s (`UseTransport`), so this is
+    // always news: the boot log's `rommsync: NetworkInitialize` line said it
+    // failed.
+    log::Info(log::Event::kNetOffline,
+              "the socket transport came up on retry " + std::to_string(transport_failures_ + 1) +
+                  "; ticks run again");
+    return std::nullopt;
+  }
+  ++transport_failures_;
+  transport_code_ = code;
+  transport_backoff_ =
+      transport_failures_ == 1 ? first : std::min(transport_backoff_ * 2, max_retry);
+  // From now rather than from `now`: the try was IPC, and the wait is meant to
+  // be between tries, not to include one.
+  transport_retry_due_ = clock_->Steady() + transport_backoff_;
+  if (transport_failures_ == 1) {
+    // Once per streak: a console whose co-resident set holds every `bsd:u`
+    // session all day is one line, and the code is what tells that case
+    // (`bsd:u` refusing a session) from a heap that would not fit the buffers.
+    // `std::to_chars` rather than `snprintf`, for the sysmodule's size
+    // (`switch.builds`).
+    char hex[16];
+    const std::to_chars_result end = std::to_chars(hex, hex + sizeof(hex), code, 16);
+    const auto seconds = [](std::chrono::milliseconds wait) {
+      return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(wait).count());
+    };
+    log::Warn(log::Event::kNetOffline,
+              "the socket transport did not come up (0x" + std::string(hex, end.ptr) +
+                  "); ticks wait for it, and it is tried again in " + seconds(first) +
+                  " s, then less often, to every " + seconds(max_retry) + " s");
+  }
+  return code;
+}
+
 bool SdEngine::AwaitNetwork() {
   // The wait for the network happens **here**, on this thread, and never in
   // `main`: a console that comes up with no Wi-Fi must not hold boot
@@ -1433,14 +1495,36 @@ void SdEngine::RunWorker() {
       // also what a console that blocks Nintendo on purpose may say forever,
       // and its RomM is on the LAN: once the hold has outlasted the budget --
       // Wi-Fi reassociating is long done by then -- RomM is asked directly.
+      //
+      // **Nor does a tick run on a transport that never came up** (#333): a
+      // co-resident set holding every `bsd:u` session at boot is held exactly
+      // like "no network", and the transport is tried again on its own backoff
+      // rather than given up on until the next boot. Ahead of nifm, which has
+      // nothing to say about sockets this process does not have.
       lock.unlock();
-      const NifmVerdict nifm = NetworkVerdict();
-      bool network_up = nifm == NifmVerdict::kOnline;
-      if (!network_up && nifm != NifmVerdict::kOffline) {
-        network_up = RommAnswers(clock_->Steady());
+      const std::optional<std::uint32_t> transport = TransportDown(clock_->Steady());
+      NifmVerdict nifm = NifmVerdict::kOnline;
+      bool network_up = false;
+      if (!transport) {
+        nifm = NetworkVerdict();
+        network_up = nifm == NifmVerdict::kOnline;
+        if (!network_up && nifm != NifmVerdict::kOffline) {
+          network_up = RommAnswers(clock_->Steady());
+        }
       }
       lock.lock();
-      if (!network_up) {
+      if (!network_up && transport) {
+        // Its own pace and its own line (`TransportDown`'s); the nifm hold's
+        // `offline_since_` is left alone, so a hold that follows once the
+        // transport is up is a new one and says so.
+        scheduler_.Defer(decision.trigger);
+        const std::chrono::steady_clock::time_point now = clock_->Steady();
+        decision = sync::Decision{};
+        decision.sleep_for = transport_retry_due_ > now
+                                 ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       transport_retry_due_ - now)
+                                 : std::chrono::milliseconds{0};
+      } else if (!network_up) {
         scheduler_.Defer(decision.trigger);
         const std::chrono::steady_clock::time_point now = clock_->Steady();
         if (!offline_since_) {

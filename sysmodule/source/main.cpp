@@ -1313,6 +1313,11 @@ bool g_psc_up = false;
 /// with nothing saying so.
 bool g_pm_up = false;
 
+/// Whether the four services `NetworkInitialize` opens were all registered by
+/// the time `__appInit` asked (#333). Only then may the worker try it again:
+/// a lookup of a name that never appeared parks inside `sm` for good.
+bool g_network_services = false;
+
 /// The network system clock (M11-11, #295), or empty when the console has none
 /// synchronised -- `timeGetCurrentTime` fails until nifm has reached Nintendo's
 /// time service once. `time:s` is the service `__appInit` opened, and the one
@@ -1718,17 +1723,17 @@ void __appInit(void) {
   // second call's `NifmServiceType` was silently ignored, which is a trap and
   // not a redundancy.
   //
-  // **The transport is not retried later, and that is now a decision rather
-  // than an oversight.** `socketInitialize` is not refcounted -- a second call
-  // answers `0xF59 AlreadyInitialized` forever -- so a lazy retry would have to
-  // be guarded, and the guards in `NetworkInitialize` are plain `bool`s read
-  // from the worker and the pairing thread both. What made a retry worth that
-  // was the transient failure: `bsd:u` or `ssl` not registered *yet*. The wait
-  // above is what removes it. What is left is a transfer memory that would not
-  // fit, which is a heap failure a reboot does not fix either.
-  const bool network = WaitForService("nifm:u") && WaitForService("bsd:u") &&
+  // **A failure here is retried later, on the worker** (#333), when the four
+  // names were all registered: what is left once the waits have passed is
+  // mostly `bsd:u` refusing a session because co-resident sysmodules hold all
+  // fifteen, which ends when one of them lets go -- not at the next boot. The
+  // guards `NetworkInitialize` keeps are atomic for it, and it brings up only
+  // the half that failed (`SdEngine::UseTransport`, wired in `main`). Not when
+  // a name never appeared: that retry would park the worker inside an `sm`
+  // lookup nothing can bound, which is the trade the paragraph above makes.
+  g_network_services = WaitForService("nifm:u") && WaitForService("bsd:u") &&
                        WaitForService("sfdnsres") && WaitForService("ssl");
-  if (network) {
+  if (g_network_services) {
     rc = rommsync::sysmodule::NetworkInitialize();
     if (R_FAILED(rc)) {
       rommsync::sysmodule::boot::Note(g_boot, "rommsync: NetworkInitialize", rc);
@@ -1860,7 +1865,9 @@ int main(int, char**) {
   g_http = rommsync::sysmodule::MakeHorizonHttpClient();
   Log(rommsync::sysmodule::NetworkReady()
           ? "rommsync: ssl transport up"
-          : "rommsync: no transport; every request will answer connect-failed");
+          : g_network_services && !rommsync::sysmodule::SocketsReady()
+              ? "rommsync: no transport yet; ticks wait while it is tried again (#333)"
+              : "rommsync: no transport; every request will answer connect-failed");
   // Either answer this build can reach holds a file to 4 GiB (`card.cpp`).
   Log(std::string("rommsync: card format ") + rommsync::fs::ToString(card_format.format) + " (" +
       card_format.basis + "); a file on it stops at 4 GiB");
@@ -1916,6 +1923,23 @@ int main(int, char**) {
   engine.UseCard(g_card.get());
   engine.UseNetworkProbe(&rommsync::sysmodule::ConsoleNetwork);
   engine.UseRommTrust(&rommsync::sysmodule::TrustRommPastNifm);
+  // A transport `__appInit` could not bring up, tried again on the worker
+  // with backoff rather than given up on until the next boot (#333). Installed
+  // only when that try failed, so a console whose transport came up pays
+  // nothing, and the engine says both ends of the streak.
+  //
+  // **Down means the sockets, not ssl.** With sockets up and `sslInitialize`
+  // refused, an `http://` RomM on the LAN still syncs (`SslConnector::Open`
+  // refuses only `https://` origins then), and holding its ticks for ssl would
+  // be a regression this issue made. So `ssl` is retried only alongside the
+  // sockets; refused on its own, it is an `https://` request's connect-failed,
+  // as it was before #333.
+  if (g_network_services && !rommsync::sysmodule::SocketsReady()) {
+    engine.UseTransport([]() -> std::uint32_t {
+      const Result rc = rommsync::sysmodule::NetworkInitialize();
+      return rommsync::sysmodule::SocketsReady() ? 0 : rc;
+    });
+  }
   // The reference a wrong console clock is caught against before it decides a
   // first sync (#295). With no clock service there is no reference to read;
   // the server's `Date` header and the floor still hold.

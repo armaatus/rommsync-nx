@@ -427,11 +427,13 @@ class SdEngine : public ipc::Engine, public power::Sink {
   using RommTrust = std::function<void(bool)>;
   void UseRommTrust(RommTrust trust);
 
-  /// Brings the console's transport up if it is not, and answers 0 when it is
-  /// up or the platform's result code when it would not come up (#333).
-  /// `main.cpp` passes `NetworkInitialize` behind `NetworkReady`: a co-resident
-  /// set holding every `bsd:u` session at boot is otherwise a console without a
-  /// network until the next boot.
+  /// Tries again to bring up a transport `__appInit` could not, and answers 0
+  /// once it is up or the platform's result code when it still would not come
+  /// up (#333). `main.cpp` installs it **only when that boot try failed**, so
+  /// every call is a retry and the engine can say "came up" without a console
+  /// whose transport was always fine ever saying it. A co-resident set holding
+  /// every `bsd:u` session at boot is otherwise a console without a network
+  /// until the next boot.
   ///
   /// Asked on the **worker**, outside `mutex_`, when a tick falls due and the
   /// last answer was not 0 -- never in `main`, so boot is not held. While it
@@ -1042,6 +1044,15 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// so a console that blocks Nintendo pays the budget once per boot rather
   /// than once per tick. Worker thread only; never called holding `mutex_`.
   bool RommAnswers(std::chrono::steady_clock::time_point now);
+
+  /// Whether the transport is down (#333): empty when it is up, or when there is
+  /// no `transport_init_`; otherwise the code its last try answered, which is
+  /// what the hold's caller has to say nothing about and a debugger has. Asks
+  /// `transport_init_` only while it has not yet said 0 and only once
+  /// `transport_retry_due_` has passed, and says the start and the end of a
+  /// failure streak, once each. Worker thread only; never called holding
+  /// `mutex_`.
+  std::optional<std::uint32_t> TransportDown(std::chrono::steady_clock::time_point now);
 
   /// Tell the worker there is something to do. Safe from any thread; takes
   /// `mutex_` for the counter and notifies outside it.
@@ -1806,6 +1817,16 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// it is what makes the log line one per change rather than one per ask.
   std::optional<bool> romm_answered_;
   std::chrono::steady_clock::time_point romm_ask_due_{};
+
+  /// Where `TransportDown` has got to (#333). Worker-only, like the two above:
+  /// whether the transport has come up, how many tries in a row it has
+  /// refused, what the last one answered, the wait it earned, and when the
+  /// next try is due.
+  bool transport_up_ = false;
+  int transport_failures_ = 0;
+  std::uint32_t transport_code_ = 0;
+  std::chrono::milliseconds transport_backoff_{0};
+  std::chrono::steady_clock::time_point transport_retry_due_{};
 
   /// Bumped by every command that gives the worker something to do, under
   /// `mutex_`, and read by the worker as part of its wait predicate.

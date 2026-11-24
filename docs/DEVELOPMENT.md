@@ -385,10 +385,14 @@ tick.** #296 asked whether to, and the answer is no, for now:
   behind the M8-1 gate.
 
 The open risk this leaves is the session count: a co-resident set that already
-holds `bsd:u` full at boot leaves this process without a transport until the
-next boot, since `NetworkInitialize` is not retried (`main.cpp` records why).
-The M12 co-resident run is where that is seen; a lazy retry of the transport is
-the follow-up if it is.
+holds `bsd:u` full at boot leaves this process without a transport at boot.
+Since #333 that is not until the next boot: the worker holds every tick as
+offline and retries `NetworkInitialize` with backoff (10 s, doubling to five
+minutes; `SdEngine::UseTransport`), and the streak is one `net.offline` line
+naming the code. Drains and list pages answer connect-failed meanwhile, as
+they did before. Only the sockets are waited for: `ssl` refused on its own is
+not retried, since a plain `http://` RomM still syncs without it. The M12 co-resident run (NET-08) is where how often it
+happens is seen.
 
 ## Repo build layout
 

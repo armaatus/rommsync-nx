@@ -183,6 +183,14 @@ blocks Nintendo still syncs. If it keeps appearing, see
 `nifm answered 0x…` is an answer this client did not expect, read the same way;
 it is worth including in a bug report.
 
+`the socket transport did not come up (0x…); ticks wait for it, …` means the
+console's network sockets could not be opened at boot — most often because
+other sysmodules hold every `bsd:u` session the system allows (ldn_mitm and
+sys-ftpd each hold some). It is tried again on its own, less often each time,
+and `the socket transport came up on retry N` follows once one of them lets
+go. If it never does, disable a sysmodule that holds sockets and reboot, and
+include the code in a bug report.
+
 `tick skipped: this build has no transport` is a different sentence and is not
 a network problem — it is a build with no HTTP client wired in, which is not
 something a release does. If you see it on a console, that is worth reporting.

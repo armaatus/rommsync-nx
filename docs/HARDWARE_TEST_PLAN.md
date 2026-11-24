@@ -338,6 +338,12 @@ of every cell and the probe's *reads N, the largest M bytes*.
 keeps working the whole time (#44's `sslInitialize` session-count question:
 2 is safe).
 
+**If it fails.** A `rommsync: NetworkInitialize` line is followed by `the
+socket transport did not come up (0x…)`: the worker retries it with backoff
+(#333). Record the code, then stop the sysmodule holding `bsd:u` (sys-ftpd is
+the easiest) without rebooting: within five minutes the log says `the socket
+transport came up on retry N` and the held tick runs.
+
 ### NET-09: A console that blocks Nintendo
 
 **Steps.** Three cells, each a cold boot with RomM on the LAN by IP address and
