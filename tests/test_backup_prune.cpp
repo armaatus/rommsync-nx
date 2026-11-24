@@ -839,6 +839,33 @@ void StateBudgetNames(checks::Checks& c) {
   c.Expect(report.state_bytes_after > 1,
            "and what is left stays over a 1-byte budget: a state's newest is never taken");
 
+  // RetroArch's slots of one game share a discriminator -- `Game.state1` and
+  // `Game.state2` are both `state-Game` -- and are still two states: a slot
+  // traded often must not push another slot's only backup out of its newest.
+  {
+    Sandbox slots_box(c, "prune-state-budget-slots");
+    state::Baseline slots;
+    KnowState(&slots, 8, "Game.state1");
+    KnowState(&slots, 8, "Game.state2");
+    const Seeded lone = Seed(slots_box, 8, "state-Game", kNow - 300 * kDay, Bytes(80, 4096), 0,
+                             "Game.state2");
+    std::vector<Seeded> busy;
+    for (int i = 0; i < 4; ++i) {
+      busy.push_back(Seed(slots_box, 8, "state-Game", kNow - (100 - i) * kDay, Bytes(81 + i, 4096),
+                          0, "Game.state1"));
+    }
+    backup::PruneOptions slot_options = options;
+    slot_options.server_since = 0;
+    slot_options.is_state_backup = backup::StateBackupsOf(slots);
+    const std::unique_ptr<fs::FileSystem> slot_files =
+        host::MakeNativeFileSystem(slots_box.root().string());
+    const backup::PruneReport slot_report = backup::Prune(*slot_files, slot_options);
+    c.Expect(slots_box.Exists(lone.sd_path),
+             "another slot's only backup stays: " + backup::Describe(slot_report));
+    c.Expect(slots_box.Exists(busy.back().sd_path), "and so does the busy slot's newest");
+    c.ExpectEq(slot_report.budget_pruned, std::size_t{3}, "the busy slot's older three go");
+  }
+
   // The predicate itself, at its edges.
   const backup::IsStateBackup is_state = backup::StateBackupsOf(baseline);
   c.Expect(is_state != nullptr, "a state.db with states answers");
