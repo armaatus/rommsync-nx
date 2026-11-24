@@ -23,6 +23,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "engine.hpp"
@@ -161,6 +162,8 @@ int Flag(const ipc::ListItem& item, std::string_view key) {
 /// is not the end of anything.
 struct Walk {
   std::vector<ipc::ListItem> items;
+  /// Every page's `start`, and the place in `items` of its first item.
+  std::vector<std::pair<std::int64_t, std::size_t>> starts;
   std::size_t pages = 0;
   std::size_t widest = 0;
   ipc::Error error = ipc::Error::kOk;
@@ -182,6 +185,7 @@ Walk WalkList(Console& console, const ipc::ListRequest& request, ipc::Cursor* ke
     }
     walk.widest = std::max(walk.widest, bytes);
     ++walk.pages;
+    walk.starts.push_back({page.start, walk.items.size()});
     for (ipc::ListItem& item : page.items) {
       walk.items.push_back(std::move(item));
     }
@@ -743,6 +747,11 @@ void QueueList(checks::Checks& c) {
   c.ExpectEq(walk.items.size(), entries.size(), "every entry arrives, terminal ones included");
   c.ExpectEq(walk.pages, std::size_t{3}, "in ceil(5/2) pages");
   c.ExpectEq(client.requests, 0, "and the network was never touched");
+  bool counted = walk.starts.size() == walk.pages;
+  for (const auto& [start, at] : walk.starts) {
+    counted = counted && start == static_cast<std::int64_t>(at);
+  }
+  c.Expect(counted, "each queue page says the row it starts at (#341)");
 
   // The projection, whole. A field spelled differently on the two sides does
   // not fail to build -- it draws a row of blanks on a console (`ipc.hpp`).
@@ -1031,6 +1040,21 @@ void TooLarge(checks::Checks& c) {
     }
     c.Expect(seen.size() == library.size() - 1 && seen.count(13) == 0,
              "and the one stepped past is the one too large");
+    // Every page says the row its first rom is, the one stepped past counted
+    // (#341): rom N is row N - 1 here. The overlay places what it is handed,
+    // and a page that did not say so would put rom 14 on rom 13's place.
+    bool placed = true;
+    bool after_the_step = false;
+    for (const auto& [start, at] : walk.starts) {
+      if (at >= walk.items.size()) {
+        continue;
+      }
+      const std::int64_t row = Number(walk.items[at], keys::kRomId) - 1;
+      placed = placed && start == row;
+      after_the_step = after_the_step || row == 13;
+    }
+    c.Expect(placed, "every page starts at the row of its first rom, by the server's count");
+    c.Expect(after_the_step, "and the page after the one stepped past starts at row 13, not 12");
   }
 }
 
@@ -1130,6 +1154,11 @@ int Library(checks::Checks& c) {
     }
     c.Expect(order == std::vector<std::int64_t>(first_order.begin() + 3, first_order.end()),
              "a cursor opened at row 3 starts at the fourth rom and ends where the list does");
+    bool counted = !walk.starts.empty();
+    for (const auto& [start, at] : walk.starts) {
+      counted = counted && start == 3 + static_cast<std::int64_t>(at);
+    }
+    c.Expect(counted, "and each page says the row it starts at, counted from row 3 (#341)");
   }
   {
     ipc::ListRequest past;
@@ -1150,6 +1179,11 @@ int Library(checks::Checks& c) {
       c.ExpectEq(Number(walk.items.front(), keys::kPlatformId),
                  Number(paged.items[2], keys::kPlatformId), "which is the third platform");
     }
+    bool counted = !walk.starts.empty();
+    for (const auto& [start, at] : walk.starts) {
+      counted = counted && start == 2 + static_cast<std::int64_t>(at);
+    }
+    c.Expect(counted, "and each platform page says the row it starts at (#341)");
   }
 
   // --- the filter, and the id that opens it.

@@ -176,6 +176,8 @@ class FakeEngine : public ipc::Engine {
       return ipc::Error::kBadCursor;
     }
     int& offset = found->second.second;
+    // Before the items, as `lists::Service` sets it (#341).
+    out->start = offset;
     if (found->second.first == ipc::ListKind::kPlatforms) {
       if (offset == 0) {
         ipc::ListItem item;

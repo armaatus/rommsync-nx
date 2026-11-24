@@ -113,6 +113,7 @@ ipc::ListPage LoadedPage() {
   second.fields.push_back({"name", ipc::ListValue::Text("")});
   page.items.push_back(second);
   page.has_more = true;
+  page.start = 1488;
   return page;
 }
 
@@ -234,9 +235,10 @@ int Version() {
   // `ConfigView` gained `play_sessions`. 17 since M11-4 (#288): and
   // `server.ca_file`. 18 since M11-21 (#316): `Status` gained `backup`. 19
   // since M11-22 (#323): and `backup.truncated`. 20 since #339: a
-  // `ListRequest` gained a required `offset`. What is frozen is command 0's
-  // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{20},
+  // `ListRequest` gained a required `offset`. 21 since #341: a `ListPage`
+  // gained a required `start`. What is frozen is command 0's *encoding*,
+  // asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{21},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -566,6 +568,7 @@ int RoundTrip() {
     checks.ExpectEq(back.value.items.size(), sent.items.size(), "both items");
     checks.ExpectEq(back.value.has_more, sent.has_more, "has_more survives");
     checks.ExpectEq(back.value.pending, sent.pending, "pending survives");
+    checks.ExpectEq(back.value.start, sent.start, "the row it starts at survives (#341)");
     if (back.value.items.size() == 2) {
       const ipc::ListValue* id = back.value.items[0].Find("id");
       const ipc::ListValue* name = back.value.items[0].Find("name");
@@ -1075,12 +1078,12 @@ int Refuses() {
 
   // The list page's one structural rule: a flat object of scalars.
   for (const char* page : {
-           R"({"items":[{"id":{"nested":1}}],"has_more":false,"pending":false})",
-           R"({"items":[{"id":[1,2]}],"has_more":false,"pending":false})",
-           R"({"items":[{"id":null}],"has_more":false,"pending":false})",
-           R"({"items":[{"id":1.5}],"has_more":false,"pending":false})",
-           R"({"items":[[1]],"has_more":false,"pending":false})",
-           R"({"items":{},"has_more":false,"pending":false})",
+           R"({"items":[{"id":{"nested":1}}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[{"id":[1,2]}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[{"id":null}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[{"id":1.5}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[[1]],"has_more":false,"pending":false,"start":0})",
+           R"({"items":{},"has_more":false,"pending":false,"start":0})",
        }) {
     checks.Expect(!ipc::DecodeListPage(page).ok(),
                   std::string("a page holding something that is not a scalar is refused: ") + page);
@@ -1093,7 +1096,7 @@ int Refuses() {
       many += at == 0 ? "" : ",";
       many += "{\"id\":" + std::to_string(at) + "}";
     }
-    many += R"(],"has_more":false,"pending":false})";
+    many += R"(],"has_more":false,"pending":false,"start":0})";
     checks.Expect(!ipc::DecodeListPage(many).ok(), "a page past the item cap is refused");
 
     std::string wide = R"({"items":[{)";
@@ -1101,9 +1104,20 @@ int Refuses() {
       wide += at == 0 ? "" : ",";
       wide += "\"f" + std::to_string(at) + "\":1";
     }
-    wide += R"(}],"has_more":false,"pending":false})";
+    wide += R"(}],"has_more":false,"pending":false,"start":0})";
     checks.Expect(!ipc::DecodeListPage(wide).ok(), "an item past the field cap is refused");
   }
+
+  // Where a page starts is what places its rows (#341), so a page that does
+  // not say is refused rather than read as starting at row 0.
+  checks.Expect(ipc::DecodeListPage(R"({"items":[],"has_more":false,"pending":false,"start":7})")
+                    .ok(),
+                "a page that says where it starts is read");
+  checks.Expect(!ipc::DecodeListPage(R"({"items":[],"has_more":false,"pending":false})").ok(),
+                "a page without a start is a v20 sysmodule's, refused");
+  checks.Expect(
+      !ipc::DecodeListPage(R"({"items":[],"has_more":false,"pending":false,"start":-1})").ok(),
+      "and a start above the first row is refused");
 
   // A `0` cursor is not a live cursor, so it is refused at the wire rather than
   // reaching the engine as an address that happens to miss.

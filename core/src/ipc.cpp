@@ -1330,6 +1330,10 @@ void WriteListPage(Out& out, const ListPage& page) {
   out += page.has_more ? "true" : "false";
   key("pending", false);
   out += page.pending ? "true" : "false";
+  key("start", false);
+  char start[24];
+  const std::to_chars_result written = std::to_chars(start, start + sizeof(start), page.start);
+  out += std::string_view(start, static_cast<std::size_t>(written.ptr - start));
   out += '}';
 }
 
@@ -1395,7 +1399,10 @@ Decoded<ListPage> DecodeListPage(std::string_view text) {
           out->items.push_back(std::move(item));
         }
         if (!ReadBool(object, "has_more", &out->has_more, error) ||
-            !ReadBool(object, "pending", &out->pending, error)) {
+            !ReadBool(object, "pending", &out->pending, error) ||
+            // Required, not defaulted to 0: a page that does not say where it
+            // starts is one whose rows cannot be placed (#341).
+            !ReadInteger(object, "start", &out->start, 0, kMaxId, error)) {
           return;
         }
       });

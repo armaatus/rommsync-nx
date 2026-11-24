@@ -907,6 +907,20 @@ struct ListPage {
   /// Fetching may not block the IPC thread on the network (#31), so a page that
   /// is not there yet is an answer rather than a wait. `items` is empty.
   bool pending = false;
+
+  /// The list row `items[0]` is, 0-based, by the sysmodule's count (#341).
+  ///
+  /// Not always the row after the last page's: a rom too large to send even
+  /// alone is stepped past (#248), and the row it held is then in the
+  /// sysmodule's count and on no page. The overlay places rows by what it has
+  /// been handed, so a step it was not told about puts every row after it one
+  /// place off -- which a cursor opened at an offset, counting places from that
+  /// row, would then route onto the wrong rom. On an empty or `pending` page,
+  /// the row the next item would be.
+  ///
+  /// Set **before** the page is filled: `AppendIfItFits` measures the page as
+  /// it will be sent, and a start written afterwards is digits it never counted.
+  std::int64_t start = 0;
 };
 
 /// Add `item` to `page` unless doing so would break a bound.
