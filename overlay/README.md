@@ -242,6 +242,15 @@ production RomM or a real library.
     the selection. Do the same with L/R and Down on the conflicts screen. Before
     M11-14 (#298) every press was one row and nothing past row 512 of a
     platform could be reached.
+    **What a slow page looks like now** (M11-24, #329): while a page is out the
+    panel keeps drawing and R keeps moving through the rows already loaded,
+    then rests on *"Loading..."* at their edge until the page lands -- never a
+    frozen frame, and never *"not responding"* for a page RomM is merely slow
+    to serve. A download pressed with A on a rom while the card is busy says
+    *"Still applying..."* on its row, then *queued*; the same goes for a
+    setting changed with A, Y on the log screen and a choice on the conflicts
+    screen. Before #329 each page held the frame it was asked on, up to half a
+    second, and a page slower than that drew *not responding* and was lost.
 
 Record what each step actually drew in #44, including the layout constants that
 had to move — every screen file keeps them in one block at the top for exactly

@@ -64,8 +64,8 @@ const char* ActionFor(const ConflictsView& view) {
 
 }  // namespace
 
-ConflictsScreen::ConflictsScreen(IpcClient& client) : client_(client) {
-  view_ = model_.Render();
+ConflictsScreen::ConflictsScreen(IpcClient& client) : pump_(client) {
+  view_ = pump_.model().Render();
 }
 
 tsl::elm::Element* ConflictsScreen::createUI() {
@@ -100,8 +100,8 @@ bool ConflictsScreen::handleInput(u64 keys_down, u64 keys_held, const HidTouchSt
     // Held, it repeats; L/R move a page. On an entry's choice the model clamps
     // a page to the last choice, which is what a page there should do.
     if (rows != 0) {
-      model_.MoveSelection(rows);
-      view_ = model_.Render();
+      pump_.model().MoveSelection(rows);
+      view_ = pump_.model().Render();
     }
     return true;
   }
@@ -111,27 +111,27 @@ bool ConflictsScreen::handleInput(u64 keys_down, u64 keys_held, const HidTouchSt
     // from the confirmation it queues the restore, or does what was chosen. A press the
     // model already knows would be refused sends nothing and leaves the reason
     // on screen. Still *handled*: the press was on this screen's own control.
-    model_.Activate();
-    view_ = model_.Render();
+    pump_.model().Activate();
+    view_ = pump_.model().Render();
     return true;
   }
   if ((keys_down & HidNpadButton_B) != 0) {
-    if (!model_.Back()) {
+    if (!pump_.model().Back()) {
       // Already at the list. Not handled, so the settings screen underneath is
       // popped back to rather than this screen inventing a second way out.
       return false;
     }
-    view_ = model_.Render();
+    view_ = pump_.model().Render();
     return true;
   }
   return false;
 }
 
 void ConflictsScreen::Pump() {
-  // The handshake, one command and its answer -- in `conflicts_pump.cpp`, where
-  // a host test can drive it (#209).
-  PumpConflicts(frame_, client_, model_, link_);
-  view_ = model_.Render();
+  // The handshake, the command out and its answer -- in `conflicts_pump.cpp`,
+  // where a host test can drive it (#209), and never waited for (#329).
+  pump_.Frame();
+  view_ = pump_.model().Render();
 }
 
 s32 ConflictsScreen::PromptRows() const {

@@ -531,7 +531,8 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # M11-1 (#285) `library_pump.cpp`, the library browser's IPC and teardown;
 # M11-15 (#299) `status_pump.cpp`, `sync_pump.cpp` and `pairing_pump.cpp`, the
 # three screens that poll, so a frame against a slow sysmodule can be timed,
-# and `poller.cpp`, the line they poll through without waiting.
+# and `poller.cpp`, the line they poll through without waiting; M11-24 (#329)
+# `log_pump.cpp` and `settings_pump.cpp`, the last two screens to stop waiting.
 # `sysmodule/source/ipc/result.cpp` is the far side's `Error` -> `Result`
 # mapping, compiled in so the overlay's inverse is tested against the real
 # one rather than against a copy of it.
@@ -554,9 +555,11 @@ add_executable(test_overlay_native
   "${CMAKE_SOURCE_DIR}/overlay/source/library_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/log_paint.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/log_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/pairing_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/poller.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/settings_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/sync_pump.cpp"
@@ -589,7 +592,7 @@ foreach(scenario
         errors     # a refusal is not a transport failure, and neither is a bad payload
         timeout    # a sysmodule that does not answer holds no frame past one budget
         restore    # a restore that is still copying holds no frame at all
-        frames     # a sysmodule that answers in 300 ms holds no frame past 2 ms
+        frames     # a sysmodule that answers in 300 ms holds no frame past 2 ms, on any screen
         cycles     # every exit path gives back everything, the same way, every time
         hidden     # polling is by showing, because update() stops while hidden
         scroll     # row 2000 of a platform, by a held R, with the heap flat

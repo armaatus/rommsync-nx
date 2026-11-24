@@ -67,11 +67,11 @@ const char* ActionFor(const LibraryRow& row) {
 
 }  // namespace
 
-LibraryScreen::LibraryScreen(IpcClient& client) : client_(client) {
-  RenderLibrary(model_, &view_, &rendered_);
+LibraryScreen::LibraryScreen(IpcClient& client) : pump_(client) {
+  RenderLibrary(pump_.model(), &view_, &rendered_);
 }
 
-LibraryScreen::~LibraryScreen() { CloseLibrary(frame_, client_, model_); }
+LibraryScreen::~LibraryScreen() { pump_.Close(); }
 
 tsl::elm::Element* LibraryScreen::createUI() {
   auto* frame = new tsl::elm::OverlayFrame("rommsync", version());
@@ -106,8 +106,8 @@ bool LibraryScreen::handleInput(u64 keys_down, u64 keys_held, const HidTouchStat
     // Handled on the frames between repeats too: a held direction passed on to
     // Tesla would be moving its focus under this screen's selection.
     if (rows != 0) {
-      model_.MoveSelection(rows);
-      RenderLibrary(model_, &view_, &rendered_);
+      pump_.model().MoveSelection(rows);
+      RenderLibrary(pump_.model(), &view_, &rendered_);
     }
     return true;
   }
@@ -116,30 +116,30 @@ bool LibraryScreen::handleInput(u64 keys_down, u64 keys_held, const HidTouchStat
     // and leaves the reason where it already is, on the row. Still *handled*:
     // the press was on a row this screen owns, and passing it on would give it
     // to Tesla.
-    model_.Activate();
-    RenderLibrary(model_, &view_, &rendered_);
+    pump_.model().Activate();
+    RenderLibrary(pump_.model(), &view_, &rendered_);
     return true;
   }
   if ((keys_down & HidNpadButton_B) != 0) {
-    if (!model_.Back()) {
+    if (!pump_.model().Back()) {
       // The bottom of the stack. Not handled, so Tesla's own B closes the
       // overlay rather than this screen inventing a second way out.
       return false;
     }
-    RenderLibrary(model_, &view_, &rendered_);
+    RenderLibrary(pump_.model(), &view_, &rendered_);
     return true;
   }
   if ((keys_down & HidNpadButton_Y) != 0) {
-    model_.OpenQueue();
-    RenderLibrary(model_, &view_, &rendered_);
+    pump_.model().OpenQueue();
+    RenderLibrary(pump_.model(), &view_, &rendered_);
     return true;
   }
   return false;
 }
 
 void LibraryScreen::Pump() {
-  PumpLibrary(frame_, client_, model_, link_);
-  RenderLibrary(model_, &view_, &rendered_);
+  pump_.Frame();
+  RenderLibrary(pump_.model(), &view_, &rendered_);
 }
 
 s32 LibraryScreen::PromptRows() const {

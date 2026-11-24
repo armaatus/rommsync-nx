@@ -841,13 +841,16 @@ ctest --test-dir build --output-on-failure
   `library_pump.cpp` (the library browser's IPC frame and teardown); M11-15 (#299)
   added `status_pump.cpp`, `sync_pump.cpp` and `pairing_pump.cpp` (the three
   polling screens' IPC frames) and `poller.cpp` (the line they poll through
-  without waiting). What those make
+  without waiting); M11-24 (#329) added `log_pump.cpp` and `settings_pump.cpp`,
+  and put the library and conflicts frames on the same line. What those make
   assertable: `overlay.timeout` holds the far side's answer and asserts the draw
   thread gets `NotResponding` at the client's budget and is never held again
   while the call is out; `overlay.restore` times every frame of the conflicts
   screen while a restore is still copying; `overlay.frames` times every frame
-  and press of the status, sync and pairing screens against a sysmodule that
-  answers in 300 ms, at the device's budget, and a write that lands past it;
+  and press of every screen -- status, sync, pairing, and since #329 the
+  library held through five pages, conflicts, log and settings -- against a
+  sysmodule that answers in 300 ms, at the device's budget, and a write that
+  lands past it;
   `overlay.cycles` drives every way the
   pinned `tsl::loop` ends, eight times over, and balances sessions, worker
   threads and -- through `count_new.hpp` -- the heap, after grepping

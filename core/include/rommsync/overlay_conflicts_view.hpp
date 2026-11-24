@@ -361,6 +361,17 @@ class ConflictsModel {
   /// The sysmodule refused the command `Next()` handed out.
   void OnRefused(ipc::Error error);
 
+  /// The command handed out is still out past the IPC budget (M11-24, #329).
+  /// A press -- a restore, a Keep local, a cancel -- says *still applying* on
+  /// its entry until the answer replaces it; a page needs nothing more than
+  /// the "Reading..." it already says.
+  void OnApplying();
+
+  /// The command handed out was answered to nobody: another call took the line
+  /// while it was out (#329). What `kNotResponding` does to it, without the
+  /// link changing: a page is asked again, a restore is asked *about*.
+  void OnLost();
+
   /// The command did not reach the sysmodule, or its answer could not be read.
   /// `link` must not be `kOk`; it is `ScreenFrame::Diagnose`'s verdict.
   ///
@@ -416,6 +427,10 @@ class ConflictsModel {
 
   /// Everything loaded, dropped. The next `Next()` asks for the first page.
   void Reset();
+
+  /// The command out is in doubt -- its answer was dropped -- and only it:
+  /// what `OnUnreachable(kNotResponding)` and `OnLost` share.
+  void Doubt();
 
   /// The restore of `restoring_` is over, with `report`.
   void FinishRestore(const conflicts::RestoreReport& report);
@@ -499,6 +514,9 @@ class ConflictsModel {
 
   /// What `Next()` last handed out, so `OnRefused` knows what was refused.
   Command::Kind issued_ = Command::Kind::kNone;
+
+  /// The press in `issued_` is out past the budget (#329).
+  bool applying_ = false;
 
   Link link_ = Link::kOk;
 

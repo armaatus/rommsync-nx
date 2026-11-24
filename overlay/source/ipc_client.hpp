@@ -100,6 +100,10 @@ constexpr Result NotResponding() { return MAKERESULT(Module_Kernel, KernelError_
 /// invent. `kOk` is never reported here; a `Result` of 0 has not failed.
 bool DecodeError(Result rc, ipc::Error* out);
 
+/// What `WriteDiagnostics` sends: this overlay's half of the versions. Shared
+/// with the log screen, which posts it rather than waiting for it (#329).
+std::string DiagnosticsRequestPayload();
+
 /// A session on `sys-rommsync`.
 ///
 /// `Open` assumes `smInitialize()` has already been called -- Tesla does it
@@ -291,6 +295,12 @@ class IpcClient {
 
   /// Whether `ticket`'s call is back. Never waits.
   Arrival Collect(Ticket ticket, Result* rc);
+
+  /// `Collect`, waiting up to the budget for it. **Not for a frame**: for a
+  /// screen's teardown, which owes the sysmodule a `ListEnd` for a cursor the
+  /// call out may be opening (#329), and already waits within the budget for
+  /// every call it makes.
+  Arrival Await(Ticket ticket, Result* rc);
 
   /// The answer `Collect` just reported, decoded -- valid until the next call
   /// or post. `MalformedResponse()` for a payload this build cannot read.

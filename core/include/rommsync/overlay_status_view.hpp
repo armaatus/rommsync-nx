@@ -65,6 +65,12 @@ const char* ToString(Link link);
 enum class Tone { kNeutral, kGood, kWarn, kBad };
 const char* ToString(Tone tone);
 
+/// What every screen says about a press that is out past the IPC budget and
+/// has not been answered yet (#299, #329), drawn neutral: the sysmodule is
+/// busy and the press will land. One spelling, because the sync screen, the
+/// library, the conflicts screen, settings and the log all say it.
+inline constexpr const char* kStillApplying = "Still applying...";
+
 /// One drawn row: a label on the left, a value on the right.
 struct Line {
   std::string label;

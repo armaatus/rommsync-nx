@@ -155,7 +155,7 @@ void SetNotice(SyncActionsView* view, const ipc::Status& status, const LastComma
       // Neutral, not bad: the sysmodule is busy -- a download has the card --
       // and the press will land. "Not responding" here would send a user to
       // press again, or to restart something that is working (#299).
-      view->notice = "Still applying...";
+      view->notice = kStillApplying;
       view->notice_tone = Tone::kNeutral;
       return;
   }

@@ -64,6 +64,8 @@ LogNotice RenderDiagnostics(DiagnosticsOutcome outcome, const std::string& sd_pa
       return {"Could not write diagnostics: the SD card refused the file", Tone::kBad};
     case DiagnosticsOutcome::kOutdated:
       return {"This sysmodule cannot write diagnostics; update sys-rommsync", Tone::kWarn};
+    case DiagnosticsOutcome::kApplying:
+      return {kStillApplying, Tone::kNeutral};
     case DiagnosticsOutcome::kNoAnswer:
       break;
   }

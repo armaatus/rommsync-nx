@@ -1223,6 +1223,106 @@ void CheckAPageCannotLandInTheWrongLevel(Checks& checks) {
                 "which opens its own list instead");
 }
 
+/// M11-24 (#329): the screen no longer waits for an answer, so the user can
+/// move between levels while one is out. Each answer lands on the level it was
+/// asked for, whatever is on top when it arrives.
+void CheckALatePageLandsOnItsOwnLevel(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 321);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, true), 321,
+          "the first platform page");
+
+  const Command outstanding = model.Next();
+  checks.Expect(outstanding.kind == Command::Kind::kListNext, "the next page is out");
+  model.Activate();  // into Game Boy while it is out
+  model.OnPage(Page(checks, {Platform(2, "Mega Drive", "md", 9, true)}, false));
+  checks.Expect(ListRows(model.Render()).empty(), "it is not drawn in the rom level");
+
+  checks.Expect(model.Back(), "B goes back to the platforms");
+  const std::vector<overlay::LibraryRow> rows = ListRows(model.Render());
+  checks.ExpectEq(rows.size(), std::size_t{2},
+                  "where the late page landed, after the row it follows");
+  checks.Expect(rows.size() == 2 && rows[1].label == "Mega Drive", "in its place");
+}
+
+/// A `ListBegin` answered for a level the user has already left is a cursor
+/// the sysmodule is holding all the same, and #31 caps how many it may hold.
+void CheckACursorForALevelLeftIsClosed(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 331);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 331,
+          "the platform page");
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kListBegin, "the rom list is being opened");
+  checks.Expect(model.Back(), "and left before it answers");
+  model.OnCursor(332);
+  const Command end = model.Next();
+  checks.Expect(end.kind == Command::Kind::kListEnd && end.cursor == 332,
+                "the cursor it answered is ended, not dropped");
+  model.OnEnded();
+  checks.ExpectEq(model.open_cursors(), std::size_t{1}, "leaving the platform list's own");
+
+  // The same on the way out: a screen closed while its list was opening.
+  overlay::LibraryBrowserModel closing;
+  checks.Expect(closing.Next().kind == Command::Kind::kListBegin, "a list is opening");
+  closing.Close();
+  closing.OnCursor(341);
+  const Command closed = closing.Next();
+  checks.Expect(closed.kind == Command::Kind::kListEnd && closed.cursor == 341,
+                "a cursor answered after Close is ended too");
+}
+
+/// A page whose answer went to nobody -- another call took the line while it
+/// was out -- leaves the cursor somewhere nothing here knows. It is ended and
+/// the level read again up to its window, rather than read on into the wrong
+/// places.
+void CheckALostPageReopensTheLevel(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 351);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, true), 351,
+          "the first platform page");
+  checks.Expect(model.Next().kind == Command::Kind::kListNext, "the next page is out");
+  model.OnLost();
+  const Command end = model.Next();
+  checks.Expect(end.kind == Command::Kind::kListEnd && end.cursor == 351,
+                "the cursor whose place is unknown is ended");
+  model.OnEnded();
+  checks.Expect(model.Next().kind == Command::Kind::kListBegin, "and the list opened again");
+  model.OnCursor(352);
+  checks.ExpectEq(ListRows(model.Render()).size(), std::size_t{1},
+                  "with the row already drawn kept on screen meanwhile");
+}
+
+/// An `Enqueue` out past the budget says so on its row, and the answer that
+/// follows replaces it. One that is lost is not sent again: it may have landed.
+void CheckALateEnqueueSaysApplying(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 361);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 361,
+          "the platform page");
+  model.Activate();
+  Begin(checks, model, 362);
+  Deliver(checks, model, Page(checks, {Rom(1, "First", 1024), Rom(2, "Second", 2048)}, false),
+          362, "the rom page");
+
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kEnqueue, "A sends Enqueue");
+  model.OnApplying();
+  checks.ExpectEq(ListRows(model.Render())[0].note, std::string(overlay::kStillApplying),
+                  "out past the budget, the row says still applying");
+  model.OnEnqueued(1);
+  checks.ExpectEq(overlay::ToString(ListRows(model.Render())[0].state),
+                  overlay::ToString(overlay::RowState::kQueued), "and queued once it lands");
+
+  model.MoveSelection(1);
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kEnqueue, "A sends Enqueue for the second");
+  model.OnLost();
+  checks.ExpectEq(ListRows(model.Render())[1].note, std::string(overlay::kStillApplying),
+                  "a lost one says still applying too");
+  checks.Expect(model.Next().kind == Command::Kind::kNone, "and is not sent again by itself");
+}
+
 /// A page that lands does not move the selection onto a row under it.
 ///
 /// The `kMore` row is addressed by the index one past the last loaded row, and
@@ -1736,6 +1836,10 @@ int main() {
   CheckUnreadableItemsAreReported(checks);
   CheckAPageCannotLandInTheWrongLevel(checks);
   CheckAnArrivingPageDoesNotMoveTheSelection(checks);
+  CheckALatePageLandsOnItsOwnLevel(checks);
+  CheckACursorForALevelLeftIsClosed(checks);
+  CheckALostPageReopensTheLevel(checks);
+  CheckALateEnqueueSaysApplying(checks);
   CheckHeldKeyRepeats(checks);
   CheckHeldScrollKey(checks);
   CheckRow2000IsReachable(checks);

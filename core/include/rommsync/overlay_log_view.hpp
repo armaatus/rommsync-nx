@@ -68,6 +68,7 @@ enum class DiagnosticsOutcome {
   kWriteFailed,  ///< the sysmodule tried, and the card refused it
   kOutdated,     ///< the sysmodule predates `WriteDiagnostics` (`kUnknownCommand`)
   kNoAnswer,     ///< anything else: not running, not answering, a payload this build cannot read
+  kApplying,     ///< out past the budget and not answered yet (#329); the answer replaces it
 };
 
 /// One sentence and its tone.
