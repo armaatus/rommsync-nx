@@ -3151,6 +3151,81 @@ void NifmUnsureUnanswered(checks::Checks& c) {
              "and RomM not answering is said once, not once per ask:" + Rendered(tail));
 }
 
+/// #333: a transport that would not come up at boot is tried again, not given
+/// up on until the next boot.
+///
+/// A co-resident set holding every `bsd:u` session makes `NetworkInitialize`
+/// fail in `__appInit`. Here it fails twice more on the worker and then comes
+/// up: the boot tick is held meanwhile -- nothing sent, nothing recorded --
+/// and runs once it does, the tries are spaced by the backoff, `StartWorker`
+/// does not wait on any of it, and the failure streak is one line naming the
+/// code.
+void TransportRetried(checks::Checks& c) {
+  // Everything the worker reaches is declared before the console, so the
+  // engine's destructor joins the worker while all of it is still alive.
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<int> tries{0};
+  std::atomic<int> sent_before_up{0};
+  std::atomic<bool> on_boot_thread{false};
+  const std::thread::id boot_thread = std::this_thread::get_id();
+  std::mutex times_mutex;
+  std::vector<std::chrono::steady_clock::time_point> times;
+  Console console(c, "engine-transport-retried");
+  SeedOfflineCard(c, console, /*on_boot=*/true);
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.UseTransport(
+      [&]() -> std::uint32_t {
+        if (std::this_thread::get_id() == boot_thread) on_boot_thread = true;
+        {
+          std::lock_guard<std::mutex> lock(times_mutex);
+          times.push_back(std::chrono::steady_clock::now());
+        }
+        sent_before_up += server.requests();
+        // 0x1E61: a made-up code, so the log line can be held to naming it.
+        return ++tries <= 2 ? 0x1E61u : 0u;
+      },
+      /*first_retry=*/std::chrono::milliseconds{100},
+      /*max_retry=*/std::chrono::milliseconds{150});
+
+  const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  console.engine.StartWorker();
+  const std::chrono::steady_clock::duration boot = std::chrono::steady_clock::now() - started;
+  c.Expect(boot < std::chrono::milliseconds{100},
+           "StartWorker returns at once: the transport is retried on the worker, not at boot");
+  c.Expect(AwaitRequests(server, 0, std::chrono::seconds{5}),
+           "and the held tick runs once the transport comes up");
+  c.Expect(!on_boot_thread.load(), "no try is made on the thread that started the worker");
+  c.ExpectEq(tries.load(), 3, "tried until it came up, and not once more after");
+  c.ExpectEq(sent_before_up.load(), 0,
+             "the tick sends nothing while the transport is down -- it is held, not run");
+  {
+    std::lock_guard<std::mutex> lock(times_mutex);
+    if (times.size() == 3) {
+      c.Expect(times[1] - times[0] >= std::chrono::milliseconds{90},
+               "the second try waits out the first backoff");
+      c.Expect(times[2] - times[1] >= std::chrono::milliseconds{140},
+               "and the third a longer one, capped at the ceiling");
+    }
+  }
+
+  // The tick that ran found nobody there, which is what `Unanswered` is; what
+  // matters is that it ran at all, so that and not its verdict is asserted.
+  const ipc::LogTail tail = console.Log();
+  int down = 0;
+  int up = 0;
+  for (const std::string& line : tail.lines) {
+    if (line.find(" net.offline ") == std::string::npos) continue;
+    if (line.find("transport did not come up (0x1e61)") != std::string::npos) ++down;
+    if (line.find("transport came up") != std::string::npos) ++up;
+  }
+  c.ExpectEq(down, 1, "the failure streak is said once, naming the code:" + Rendered(tail));
+  c.ExpectEq(up, 1, "and its end once:" + Rendered(tail));
+}
+
 /// Every misconfiguration docs/TROUBLESHOOTING.md answers that needs no server.
 ///
 /// Three consoles, because each is a different section of the guide and a
@@ -8562,6 +8637,8 @@ int main(int argc, char** argv) {
     WakesOffline(checks);
   } else if (scenario == "nifm_unsure_unanswered") {
     NifmUnsureUnanswered(checks);
+  } else if (scenario == "transport_retried") {
+    TransportRetried(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
   } else if (scenario == "restore_polled") {

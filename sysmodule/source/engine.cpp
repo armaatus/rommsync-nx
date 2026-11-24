@@ -175,6 +175,14 @@ void SdEngine::UseNetworkProbe(NetworkProbe probe, std::chrono::milliseconds bud
   network_idle_poll_ = idle_poll;
 }
 
+void SdEngine::UseTransport(TransportInit init, std::chrono::milliseconds first_retry,
+                            std::chrono::milliseconds max_retry) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  transport_init_ = std::move(init);
+  transport_first_retry_ = first_retry;
+  transport_max_retry_ = max_retry;
+}
+
 void SdEngine::UseRommTrust(RommTrust trust) {
   std::lock_guard<std::mutex> lock(mutex_);
   romm_trust_ = std::move(trust);

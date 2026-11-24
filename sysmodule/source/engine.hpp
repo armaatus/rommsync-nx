@@ -142,6 +142,13 @@ inline constexpr std::chrono::seconds kNetworkPollInterval{2};
 /// sends nothing.
 inline constexpr std::chrono::seconds kNetworkIdlePollInterval{30};
 
+/// How soon a transport that did not come up is tried again, and the most the
+/// wait doubles to (#333, `SdEngine::UseTransport`). Each try is a few IPC
+/// calls and a 116 KiB transfer memory handed back on failure, so the ceiling
+/// is about not filling the log's tail, not about cost.
+inline constexpr std::chrono::seconds kTransportRetryFirst{10};
+inline constexpr std::chrono::seconds kTransportRetryMax{300};
+
 /// The ceiling on the one heartbeat a tick held on nifm's "no internet" asks
 /// RomM directly (#328, `SdEngine::RommAnswers`). Short, because the console it
 /// is wrong about is the one that really is offline; a LAN RomM answers in far
@@ -419,6 +426,23 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// `mutex_`. Null is a build whose transport does not gate on nifm.
   using RommTrust = std::function<void(bool)>;
   void UseRommTrust(RommTrust trust);
+
+  /// Brings the console's transport up if it is not, and answers 0 when it is
+  /// up or the platform's result code when it would not come up (#333).
+  /// `main.cpp` passes `NetworkInitialize` behind `NetworkReady`: a co-resident
+  /// set holding every `bsd:u` session at boot is otherwise a console without a
+  /// network until the next boot.
+  ///
+  /// Asked on the **worker**, outside `mutex_`, when a tick falls due and the
+  /// last answer was not 0 -- never in `main`, so boot is not held. While it
+  /// says no the tick is held as nifm's "no network" holds one (#289): nothing
+  /// sent, nothing recorded, no backoff earned. It is asked again after
+  /// `first_retry`, doubling to `max_retry`, and once it says 0 it is not asked
+  /// again. Null is a transport that is always up, which every host build is.
+  using TransportInit = std::function<std::uint32_t()>;
+  void UseTransport(TransportInit init,
+                    std::chrono::milliseconds first_retry = kTransportRetryFirst,
+                    std::chrono::milliseconds max_retry = kTransportRetryMax);
 
   /// Whether an application -- a retail game, Tico, RetroArch launched over a
   /// title -- is in the foreground right now (M10-16, #242).
@@ -1727,6 +1751,12 @@ class SdEngine : public ipc::Engine, public power::Sink {
   std::chrono::milliseconds network_budget_ = kNetworkWaitBudget;
   std::chrono::milliseconds network_poll_ = kNetworkPollInterval;
   std::chrono::milliseconds network_idle_poll_ = kNetworkIdlePollInterval;
+
+  /// `UseTransport`'s, and its two paces. Guarded by `mutex_`; the hook is
+  /// copied out and called outside it.
+  TransportInit transport_init_;
+  std::chrono::milliseconds transport_first_retry_ = kTransportRetryFirst;
+  std::chrono::milliseconds transport_max_retry_ = kTransportRetryMax;
 
   /// Whether a game is in the foreground, and how often to ask while a tick
   /// waits for it (#242). Null means "nothing is running". Both guarded by
