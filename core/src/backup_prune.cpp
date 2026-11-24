@@ -55,8 +55,10 @@ struct Backup {
   bool removed = false;
   /// Examined and kept as the only copy; not offered a second time.
   bool kept = false;
-  /// Position among its group's backups the state budget counts, newest
-  /// first and from 1; 0 is one it does not count (#340).
+  /// The card refused to remove it once; never asked again this prune.
+  bool unremovable = false;
+  /// Position among its state's backups the state budget counts, newest first
+  /// and from 1; 0 is one it does not count (#340).
   std::size_t state_rank = 0;
   std::optional<std::string> digest;  ///< computed once, empty string = unreadable
 };
@@ -186,27 +188,36 @@ class Pruner {
     const std::size_t keep_states = static_cast<std::size_t>(std::max(keep.keep_states, 1));
     // A state's own rank, counted over what is still on the card and what the
     // budget counts: a save backup that happens to share a group, or one from
-    // before this server, must not stand in for one of a state's newest.
+    // before this server, must not stand in for one of a state's newest. And
+    // per extension, not per group: RetroArch's slots of one game, `.state1`
+    // and `.state2`, share the discriminator `state-Game` and are two states.
     std::int64_t state_total = 0;
     for (const std::vector<std::size_t>& members : members_) {
-      std::size_t next = 0;
-      for (const std::size_t at : members) {
-        Backup& backup = backups_[at];
+      for (std::size_t i = 0; i < members.size(); ++i) {
+        Backup& backup = backups_[members[i]];
+        const std::string_view extension = sync::ExtensionOf(backup.name);
         if (backup.removed || backup.parsed.unix_seconds < options_.server_since ||
-            !options_.is_state_backup(backup.parsed, sync::ExtensionOf(backup.name))) {
+            !options_.is_state_backup(backup.parsed, extension)) {
           continue;
         }
-        backup.state_rank = ++next;
+        backup.state_rank = 1;
+        for (std::size_t newer = 0; newer < i; ++newer) {
+          const Backup& other = backups_[members[newer]];
+          if (other.state_rank > 0 && sync::ExtensionOf(other.name) == extension) {
+            ++backup.state_rank;
+          }
+        }
         state_total += backup.size;
       }
     }
     for (const std::size_t at : order) {
       if (state_total <= keep.max_state_bytes) break;
       Backup& backup = backups_[at];
-      if (backup.removed || backup.state_rank <= keep_states) continue;
+      if (backup.removed || backup.unremovable || backup.state_rank <= keep_states) continue;
       // A copy that is provably elsewhere goes as one: only what is left --
       // which `Offer` has counted as kept -- is the budget's to answer for.
       if (!backup.kept) Offer(at);
+      if (backup.unremovable) continue;
       if (!backup.removed) {
         if (!Remove(at)) continue;
         --report_->kept_unique;
@@ -240,6 +251,7 @@ class Pruner {
     const std::string resolved = files_.Resolve(backup.sd_path);
     if (resolved.empty() || io::Remove(resolved) != 0) {
       backup.kept = true;
+      backup.unremovable = true;
       Warn(backup.sd_path + " could not be removed");
       return false;
     }
@@ -398,15 +410,6 @@ IsStateBackup StateBackupsOf(const state::Baseline& baseline) {
   };
 }
 
-std::string DescribeStateBudget(const PruneReport& report) {
-  if (report.budget_pruned == 0) return {};
-  // One shape for every count: the sysmodule's image is budgeted by the page.
-  return "save-state backups removed by [backup] max_state_mib with no other copy known: " +
-         std::to_string(report.budget_pruned) + "; state backups now hold " +
-         std::to_string(report.state_bytes_after) +
-         " bytes. Never a save backup, nor the newest of a state";
-}
-
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options) {
   PruneReport report;
   Pruner(files, options, &report).Run();
@@ -421,6 +424,10 @@ std::string Describe(const PruneReport& report) {
   if (report.kept_unique > 0) {
     line += "; " + std::to_string(report.kept_unique) +
             " kept past the retention rule because no other copy of their bytes could be found";
+  }
+  if (report.budget_pruned > 0) {
+    line += "; " + std::to_string(report.budget_pruned) +
+            " of them save-state backups [backup] max_state_mib removed with no other copy known";
   }
   if (report.over_cap) line += "; still over the size cap";
   if (report.truncated) line += "; the directory holds more than one listing shows";

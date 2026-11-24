@@ -839,8 +839,8 @@ row's slot of the same rom, since a save's slot is whatever some client chose
 and could read `state-Game`. A backup from before `server_since` (#294), or of
 a state `state.db` no longer lists, is not counted and stays. Each removal is
 one `remove()`, so a power cut leaves a subset of what the whole prune removes
-(`prune.state_budget_crash`). Each prune that used it logs a second
-`backup.pruned` line naming `max_state_mib`, and `Status.backup.state_budget_pruned`
+(`prune.state_budget_crash`). Each prune that used it says so in a clause of
+its `backup.pruned` line naming `max_state_mib`, and `Status.backup.state_budget_pruned`
 counts the removals since boot for the overlay's **State budget** row.
 
 #### A write after the backup (#263)

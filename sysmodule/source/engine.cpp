@@ -2777,10 +2777,6 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap || report.truncated) {
     log::Info(log::Event::kBackupPruned, backup::Describe(report));
   }
-  // A line of its own, so a reader of the log can tell the one removal that is
-  // not a proof from all the ones that are (#340).
-  const std::string budget = backup::DescribeStateBudget(report);
-  if (!budget.empty()) log::Info(log::Event::kBackupPruned, budget);
 }
 
 bool SdEngine::StartTick(TickInputs* inputs) {

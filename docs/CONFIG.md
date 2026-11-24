@@ -565,8 +565,8 @@ state `state.db` no longer lists, or one whose name a save's slot could also
 have written. 256 MiB is a few dozen of the heaviest states a synced core
 writes (some are several MiB) and hundreds of a handheld's, and a console that
 does not trade states writes almost no state backups, so ordinary use never
-reaches it. Each prune that removed one says so on a `backup.pruned` line of its
-own, naming `max_state_mib`, and the status screen shows a **State budget** row
+reaches it. Each prune that removed one says so in its `backup.pruned` line, in a
+clause naming `max_state_mib`, and the status screen shows a **State budget** row
 counting them since boot. Set `max_state_mib = 0` to keep every unique state
 backup, as before, and clear them by hand.
 

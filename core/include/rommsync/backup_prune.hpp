@@ -257,13 +257,11 @@ struct PruneReport {
 /// Apply the retention rule to `options.backup_dir`. See the header.
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options);
 
-/// `backup.pruned`'s line: counts and bytes, never a path.
+/// `backup.pruned`'s line: counts and bytes, never a path. A prune the state
+/// budget removed sole copies in says so in a clause naming `max_state_mib`:
+/// the one removal a reader of the log has to be able to tell from a proven
+/// one (#340).
 std::string Describe(const PruneReport& report);
-
-/// `backup.pruned`'s second line, for a prune the state budget removed sole
-/// copies in, and empty for one it did not: the one removal a reader of the
-/// log has to be able to tell from a proven one (#340).
-std::string DescribeStateBudget(const PruneReport& report);
 
 /// `GET /api/saves?rom_id=<rom_id>`, reduced to its rows' `content_hash`es.
 ///

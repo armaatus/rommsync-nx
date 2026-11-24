@@ -728,11 +728,11 @@ void StateBudget(checks::Checks& c) {
     c.ExpectEq(sandbox.Read(save.sd_path), save.bytes, "no save backup is touched");
   }
   c.ExpectEq(report.state_bytes_after, 256 * kMiB, "the state backups are down to the budget");
-  c.Expect(backup::DescribeStateBudget(report).find("max_state_mib with no other copy known: 6;") !=
-               std::string::npos,
-           "and a log line of its own says so: " + backup::DescribeStateBudget(report));
-  c.Expect(backup::Describe(report).rfind("6 of 34 backups pruned", 0) == 0,
-           "and the prune's own line counts them with the rest: " + backup::Describe(report));
+  const std::string line = backup::Describe(report);
+  c.Expect(line.rfind("6 of 34 backups pruned", 0) == 0, "the log line counts them: " + line);
+  c.Expect(line.find("; 6 of them save-state backups [backup] max_state_mib removed with no "
+                     "other copy known") != std::string::npos,
+           "and names the budget, apart from every proven removal: " + line);
 }
 
 /// With the budget off -- or nothing known to be a state -- a sole copy is
