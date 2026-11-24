@@ -491,6 +491,12 @@ struct BackupUsage {
   /// what was listed -- and the status screen leads its row with `≥` rather
   /// than drawing it as the total.
   bool truncated = false;
+
+  /// State backups the state budget (`[backup] max_state_mib`, #340) removed
+  /// since boot with no other copy of their bytes shown: the one removal that is
+  /// not a proof. Since boot rather than the last prune's, because a trade
+  /// removes about one per prune and the row is there to say it happens at all.
+  std::int64_t state_budget_pruned = 0;
 };
 
 /// Everything the status screen needs, in one call.

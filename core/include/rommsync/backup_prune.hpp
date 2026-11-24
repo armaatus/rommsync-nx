@@ -120,6 +120,14 @@ struct Retention {
 
   /// The directory's target size. Zero is no cap.
   std::int64_t max_bytes = std::int64_t{config::kDefaultBackupMaxMib} * 1024 * 1024;
+
+  /// The state budget (#340): the bytes state backups may hold before the
+  /// oldest beyond `keep_states` of each state go with no other copy shown.
+  /// Zero is off. See the header.
+  std::int64_t max_state_bytes = std::int64_t{config::kDefaultBackupMaxStateMib} * 1024 * 1024;
+
+  /// The newest this many of each state the budget never removes. At least one.
+  int keep_states = config::kDefaultBackupKeepStates;
 };
 
 /// `[backup]` as a `Retention`.
@@ -149,6 +157,18 @@ std::optional<BackupName> ParseBackupName(std::string_view name);
 /// learnt. Nullopt keeps every candidate of the rom that is not a duplicate.
 using ServerDigests = std::function<std::optional<std::vector<std::string>>(std::int64_t rom_id)>;
 
+/// Whether a backup -- its parsed name, and the extension it carries -- is a
+/// save state's, which the state budget may remove (#340). False is "a save's,
+/// or not known to be a state's", which it never touches.
+using IsStateBackup = std::function<bool(const BackupName& name, std::string_view extension)>;
+
+/// The state backups `baseline` names: those under a state row's rom, spelled
+/// with `sync::StateBackupDiscriminator` of its name and carrying its name's
+/// extension -- exactly what a state download and a state restore write -- and
+/// under no save row's discriminator of the same rom. See the header for why
+/// the name alone is not enough.
+IsStateBackup StateBackupsOf(const state::Baseline& baseline);
+
 struct PruneOptions {
   std::string backup_dir = sync::kBackupDir;
   Retention retention;
@@ -169,6 +189,12 @@ struct PruneOptions {
   /// never asks the server about its rom. Zero trusts the server with every
   /// backup.
   std::int64_t server_since = 0;
+
+  /// Which backups the state budget counts and may remove. Null is none: the
+  /// budget never runs, whatever `retention` says. A backup named before
+  /// `server_since` is never one -- its rom id is another server's, and its
+  /// name proves nothing against this console's `state.db`.
+  IsStateBackup is_state_backup;
 };
 
 struct PruneReport {
@@ -196,6 +222,15 @@ struct PruneReport {
 
   /// Still over `max_bytes` after everything provable went.
   bool over_cap = false;
+
+  /// Of `pruned`, state backups the state budget removed with no other copy of
+  /// their bytes shown: the one removal that is not a proof (#340).
+  std::size_t budget_pruned = 0;
+
+  /// What state backups held after the prune, and whether that is still over
+  /// the budget -- the newest `keep_states` of each are never removed.
+  std::int64_t state_bytes_after = 0;
+  bool over_state_budget = false;
 };
 
 /// Apply the retention rule to `options.backup_dir`. See the header.
@@ -203,6 +238,11 @@ PruneReport Prune(fs::FileSystem& files, const PruneOptions& options);
 
 /// `backup.pruned`'s line: counts and bytes, never a path.
 std::string Describe(const PruneReport& report);
+
+/// `backup.pruned`'s second line, for a prune the state budget removed sole
+/// copies in, and empty for one it did not: the one removal a reader of the
+/// log has to be able to tell from a proven one (#340).
+std::string DescribeStateBudget(const PruneReport& report);
 
 /// `GET /api/saves?rom_id=<rom_id>`, reduced to its rows' `content_hash`es.
 ///

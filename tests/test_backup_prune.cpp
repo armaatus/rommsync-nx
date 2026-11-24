@@ -22,6 +22,17 @@
 //   state_crash  `crash`, over state backups proven by `state.db`
 //   state_proven only the rows this tick's states half confirmed are a proof:
 //              never one an upload just wrote
+//   state_budget  #340: two consoles trading a state, its backups over the
+//              default state budget -- each the only copy of its bytes. The
+//              oldest go down to the budget, the newest `keep_states` of each
+//              state stay, and no save backup is touched
+//   state_budget_off  with the budget at 0, or nothing known to be a state,
+//              nothing unique goes (#330's behaviour)
+//   state_budget_names  only what `state.db` names a state's backup counts: a
+//              save's slot spelled `state-...`, an unknown state, another
+//              server's backup, never
+//   state_budget_crash  a power cut at every call of a budget prune removes a
+//              subset of what the whole prune removes, and nothing else
 //   server     against the real RomM: a save's digest is listed for its rom,
 //              and a state's is while its row has not moved
 #include <algorithm>
@@ -625,6 +636,285 @@ void StateCrash(checks::Checks& c) {
              "no power cut loses a state backup's bytes: " + verdict.first);
 }
 
+// --- the state budget (#340) -------------------------------------------------
+
+constexpr std::int64_t kMiB = 1024 * 1024;
+
+/// A state backup of `size` bytes whose content is unique to `n`: a tag up
+/// front and the rest a hole, so a test can put hundreds of MiB of realistic
+/// states on the card without writing them.
+Seeded SeedLarge(Sandbox& sandbox, std::int64_t rom_id, const std::string& file_name,
+                 std::int64_t unix_seconds, int n, std::int64_t size) {
+  const Seeded seeded =
+      Seed(sandbox, rom_id, sync::StateBackupDiscriminator(file_name), unix_seconds,
+           "state " + std::to_string(rom_id) + " " + std::to_string(n), 0, file_name);
+  std::error_code error;
+  std::filesystem::resize_file(sandbox.Host(seeded.sd_path), static_cast<std::uintmax_t>(size),
+                               error);
+  return seeded;
+}
+
+/// A `state.db` row for a state, as the last trade left it. Where the server
+/// row is now does not matter: the budget asks the server nothing.
+void KnowState(state::Baseline* baseline, std::int64_t rom_id, const std::string& file_name) {
+  baseline->SetState(
+      Paired(Listed(rom_id * 100, rom_id, file_name, 1, kNow - kDay), "the live " + file_name));
+}
+
+void KnowSave(state::Baseline* baseline, std::int64_t rom_id,
+              const std::optional<std::string>& slot) {
+  state::SaveRecord row;
+  row.rom_id = rom_id;
+  row.slot = slot;
+  row.content_hash = crypto::Md5Hex("live save " + std::to_string(rom_id));
+  row.mtime = Moment(kNow - kDay);
+  row.file_size_bytes = 64;
+  baseline->Set(row);
+}
+
+/// The acceptance test. Two consoles trade one game's state through RomM -- a
+/// heavy core's 16 MiB -- every half hour, and each download on this console
+/// backed up the live state it replaced: bytes `POST /api/states` had already
+/// replaced on the server, so each backup is the only copy. Twenty trades is
+/// 320 MiB of them, over the default budget, and all young enough that
+/// `keep_days` keeps every one for a month: on #330's rule nothing goes, and
+/// the card fills one trade at a time.
+void StateBudget(checks::Checks& c) {
+  Sandbox sandbox(c, "prune-state-budget");
+  state::Baseline baseline;
+  KnowState(&baseline, 4, "Game.state");
+  KnowState(&baseline, 5, "Other.state");
+  KnowSave(&baseline, 4, "autosave");
+
+  std::vector<Seeded> traded;
+  for (int i = 0; i < 20; ++i) {
+    traded.push_back(
+        SeedLarge(sandbox, 4, "Game.state", kNow - (20 - i) * 30 * 60, i, 16 * kMiB));
+  }
+  // Another game's state, traded twice long ago: older than every trade above,
+  // and within its newest three, which the budget never takes.
+  const Seeded other_old = SeedLarge(sandbox, 5, "Other.state", kNow - 90 * kDay, 1, 16 * kMiB);
+  const Seeded other_new = SeedLarge(sandbox, 5, "Other.state", kNow - 80 * kDay, 2, 16 * kMiB);
+  // Save backups: old, past the count, and on no server. Hard rule 2 holds for
+  // them without exception, so the budget never even counts them.
+  std::vector<Seeded> saves;
+  for (int i = 0; i < 12; ++i) {
+    saves.push_back(Seed(sandbox, 4, "autosave", kNow - (400 - i) * kDay, Bytes(i, 1024)));
+  }
+
+  backup::PruneOptions options;
+  options.backup_dir = kBackupDir;
+  options.retention = backup::RetentionFor(config::Defaults().backup);
+  options.now = []() { return Moment(kNow); };
+  FakeServer server;  // knows nothing: every backup here is the only copy
+  options.server_digests = server.Callback();
+  options.is_state_backup = backup::StateBackupsOf(baseline);
+  const std::unique_ptr<fs::FileSystem> files =
+      host::MakeNativeFileSystem(sandbox.root().string());
+  const backup::PruneReport report = backup::Prune(*files, options);
+
+  // 22 states of 16 MiB is 352; the budget is 256, so six go -- the six oldest
+  // the budget may take, which are the first six trades.
+  c.ExpectEq(report.budget_pruned, std::size_t{6},
+             "six state backups went to the budget: " + backup::Describe(report));
+  c.ExpectEq(report.pruned, std::size_t{6}, "and nothing else went");
+  for (std::size_t i = 0; i < traded.size(); ++i) {
+    const bool gone = !sandbox.Exists(traded[i].sd_path);
+    c.Expect(gone == (i < 6), "trade " + std::to_string(i) + (i < 6 ? " went" : " stayed"));
+  }
+  c.Expect(sandbox.Exists(other_old.sd_path) && sandbox.Exists(other_new.sd_path),
+           "another state's newest three stay, however old");
+  for (const Seeded& save : saves) {
+    c.ExpectEq(sandbox.Read(save.sd_path), save.bytes, "no save backup is touched");
+  }
+  c.ExpectEq(report.state_bytes_after, 256 * kMiB, "the state backups are down to the budget");
+  c.Expect(!report.over_state_budget, "which the report says");
+  c.Expect(backup::DescribeStateBudget(report).rfind("6 ", 0) == 0,
+           "and a log line of its own says so: " + backup::DescribeStateBudget(report));
+  c.Expect(backup::Describe(report).find("budget") != std::string::npos,
+           "as does the prune's own: " + backup::Describe(report));
+}
+
+/// With the budget off -- or nothing known to be a state -- a sole copy is
+/// never removed: #330's behaviour, exactly.
+void StateBudgetOff(checks::Checks& c) {
+  for (const bool off_by_setting : {true, false}) {
+    Sandbox sandbox(c, off_by_setting ? "prune-state-budget-zero" : "prune-state-budget-unknown");
+    state::Baseline baseline;
+    KnowState(&baseline, 4, "Game.state");
+    std::vector<Seeded> traded;
+    for (int i = 0; i < 8; ++i) {
+      traded.push_back(SeedLarge(sandbox, 4, "Game.state", kNow - (400 - i) * kDay, i, 4096));
+    }
+    backup::PruneOptions options;
+    options.backup_dir = kBackupDir;
+    options.retention.keep = 1;
+    options.retention.keep_days = 0;
+    options.retention.max_bytes = 1;
+    options.retention.max_state_bytes = off_by_setting ? 0 : 1;
+    options.retention.keep_states = 1;
+    options.now = []() { return Moment(kNow); };
+    if (off_by_setting) options.is_state_backup = backup::StateBackupsOf(baseline);
+    const std::unique_ptr<fs::FileSystem> files =
+        host::MakeNativeFileSystem(sandbox.root().string());
+    const backup::PruneReport report = backup::Prune(*files, options);
+    const std::string why = off_by_setting ? "max_state_mib = 0" : "no state known";
+    c.ExpectEq(report.pruned, std::size_t{0}, why + ": nothing unique went");
+    c.ExpectEq(report.budget_pruned, std::size_t{0}, why + ": not by the budget either");
+    for (const Seeded& seeded : traded) {
+      c.Expect(sandbox.Exists(seeded.sd_path), why + ": every sole copy stays");
+    }
+  }
+}
+
+/// The budget is the one removal without a second copy, so what it counts is
+/// what `state.db` says a state download or restore wrote -- never a name that
+/// merely looks like one.
+void StateBudgetNames(checks::Checks& c) {
+  Sandbox sandbox(c, "prune-state-budget-names");
+  state::Baseline baseline;
+  KnowState(&baseline, 4, "Game.state");
+  KnowState(&baseline, 4, "Game.state.auto");  // RetroArch's Auto: `.auto` is the extension
+  // Rom 6: a state and, from another client, a save whose slot is spelled the
+  // way that state's backups are. Their backups cannot be told apart, so the
+  // budget takes neither.
+  KnowState(&baseline, 6, "Clash.state");
+  KnowSave(&baseline, 6, "state-Clash");
+
+  const auto seed_run = [&sandbox](std::int64_t rom_id, const std::string& discriminator,
+                                   const std::string& file_name, std::int64_t from) {
+    std::vector<Seeded> run;
+    for (int i = 0; i < 3; ++i) {
+      run.push_back(Seed(sandbox, rom_id, discriminator, from + i * kDay,
+                         Bytes(static_cast<int>(rom_id * 10 + i), 4096) + discriminator +
+                             file_name + std::to_string(from),
+                         0, file_name));
+    }
+    return run;
+  };
+  const std::int64_t since = kNow - 500 * kDay;
+  const std::vector<Seeded> known = seed_run(4, "state-Game", "Game.state", since + 10 * kDay);
+  const std::vector<Seeded> auto_slot =
+      seed_run(4, sync::StateBackupDiscriminator("Game.state.auto"), "Game.state.auto",
+               since + 20 * kDay);
+  const std::vector<Seeded> clash = seed_run(6, "state-Clash", "Clash.state", since + 30 * kDay);
+  // A save slot that happens to read `state-Game`, under a save's extension,
+  // and newer than every state backup of its group.
+  const std::vector<Seeded> lookalike = seed_run(4, "state-Game", "game.srm", since + 40 * kDay);
+  // A state `state.db` has no row for -- deleted since, or never this server's.
+  const std::vector<Seeded> unknown = seed_run(7, "state-Gone", "Gone.state", since + 50 * kDay);
+  // `Game.state`'s backups from before this console was bound to this server,
+  // where rom 4 was some other game.
+  const std::vector<Seeded> before = seed_run(4, "state-Game", "Game.state", since - 10 * kDay);
+
+  backup::PruneOptions options;
+  options.backup_dir = kBackupDir;
+  options.retention.keep = 1;
+  options.retention.keep_days = 0;
+  options.retention.max_bytes = 0;
+  options.retention.max_state_bytes = 1;
+  options.retention.keep_states = 1;
+  options.now = []() { return Moment(kNow); };
+  options.server_since = since;
+  options.is_state_backup = backup::StateBackupsOf(baseline);
+  const std::unique_ptr<fs::FileSystem> files =
+      host::MakeNativeFileSystem(sandbox.root().string());
+  const backup::PruneReport report = backup::Prune(*files, options);
+
+  const auto left = [&sandbox](const std::vector<Seeded>& run) {
+    std::size_t count = 0;
+    for (const Seeded& seeded : run) count += sandbox.Exists(seeded.sd_path) ? 1 : 0;
+    return count;
+  };
+  c.ExpectEq(left(known), std::size_t{1},
+             "a known state's backups go to its newest: " + backup::Describe(report));
+  c.Expect(sandbox.Exists(known.back().sd_path), "which is the one that stays");
+  c.ExpectEq(left(auto_slot), std::size_t{1}, "and so do RetroArch's Auto state's");
+  c.ExpectEq(left(clash), clash.size(), "a state a save's slot shadows is not taken");
+  c.ExpectEq(left(lookalike), lookalike.size(),
+             "nor a save backup whose slot reads like a state's");
+  c.ExpectEq(left(unknown), unknown.size(), "nor a state state.db does not know");
+  c.ExpectEq(left(before), before.size(), "nor one from before this server");
+  c.ExpectEq(report.budget_pruned, std::size_t{4}, "four in all");
+  c.Expect(report.over_state_budget, "and what is left is still over a 1-byte budget");
+
+  // The predicate itself, at its edges.
+  const backup::IsStateBackup is_state = backup::StateBackupsOf(baseline);
+  c.Expect(is_state != nullptr, "a state.db with states answers");
+  if (is_state == nullptr) return;
+  const auto parsed = [](const std::string& name) { return *backup::ParseBackupName(name); };
+  c.Expect(is_state(parsed("4-state-Game-1757000000.state"), ".state"), "a state's backup is one");
+  c.Expect(!is_state(parsed("4-state-Game-1757000000.srm"), ".srm"),
+           "the same discriminator under a save's extension is not");
+  c.Expect(!is_state(parsed("5-state-Game-1757000000.state"), ".state"), "nor under another rom");
+  c.Expect(!is_state(parsed("4-autosave-1757000000.srm"), ".srm"), "nor a save's");
+  const backup::IsStateBackup none = backup::StateBackupsOf(state::Baseline{});
+  c.Expect(none == nullptr || !none(parsed("4-state-Game-1757000000.state"), ".state"),
+           "and an empty state.db knows no state at all");
+}
+
+/// Every power cut of a budget prune leaves a card holding all it held before
+/// but some of what the whole prune removed: never a backup the prune would
+/// have kept, and never part of a file.
+void StateBudgetCrash(checks::Checks& c) {
+  Sandbox sandbox(c, "prune-state-budget-crash");
+  state::Baseline baseline;
+  KnowState(&baseline, 4, "Game.state");
+  for (int i = 0; i < 5; ++i) {
+    Seed(sandbox, 4, "state-Game", kNow - (10 - i) * kDay, Bytes(i, 512), 0, "Game.state");
+  }
+  Seed(sandbox, 4, "autosave", kNow - 300 * kDay, Bytes(20, 512));
+  Seed(sandbox, 4, "autosave", kNow - 200 * kDay, Bytes(21, 512));
+
+  backup::PruneOptions options;
+  options.backup_dir = kBackupDir;
+  options.retention.keep = 1;
+  options.retention.keep_days = 0;
+  options.retention.max_bytes = 0;
+  options.retention.max_state_bytes = 2 * 512;
+  options.retention.keep_states = 1;
+  options.now = []() { return Moment(kNow); };
+  options.is_state_backup = backup::StateBackupsOf(baseline);
+
+  std::set<std::string> before;
+  for (const auto& entry : std::filesystem::directory_iterator(sandbox.Host(kBackupDir))) {
+    before.insert(entry.path().filename().string());
+  }
+  const std::unique_ptr<fs::FileSystem> files =
+      host::MakeNativeFileSystem(sandbox.root().string());
+  crash::Recorder recorder(sandbox.root(), {});
+  const backup::PruneReport report = backup::Prune(*files, options);
+  c.ExpectEq(report.budget_pruned, std::size_t{3},
+             "the budget took three: " + backup::Describe(report));
+  std::set<std::string> removed;
+  for (const std::string& name : before) {
+    if (!sandbox.Exists(std::string(kBackupDir) + "/" + name)) {
+      removed.insert(crash::RelativeOf(kBackupDir) + "/" + name);
+    }
+  }
+  c.ExpectEq(removed.size(), std::size_t{3}, "three files left the card");
+
+  const crash::Judge subset = [removed](const crash::Tree& after,
+                                        const crash::Snapshot& prior) -> std::string {
+    for (const auto& [path, bytes] : prior.files) {
+      if (removed.count(path) != 0) continue;
+      const auto found = after.find(path);
+      if (found == after.end()) return path + " is gone, and the prune would have kept it";
+      if (found->second != bytes) return path + " holds other bytes than it did";
+    }
+    for (const auto& [path, bytes] : after) {
+      if (prior.files.count(path) == 0) return path + " appeared from nowhere";
+    }
+    return {};
+  };
+  const crash::Verdict verdict = crash::Replay(recorder, {kBackupDir}, {kBackupDir},
+                                               rig::ScratchDir() + "/crash-prune-budget", subset);
+  c.Expect(verdict.unmodelled.empty(), "the model followed every call: " + verdict.unmodelled);
+  c.Expect(verdict.points > 1, "the prune made calls to cut");
+  c.ExpectEq(verdict.failures, std::size_t{0},
+             "no power cut removes more than the prune would: " + verdict.first);
+}
+
 void StateProven(checks::Checks& c) {
   state::Baseline baseline;
   const auto row = [&baseline](std::int64_t rom_id, const std::string& name) {
@@ -806,6 +1096,14 @@ int main(int argc, char** argv) {
       StateCrash(checks);
     } else if (scenario == "state_proven") {
       StateProven(checks);
+    } else if (scenario == "state_budget") {
+      StateBudget(checks);
+    } else if (scenario == "state_budget_off") {
+      StateBudgetOff(checks);
+    } else if (scenario == "state_budget_names") {
+      StateBudgetNames(checks);
+    } else if (scenario == "state_budget_crash") {
+      StateBudgetCrash(checks);
     } else {
       std::cerr << "unknown scenario " << scenario << "\n";
       return 2;

@@ -297,6 +297,10 @@ Retention RetentionFor(const config::BackupConfig& backup) {
   return retention;
 }
 
+IsStateBackup StateBackupsOf(const state::Baseline&) { return nullptr; }
+
+std::string DescribeStateBudget(const PruneReport&) { return {}; }
+
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options) {
   PruneReport report;
   Pruner(files, options, &report).Run();

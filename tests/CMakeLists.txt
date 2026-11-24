@@ -1357,6 +1357,10 @@ set(PRUNE_UNIT_SCENARIOS
   state_moved  # #330: a state row the server moved, replaced or dropped, or could not list, proves nothing
   state_crash  # #330: a power cut at every call of a state prune loses no backup's bytes
   state_proven  # #330: only a state row this tick confirmed is a proof, never an upload's own
+  state_budget  # #340: traded state backups over the default budget go oldest first; saves never
+  state_budget_off  # #340: with the budget at 0, nothing unique goes
+  state_budget_names  # #340: only a backup state.db names a state's counts against the budget
+  state_budget_crash  # #340: a power cut mid-budget removes a subset of what the prune removes
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})
@@ -2676,6 +2680,7 @@ set(ENGINE_RIG_SCENARIOS
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
   backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
   state_backup_pruned  # #330: a state backup state.db proves RomM holds is pruned; a unique one stays
+  state_budget  # #340: past [backup] max_state_mib the oldest sole-copy state backup goes; saves never
   backup_truncated  # #323: a .backup/ past one listing draws its Backups row as a floor
   server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch

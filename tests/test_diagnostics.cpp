@@ -153,8 +153,10 @@ void Sections(checks::Checks& checks) {
   bundle.engine.backup.over_cap = true;
   bundle.written_at += 1;
   text = WriteAndRead(checks, dir, bundle);
+  bundle.engine.backup.state_budget_pruned = 3;
   for (const char* expected : {"measured = yes", "bytes = 5242880", "backups = 12",
-                               "kept_unique = 2", "over_cap = yes"}) {
+                               "kept_unique = 2", "over_cap = yes",
+                               "state_budget_pruned = 3"}) {
     checks.Expect(text.find(expected) != std::string::npos,
                   std::string("backup usage is #316's numbers: \"") + expected + "\"");
   }

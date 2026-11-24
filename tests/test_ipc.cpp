@@ -93,6 +93,7 @@ ipc::Status LoadedStatus() {
   status.backup.kept_unique = 9;
   status.backup.over_cap = true;
   status.backup.truncated = true;
+  status.backup.state_budget_pruned = 6;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -236,9 +237,10 @@ int Version() {
   // `server.ca_file`. 18 since M11-21 (#316): `Status` gained `backup`. 19
   // since M11-22 (#323): and `backup.truncated`. 20 since #339: a
   // `ListRequest` gained a required `offset`. 21 since #341: a `ListPage`
-  // gained a required `start`. What is frozen is command 0's *encoding*,
+  // gained a required `start`. 22 since M11-26 (#340): and
+  // `backup.state_budget_pruned`. What is frozen is command 0's *encoding*,
   // asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{21},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{22},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -380,6 +382,8 @@ int RoundTrip() {
     checks.ExpectEq(back.value.backup.over_cap, sent.backup.over_cap, "backup.over_cap survives");
     checks.ExpectEq(back.value.backup.truncated, sent.backup.truncated,
                     "backup.truncated survives (#323)");
+    checks.ExpectEq(back.value.backup.state_budget_pruned, sent.backup.state_budget_pruned,
+                    "backup.state_budget_pruned survives (#340)");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");
@@ -1827,12 +1831,14 @@ int DispatchTable() {
     engine.snapshot.backup.kept_unique = 1;
     engine.snapshot.backup.over_cap = true;
     engine.snapshot.backup.truncated = true;
+    engine.snapshot.backup.state_budget_pruned = 4;
     ipc::ServiceCore core(engine);
     const ipc::Status status = core.GetStatus();
     checks.Expect(status.backup.measured && status.backup.bytes == 4096 &&
                       status.backup.backups == 2 && status.backup.kept_unique == 1 &&
-                      status.backup.over_cap && status.backup.truncated,
-                  "backup usage comes off the engine, every field of it (#316, #323)");
+                      status.backup.over_cap && status.backup.truncated &&
+                      status.backup.state_budget_pruned == 4,
+                  "backup usage comes off the engine, every field of it (#316, #323, #340)");
     checks.ExpectEq(status.enabled, false, "the switch is the one in config.ini");
     checks.ExpectEq(status.configured, true, "and configured follows from a usable server");
     checks.ExpectEq(status.queue_depth, std::int64_t{3}, "the queue depth comes off the engine");

@@ -290,6 +290,21 @@ void BackupRetentionIsReadAndChecked(checks::Checks& c) {
 
   const config::LoadResult stranger = parse("prune = never");
   c.Expect(Complaint(stranger, "backup", "prune") != nullptr, "an unknown key is named");
+
+  // #340: the state budget, on by default -- the one rule that removes a
+  // backup with no second copy, and only ever a state's.
+  c.ExpectEq(defaults.max_state_mib, 256, "state backups are budgeted to 256 MiB by default");
+  c.ExpectEq(defaults.keep_states, 3, "keeping the newest three of each state whatever it says");
+  const config::LoadResult budget = parse("max_state_mib = 0\nkeep_states = 7");
+  c.Expect(budget.value.backup.max_state_mib == 0 && budget.value.backup.keep_states == 7 &&
+               budget.diagnostics.empty(),
+           "both are read, and 0 turns the budget off: " + budget.DescribeDiagnostics());
+  const config::LoadResult no_states = parse("keep_states = 0");
+  c.ExpectEq(no_states.value.backup.keep_states, 3,
+             "keep_states = 0 leaves the default: the newest of a state always stays");
+  c.Expect(Complaint(no_states, "backup", "keep_states") != nullptr, "and says so");
+  const config::LoadResult vast = parse("max_state_mib = 99999999");
+  c.ExpectEq(vast.value.backup.max_state_mib, config::kMaxBackupMaxMib, "past the ceiling clamps");
 }
 
 // --- the happy path ----------------------------------------------------------
@@ -1089,6 +1104,10 @@ void TheDocumentedExampleParses(checks::Checks& c) {
   c.ExpectEq(result.value.sync.interval_min, 30, "the interval the document shows");
   c.ExpectEq(result.value.sync.slot, std::string("autosave"), "the slot the document shows");
   c.Expect(!result.value.sync.states, "states off, as the document shows");
+  c.ExpectEq(result.value.backup.max_state_mib, config::kDefaultBackupMaxStateMib,
+             "the state budget the document shows is the built-in one (#340)");
+  c.ExpectEq(result.value.backup.keep_states, config::kDefaultBackupKeepStates,
+             "and so is keep_states");
   c.ExpectEq(result.value.RomTarget("snes"), std::string("/tico/roms/snes"),
              "and the snes mapping the document shows");
 }
@@ -1152,6 +1171,12 @@ void TheShippedExampleParses(checks::Checks& c) {
              "so is [downloads] verify_hash");
   c.ExpectEq(result.value.downloads.resume, defaults.downloads.resume,
              "and so is [downloads] resume");
+  c.ExpectEq(result.value.backup.max_state_mib, defaults.backup.max_state_mib,
+             "so is [backup] max_state_mib (#340)");
+  c.ExpectEq(result.value.backup.keep_states, defaults.backup.keep_states,
+             "and [backup] keep_states");
+  c.Expect(example.find("\nmax_state_mib") != std::string::npos,
+           "which the shipped example spells out: it is the one setting that removes sole copies");
   // The folder map is commented out, so the built-in one survives a copy whole.
   c.ExpectEq(result.value.RomTarget("snes"), defaults.RomTarget("snes"),
              "the built-in folder map is untouched");
