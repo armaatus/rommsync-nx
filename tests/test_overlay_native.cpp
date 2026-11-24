@@ -1199,6 +1199,63 @@ int RunFrames(Checks& checks) {
                   "and no pairing frame or press waited for a 300 ms answer" + Took(slowest));
   }
 
+  // M11-24 (#329): the library, with R held across several pages of a long
+  // platform. Every page is a `ListNext` the sysmodule takes 300 ms over --
+  // on a console, a page RomM is still serving -- and not one frame waits
+  // for it.
+  {
+    console.engine().library_roms = 300;
+    overlay::ScreenFrame frame(client);
+    overlay::LibraryBrowserModel model;
+    overlay::Link link = overlay::Link::kOk;
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { overlay::PumpLibrary(frame, client, model, link); },
+                                 [&] { return model.selected_position() == 0; }, &slowest),
+                  "the library lists its platform" + Took(slowest));
+    model.Activate();
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        model.MoveSelection(overlay::kPageRows);
+                        overlay::PumpLibrary(frame, client, model, link);
+                      },
+                      [&] { return model.selected_position() >= 290; }, &slowest),
+                  "a held R reaches row 290 of 300, across five pages" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no library frame waited for a 300 ms page" + Took(slowest));
+    overlay::CloseLibrary(frame, client, model);
+    console.engine().library_roms = 0;
+  }
+
+  // The conflicts screen's pages, the same way.
+  {
+    for (std::int64_t id = 1; id <= 12; ++id) {
+      ipc::ConflictRow row;
+      row.entry.id = id;
+      row.entry.kind = rommsync::conflicts::EntryKind::kSave;
+      row.entry.event = rommsync::conflicts::Event::kReplaced;
+      row.entry.rom_id = id;
+      row.entry.rom_name = "Game " + std::to_string(id);
+      row.entry.file_name = "game.srm";
+      row.entry.sd_path = "/roms/gba/game.srm";
+      row.entry.backup_sd_path = "/config/rommsync/.backup/game.srm";
+      row.backup_present = true;
+      console.engine().conflicts_.push_back(row);
+    }
+    overlay::ScreenFrame frame(client);
+    overlay::ConflictsModel model;
+    overlay::Link link = overlay::Link::kOk;
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        model.MoveSelection(1);
+                        overlay::PumpConflicts(frame, client, model, link);
+                      },
+                      [&] { return model.loaded() == 12; }, &slowest),
+                  "the conflicts screen pages through the history" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no conflicts frame waited for a 300 ms page" + Took(slowest));
+  }
+
   // A write past the budget is still applying, not "not responding" (#299):
   // the edit lands, late, and the screen says so rather than calling it a
   // failure and dropping the answer.
