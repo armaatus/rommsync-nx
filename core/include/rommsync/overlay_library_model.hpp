@@ -30,10 +30,15 @@
 //   model.OnRefused(error);             // the sysmodule refused it
 //   model.OnUnreachable(link);          // the transport, or the handshake
 //
-// One command per frame, and one in flight at a time: the overlay draws on one
-// thread and a `cmif` call from it is synchronous, so there is no second
-// command to race. That is also what lets `OnRefused` take an error and nothing
+// One command in flight at a time, and the screen does not ask `Next()` again
+// until it is answered. That is what lets `OnRefused` take an error and nothing
 // else -- the model remembers what it handed out.
+//
+// **The answer can arrive frames later** (M11-24, #329). The screen posts the
+// command and goes on drawing, so the user may scroll, open a platform or go
+// back while a page is out. Every answer is therefore routed to the level it
+// was asked for -- not to whichever level is on top when it lands -- and a
+// cursor answered for a level that has gone since is closed rather than lost.
 //
 // ## What it never does
 //
@@ -229,12 +234,13 @@ class LibraryBrowserModel {
   /// went missing.
   ///
   /// Each `On...` below answers exactly the kind that was handed out and is
-  /// ignored otherwise. The screen sends synchronously, so nothing arrives out
-  /// of order today; the guard is what keeps a page from being answered into a
-  /// level it did not come from if anything ever does.
+  /// ignored otherwise, and lands on the level it was asked for: since #329
+  /// the screen does not wait for the answer, and the level on top may have
+  /// changed under it.
   Command Next();
 
-  /// `ListBegin` answered `cursor`.
+  /// `ListBegin` answered `cursor`. A cursor for a level that has been left
+  /// since, or answered after `Close()`, is queued for `ListEnd` (#329).
   void OnCursor(ipc::Cursor cursor);
 
   /// `ListNext` answered `page`.
@@ -259,6 +265,18 @@ class LibraryBrowserModel {
   /// when the first fresh page arrives -- they stay on screen until then, so a
   /// reclaimed cursor is not a screen that blinks empty.
   void OnRefused(ipc::Error error);
+
+  /// The command handed out is still out past the IPC budget (#329). An
+  /// `Enqueue` says *still applying* on its row; a page needs nothing more
+  /// than the "Loading..." row it already has.
+  void OnApplying();
+
+  /// The command handed out was answered to nobody: another call took the line
+  /// while it was out (#329). Nothing is known about what it did, so a page is
+  /// asked for again on a fresh cursor -- the old one is ended, because its
+  /// place in the list is no longer known -- and an `Enqueue` is not sent again:
+  /// it may have landed, and a press the user did not make is not one to send.
+  void OnLost();
 
   /// The command did not reach the sysmodule, or its answer could not be read.
   ///
@@ -344,19 +362,28 @@ class LibraryBrowserModel {
   /// them reads them again.
   ///
   /// A cursor only goes forward (`list_service.hpp`), so reading them again is
-  /// a **rewind**: the cursor is ended, a new one is opened, and the rows up to
-  /// `rewind_from` are read and dropped on the way, the ones from there to
-  /// `first` gathered into `above`, which is put in front of the window when it
-  /// is complete. Every row the new cursor hands over is routed by its place:
-  /// above the window, inside it (where it replaces the row it is a fresher
-  /// copy of), or at its end. A reclaimed cursor is re-opened the same way --
-  /// up to the window, gathering nothing -- which is why a page off a fresh
-  /// cursor cannot double the rows already drawn.
+  /// a **rewind**: the cursor is ended, a new one is opened at `rewind_from`
+  /// (#339), and the rows from there to `first` are gathered into `above`,
+  /// which is put in front of the window when it is complete. Every row the new
+  /// cursor hands over is routed by its place: above the window, inside it
+  /// (where it replaces the row it is a fresher copy of), or at its end. A
+  /// reclaimed cursor is re-opened the same way -- at the window, gathering
+  /// nothing -- which is why a page off a fresh cursor cannot double the rows
+  /// already drawn. A level that dropped an item it could not read, or was
+  /// handed a page that did not start where its places said (#341), opens at
+  /// row 0 instead and reads down (`StartOf`).
   struct Level {
     LibraryLevel kind = LibraryLevel::kPlatforms;
 
+    /// Which level this is, for an answer that arrives after the stack moved
+    /// (#329). Never reused within a model, so a level left and another opened
+    /// at the same depth is not mistaken for it.
+    std::uint64_t id = 0;
+
     /// How it was opened, kept so a reclaimed cursor can be re-opened with the
-    /// same filter rather than with a guess.
+    /// same filter rather than with a guess. `offset` is the last cursor's
+    /// start, set as each `ListBegin` is handed out, which is where `OnCursor`
+    /// counts the new one's places from.
     ipc::ListRequest request;
 
     /// Zero before `ListBegin` answers, and after a `kBadCursor` retires one.
@@ -372,6 +399,18 @@ class LibraryBrowserModel {
 
     /// The rows the cursor has handed over: the place of the next one.
     int consumed = 0;
+
+    /// The sysmodule's row of the next item the cursor hands over (#341).
+    /// Not `consumed`: an item this build cannot read is a row there and no
+    /// place here. A page whose `start` is not this is one the sysmodule
+    /// counted rows ahead of -- it stepped past a rom too large to send (#248)
+    /// -- and from there down the places here are not its rows.
+    std::int64_t served = 0;
+
+    /// A page has started somewhere other than `served`. Kept for the life of
+    /// the level, as `unreadable_items` is, and for its reason: every later
+    /// cursor opens at row 0, where places count what was handed over.
+    bool drifted = false;
 
     /// The cursor would hand over more. True until a page says otherwise, so a
     /// level that has loaded nothing yet still asks for its first page.
@@ -414,6 +453,24 @@ class LibraryBrowserModel {
 
   Level& top();
   const Level& top() const;
+
+  /// The level the command out was asked for, or nullptr when it has gone.
+  Level* Issued();
+
+  /// Push `level` with a fresh id.
+  void Push(Level level);
+
+  /// The row for `rom_id` in `level` says *still applying* (#329).
+  void MarkApplying(Level* level, std::int64_t rom_id);
+
+  /// Re-open `level` from the start of the list, catching up to its window
+  /// rather than redrawing it: what a reclaimed cursor and a lost page share.
+  static void Reopen(Level& level);
+
+  /// The row a fresh cursor for `level` should start at (#339): the first one
+  /// it has a use for, so a rewind reads the rows it dropped rather than the
+  /// list down to them.
+  static std::int64_t StartOf(const Level& level);
 
   /// Whether this level draws the `kMore` row under its loaded ones.
   ///
@@ -488,11 +545,16 @@ class LibraryBrowserModel {
   /// What `Next()` last handed out, so `OnRefused` knows what was refused.
   Command::Kind issued_ = Command::Kind::kNone;
 
-  /// How deep the stack was when it was handed out. A page is answered into the
-  /// level it was asked for or not at all: `top()` moves under `Back()`,
-  /// `Activate()` and `OpenQueue()`, and a rom page decoded as a platform page
-  /// drops every item and starts a level counting toward `kMaxEmptyPages`.
-  std::size_t issued_depth_ = 0;
+  /// Which level it was handed out for, and on which cursor. A page is
+  /// answered into the level it was asked for or not at all: `top()` moves
+  /// under `Back()`, `Activate()` and `OpenQueue()` while it is out (#329), and
+  /// a rom page decoded as a platform page drops every item and starts a level
+  /// counting toward `kMaxEmptyPages`.
+  std::uint64_t issued_level_ = 0;
+  ipc::Cursor issued_cursor_ = 0;
+
+  /// The id the next level pushed takes.
+  std::uint64_t next_level_id_ = 1;
 
   /// `Close()` has been called. The browser asks for nothing further -- a
   /// screen on its way out that re-opened the list it was closing would hold a

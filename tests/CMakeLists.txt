@@ -531,7 +531,8 @@ add_test(NAME overlay.settings COMMAND test_overlay_settings)
 # M11-1 (#285) `library_pump.cpp`, the library browser's IPC and teardown;
 # M11-15 (#299) `status_pump.cpp`, `sync_pump.cpp` and `pairing_pump.cpp`, the
 # three screens that poll, so a frame against a slow sysmodule can be timed,
-# and `poller.cpp`, the line they poll through without waiting.
+# and `poller.cpp`, the line they poll through without waiting; M11-24 (#329)
+# `log_pump.cpp` and `settings_pump.cpp`, the last two screens to stop waiting.
 # `sysmodule/source/ipc/result.cpp` is the far side's `Error` -> `Result`
 # mapping, compiled in so the overlay's inverse is tested against the real
 # one rather than against a copy of it.
@@ -554,9 +555,11 @@ add_executable(test_overlay_native
   "${CMAKE_SOURCE_DIR}/overlay/source/library_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/lifecycle.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/log_paint.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/log_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/pairing_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/poller.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/screen_frame.cpp"
+  "${CMAKE_SOURCE_DIR}/overlay/source/settings_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_paint.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/status_pump.cpp"
   "${CMAKE_SOURCE_DIR}/overlay/source/sync_pump.cpp"
@@ -589,7 +592,7 @@ foreach(scenario
         errors     # a refusal is not a transport failure, and neither is a bad payload
         timeout    # a sysmodule that does not answer holds no frame past one budget
         restore    # a restore that is still copying holds no frame at all
-        frames     # a sysmodule that answers in 300 ms holds no frame past 2 ms
+        frames     # a sysmodule that answers in 300 ms holds no frame past 2 ms, on any screen
         cycles     # every exit path gives back everything, the same way, every time
         hidden     # polling is by showing, because update() stops while hidden
         scroll     # row 2000 of a platform, by a held R, with the heap flat
@@ -1350,6 +1353,14 @@ set(PRUNE_UNIT_SCENARIOS
   truncated  # past one listing, the rom it cuts sits the prune out, all its groups
   crash      # a power cut at every call of a prune loses no backup's bytes
   other_server  # #294: a backup from before a server switch is never pruned on the new one's word
+  states     # #330: state backups the server provably holds (state.db + an unmoved row) go to the cap
+  state_moved  # #330: a state row the server moved, replaced or dropped, or could not list, proves nothing
+  state_crash  # #330: a power cut at every call of a state prune loses no backup's bytes
+  state_proven  # #330: only a state row this tick confirmed is a proof, never an upload's own
+  state_budget  # #340: traded state backups over the default budget go oldest first; saves never
+  state_budget_off  # #340: with the budget at 0, nothing unique goes
+  state_budget_names  # #340: only a backup state.db names a state's counts against the budget
+  state_budget_crash  # #340: a power cut mid-budget removes a subset of what the prune removes
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})
@@ -2613,6 +2624,8 @@ set(ENGINE_SCENARIOS
   nifm_verdict   # #289: a nifm probe that fails is the console offline, not online
   boots_offline  # #289: a boot with no Wi-Fi holds its tick for the network, past the boot wait
   wakes_offline  # #289: a tick due at a wake waits for Wi-Fi to reassociate, and earns no backoff
+  nifm_unsure_unanswered  # #328: nifm says no internet, RomM silent: held, one heartbeat per budget
+  transport_retried  # #333: a transport down at boot is retried with backoff; the tick waits for it
   romm_forgotten  # M10-2: a heartbeat answered after the engine forgot the server is not recorded
   index_canceled  # #251: a sleep in the library fetch's backoff is a cancelled tick, not an offline one
 )
@@ -2658,13 +2671,16 @@ set(ENGINE_RIG_SCENARIOS
   pair_commit  # `kApproved` only once token.dat is committed; a refused commit keeps the old one
   log_faults   # M7-3: the four transport failures the guide documents, as the proxy makes them
   server_disabled  # #235: sync off in RomM reaches the status screen as the server's switch
-  drains       # M9-5: a rom queued over IPC becomes a file on the card
+  nifm_unsure  # #328: nifm up but never Connected, RomM answering: the held tick runs anyway
+  drains      # M9-5: a rom queued over IPC becomes a file on the card
   romm_version # M10-2: the server's version is read first, and below the floor nothing is asked
   clock        # #295: a console clock a month off the network clock is logged and drawn, then trusted again
   tico_accounts  # #231: two Tico accounts and none named reach the settings screen
   foreground   # #242: no tick under a running game, and one after it closes
   server_deleted # #233: a save deleted in RomM, removed or kept as config.ini says, logged and listed
   backup_pruned  # #292: [backup] read, .backup/ pruned after a completed tick, unique bytes kept
+  state_backup_pruned  # #330: a state backup state.db proves RomM holds is pruned; a unique one stays
+  state_budget  # #340: past [backup] max_state_mib the oldest sole-copy state backup goes; saves never
   backup_truncated  # #323: a .backup/ past one listing draws its Backups row as a floor
   server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch

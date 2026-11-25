@@ -333,8 +333,10 @@ whole life, measured off the linked image in `devkitpro/devkita64:20260219`:
 | the TLS page its four threads share | 4,096 | `TLS_BYTES` |
 | `ssl` | 0 | the `ssl` sysmodule's own process ([M0-1](#m0-1-the-measurement-and-the-decision)) |
 
-**The resident footprint is 2,342,912 bytes (2.23 MiB), recorded 24 KiB over
-what this build measures.** It is one number, and it is held: `switch.builds`
+**The resident footprint is 2,347,008 bytes (2.24 MiB), what this build
+measures.** It was recorded 24 KiB over the build that set it (#296), and raised
+one page from 2,342,912 when #340 and #341 together took the text segment past a
+page boundary (#338). It is one number, and it is held: `switch.builds`
 fails when the linked image plus the stack and the TLS page is over it, or more
 than 64 KiB under it -- a number that stopped being a measurement -- and
 `heap.footprint` fails when this page or INSTALL quotes any other. Moving it is
@@ -385,10 +387,14 @@ tick.** #296 asked whether to, and the answer is no, for now:
   behind the M8-1 gate.
 
 The open risk this leaves is the session count: a co-resident set that already
-holds `bsd:u` full at boot leaves this process without a transport until the
-next boot, since `NetworkInitialize` is not retried (`main.cpp` records why).
-The M12 co-resident run is where that is seen; a lazy retry of the transport is
-the follow-up if it is.
+holds `bsd:u` full at boot leaves this process without a transport at boot.
+Since #333 that is not until the next boot: the worker holds every tick as
+offline and retries `NetworkInitialize` with backoff (10 s, doubling to five
+minutes; `SdEngine::UseTransport`), and the streak is one `net.offline` line
+naming the code. Drains and list pages answer connect-failed meanwhile, as
+they did before. Only the sockets are waited for: `ssl` refused on its own is
+not retried, since a plain `http://` RomM still syncs without it. The M12 co-resident run (NET-08) is where how often it
+happens is seen.
 
 ## Repo build layout
 
@@ -1049,8 +1055,8 @@ A removed command leaves a hole.
 | 8 | `Unpair` | - -> - | `kWriteFailed` |
 | 9 | `Enqueue` | `rom_id` -> position | `kUnknownRom`, `kQueueFull`, `kDuplicate`, `kMultiFile` |
 | 10 | `Dequeue` | `rom_id` -> - | `kNotQueued` |
-| 11 | `ListBegin` | `ListRequest` -> cursor | never fails |
-| 12 | `ListNext` | cursor -> `ListPage` | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
+| 11 | `ListBegin` | `ListRequest` (kind, filter, page size, starting `offset`) -> cursor | never fails; an `offset` past the end opens a list whose first page is empty and the last |
+| 12 | `ListNext` | cursor -> `ListPage` (items, `has_more`, `pending`, and the `start` row of its first item, a rom stepped past counted) | `kBadCursor`, `kNotConfigured`, `kOffline`, `kInternal` |
 | 13 | `ListEnd` | cursor -> - | `kBadCursor` |
 | 14 | `ListConflicts` | `ConflictQuery` (offset + limit) -> `ConflictPage` (each row with `backup_present` and `keep_local`: `open \| held \| waiting`) | never fails; an empty history is a page |
 | 15 | `RestoreBackup` | `entry_id` -> `RestoreState` (phase + which entry) | never fails, never waits for the copy; a press while one runs answers that one |
@@ -1191,7 +1197,7 @@ sync's time, result and counts, whether a tick is running right now
 (`sync_in_progress`), the queue depth, the RomM version the last heartbeat
 read and whether this build syncs with it (`server_version`,
 `server_supported`, #228), what the last prune left in `.backup/` and whether
-it is still over `max_mib` (`backup`, #316), and the **current download**
+it is still over `max_mib`, with the state budget's removals since boot (`backup`, #316, #340), and the **current download**
 (`rom_id`, `fs_name`, `bytes_done`, `bytes_total`, state). That last field is how
 M3-5 is served: one poll per frame, not a second round trip. Per-item queue
 progress rides on the `queue` list kind (M5-4).

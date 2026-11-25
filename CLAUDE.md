@@ -13,9 +13,14 @@ idea to a merged PR — this file is the short form of it.
    command `./scripts/v1-gate.sh`. If a task seems to need hardware, it is the
    wrong task — say so instead of doing it.
 2. **Back up before overwriting a save.** Every path that overwrites a save file
-   writes a backup *first* and writes atomically. This is the one guarantee
-   standing between a bug and a player's destroyed save. It is tested, not
-   assumed — see [docs/SYNC_PROTOCOL.md](docs/SYNC_PROTOCOL.md).
+   writes a backup *first* and writes atomically, and a save's backup is deleted
+   only when its bytes provably exist elsewhere (on RomM, or in a newer backup).
+   The one exception is save-**state** backups past `[backup] max_state_mib` (on
+   by default, #340): the oldest beyond the newest `keep_states` of each state
+   are deleted with no second copy. It never applies to a save's backup, never to
+   one of a state's newest, and only to backups `state.db` names as a state's.
+   This is the one guarantee standing between a bug and a player's destroyed
+   save. It is tested, not assumed — see [docs/SYNC_PROTOCOL.md](docs/SYNC_PROTOCOL.md).
 3. **The server is the source of truth** for sync conflicts.
 4. **Nothing in `core/` may include a host-only or libnx header.** Platform
    details live behind interfaces so the engine stays testable natively.

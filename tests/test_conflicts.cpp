@@ -2202,6 +2202,29 @@ void Overlay(checks::Checks& c) {
                "and one that ran out of budget is asked about, not pressed again");
     }
 
+    // M11-24 (#329): the screen does not wait for the press. Out past the
+    // budget it says still applying -- off the choice, which would invite a
+    // second press -- and one whose answer went to nobody is asked about, as a
+    // slow one is, without the link ever changing.
+    {
+      overlay::ConflictsModel late = conflict_model(66);
+      late.Activate();
+      late.Activate();
+      late.MoveSelection(1);
+      late.Activate();
+      c.Expect(late.Next().kind == overlay::ConflictsModel::Command::Kind::kKeepLocal,
+               "the Keep local goes out");
+      late.OnApplying();
+      const overlay::ConflictsView applying = late.Render();
+      c.Expect(applying.mode == overlay::ConflictsMode::kDetail &&
+                   applying.headline == overlay::kStillApplying,
+               "past the budget the entry says still applying: " + applying.headline);
+      late.OnLost();
+      c.Expect(late.Render().link == overlay::Link::kOk, "a lost answer is not a lost link");
+      c.Expect(late.Next().kind == overlay::ConflictsModel::Command::Kind::kRestoreState,
+               "and the press is asked about, not sent again");
+    }
+
     // Skip decides nothing: back to the list, nothing sent.
     {
       overlay::ConflictsModel skip = conflict_model(64);

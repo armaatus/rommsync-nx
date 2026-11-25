@@ -194,7 +194,20 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **19** since M11-22 (#323), which added `truncated` to `Status`'s `backup`
 /// -- a required field, so a v19 overlay reading a v18 sysmodule's `Status`
 /// fails to decode it.
-inline constexpr std::uint32_t kVersion = 19;
+///
+/// **20** since #339, which added `offset` to `ListRequest` -- a required
+/// field, so a v19 overlay's `ListBegin` is refused by a v20 sysmodule, and a
+/// v19 sysmodule would serve a v20 overlay's rewind from row 0 into rows it
+/// routes as though they started further down.
+///
+/// **21** since #341, which added `start` to `ListPage` -- a required field,
+/// so a v21 overlay refuses a v20 sysmodule's pages rather than place rows
+/// after a rom it stepped past one place off.
+///
+/// **22** since M11-26 (#340), which added `state_budget_pruned` to `Status`'s
+/// `backup` -- a required field, so a v22 overlay reading a v21 sysmodule's
+/// `Status` fails to decode it.
+inline constexpr std::uint32_t kVersion = 22;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -482,6 +495,12 @@ struct BackupUsage {
   /// what was listed -- and the status screen leads its row with `≥` rather
   /// than drawing it as the total.
   bool truncated = false;
+
+  /// State backups the state budget (`[backup] max_state_mib`, #340) removed
+  /// since boot with no other copy of their bytes shown: the one removal that is
+  /// not a proof. Since boot rather than the last prune's, because a trade
+  /// removes about one per prune and the row is there to say it happens at all.
+  std::int64_t state_budget_pruned = 0;
 };
 
 /// Everything the status screen needs, in one call.
@@ -847,6 +866,13 @@ struct ListRequest {
   /// What the client would like. **Clamped** to `[1, kMaxPageSize]` by the
   /// sysmodule; the page says how many it actually holds.
   std::int32_t page_size = kMaxPageSize;
+
+  /// The row the cursor starts at, 0-based (#339). What lets the library climb
+  /// back above its window by reading the rows it dropped rather than the whole
+  /// list down to them: the sysmodule pages RomM by offset already, so a
+  /// cursor opened at row 1500 costs one page, not 1500 rows of them. Past the
+  /// end of the list is not an error -- the first page is empty and the last.
+  std::int64_t offset = 0;
 };
 
 /// One field of one list item.
@@ -895,6 +921,20 @@ struct ListPage {
   /// Fetching may not block the IPC thread on the network (#31), so a page that
   /// is not there yet is an answer rather than a wait. `items` is empty.
   bool pending = false;
+
+  /// The list row `items[0]` is, 0-based, by the sysmodule's count (#341).
+  ///
+  /// Not always the row after the last page's: a rom too large to send even
+  /// alone is stepped past (#248), and the row it held is then in the
+  /// sysmodule's count and on no page. The overlay places rows by what it has
+  /// been handed, so a step it was not told about puts every row after it one
+  /// place off -- which a cursor opened at an offset, counting places from that
+  /// row, would then route onto the wrong rom. On an empty or `pending` page,
+  /// the row the next item would be.
+  ///
+  /// Set **before** the page is filled: `AppendIfItFits` measures the page as
+  /// it will be sent, and a start written afterwards is digits it never counted.
+  std::int64_t start = 0;
 };
 
 /// Add `item` to `page` unless doing so would break a bound.

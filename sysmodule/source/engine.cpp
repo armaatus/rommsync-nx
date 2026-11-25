@@ -1,7 +1,9 @@
 #include "engine.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -173,6 +175,19 @@ void SdEngine::UseNetworkProbe(NetworkProbe probe, std::chrono::milliseconds bud
   network_budget_ = budget;
   network_poll_ = poll;
   network_idle_poll_ = idle_poll;
+}
+
+void SdEngine::UseTransport(TransportInit init, std::chrono::milliseconds first_retry,
+                            std::chrono::milliseconds max_retry) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  transport_init_ = std::move(init);
+  transport_first_retry_ = first_retry;
+  transport_max_retry_ = max_retry;
+}
+
+void SdEngine::UseRommTrust(RommTrust trust) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  romm_trust_ = std::move(trust);
 }
 
 void SdEngine::UseNetworkClock(NetworkClock clock) {
@@ -1172,13 +1187,143 @@ void SdEngine::ObserveAnswer(auth::Answer answer) {
   auth::SaveBlock(PathTo(auth::kAuthStateFileName), block);
 }
 
-bool SdEngine::NetworkUp() const {
+NifmVerdict SdEngine::NetworkVerdict() const {
   NetworkProbe probe;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     probe = network_probe_;
   }
-  return !probe || probe();
+  return probe ? probe() : NifmVerdict::kOnline;
+}
+
+bool SdEngine::RommAnswers(std::chrono::steady_clock::time_point now) {
+  const std::shared_ptr<http::CancelToken> cancel = std::make_shared<http::CancelToken>();
+  http::HttpClient* client = nullptr;
+  std::chrono::milliseconds budget{0};
+  RommTrust trust;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    budget = network_budget_;
+    trust = romm_trust_;
+    client = server_;
+  }
+  // `offline_since_` and the two `romm_` members are the worker's alone, so
+  // they are read here without `mutex_`.
+  if (romm_answered_ != true &&
+      (now - offline_since_.value_or(now) < budget || now < romm_ask_due_)) {
+    return false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Registered as the tick's, so a shutdown or a sleep landing during the
+    // ask cuts it short exactly as it would the tick's own heartbeat.
+    tick_cancel_ = cancel;
+    if (stopping_ || suspended_) {
+      cancel->Cancel();
+    }
+  }
+  const std::shared_ptr<const config::Config> config = ConfigSnapshot();
+  if (client == nullptr || !config->configured()) {
+    // Nothing to ask, and nothing for the hold to protect: the tick runs and
+    // says what is missing, as it would on a console nifm vouched for.
+    return true;
+  }
+  // One attempt rather than the retries every other call gets: the retry is
+  // the next ask, a budget later, and a console that really is offline should
+  // not spend a backoff's worth of attempts finding out each time.
+  sync::CallPolicy policy = PolicyFor(cancel.get());
+  policy.timeout = kRommAskTimeout;
+  policy.max_attempts = 1;
+  // The connector refuses nifm's "no internet" unless told otherwise, and this
+  // heartbeat is the one request that has to get past it to find out.
+  if (trust) trust(true);
+  const server::Probe probe = server::ReadServer(*client, config->server.url, policy);
+  if (probe.transport == http::Error::kCanceled) {
+    if (trust) trust(romm_answered_ == true);
+    return false;
+  }
+  // A heartbeat, and not merely an answer: a captive portal answers every
+  // plain-http URL, and a tick run against one sends it the library fetch and
+  // the token (NET-04). A RomM too old still reads as a heartbeat, and the tick
+  // is what says so.
+  const bool answered = probe.ok();
+  if (trust) trust(answered);
+  if (!answered) {
+    romm_ask_due_ = clock_->Steady() + budget;
+  }
+  if (romm_answered_ != answered) {
+    romm_answered_ = answered;
+    if (answered) {
+      log::Info(log::Event::kNetOffline,
+                "nifm says the console has no internet connection, but RomM answered; "
+                "syncing without nifm");
+    } else {
+      log::Warn(log::Event::kNetOffline,
+                "nifm says the console has no internet connection, and RomM did not answer "
+                "either: " + probe.message);
+    }
+  }
+  return answered;
+}
+
+std::optional<std::uint32_t> SdEngine::TransportDown(std::chrono::steady_clock::time_point now) {
+  // The `transport_` members are the worker's alone, so they are read here
+  // without `mutex_`.
+  if (transport_up_) {
+    return std::nullopt;
+  }
+  TransportInit init;
+  std::chrono::milliseconds first{0};
+  std::chrono::milliseconds max_retry{0};
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    init = transport_init_;
+    first = transport_first_retry_;
+    max_retry = std::max(first, transport_max_retry_);
+  }
+  if (!init) {
+    return std::nullopt;
+  }
+  if (transport_failures_ > 0 && now < transport_retry_due_) {
+    return transport_code_;
+  }
+  // Outside the lock: on a console this is `socketInitialize` and
+  // `sslInitialize`, IPC to three services.
+  const std::uint32_t code = init();
+  if (code == 0) {
+    transport_up_ = true;
+    // Every call is a retry of `__appInit`'s (`UseTransport`), so this is
+    // always news: the boot log's `rommsync: NetworkInitialize` line said it
+    // failed.
+    log::Info(log::Event::kNetOffline,
+              "the socket transport came up on retry " + std::to_string(transport_failures_ + 1) +
+                  "; ticks run again");
+    return std::nullopt;
+  }
+  ++transport_failures_;
+  transport_code_ = code;
+  transport_backoff_ =
+      transport_failures_ == 1 ? first : std::min(transport_backoff_ * 2, max_retry);
+  // From now rather than from `now`: the try was IPC, and the wait is meant to
+  // be between tries, not to include one.
+  transport_retry_due_ = clock_->Steady() + transport_backoff_;
+  if (transport_failures_ == 1) {
+    // Once per streak: a console whose co-resident set holds every `bsd:u`
+    // session all day is one line, and the code is what tells that case
+    // (`bsd:u` refusing a session) from a heap that would not fit the buffers.
+    // `std::to_chars` rather than `snprintf`, for the sysmodule's size
+    // (`switch.builds`).
+    char hex[16];
+    const std::to_chars_result end = std::to_chars(hex, hex + sizeof(hex), code, 16);
+    const auto seconds = [](std::chrono::milliseconds wait) {
+      return std::to_string(std::chrono::duration_cast<std::chrono::seconds>(wait).count());
+    };
+    log::Warn(log::Event::kNetOffline,
+              "the socket transport did not come up (0x" + std::string(hex, end.ptr) +
+                  "); ticks wait for it, and it is tried again in " + seconds(first) +
+                  " s, then less often, to every " + seconds(max_retry) + " s");
+  }
+  return code;
 }
 
 bool SdEngine::AwaitNetwork() {
@@ -1221,7 +1366,7 @@ bool SdEngine::AwaitNetwork() {
     lock.unlock();
     // Outside the lock: `nifm` is a service call and `mutex_` guards state the
     // frame-polled commands read.
-    const bool up = probe();
+    const bool up = probe() == NifmVerdict::kOnline;
     lock.lock();
     if (up) {
       return true;
@@ -1345,10 +1490,41 @@ void SdEngine::RunWorker() {
       // `network_poll_` for a budget and every `network_idle_poll_` after it,
       // so the tick runs within seconds of Wi-Fi coming back. Ahead of the
       // game check, which is a `pm` call a held tick need not spend.
+      //
+      // **Only nifm's "no network" holds for good** (#328). "No internet" is
+      // also what a console that blocks Nintendo on purpose may say forever,
+      // and its RomM is on the LAN: once the hold has outlasted the budget --
+      // Wi-Fi reassociating is long done by then -- RomM is asked directly.
+      //
+      // **Nor does a tick run on a transport that never came up** (#333): a
+      // co-resident set holding every `bsd:u` session at boot is held exactly
+      // like "no network", and the transport is tried again on its own backoff
+      // rather than given up on until the next boot. Ahead of nifm, which has
+      // nothing to say about sockets this process does not have.
       lock.unlock();
-      const bool network_up = NetworkUp();
+      const std::optional<std::uint32_t> transport = TransportDown(clock_->Steady());
+      NifmVerdict nifm = NifmVerdict::kOnline;
+      bool network_up = false;
+      if (!transport) {
+        nifm = NetworkVerdict();
+        network_up = nifm == NifmVerdict::kOnline;
+        if (!network_up && nifm != NifmVerdict::kOffline) {
+          network_up = RommAnswers(clock_->Steady());
+        }
+      }
       lock.lock();
-      if (!network_up) {
+      if (!network_up && transport) {
+        // Its own pace and its own line (`TransportDown`'s); the nifm hold's
+        // `offline_since_` is left alone, so a hold that follows once the
+        // transport is up is a new one and says so.
+        scheduler_.Defer(decision.trigger);
+        const std::chrono::steady_clock::time_point now = clock_->Steady();
+        decision = sync::Decision{};
+        decision.sleep_for = transport_retry_due_ > now
+                                 ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       transport_retry_due_ - now)
+                                 : std::chrono::milliseconds{0};
+      } else if (!network_up) {
         scheduler_.Defer(decision.trigger);
         const std::chrono::steady_clock::time_point now = clock_->Steady();
         if (!offline_since_) {
@@ -1360,10 +1536,21 @@ void SdEngine::RunWorker() {
           offline_said_ = true;
           // Once per hold, as `sync.held` is: a console in a bag all day is one
           // line, not one per re-check. Outside the lock: it is a card write.
+          // Which of the two it is, because only one has a fix (#328).
+          const std::string tick = sync::ToString(decision.trigger);
+          const std::string seconds = std::to_string(
+              std::chrono::duration_cast<std::chrono::seconds>(network_budget_).count());
           lock.unlock();
-          log::Warn(log::Event::kNetOffline,
-                    std::string("the console has no internet connection; the ") +
-                        sync::ToString(decision.trigger) + " tick waits for the network");
+          if (nifm == NifmVerdict::kOffline) {
+            log::Warn(log::Event::kNetOffline,
+                      "the console has no network (airplane mode, or none in range); the " +
+                          tick + " tick waits for the network");
+          } else {
+            log::Warn(log::Event::kNetOffline,
+                      "nifm says the console has no internet connection; the " + tick +
+                          " tick waits for the network, and asks RomM directly after " +
+                          seconds + " s");
+          }
           lock.lock();
         }
         decision = sync::Decision{};
@@ -2484,7 +2671,8 @@ SdEngine::TickRun SdEngine::RunOneTick() {
   bool states_held = false;
   const sync::StateSyncReport states =
       RunStatesHalf(inputs, library, found, &placer, record, tick.outcome, &states_held);
-  PruneBackups(inputs, tick, states, tally, states_held, found.bound_since);
+  PruneBackups(inputs, tick, states, tally, states_held, found.baseline_path,
+               found.bound_since);
   writing.unlock();
   // The states half's requests went out on the same token, so what they were
   // answered counts towards the one verdict, as the saves half's did.
@@ -2510,7 +2698,8 @@ SdEngine::TickRun SdEngine::RunOneTick() {
 
 void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& tick,
                             const sync::StateSyncReport& states, const SavesTally& tally,
-                            bool states_held, std::int64_t bound_since) {
+                            bool states_held, const std::string& baseline_path,
+                            std::int64_t bound_since) {
   // Only at the end of a tick that did everything it set out to: a backup an
   // operation that failed half way wrote is the one most likely to be wanted,
   // and the retention rule is not the place to second-guess that tick.
@@ -2536,8 +2725,26 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   const auth::StoredToken* token = &inputs.token;
   sync::CallPolicy policy;
   policy.cancel = inputs.cancel.get();
-  options.server_digests = [client, token, policy](std::int64_t rom_id) {
-    return backup::ListServerSaveDigests(*client, *token, rom_id, policy);
+  // RomM keeps no digest of a state, so a state's proof is `state.db`'s: the
+  // MD5 of the bytes the last transfer moved, for the rows this tick's states
+  // half confirmed, against a server row the prune then finds unmoved (#330).
+  // Read back rather than carried, as the states half reads it, after that
+  // half stored it.
+  //
+  // The whole of it also says which backups are a state's, for the state
+  // budget (#340): the one removal without a proof, so what it counts is what
+  // `state.db` names, never a name that only looks like a state's. Read
+  // whether or not the states half ran -- a state traded last week is still a
+  // state's backup with `[sync] states` turned off since.
+  const state::Baseline stored = state::LoadBaseline(baseline_path).value;
+  options.is_state_backup = backup::StateBackupsOf(stored);
+  state::Baseline proven;
+  if (states.ran) {
+    proven = backup::ProvenStates(stored, states);
+  }
+  const state::Baseline* proven_states = proven.state_rows().empty() ? nullptr : &proven;
+  options.server_digests = [client, token, policy, proven_states](std::int64_t rom_id) {
+    return backup::ListProvenServerDigests(*client, *token, rom_id, proven_states, policy);
   };
   // A backup from before this console synced with this server names another
   // server's rom id, so this one's digests are not its proof (#294).
@@ -2560,6 +2767,9 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
     backup_usage_.kept_unique = static_cast<std::int64_t>(report.kept_unique);
     backup_usage_.over_cap = report.over_cap;
     backup_usage_.truncated = report.truncated;
+    // Since boot rather than this prune's (#340). A removal means a backup was
+    // found, so it never misses this branch.
+    backup_usage_.state_budget_pruned += static_cast<std::int64_t>(report.budget_pruned);
   }
   log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
   // A cut listing is logged even with nothing else to say: it is what explains

@@ -240,6 +240,10 @@ struct RepairState {
   bool confirming = false;
 
   RepairOutcome outcome = RepairOutcome::kNone;
+
+  /// The confirmed press is out past the IPC budget and not answered yet
+  /// (#329): `kStillApplying`, until the answer replaces it.
+  bool applying = false;
 };
 
 /// What the last press on a setting row produced (#264).
@@ -256,6 +260,10 @@ struct ChangeState {
 
   /// What `SetConfig` answered.
   ipc::ConfigResult result;
+
+  /// A press is out past the IPC budget and not answered yet (#329). Said
+  /// whether or not `sent` is, and ahead of it: the answer replaces it.
+  bool applying = false;
 };
 
 /// Everything the settings screen draws, and nothing about how.

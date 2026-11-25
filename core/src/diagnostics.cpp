@@ -175,6 +175,8 @@ std::string Header(const Bundle& bundle) {
     Line(&out, "kept_unique", at_least + std::to_string(b.kept_unique));
     Line(&out, "over_cap", YesNo(b.over_cap));
     Line(&out, "truncated", YesNo(b.truncated));
+    // Since boot, and never a floor: it counts removals, not what a listing saw.
+    Line(&out, "state_budget_pruned", b.state_budget_pruned);
   }
 
   out += "\n[crash_reports]\n";

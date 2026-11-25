@@ -18,6 +18,11 @@
 // drop an edit that took. A press still out after `kBudgetsBeforeStuck`
 // budgets is *not responding* after all; its answer is still used if it comes.
 //
+// A screen whose commands are decided by a model rather than by a clock -- the
+// library and conflicts screens' `Next()` (M11-24, #329) -- takes one with
+// `kSendsOnly`: no read, only the handshake, the port on the cadence while it
+// is down, and the commands it is handed through `Send`.
+//
 // It names no libultrahand type, which `overlay.portable` holds it to.
 #pragma once
 
@@ -63,8 +68,16 @@ class Poller {
     Result rc = 0;
   };
 
-  /// `read` is the command asked on the cadence, with an empty request.
+  /// `read` is the command asked on the cadence, with `read_request` -- an
+  /// empty one when that is empty.
   Poller(ScreenFrame& frame, IpcClient& client, ipc::Command read,
+         int frames_between_reads = kFramesBetweenReads, std::string_view read_request = {});
+
+  /// No read: what a screen whose model decides every command takes (#329).
+  /// The cadence then only says when to try the port again while it is down.
+  struct SendsOnly {};
+  static constexpr SendsOnly kSendsOnly{};
+  Poller(ScreenFrame& frame, IpcClient& client, SendsOnly,
          int frames_between_reads = kFramesBetweenReads);
 
   Poller(const Poller&) = delete;
@@ -82,6 +95,17 @@ class Poller {
   /// A `Send` is waiting to go or still out.
   bool sending() const { return queued_ || flight_ == Flight::kSend; }
 
+  /// The last word on the line was not `kUnreachable`: the handshake passed, a
+  /// call was taken or a call came back since. With `ScreenFrame::checked()`,
+  /// what tells a screen whose model was told the line went that it is back.
+  bool linked() const { return linked_; }
+
+  /// The screen is going away: wait, **within the budget**, for the call that
+  /// is out and report it as `Frame` would. `kNone` when nothing was out or it
+  /// did not come back in time. A `Send` not yet posted is dropped. For a
+  /// teardown only -- it is the one place a `Poller` waits (#329).
+  Event Drain();
+
  private:
   enum class Flight { kNone, kHandshake, kRead, kSend };
 
@@ -96,7 +120,8 @@ class Poller {
   /// The call is still out: say so once it has been out for the budget.
   Event Pending();
 
-  static Event Unreachable(Link link) {
+  Event Unreachable(Link link) {
+    linked_ = false;
     Event event;
     event.kind = Event::Kind::kUnreachable;
     event.link = link;
@@ -105,8 +130,14 @@ class Poller {
 
   ScreenFrame& frame_;
   IpcClient& client_;
+  /// Whether there is a read at all (`kSendsOnly`), which, and with what.
+  const bool reads_;
   const ipc::Command read_;
+  const std::string read_request_;
   Cadence cadence_;
+
+  /// See `linked()`.
+  bool linked_ = true;
 
   /// What is out, under which ticket, since when, and in which showing.
   Flight flight_ = Flight::kNone;

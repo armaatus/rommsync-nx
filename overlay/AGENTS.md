@@ -61,9 +61,10 @@ Ultrahand overlay list.
 - **The parts of this directory that need no renderer are compiled and run on a
   host.** `source/card_probe.cpp`, `source/conflicts_pump.cpp`,
   `source/ipc_client.cpp`, `source/library_pump.cpp`, `source/lifecycle.cpp`,
-  `source/log_paint.cpp`, `source/pairing_pump.cpp`, `source/poller.cpp`,
-  `source/screen_frame.cpp`, `source/status_paint.cpp`,
-  `source/status_pump.cpp` and `source/sync_pump.cpp` are built into
+  `source/log_paint.cpp`, `source/log_pump.cpp`, `source/pairing_pump.cpp`,
+  `source/poller.cpp`, `source/screen_frame.cpp`, `source/settings_pump.cpp`,
+  `source/status_paint.cpp`, `source/status_pump.cpp` and
+  `source/sync_pump.cpp` are built into
   `test_overlay_native` and driven against the real `ipc::Dispatch` and the real
   `sysmodule::ToResult` — so a payload the two halves disagree about is a red
   test rather than a first-boot surprise. libnx comes from
@@ -125,7 +126,10 @@ Ultrahand overlay list.
   menus that disagree about what exists.
 - All IPC goes through `source/ipc_client.*`. A screen never builds a payload
   itself; if a screen needs something the client cannot answer, the command
-  belongs in `docs/DEVELOPMENT.md#ipc` and in `rommsync/ipc.hpp` first.
+  belongs in `docs/DEVELOPMENT.md#ipc` and in `rommsync/ipc.hpp` first. A pump
+  posting through a `Poller` encodes its request with `rommsync/ipc.hpp`'s own
+  encoders -- what `sync_pump` and `pairing_pump` did since #299, and the
+  library, conflicts, log and settings pumps since #329 -- never by hand.
 - **No call waits longer than `IpcClient::kCallBudget`, and no command may need
   to** (M9-6, #209). The client dispatches on a worker thread of its own and the
   draw thread waits at most the budget; past it the call answers
@@ -155,12 +159,16 @@ Ultrahand overlay list.
   overlay at three frames a second. The status, sync and pairing screens go
   through `source/poller.*` instead: it posts (`IpcClient::Post`), collects on
   a later frame, reads about four times a second, and turns a press out past
-  the budget into *still applying* rather than a failure. A new screen that
-  polls takes a `Poller` and puts its frame in a `<thing>_pump.*`;
-  `ctest -R overlay.frames` is where its frames get timed. The library,
-  conflicts, log and settings screens still wait, within the budget, for at
-  most one command a frame; they were outside #299's scope, and moving one is
-  moving its pump onto a `Poller`.
+  the budget into *still applying* rather than a failure. M11-24 (#329) moved
+  the other four: the log and settings screens poll the same way
+  (`log_pump.*`, `settings_pump.*`), and the library and conflicts screens,
+  whose commands a model decides rather than a clock, take a `Poller` with
+  `kSendsOnly` and hand it the model's `Next()` -- one out at a time, its
+  answer routed to the level it was asked for, since the user may have moved
+  on by the time it lands. **No screen waits on the draw thread now**; the one
+  wait left is a teardown's (`LibraryPump::Close`, within the budget per
+  call). A new screen takes a `Poller` and puts its frame in a
+  `<thing>_pump.*`; `ctest -R overlay.frames` is where its frames get timed.
 - **A list repeats a held key itself** (M11-14, #298). libtesla repeats only by
   moving focus, and a `CustomDrawer` is never focused, so a held D-pad on the
   library or the conflicts screen used to be one row. Those screens turn their

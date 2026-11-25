@@ -55,6 +55,11 @@ struct Backup {
   bool removed = false;
   /// Examined and kept as the only copy; not offered a second time.
   bool kept = false;
+  /// The card refused to remove it once; never asked again this prune.
+  bool unremovable = false;
+  /// Position among its state's backups the state budget counts, newest first
+  /// and from 1; 0 is one it does not count (#340).
+  std::size_t state_rank = 0;
   std::optional<std::string> digest;  ///< computed once, empty string = unreadable
 };
 
@@ -112,8 +117,10 @@ class Pruner {
         if (backup.removed || backup.kept || backup.rank == 0) continue;
         Offer(at);
       }
-      report_->over_cap = total_ > keep.max_bytes;
     }
+    // Last, and only over states: the one pass that removes without a proof.
+    if (keep.max_state_bytes > 0 && options_.is_state_backup) Budget(order, keep);
+    report_->over_cap = keep.max_bytes > 0 && total_ > keep.max_bytes;
     report_->bytes_after = total_;
   }
 
@@ -173,6 +180,54 @@ class Pruner {
     }
   }
 
+  /// The state budget (#340): while the state backups `is_state_backup` names
+  /// hold more than `max_state_bytes`, the oldest of them beyond the newest
+  /// `keep_states` of their state go -- by proof when there is one, and
+  /// without one when there is not. See the header.
+  void Budget(const std::vector<std::size_t>& order, const Retention& keep) {
+    const std::size_t keep_states = static_cast<std::size_t>(std::max(keep.keep_states, 1));
+    // A state's own rank, counted over what is still on the card and what the
+    // budget counts: a save backup that happens to share a group, or one from
+    // before this server, must not stand in for one of a state's newest. And
+    // per extension, not per group: RetroArch's slots of one game, `.state1`
+    // and `.state2`, share the discriminator `state-Game` and are two states.
+    std::int64_t state_total = 0;
+    for (const std::vector<std::size_t>& members : members_) {
+      for (std::size_t i = 0; i < members.size(); ++i) {
+        Backup& backup = backups_[members[i]];
+        const std::string_view extension = sync::ExtensionOf(backup.name);
+        if (backup.removed || backup.parsed.unix_seconds < options_.server_since ||
+            !options_.is_state_backup(backup.parsed, extension)) {
+          continue;
+        }
+        backup.state_rank = 1;
+        for (std::size_t newer = 0; newer < i; ++newer) {
+          const Backup& other = backups_[members[newer]];
+          if (other.state_rank > 0 && sync::ExtensionOf(other.name) == extension) {
+            ++backup.state_rank;
+          }
+        }
+        state_total += backup.size;
+      }
+    }
+    for (const std::size_t at : order) {
+      if (state_total <= keep.max_state_bytes) break;
+      Backup& backup = backups_[at];
+      if (backup.removed || backup.unremovable || backup.state_rank <= keep_states) continue;
+      // A copy that is provably elsewhere goes as one: only what is left --
+      // which `Offer` has counted as kept -- is the budget's to answer for.
+      if (!backup.kept) Offer(at);
+      if (backup.unremovable) continue;
+      if (!backup.removed) {
+        if (!Remove(at)) continue;
+        --report_->kept_unique;
+        ++report_->budget_pruned;
+      }
+      state_total -= backup.size;
+    }
+    report_->state_bytes_after = state_total;
+  }
+
   /// Remove `at` if its bytes are provably somewhere else; otherwise keep it.
   void Offer(std::size_t at) {
     Backup& backup = backups_[at];
@@ -186,16 +241,25 @@ class Pruner {
       ++report_->kept_unique;
       return;
     }
+    if (!Remove(at)) ++report_->kept_unique;
+  }
+
+  /// One `remove()`, accounted. False, with the backup marked kept and a
+  /// warning, when the card would not.
+  bool Remove(std::size_t at) {
+    Backup& backup = backups_[at];
     const std::string resolved = files_.Resolve(backup.sd_path);
     if (resolved.empty() || io::Remove(resolved) != 0) {
       backup.kept = true;
-      ++report_->kept_unique;
+      backup.unremovable = true;
       Warn(backup.sd_path + " could not be removed");
-      return;
+      return false;
     }
     backup.removed = true;
+    backup.kept = false;
     total_ -= backup.size;
     ++report_->pruned;
+    return true;
   }
 
   const std::string& DigestOf(std::size_t at) {
@@ -294,7 +358,56 @@ Retention RetentionFor(const config::BackupConfig& backup) {
   retention.keep = backup.keep;
   retention.keep_days = backup.keep_days;
   retention.max_bytes = std::int64_t{backup.max_mib} * 1024 * 1024;
+  retention.max_state_bytes = std::int64_t{backup.max_state_mib} * 1024 * 1024;
+  retention.keep_states = backup.keep_states;
   return retention;
+}
+
+namespace {
+
+/// `<rom>/<discriminator>/<extension>`: one string per group, so the lookup is
+/// a sorted vector's rather than a set of tuples' -- the sysmodule's image is
+/// budgeted by the page (scripts/image-budget.sh). A discriminator is
+/// sanitised and an extension is part of a single file name, so neither holds
+/// a `/`.
+std::string GroupKey(std::int64_t rom_id, std::string_view discriminator,
+                     std::string_view extension) {
+  std::string key = std::to_string(rom_id);
+  key += '/';
+  key += discriminator;
+  key += '/';
+  key += extension;
+  return key;
+}
+
+}  // namespace
+
+IsStateBackup StateBackupsOf(const state::Baseline& baseline) {
+  // What a state download (`state_sync.cpp`) and a state restore
+  // (`conflict_record.cpp`) name a backup: the row's rom, the discriminator of
+  // its name, and its name's extension.
+  std::vector<std::string> states;
+  for (const auto& [key, row] : baseline.state_rows()) {
+    states.push_back(GroupKey(row.rom_id, sync::StateBackupDiscriminator(row.file_name),
+                              sync::ExtensionOf(row.file_name)));
+  }
+  if (states.empty()) return nullptr;
+  // A save's slot is whatever some client chose, so one can be spelled
+  // `state-Game` (sync_execute.hpp). A group a save row of the same rom could
+  // also have written is not known to be a state's, and stays out.
+  std::vector<std::string> saves;
+  for (const auto& [key, row] : baseline.rows()) {
+    saves.push_back(GroupKey(row.rom_id, sync::SlotBackupDiscriminator(row.slot), {}));
+  }
+  std::sort(states.begin(), states.end());
+  std::sort(saves.begin(), saves.end());
+  return [states = std::move(states), saves = std::move(saves)](const BackupName& name,
+                                                                std::string_view extension) {
+    return !std::binary_search(saves.begin(), saves.end(),
+                               GroupKey(name.rom_id, name.discriminator, {})) &&
+           std::binary_search(states.begin(), states.end(),
+                              GroupKey(name.rom_id, name.discriminator, extension));
+  };
 }
 
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options) {
@@ -312,18 +425,26 @@ std::string Describe(const PruneReport& report) {
     line += "; " + std::to_string(report.kept_unique) +
             " kept past the retention rule because no other copy of their bytes could be found";
   }
+  if (report.budget_pruned > 0) {
+    line += "; " + std::to_string(report.budget_pruned) +
+            " of them save-state backups [backup] max_state_mib removed with no other copy known";
+  }
   if (report.over_cap) line += "; still over the size cap";
   if (report.truncated) line += "; the directory holds more than one listing shows";
   return line;
 }
 
-std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& client,
-                                                              const auth::StoredToken& token,
-                                                              std::int64_t rom_id,
-                                                              const sync::CallPolicy& policy) {
+namespace {
+
+/// `GET <path>?rom_id=<rom_id>`'s body, retried with backoff on a transient
+/// failure; nullopt for anything that is not a clean 2xx of at most `max_bytes`.
+/// The listings the prune proves a backup with, which an unread one never does.
+std::optional<std::string> GetRomListing(http::HttpClient& client, const auth::StoredToken& token,
+                                         const char* path, std::int64_t rom_id,
+                                         std::size_t max_bytes, const sync::CallPolicy& policy) {
   http::Request request;
   request.method = http::Method::kGet;
-  request.url = http::JoinUrl(token.server_url, "/api/saves") + "?rom_id=" + std::to_string(rom_id);
+  request.url = http::JoinUrl(token.server_url, path) + "?rom_id=" + std::to_string(rom_id);
   request.headers.push_back({"Accept", "application/json"});
   request.headers.push_back({"Authorization", "Bearer " + token.access_token});
   request.timeout = policy.timeout;
@@ -333,29 +454,111 @@ std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& 
   retry::Backoff backoff = sync::BackoffFor(policy);
   for (int attempt = 1;; ++attempt) {
     if (policy.cancel != nullptr && policy.cancel->canceled()) return std::nullopt;
-    const http::Result result = client.Send(request);
+    http::Result result = client.Send(request);
     if (result.successful()) {
-      if (result.response.body.size() > http::kMaxResponseBytes) return std::nullopt;
-      std::vector<std::string> digests;
-      static constexpr std::string_view kKeep[] = {"content_hash"};
-      const json::ParseResult parsed = json::ParseEach(
-          result.response.body, "", kKeep,
-          [&digests](const json::Value& row, std::size_t) {
-            const json::Value* hash = row.Find("content_hash");
-            if (hash != nullptr && hash->is_string() && sync::IsContentHash(hash->string())) {
-              digests.push_back(config::text::LowerAscii(hash->string()));
-            }
-            return json::Error{};
-          },
-          "the save listing");
-      if (!parsed.ok()) return std::nullopt;
-      return digests;
+      if (result.response.body.size() > max_bytes) return std::nullopt;
+      return std::move(result.response.body);
     }
     const bool transient = result.ok() ? http::TransientStatus(result.response.status)
                                        : result.error != http::Error::kCanceled;
     if (!transient || attempt >= attempts) return std::nullopt;
     sync::WaitToRetry(policy, &backoff);
   }
+}
+
+}  // namespace
+
+std::optional<std::vector<std::string>> ListServerSaveDigests(http::HttpClient& client,
+                                                              const auth::StoredToken& token,
+                                                              std::int64_t rom_id,
+                                                              const sync::CallPolicy& policy) {
+  const std::optional<std::string> body =
+      GetRomListing(client, token, "/api/saves", rom_id, http::kMaxResponseBytes, policy);
+  if (!body) return std::nullopt;
+  std::vector<std::string> digests;
+  static constexpr std::string_view kKeep[] = {"content_hash"};
+  const json::ParseResult parsed = json::ParseEach(
+      *body, "", kKeep,
+      [&digests](const json::Value& row, std::size_t) {
+        const json::Value* hash = row.Find("content_hash");
+        if (hash != nullptr && hash->is_string() && sync::IsContentHash(hash->string())) {
+          digests.push_back(config::text::LowerAscii(hash->string()));
+        }
+        return json::Error{};
+      },
+      "the save listing");
+  if (!parsed.ok()) return std::nullopt;
+  return digests;
+}
+
+state::Baseline ProvenStates(const state::Baseline& baseline,
+                             const sync::StateSyncReport& report) {
+  state::Baseline proven;
+  if (!report.ran) return proven;
+  for (const sync::StateOperationResult& operation : report.operations) {
+    if (operation.outcome != sync::StateOutcome::kNoOp &&
+        operation.outcome != sync::StateOutcome::kDownloaded) {
+      continue;
+    }
+    if (const state::StateRecord* row =
+            baseline.FindState(operation.rom_id, operation.file_name)) {
+      proven.SetState(*row);
+    }
+  }
+  return proven;
+}
+
+std::vector<std::string> StateDigestsOnServer(const state::Baseline& baseline, std::int64_t rom_id,
+                                              const std::vector<sync::ServerState>& listed) {
+  std::vector<std::string> digests;
+  for (const auto& [key, row] : baseline.state_rows()) {
+    if (key.first != rom_id || !sync::IsContentHash(row.content_hash) ||
+        row.file_size_bytes != row.server_file_size_bytes) {
+      continue;
+    }
+    for (const sync::ServerState& server : listed) {
+      if (server.rom_id == rom_id && sync::ServerUnmoved(row, server)) {
+        digests.push_back(config::text::LowerAscii(row.content_hash));
+        break;
+      }
+    }
+  }
+  return digests;
+}
+
+std::optional<std::vector<std::string>> ListServerStateDigests(http::HttpClient& client,
+                                                               const auth::StoredToken& token,
+                                                               std::int64_t rom_id,
+                                                               const state::Baseline& baseline,
+                                                               const sync::CallPolicy& policy) {
+  const bool has_state_rows =
+      std::any_of(baseline.state_rows().begin(), baseline.state_rows().end(),
+                  [rom_id](const auto& row) { return row.first.first == rom_id; });
+  if (!has_state_rows) return std::vector<std::string>{};
+  const std::optional<std::string> body =
+      GetRomListing(client, token, "/api/states", rom_id, sync::kMaxStateListBytes, policy);
+  if (!body) return std::nullopt;
+  // Strict, as the states half reads it: a row it cannot read is no listing,
+  // never a listing missing a row.
+  const auth::Parsed<std::vector<sync::ServerState>> listed = sync::ParseStateList(*body);
+  if (!listed.ok()) return std::nullopt;
+  return StateDigestsOnServer(baseline, rom_id, listed.value);
+}
+
+std::optional<std::vector<std::string>> ListProvenServerDigests(http::HttpClient& client,
+                                                                const auth::StoredToken& token,
+                                                                std::int64_t rom_id,
+                                                                const state::Baseline* proven_states,
+                                                                const sync::CallPolicy& policy) {
+  std::optional<std::vector<std::string>> digests =
+      ListServerSaveDigests(client, token, rom_id, policy);
+  if (proven_states == nullptr) return digests;
+  std::optional<std::vector<std::string>> of_states =
+      ListServerStateDigests(client, token, rom_id, *proven_states, policy);
+  if (!of_states) return digests;
+  if (!digests) return of_states;
+  digests->insert(digests->end(), of_states->begin(), of_states->end());
+  return digests;
 }
 
 }  // namespace rommsync::backup

@@ -334,6 +334,21 @@ IpcClient::Arrival IpcClient::Collect(Ticket ticket, Result* rc) {
   return Arrival::kArrived;
 }
 
+IpcClient::Arrival IpcClient::Await(Ticket ticket, Result* rc) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  done_.wait_for(lock, budget_, [this, ticket] { return posted_ != ticket || slot_ == Slot::kDone; });
+  if (ticket == 0 || posted_ != ticket) {
+    return Arrival::kLost;
+  }
+  if (slot_ != Slot::kDone) {
+    return Arrival::kPending;
+  }
+  *rc = result_;
+  posted_ = 0;
+  slot_ = Slot::kIdle;
+  return Arrival::kArrived;
+}
+
 template <typename T, typename DecodeFn>
 Result IpcClient::CallAndDecode(ipc::Command command, std::string_view request, DecodeFn decode,
                                T* out) {
@@ -436,7 +451,7 @@ Result IpcClient::GetRestoreState(ipc::RestoreState* state) {
                        ipc::DecodeRestoreState, state);
 }
 
-Result IpcClient::WriteDiagnostics(ipc::DiagnosticsResult* result) {
+std::string DiagnosticsRequestPayload() {
   // The overlay's half of the versions: the sysmodule cannot know which overlay
   // is on the card, and a mismatched pair is the first thing triage checks.
   // `ROMMSYNC_LIBULTRAHAND` is switch.mk's, read off .gitmodules' pin line; a
@@ -447,7 +462,11 @@ Result IpcClient::WriteDiagnostics(ipc::DiagnosticsResult* result) {
   const char* libultrahand = "";
 #endif
   const ipc::DiagnosticsRequest request{rommsync::version(), ipc::kVersion, libultrahand};
-  return CallAndDecode(ipc::Command::kWriteDiagnostics, ipc::EncodeDiagnosticsRequest(request),
+  return ipc::EncodeDiagnosticsRequest(request);
+}
+
+Result IpcClient::WriteDiagnostics(ipc::DiagnosticsResult* result) {
+  return CallAndDecode(ipc::Command::kWriteDiagnostics, DiagnosticsRequestPayload(),
                        ipc::DecodeDiagnosticsResult, result);
 }
 

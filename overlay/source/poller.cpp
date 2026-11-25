@@ -1,6 +1,7 @@
 #include "poller.hpp"
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 #include "ipc_client.hpp"
@@ -11,8 +12,21 @@
 
 namespace rommsync::overlay {
 
-Poller::Poller(ScreenFrame& frame, IpcClient& client, ipc::Command read, int frames_between_reads)
-    : frame_(frame), client_(client), read_(read), cadence_(frames_between_reads) {}
+Poller::Poller(ScreenFrame& frame, IpcClient& client, ipc::Command read, int frames_between_reads,
+               std::string_view read_request)
+    : frame_(frame),
+      client_(client),
+      reads_(true),
+      read_(read),
+      read_request_(read_request.empty() ? ipc::EncodeEmpty() : std::string(read_request)),
+      cadence_(frames_between_reads) {}
+
+Poller::Poller(ScreenFrame& frame, IpcClient& client, SendsOnly, int frames_between_reads)
+    : frame_(frame),
+      client_(client),
+      reads_(false),
+      read_(ipc::Command::kGetInterfaceVersion),
+      cadence_(frames_between_reads) {}
 
 bool Poller::Send(ipc::Command command, std::string_view request) {
   if (sending()) {
@@ -50,6 +64,7 @@ Poller::Event Poller::Frame() {
       case IpcClient::Arrival::kArrived: {
         const Flight arrived = flight_;
         flight_ = Flight::kNone;
+        linked_ = true;
         const Event event = Answer(arrived, command_, rc);
         if (event.kind != Event::Kind::kNone) {
           return event;
@@ -83,7 +98,30 @@ Poller::Event Poller::Frame() {
   if (queued_) {
     return Post(Flight::kSend, queued_command_, queued_request_);
   }
-  return Post(Flight::kRead, read_, ipc::EncodeEmpty());
+  if (!reads_) {
+    // Nothing owed: the port is open and the handshake has passed, which on
+    // a screen with no read is all the cadence was asking.
+    linked_ = true;
+    return Event{};
+  }
+  return Post(Flight::kRead, read_, read_request_);
+}
+
+Poller::Event Poller::Drain() {
+  queued_ = false;
+  if (flight_ == Flight::kNone) {
+    return Event{};
+  }
+  Result rc = 0;
+  const IpcClient::Arrival arrival = client_.Await(ticket_, &rc);
+  const Flight out = flight_;
+  flight_ = Flight::kNone;
+  if (arrival != IpcClient::Arrival::kArrived) {
+    // Not back within the budget, or taken by a call that waited for it. The
+    // next call the screen makes waits it out and drops it (`IpcClient::Call`).
+    return Event{};
+  }
+  return Answer(out, command_, rc);
 }
 
 Poller::Event Poller::Post(Flight flight, ipc::Command command, std::string_view request) {
@@ -109,6 +147,7 @@ Poller::Event Poller::Post(Flight flight, ipc::Command command, std::string_view
     // Refused before it was sent -- no session -- which is an answer.
     return Answer(flight, command, rc);
   }
+  linked_ = true;
   flight_ = flight;
   command_ = command;
   ticket_ = ticket;

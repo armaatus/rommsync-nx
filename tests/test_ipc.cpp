@@ -93,6 +93,7 @@ ipc::Status LoadedStatus() {
   status.backup.kept_unique = 9;
   status.backup.over_cap = true;
   status.backup.truncated = true;
+  status.backup.state_budget_pruned = 6;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -113,6 +114,7 @@ ipc::ListPage LoadedPage() {
   second.fields.push_back({"name", ipc::ListValue::Text("")});
   page.items.push_back(second);
   page.has_more = true;
+  page.start = 1488;
   return page;
 }
 
@@ -233,9 +235,12 @@ int Version() {
   // `clock_trusted` and `clock_skew_seconds`. 16 since M11-17 (#301):
   // `ConfigView` gained `play_sessions`. 17 since M11-4 (#288): and
   // `server.ca_file`. 18 since M11-21 (#316): `Status` gained `backup`. 19
-  // since M11-22 (#323): and `backup.truncated`. What is frozen is command 0's
-  // *encoding*, asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{19},
+  // since M11-22 (#323): and `backup.truncated`. 20 since #339: a
+  // `ListRequest` gained a required `offset`. 21 since #341: a `ListPage`
+  // gained a required `start`. 22 since M11-26 (#340): and
+  // `backup.state_budget_pruned`. What is frozen is command 0's *encoding*,
+  // asserted above -- not the number in it.
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{22},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -377,6 +382,8 @@ int RoundTrip() {
     checks.ExpectEq(back.value.backup.over_cap, sent.backup.over_cap, "backup.over_cap survives");
     checks.ExpectEq(back.value.backup.truncated, sent.backup.truncated,
                     "backup.truncated survives (#323)");
+    checks.ExpectEq(back.value.backup.state_budget_pruned, sent.backup.state_budget_pruned,
+                    "backup.state_budget_pruned survives (#340)");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");
@@ -548,13 +555,14 @@ int RoundTrip() {
   }
 
   {
-    const ipc::ListRequest sent{ipc::ListKind::kRoms, 3, "zelda", 12};
+    const ipc::ListRequest sent{ipc::ListKind::kRoms, 3, "zelda", 12, 1488};
     const ipc::Decoded<ipc::ListRequest> back =
         ipc::DecodeListRequest(ipc::EncodeListRequest(sent));
     checks.Expect(back.ok(), "a list request round trips: " + back.error.Describe());
     checks.ExpectEq(back.value.platform_id, sent.platform_id, "the platform filter survives");
     checks.ExpectEq(back.value.search, sent.search, "the search term survives");
     checks.ExpectEq(back.value.page_size, sent.page_size, "the page size survives");
+    checks.ExpectEq(back.value.offset, sent.offset, "the starting row survives (#339)");
   }
 
   {
@@ -564,6 +572,7 @@ int RoundTrip() {
     checks.ExpectEq(back.value.items.size(), sent.items.size(), "both items");
     checks.ExpectEq(back.value.has_more, sent.has_more, "has_more survives");
     checks.ExpectEq(back.value.pending, sent.pending, "pending survives");
+    checks.ExpectEq(back.value.start, sent.start, "the row it starts at survives (#341)");
     if (back.value.items.size() == 2) {
       const ipc::ListValue* id = back.value.items[0].Find("id");
       const ipc::ListValue* name = back.value.items[0].Find("name");
@@ -1073,12 +1082,12 @@ int Refuses() {
 
   // The list page's one structural rule: a flat object of scalars.
   for (const char* page : {
-           R"({"items":[{"id":{"nested":1}}],"has_more":false,"pending":false})",
-           R"({"items":[{"id":[1,2]}],"has_more":false,"pending":false})",
-           R"({"items":[{"id":null}],"has_more":false,"pending":false})",
-           R"({"items":[{"id":1.5}],"has_more":false,"pending":false})",
-           R"({"items":[[1]],"has_more":false,"pending":false})",
-           R"({"items":{},"has_more":false,"pending":false})",
+           R"({"items":[{"id":{"nested":1}}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[{"id":[1,2]}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[{"id":null}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[{"id":1.5}],"has_more":false,"pending":false,"start":0})",
+           R"({"items":[[1]],"has_more":false,"pending":false,"start":0})",
+           R"({"items":{},"has_more":false,"pending":false,"start":0})",
        }) {
     checks.Expect(!ipc::DecodeListPage(page).ok(),
                   std::string("a page holding something that is not a scalar is refused: ") + page);
@@ -1091,7 +1100,7 @@ int Refuses() {
       many += at == 0 ? "" : ",";
       many += "{\"id\":" + std::to_string(at) + "}";
     }
-    many += R"(],"has_more":false,"pending":false})";
+    many += R"(],"has_more":false,"pending":false,"start":0})";
     checks.Expect(!ipc::DecodeListPage(many).ok(), "a page past the item cap is refused");
 
     std::string wide = R"({"items":[{)";
@@ -1099,9 +1108,20 @@ int Refuses() {
       wide += at == 0 ? "" : ",";
       wide += "\"f" + std::to_string(at) + "\":1";
     }
-    wide += R"(}],"has_more":false,"pending":false})";
+    wide += R"(}],"has_more":false,"pending":false,"start":0})";
     checks.Expect(!ipc::DecodeListPage(wide).ok(), "an item past the field cap is refused");
   }
+
+  // Where a page starts is what places its rows (#341), so a page that does
+  // not say is refused rather than read as starting at row 0.
+  checks.Expect(ipc::DecodeListPage(R"({"items":[],"has_more":false,"pending":false,"start":7})")
+                    .ok(),
+                "a page that says where it starts is read");
+  checks.Expect(!ipc::DecodeListPage(R"({"items":[],"has_more":false,"pending":false})").ok(),
+                "a page without a start is a v20 sysmodule's, refused");
+  checks.Expect(
+      !ipc::DecodeListPage(R"({"items":[],"has_more":false,"pending":false,"start":-1})").ok(),
+      "and a start above the first row is refused");
 
   // A `0` cursor is not a live cursor, so it is refused at the wire rather than
   // reaching the engine as an address that happens to miss.
@@ -1111,6 +1131,14 @@ int Refuses() {
                      R"({"kind":"roms","platform_id":0,"search":"","page_size":0})")
                      .ok(),
                 "a page size of zero is the one value that cannot mean anything");
+  checks.Expect(!ipc::DecodeListRequest(
+                     R"({"kind":"roms","platform_id":0,"search":"","page_size":8,"offset":-1})")
+                     .ok(),
+                "a starting row above the first is refused (#339)");
+  checks.Expect(!ipc::DecodeListRequest(
+                     R"({"kind":"roms","platform_id":0,"search":"","page_size":8})")
+                     .ok(),
+                "and a request without one is a v19 overlay's, refused rather than read as 0");
 
   // A NUL inside a string is legal JSON and stops every C API downstream, so the
   // value that got used would not be the value that was checked.
@@ -1803,12 +1831,14 @@ int DispatchTable() {
     engine.snapshot.backup.kept_unique = 1;
     engine.snapshot.backup.over_cap = true;
     engine.snapshot.backup.truncated = true;
+    engine.snapshot.backup.state_budget_pruned = 4;
     ipc::ServiceCore core(engine);
     const ipc::Status status = core.GetStatus();
     checks.Expect(status.backup.measured && status.backup.bytes == 4096 &&
                       status.backup.backups == 2 && status.backup.kept_unique == 1 &&
-                      status.backup.over_cap && status.backup.truncated,
-                  "backup usage comes off the engine, every field of it (#316, #323)");
+                      status.backup.over_cap && status.backup.truncated &&
+                      status.backup.state_budget_pruned == 4,
+                  "backup usage comes off the engine, every field of it (#316, #323, #340)");
     checks.ExpectEq(status.enabled, false, "the switch is the one in config.ini");
     checks.ExpectEq(status.configured, true, "and configured follows from a usable server");
     checks.ExpectEq(status.queue_depth, std::int64_t{3}, "the queue depth comes off the engine");
@@ -1852,6 +1882,12 @@ int DispatchTable() {
                     "and a platform filter on it is dropped rather than half-honoured");
     checks.ExpectEq(engine.last_list.search, std::string(""), "along with the search term");
     checks.ExpectEq(engine.last_list.page_size, 8, "what the client asked for is kept");
+
+    checks.Expect(core.ListBegin({ipc::ListKind::kRoms, 3, "", 8, 1488}, &cursor) ==
+                      ipc::Error::kOk,
+                  "a list may start anywhere in it (#339)");
+    checks.ExpectEq(engine.last_list.offset, std::int64_t{1488},
+                    "and the engine is told where");
   }
 
   // A cursor of zero never addresses a live list.

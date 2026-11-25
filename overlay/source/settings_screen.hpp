@@ -31,14 +31,12 @@
 #include <tesla.hpp>
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "ipc_client.hpp"
-#include "lifecycle.hpp"
-#include "rommsync/config.hpp"
-#include "rommsync/ipc.hpp"
 #include "rommsync/overlay_settings_view.hpp"
-#include "screen_frame.hpp"
+#include "settings_pump.hpp"
 
 namespace rommsync::overlay {
 
@@ -57,8 +55,9 @@ class SettingsScreen : public tsl::Gui {
   /// Unlike a `Status`, a configuration changes only when somebody edits it, and
   /// this payload is the whole folder map -- up to `ipc::kMaxPayloadBytes` to
   /// decode and a few hundred rows to rebuild. So it is polled on a cadence
-  /// (`kPollFrames`) rather than on every draw, and immediately after anything
-  /// this screen does that could have changed it.
+  /// (`SettingsPump::kFramesBetweenReads`) rather than on every draw, and
+  /// immediately after anything this screen does that could have changed it --
+  /// and since M11-24 (#329) no frame waits for the answer.
   void update() override;
 
   /// Up/Down scroll the list, A opens the screen under the cursor or steps the
@@ -84,42 +83,11 @@ class SettingsScreen : public tsl::Gui {
     std::size_t index = 0;
   };
 
-  /// Ask for the configuration, and turn whatever came back -- including
-  /// nothing -- into `view_`.
-  void Poll();
-
-  /// Draw the sysmodule's absence, and drop everything that belonged to the
-  /// session that is gone.
-  ///
-  /// One function rather than the five call sites that reach it, because four
-  /// of them are error arms: the `repair_` reset is the easy half to forget,
-  /// and forgetting it leaves a half-pressed "Re-pair" armed across a sysmodule
-  /// restart.
-  void ShowUnreachable(Link link);
-
-  /// Re-render `view_` from the last answer and rebuild the flat list.
-  void Refresh();
-
-  /// Rebuild `entries_` from `view_`, keeping the cursor where it can be.
+  /// Rebuild `entries_` from the pump's view, keeping the cursor where it can
+  /// be.
   void Rebuild();
 
-  /// X: ask once, then do it.
-  ///
-  /// **`StartPair` goes first and `Unpair` follows it**, which is the opposite
-  /// of the order docs/AUTH.md describes. It was #26's gate on a
-  /// `SdEngine::StartPairing` that answered `kUnavailable` unconditionally, and
-  /// it outlives M1-6 (#123) building that: `StartPair` writes nothing and
-  /// touches no token when it refuses, so asking it first is free, and the token
-  /// is discarded only once a pairing is genuinely starting.
-  /// `overlay_settings_view.hpp` carries the rest of the reasoning.
-  void PressRepair();
-
-  /// A: send `assignment` to `SetConfig`, then poll for what is now in force.
-  ///
-  /// One press, no confirmation: every setting offered this way is a choice
-  /// between words that are all safe to land on, and pressing again undoes it
-  /// (`SettingsRow::change`).
-  void PressChange(config::Assignment assignment);
+  const SettingsView& view() const { return pump_.view(); }
 
   /// The row the cursor is on, or nullptr when there is none.
   const SettingsRow* CursorRow() const;
@@ -129,39 +97,29 @@ class SettingsScreen : public tsl::Gui {
   /// otherwise push every control off the bottom.
   s32 PromptRows() const;
 
-  /// Draw `view_` into the bounds `CustomDrawer` hands us.
+  /// Draw the pump's view into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
+  /// Borrowed, for the screens this one pushes.
   IpcClient& client_;
 
-  /// The session handshake, and which of the two unreachable sentences a failed
-  /// call means. Shared with every other screen (`screen_frame.hpp`).
-  ScreenFrame frame_{client_};
+  /// The poll, the two presses and the view (`settings_pump.hpp`). "Re-pair"
+  /// sends `StartPair` first and `Unpair` after it, the opposite of the order
+  /// docs/AUTH.md describes: it was #26's gate on a `SdEngine::StartPairing`
+  /// that answered `kUnavailable` unconditionally, and it outlives M1-6 (#123)
+  /// building that -- `StartPair` writes nothing and touches no token when it
+  /// refuses, so asking it first is free, and the token is discarded only once
+  /// a pairing is genuinely starting. `overlay_settings_view.hpp` carries the
+  /// rest of the reasoning.
+  SettingsPump pump_;
 
-  /// The last answer, kept so a press can re-render without a round trip.
-  ipc::ConfigView config_;
-
-  /// Where the button is between presses. Not in the view, for the reason
-  /// `LastCommand` is not (`overlay_sync_actions.hpp`).
-  RepairState repair_;
-
-  /// What the last setting press produced. Dropped with `repair_`, and by a
-  /// press on the other button.
-  ChangeState change_;
-
-  /// What the last render produced. Starts as "not running" rather than as an
-  /// empty screen: the first frame is drawn before the first poll returns, and
-  /// a blank one there is indistinguishable from a broken overlay.
-  SettingsView view_ = RenderSettingsUnreachable(Link::kNotRunning);
+  /// The pump's `revision()` `entries_` was built at.
+  std::uint64_t rendered_ = 0;
 
   std::vector<Entry> entries_;
 
   /// Where the cursor is in `entries_`. `-1` when there is nothing to scroll.
   int cursor_ = -1;
-
-  /// When the next `GetConfig` goes out: the first frame, every `kPollFrames`
-  /// after it, and the first frame of every showing (`lifecycle.hpp`).
-  Cadence cadence_;
 };
 
 }  // namespace rommsync::overlay

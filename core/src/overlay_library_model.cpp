@@ -287,7 +287,55 @@ void LibraryBrowserModel::Reset() {
   platforms.kind = LibraryLevel::kPlatforms;
   platforms.request.kind = ipc::ListKind::kPlatforms;
   platforms.title = "Library";
-  stack_.push_back(std::move(platforms));
+  Push(std::move(platforms));
+}
+
+void LibraryBrowserModel::Push(Level level) {
+  level.id = next_level_id_++;
+  stack_.push_back(std::move(level));
+}
+
+LibraryBrowserModel::Level* LibraryBrowserModel::Issued() {
+  for (Level& level : stack_) {
+    if (level.id == issued_level_) {
+      return &level;
+    }
+  }
+  return nullptr;
+}
+
+void LibraryBrowserModel::Reopen(Level& level) {
+  // The rows already loaded stay on screen while the new cursor reads its way
+  // back to them, so this costs the user nothing visible. A rewind that was
+  // gathering rows above the window starts its gathering again; anything else
+  // gathers nothing and only catches up.
+  if (!Rewinding(level)) {
+    level.rewind_from = level.first;
+  }
+  std::vector<LibraryRow>().swap(level.above);
+  level.cursor = 0;
+  level.consumed = 0;
+  level.has_more = true;
+  level.loading = false;
+  level.page_error = ipc::Error::kOk;
+}
+
+std::int64_t LibraryBrowserModel::StartOf(const Level& level) {
+  // A rewind, or a reclaimed cursor catching up to its window, opens at the
+  // first row it has a use for: `rewind_from` (which `Reopen` sets to `first`
+  // when nothing is being gathered). Reading down to it from row 0 was ~1500
+  // rows at row 2000 of a platform, a RomM page per 64 of them.
+  //
+  // Not once an item was dropped unread, though: places here count the rows
+  // this build could read, and the sysmodule's offset counts every row, so the
+  // two would disagree by however many were dropped above. From row 0 they
+  // agree, which is what the list did before the offset existed. A rom the
+  // sysmodule stepped past as too large to send even alone (#248) is the same
+  // disagreement, seen as a page that started late (`drifted`, #341).
+  if (level.first == 0 || level.unreadable_items > 0 || level.drifted) {
+    return 0;
+  }
+  return level.rewind_from;
 }
 
 bool LibraryBrowserModel::HasMoreRow(const Level& level) {
@@ -420,7 +468,8 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
     command.kind = Command::Kind::kListEnd;
     command.cursor = closing_.front();
     issued_ = command.kind;
-    issued_depth_ = stack_.size();
+    issued_level_ = top().id;
+    issued_cursor_ = command.cursor;
     return command;
   }
 
@@ -441,7 +490,8 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
     // The press is retired by whichever `On...` answers it.
     enqueueing_ = enqueue_wanted_;
     issued_ = command.kind;
-    issued_depth_ = stack_.size();
+    issued_level_ = top().id;
+    issued_cursor_ = command.cursor;
     return command;
   }
 
@@ -454,19 +504,21 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
       return command;
     }
     command.kind = Command::Kind::kListBegin;
+    level.request.offset = StartOf(level);
     command.request = level.request;
     level.loading = true;
     issued_ = command.kind;
-    issued_depth_ = stack_.size();
+    issued_level_ = top().id;
+    issued_cursor_ = command.cursor;
     return command;
   }
 
   if (level.first > 0 && level.page_error == ipc::Error::kOk && level.consumed >= level.first &&
       level.selected - level.first < kPrefetchRows) {
     // The selection is coming up to rows that were dropped (#298). A cursor
-    // only goes forward, so this one is ended and the list read again from the
-    // top, gathering `kRewindRows` above the window on the way. Ended first:
-    // #31 caps how many may be open.
+    // only goes forward, so this one is ended and a new one opened `kRewindRows`
+    // above the window (`StartOf`, #339), gathering them on its way down to it.
+    // Ended first: #31 caps how many may be open.
     closing_.push_back(level.cursor);
     level.cursor = 0;
     level.consumed = 0;
@@ -487,7 +539,8 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
     command.cursor = level.cursor;
     level.loading = true;
     issued_ = command.kind;
-    issued_depth_ = stack_.size();
+    issued_level_ = top().id;
+    issued_cursor_ = command.cursor;
     return command;
   }
 
@@ -498,32 +551,49 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
 
 void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
   // Only the command that was handed out, and only into the level it was asked
-  // for. The screen sends synchronously, so nothing can arrive out of order
-  // today -- this is what keeps that true when something else drives the model,
-  // because a rom page answered into the platform level decodes to no rows at
-  // all and starts that level counting toward `kMaxEmptyPages`.
-  if (issued_ != Command::Kind::kListBegin || issued_depth_ != stack_.size()) {
+  // for. The screen does not wait for the answer (#329), so the user may have
+  // opened or left a level since -- and a rom page answered into the platform
+  // level decodes to no rows at all and starts that level counting toward
+  // `kMaxEmptyPages`.
+  if (issued_ != Command::Kind::kListBegin) {
     return;
   }
   issued_ = Command::Kind::kNone;
-  Level& level = top();
+  ++revision_;
+  Level* found = Issued();
+  if (found == nullptr || closed_) {
+    // Opened for a level the user has left, or for a screen on its way out.
+    // It is a cursor all the same, and #31 caps how many may be open.
+    closing_.push_back(cursor);
+    return;
+  }
+  Level& level = *found;
   level.cursor = cursor;
   level.page_error = ipc::Error::kOk;
   level.empty_pages = 0;
-  // A fresh cursor starts at the beginning of the list, so whatever is on
-  // screen is about to be said again. Counting from zero is what routes the
-  // second telling onto the rows it repeats rather than after them (`Level`).
-  level.consumed = 0;
+  // A fresh cursor starts where it was asked to (#339), so whatever is on
+  // screen from there down is about to be said again. Counting from that place
+  // is what routes the second telling onto the rows it repeats rather than
+  // after them (`Level`).
+  level.consumed = static_cast<int>(level.request.offset);
+  level.served = level.request.offset;
   level.has_more = true;
-  ++revision_;
 }
 
 void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
-  if (issued_ != Command::Kind::kListNext || issued_depth_ != stack_.size()) {
+  if (issued_ != Command::Kind::kListNext) {
     return;
   }
   issued_ = Command::Kind::kNone;
-  Level& level = top();
+  Level* found = Issued();
+  if (found == nullptr || found->cursor != issued_cursor_) {
+    // The level was left while the page was out, and its cursor is already
+    // queued for `ListEnd`; or the cursor was replaced under it. Either way
+    // these rows belong to no list on screen.
+    ++revision_;
+    return;
+  }
+  Level& level = *found;
   level.page_error = ipc::Error::kOk;
   ++revision_;
 
@@ -534,6 +604,24 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
     level.loading = true;
     return;
   }
+
+  if (page.start != level.served) {
+    // The sysmodule counts rows this level was never handed: it stepped past a
+    // rom too large to send (#248). Places here count what was handed over, so
+    // from this page down they are a row behind its rows (#341).
+    level.drifted = true;
+    if (level.request.offset > 0) {
+      // And this cursor took its offset for a place, so its rows would land
+      // that far off -- A on one of them enqueuing the rom beside it. Ended,
+      // and the level read again from row 0 (`StartOf`). A cursor opened at
+      // row 0 has nothing to correct: its places are its own count, as they
+      // were before #339, and ending it would only meet the step again.
+      closing_.push_back(level.cursor);
+      Reopen(level);
+      return;
+    }
+  }
+  level.served = page.start + static_cast<std::int64_t>(page.items.size());
 
   // Was the selection resting on the `kMore` row? `MoveSelection` lets it,
   // because that row is how a user reaches "Loading..." and "press A to try
@@ -652,10 +740,11 @@ void LibraryBrowserModel::OnEnqueued(std::int32_t position) {
   const std::int64_t rom_id = enqueueing_;
   enqueueing_ = 0;
   enqueue_wanted_ = 0;
-  if (rom_id == 0) {
+  Level* level = Issued();
+  if (rom_id == 0 || level == nullptr) {
     return;
   }
-  for (LibraryRow& row : top().rows) {
+  for (LibraryRow& row : level->rows) {
     if (row.kind != RowKind::kRom || row.rom_id != rom_id) {
       continue;
     }
@@ -689,7 +778,11 @@ void LibraryBrowserModel::OnRefused(ipc::Error error) {
       const std::int64_t rom_id = enqueueing_;
       enqueueing_ = 0;
       enqueue_wanted_ = 0;
-      for (LibraryRow& row : top().rows) {
+      Level* level = Issued();
+      if (level == nullptr) {
+        return;
+      }
+      for (LibraryRow& row : level->rows) {
         if (row.kind != RowKind::kRom || row.rom_id != rom_id) {
           continue;
         }
@@ -702,29 +795,25 @@ void LibraryBrowserModel::OnRefused(ipc::Error error) {
     }
 
     case Command::Kind::kListBegin: {
-      Level& level = top();
-      level.loading = false;
-      level.page_error = error;
+      Level* found = Issued();
+      if (found == nullptr) {
+        return;
+      }
+      found->loading = false;
+      found->page_error = error;
       return;
     }
 
     case Command::Kind::kListNext: {
-      Level& level = top();
+      Level* found = Issued();
+      if (found == nullptr || found->cursor != issued_cursor_) {
+        return;
+      }
+      Level& level = *found;
       level.loading = false;
       if (error == ipc::Error::kBadCursor) {
         // Reclaimed, never issued, or ended (#31): re-open rather than report.
-        // The rows already loaded stay on screen while the new cursor reads
-        // its way back to them, so this costs the user nothing visible. A
-        // rewind that was gathering rows above the window starts its gathering
-        // again; anything else gathers nothing and only catches up.
-        if (!Rewinding(level)) {
-          level.rewind_from = level.first;
-        }
-        std::vector<LibraryRow>().swap(level.above);
-        level.cursor = 0;
-        level.consumed = 0;
-        level.has_more = true;
-        level.page_error = ipc::Error::kOk;
+        Reopen(level);
         return;
       }
       // A failed page is a failed page: the cursor is still usable, the loaded
@@ -734,6 +823,73 @@ void LibraryBrowserModel::OnRefused(ipc::Error error) {
       return;
     }
 
+    case Command::Kind::kNone:
+      return;
+  }
+}
+
+void LibraryBrowserModel::OnApplying() {
+  if (issued_ != Command::Kind::kEnqueue) {
+    // A page out past the budget already says so: the `kMore` row is
+    // "Loading...", and the rows above it are still the library.
+    return;
+  }
+  MarkApplying(Issued(), enqueueing_);
+}
+
+void LibraryBrowserModel::MarkApplying(Level* level, std::int64_t rom_id) {
+  if (level == nullptr) {
+    return;
+  }
+  for (LibraryRow& row : level->rows) {
+    if (row.kind == RowKind::kRom && row.rom_id == rom_id) {
+      // Neutral: the sysmodule is busy, not gone, and the press will land
+      // (#299's sentence). The answer replaces it.
+      row.note = kStillApplying;
+      row.tone = Tone::kNeutral;
+      ++revision_;
+      return;
+    }
+  }
+}
+
+void LibraryBrowserModel::OnLost() {
+  const Command::Kind lost = issued_;
+  issued_ = Command::Kind::kNone;
+  ++revision_;
+  Level* level = Issued();
+  switch (lost) {
+    case Command::Kind::kListBegin:
+      // A cursor may have been opened that nothing here knows the number of;
+      // the sysmodule's TTL reclaims it (#31). The level asks again.
+      if (level != nullptr) {
+        level->loading = false;
+      }
+      return;
+    case Command::Kind::kListNext:
+      // The cursor may have moved past a page nobody read, so the places it
+      // hands over next are not the ones `consumed` would give them. Ended,
+      // and the level read again up to its window -- the `kBadCursor` path,
+      // with the cursor closed rather than presumed gone.
+      if (level != nullptr && level->cursor == issued_cursor_ && level->cursor != 0) {
+        closing_.push_back(level->cursor);
+        Reopen(*level);
+      }
+      return;
+    case Command::Kind::kListEnd:
+      // Ended or not, it is not asked about again: a second `ListEnd` for a
+      // cursor that went is `kBadCursor`, and the TTL covers one that did not.
+      if (!closing_.empty()) {
+        closing_.erase(closing_.begin());
+      }
+      return;
+    case Command::Kind::kEnqueue:
+      // Not sent again: it may have landed. The row says it is applying, and a
+      // second press is the user's to make -- a duplicate answers `kQueued`.
+      MarkApplying(level, enqueueing_);
+      enqueueing_ = 0;
+      enqueue_wanted_ = 0;
+      return;
     case Command::Kind::kNone:
       return;
   }
@@ -823,7 +979,7 @@ void LibraryBrowserModel::Activate() {
       roms.title = row.label;
       roms.platform_mapped = row.state != RowState::kUnmapped;
       roms.platform_fs_slug = row.fs_slug;
-      stack_.push_back(std::move(roms));
+      Push(std::move(roms));
       return;
     }
 
@@ -879,7 +1035,7 @@ void LibraryBrowserModel::OpenQueue() {
   queue.kind = LibraryLevel::kQueue;
   queue.request.kind = ipc::ListKind::kQueue;
   queue.title = "Downloads";
-  stack_.push_back(std::move(queue));
+  Push(std::move(queue));
   ++revision_;
 }
 

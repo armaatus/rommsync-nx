@@ -624,6 +624,12 @@ void SetRepair(SettingsView* view, const ipc::ConfigView& config, const RepairSt
     view->notice_tone = Tone::kWarn;
     return;
   }
+  if (repair.applying) {
+    // Neutral: the sysmodule is busy, not gone, and the press will land.
+    view->notice = kStillApplying;
+    view->notice_tone = Tone::kNeutral;
+    return;
+  }
   if (repair.outcome != RepairOutcome::kNone) {
     view->notice = RepairOutcomeText(repair.outcome);
     view->notice_tone = RepairOutcomeTone(repair.outcome);
@@ -632,6 +638,11 @@ void SetRepair(SettingsView* view, const ipc::ConfigView& config, const RepairSt
 
 /// The sentence for what the last setting press produced.
 void SetChange(SettingsView* view, const ChangeState& change) {
+  if (change.applying) {
+    view->notice = kStillApplying;
+    view->notice_tone = Tone::kNeutral;
+    return;
+  }
   if (!change.sent) {
     return;
   }

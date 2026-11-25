@@ -40,9 +40,18 @@ namespace {
 /// Process-wide, because `socketInitialize` and `sslInitialize` are: both take
 /// an `sm` session, and a sysmodule has one only inside `__appInit`
 /// (`ipc/server.hpp` says the same thing about its port).
-bool g_socket_up = false;
-bool g_ssl_up = false;
-bool g_nifm_up = false;
+///
+/// Atomic since #333: a transport that did not come up in `__appInit` is
+/// brought up later by the worker, while the IPC and pairing threads read
+/// these to decide whether to connect. Only `__appInit`, the worker and
+/// `__appExit` write them, never two at once -- the worker is joined before
+/// `main` returns -- so a flag is the whole of the guard: each is set only
+/// after its service is up.
+std::atomic<bool> g_socket_up{false};
+std::atomic<bool> g_ssl_up{false};
+std::atomic<bool> g_nifm_up{false};
+// The worker writes this one while the IPC and pairing threads connect.
+std::atomic<bool> g_romm_trusted{false};
 
 /// `[server] ca_file` as the engine last handed it over (`TrustServerCa`,
 /// #288). Process-wide for the reason the flags above are: there is one
@@ -183,9 +192,16 @@ class SslConnector final : public Connector {
       *message = "this build brought no ssl service up";
       return nullptr;
     }
-    if (!ConsoleIsOnline()) {
+    // nifm's "no internet" is let past only once RomM has answered the engine's
+    // heartbeat through it (#328, `TrustRommPastNifm`): a console that blocks
+    // Nintendo reaches RomM on its LAN, but a captive portal would answer a
+    // drain or a list page too, and be handed the token for it.
+    const NifmVerdict nifm = ConsoleNetwork();
+    if (nifm == NifmVerdict::kOffline ||
+        (nifm != NifmVerdict::kOnline && !g_romm_trusted.load())) {
       *error = http::Error::kConnectFailed;
-      *message = "the console has no internet connection";
+      *message = nifm == NifmVerdict::kOffline ? "the console has no network connection"
+                                               : "the console has no internet connection";
       return nullptr;
     }
 
@@ -461,14 +477,14 @@ Result NetworkInitialize(const SocketBudget& budget) {
   //
   // nifm is diagnostics rather than transport, and a failure here is not one:
   // the console can still reach a server, it just cannot be asked first whether
-  // it is worth trying (`ConsoleIsOnline`).
+  // it is worth trying (`ConsoleNetwork`).
   //
   // **It is first, and that is not the arbitrary order it looks like.** It is
   // the only half whose failure is not returned, and since M9-1 (#195) it is
   // also the only `nifmInitialize` in this build -- `main.cpp` had a second one,
   // whose `NifmServiceType` libnx silently ignored because the call refcounts.
   // Bringing it up after `socketInitialize` would mean a console whose transfer
-  // memory did not fit lost `ConsoleIsOnline()`'s real answer as well as its
+  // memory did not fit lost `ConsoleNetwork()`'s real answer as well as its
   // transport, and a connection probe is exactly what such a console still wants
   // to be able to give.
   if (!g_nifm_up) {
@@ -517,24 +533,23 @@ void NetworkExit() {
 
 bool NetworkReady() { return g_socket_up && g_ssl_up; }
 
-bool ConsoleIsOnline() {
-  if (!g_nifm_up) return true;
+bool SocketsReady() { return g_socket_up; }
+
+NifmVerdict ConsoleNetwork() {
+  if (!g_nifm_up) return NifmVerdict::kOnline;
   NifmInternetConnectionType type{};
   u32 strength = 0;
   NifmInternetConnectionStatus status{};
   const Result rc = nifmGetInternetConnectionStatus(&type, &strength, &status);
-  // **A failure is offline** (M11-5, #289): libnx documents this call failing
-  // in airplane mode and with no known network in range, so reading a failure
-  // as "nifm was busy" skipped the boot wait and the connector's pre-check on
-  // exactly the consoles they exist for (`nifm_verdict.hpp`).
-  switch (ClassifyNifm(R_FAILED(rc) ? rc : 0, status == NifmInternetConnectionStatus_Connected)) {
-    case NifmVerdict::kOnline:
-      return true;
-    case NifmVerdict::kOffline:
-      return false;
-    case NifmVerdict::kOfflineUnexpected:
-      break;
-  }
+  // **0xd46ed is offline** (M11-5, #289): libnx documents this call failing
+  // with it in airplane mode and with no known network in range, so reading a
+  // failure as "nifm was busy" skipped the boot wait and the connector's
+  // pre-check on exactly the consoles they exist for. Anything else short of
+  // `Connected` may be a console that blocks Nintendo and reaches RomM fine
+  // (#328, `nifm_verdict.hpp`).
+  const NifmVerdict verdict =
+      ClassifyNifm(R_FAILED(rc) ? rc : 0, status == NifmInternetConnectionStatus_Connected);
+  if (verdict != NifmVerdict::kUnexpected) return verdict;
   // Said once per change of code rather than once per two-second probe: the
   // worker asks every poll while a tick is held.
   static std::atomic<Result> last_said{0};
@@ -547,8 +562,10 @@ bool ConsoleIsOnline() {
     log::Warn(log::Event::kNetOffline, "nifm answered 0x" + std::string(hex, end.ptr) +
                                            "; read as no internet connection");
   }
-  return false;
+  return verdict;
 }
+
+void TrustRommPastNifm(bool trusted) { g_romm_trusted.store(trusted); }
 
 void TrustServerCa(const std::string& path) {
   std::lock_guard<std::mutex> lock(g_trusted_ca_mutex);

@@ -315,6 +315,7 @@ void ConflictsModel::Reset() {
   last_cancel_ = ipc::CancelOutcome::kNotHeld;
   cancel_error_ = ipc::Error::kOk;
   issued_ = Command::Kind::kNone;
+  applying_ = false;
   stale_ = false;
 }
 
@@ -430,6 +431,7 @@ void ConflictsModel::OnRestoreState(const ipc::RestoreState& state) {
     return;
   }
   issued_ = Command::Kind::kNone;
+  applying_ = false;
   restore_wanted_ = 0;
 
   if (state.entry_id == restoring_ && state.phase == ipc::RestorePhase::kRunning) {
@@ -521,6 +523,7 @@ void ConflictsModel::OnCancelKeepLocal(const ipc::CancelKeepLocalResult& result)
     return;
   }
   issued_ = Command::Kind::kNone;
+  applying_ = false;
   const std::int64_t cancelled = cancelling_;
   cancel_wanted_ = 0;
   cancelling_ = 0;
@@ -541,6 +544,7 @@ void ConflictsModel::OnCancelKeepLocal(const ipc::CancelKeepLocalResult& result)
 void ConflictsModel::OnRefused(ipc::Error error) {
   const Command::Kind refused = issued_;
   issued_ = Command::Kind::kNone;
+  applying_ = false;
   if (refused == Command::Kind::kCancelKeepLocal) {
     // Not documented to fail either. The row is left as drawn -- held -- and
     // the press can be made again.
@@ -580,33 +584,11 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
     // sysmodule on the far side is the one that answered every page here and
     // nothing loaded is stale -- only the command that ran out of budget is in
     // doubt, and its answer was dropped.
-    switch (issued_) {
-      case Command::Kind::kListConflicts:
-        loading_ = false;  // asked again once it answers
-        break;
-      case Command::Kind::kRestore:
-      case Command::Kind::kKeepLocal:
-        // It may have been taken. Asked about, never sent again: a second
-        // press the user did not make is a second overwrite of their save.
-        restore_wanted_ = 0;
-        keep_local_wanted_ = false;
-        awaiting_ = true;
-        break;
-      case Command::Kind::kCancelKeepLocal:
-        // Not sent again on its own: the row stays drawn as held, and a
-        // second press is harmless -- a cancel that was taken answers
-        // `not_held` with the row open.
-        cancel_wanted_ = 0;
-        cancelling_ = 0;
-        break;
-      case Command::Kind::kRestoreState:
-      case Command::Kind::kNone:
-        break;
-    }
-    issued_ = Command::Kind::kNone;
+    Doubt();
     return;
   }
   issued_ = Command::Kind::kNone;
+  applying_ = false;
   loading_ = false;
   restore_wanted_ = 0;
   keep_local_wanted_ = false;
@@ -616,6 +598,57 @@ void ConflictsModel::OnUnreachable(Link link, std::uint32_t sysmodule_interface)
   cancel_wanted_ = 0;
   cancelling_ = 0;
   stale_ = true;
+}
+
+void ConflictsModel::OnApplying() {
+  switch (issued_) {
+    case Command::Kind::kRestore:
+    case Command::Kind::kKeepLocal:
+      // The press has happened: off the confirmation, which would otherwise
+      // invite a second one, and onto the entry, which says it is applying.
+      if (mode_ == ConflictsMode::kConfirm && opened_ == restoring_) {
+        mode_ = ConflictsMode::kDetail;
+      }
+      applying_ = true;
+      return;
+    case Command::Kind::kCancelKeepLocal:
+      applying_ = true;
+      return;
+    case Command::Kind::kListConflicts:
+    case Command::Kind::kRestoreState:
+    case Command::Kind::kNone:
+      return;
+  }
+}
+
+void ConflictsModel::OnLost() { Doubt(); }
+
+void ConflictsModel::Doubt() {
+  applying_ = false;
+  switch (issued_) {
+    case Command::Kind::kListConflicts:
+      loading_ = false;  // asked again once it answers
+      break;
+    case Command::Kind::kRestore:
+    case Command::Kind::kKeepLocal:
+      // It may have been taken. Asked about, never sent again: a second
+      // press the user did not make is a second overwrite of their save.
+      restore_wanted_ = 0;
+      keep_local_wanted_ = false;
+      awaiting_ = true;
+      break;
+    case Command::Kind::kCancelKeepLocal:
+      // Not sent again on its own: the row stays drawn as held, and a
+      // second press is harmless -- a cancel that was taken answers
+      // `not_held` with the row open.
+      cancel_wanted_ = 0;
+      cancelling_ = 0;
+      break;
+    case Command::Kind::kRestoreState:
+    case Command::Kind::kNone:
+      break;
+  }
+  issued_ = Command::Kind::kNone;
 }
 
 void ConflictsModel::OnLinkRestored() {
@@ -972,7 +1005,9 @@ ConflictsView ConflictsModel::Render() const {
   if (restoring_ != 0 && restoring_ == entry.id) {
     // Taken, and copying on the sysmodule's worker. A frame is never held for
     // it (#209); this is what the screen says while it is not.
-    view.headline = keeping_local_ ? "Keeping this console's copy..." : "Restoring...";
+    view.headline = applying_          ? std::string(kStillApplying)
+                    : keeping_local_ ? "Keeping this console's copy..."
+                                     : "Restoring...";
     view.hint = "The bytes there now are backed up first. B goes back to the list.";
     return view;
   }
@@ -984,7 +1019,7 @@ ConflictsView ConflictsModel::Render() const {
     return view;
   }
   if (cancel_out) {
-    view.headline = "Cancelling Keep local...";
+    view.headline = applying_ ? kStillApplying : "Cancelling Keep local...";
     view.hint = "B goes back to the list";
     return view;
   }

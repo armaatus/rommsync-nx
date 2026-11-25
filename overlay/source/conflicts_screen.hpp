@@ -33,6 +33,7 @@
 
 #include <tesla.hpp>
 
+#include "conflicts_pump.hpp"
 #include "ipc_client.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_conflicts_view.hpp"
@@ -51,9 +52,9 @@ class ConflictsScreen : public tsl::Gui {
 
   tsl::elm::Element* createUI() override;
 
-  /// Called once per frame by Tesla. At most one IPC command goes out per
-  /// frame; the model answers `kNone` once the loaded page covers the screen,
-  /// so a screen sitting still costs nothing.
+  /// Called once per frame by Tesla. At most one IPC command is out at a time
+  /// and no frame waits for it (#329); the model answers `kNone` once the
+  /// loaded page covers the screen, so a screen sitting still costs nothing.
   ///
   /// There is no cursor to close on the way out, which is why this screen has
   /// no destructor where `LibraryScreen` has one: `ListConflicts` is answered
@@ -73,8 +74,8 @@ class ConflictsScreen : public tsl::Gui {
                    HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
 
  private:
-  /// Send at most one command, tell the model what came back, and render.
-  /// The first two are `PumpConflicts`'s (`conflicts_pump.hpp`).
+  /// Collect what came back, post the model's next command, and render. The
+  /// first two are `ConflictsPump`'s (`conflicts_pump.hpp`).
   void Pump();
 
   /// How many prompt rows this view will draw. Read before the body so the
@@ -85,21 +86,13 @@ class ConflictsScreen : public tsl::Gui {
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
-  IpcClient& client_;
-
-  /// The session handshake, and which of the two unreachable sentences a failed
-  /// call means. Shared with every other screen (`screen_frame.hpp`).
-  ScreenFrame frame_{client_};
-
-  ConflictsModel model_;
+  /// The model, the session handshake and the line to the sysmodule
+  /// (`conflicts_pump.hpp`).
+  ConflictsPump pump_;
 
   /// What the last `Render()` produced. Kept rather than rebuilt in `Draw`,
   /// which is `const` and is called by libtesla rather than by us.
   ConflictsView view_ = ConflictsView{};
-
-  /// The link the model was last told about, so a session that came back is
-  /// noticed once rather than restarting the screen every frame.
-  Link link_ = Link::kOk;
 
   /// The held Up/Down/L/R, and how many rows it is worth this frame (#298).
   ScrollRepeat repeat_;

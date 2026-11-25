@@ -8,15 +8,13 @@
 #include "conflicts_screen.hpp"
 #include "ipc_client.hpp"
 #include "library_screen.hpp"
-#include "lifecycle.hpp"
 #include "log_screen.hpp"
 #include "pairing_screen.hpp"
 #include "palette.hpp"
-#include "rommsync/auth.hpp"
 #include "rommsync/core.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_settings_view.hpp"
-#include "screen_frame.hpp"
+#include "settings_pump.hpp"
 #include "sync_screen.hpp"
 
 namespace rommsync::overlay {
@@ -44,20 +42,9 @@ constexpr s32 kInset = 8;
 /// How far a row is indented from the cursor marker.
 constexpr s32 kRowIndent = 18;
 
-/// How many frames pass between two `GetConfig`s.
-///
-/// A configuration changes when somebody edits it, which on this console is
-/// never while the overlay is up -- unlike a `Status`, which moves under the
-/// status screen every second. What one poll costs is the whole folder map
-/// decoded and a few hundred rows rebuilt, so it is asked on a cadence and
-/// immediately after anything this screen does. Half a second at 60 Hz.
-constexpr int kPollFrames = 30;
-
 }  // namespace
 
-SettingsScreen::SettingsScreen(IpcClient& client) : client_(client), cadence_(kPollFrames) {
-  Rebuild();
-}
+SettingsScreen::SettingsScreen(IpcClient& client) : client_(client), pump_(client) { Rebuild(); }
 
 tsl::elm::Element* SettingsScreen::createUI() {
   auto* frame = new tsl::elm::OverlayFrame("rommsync", version());
@@ -72,18 +59,24 @@ tsl::elm::Element* SettingsScreen::createUI() {
 }
 
 void SettingsScreen::update() {
-  // By `Cadence` rather than a frame count of this screen's own: `update()`
-  // does not run while the overlay is hidden, and a count resumed after a hide
-  // would draw the configuration from before it for up to half a second
-  // (`lifecycle.hpp`, #209).
-  if (cadence_.Due()) {
-    Poll();
+  // The poll and the presses are `SettingsPump`'s, and no frame waits for any
+  // of them (#329). The flat list is rebuilt on an answer, not on every frame.
+  pump_.Frame();
+  if (pump_.TakePairing()) {
+    // Re-pair has started a pairing and discarded the old token. The code,
+    // the address and the countdown are the pairing screen's (#27).
+    tsl::changeTo<PairingScreen>(client_);
+    return;
+  }
+  if (pump_.revision() != rendered_) {
+    rendered_ = pump_.revision();
+    Rebuild();
   }
 }
 
 bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAnalogStickState,
                                  HidAnalogStickState) {
-  if (view_.link != Link::kOk) {
+  if (view().link != Link::kOk) {
     // Nothing to scroll and nothing to press. Not handled, so B still leaves
     // the screen and Tesla keeps its own bindings -- and the headline is
     // already saying why, so there is nothing to add.
@@ -107,8 +100,8 @@ bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAn
       return false;
     }
     if (row->change.has_value()) {
-      // Copied out: the poll after the write rebuilds the view `row` points into.
-      PressChange(*row->change);
+      // Copied out: the answer rebuilds the view `row` points into.
+      pump_.PressChange(*row->change);
       return true;
     }
     switch (row->destination) {
@@ -140,99 +133,25 @@ bool SettingsScreen::handleInput(u64 keys_down, u64, const HidTouchState&, HidAn
     return false;
   }
   if ((keys_down & HidNpadButton_X) != 0) {
-    if (view_.repair.state == ControlState::kInert) {
+    if (view().repair.state == ControlState::kInert) {
       return false;
     }
-    PressRepair();
+    pump_.PressRepair();
     return true;
   }
   return false;
 }
 
-void SettingsScreen::PressChange(config::Assignment assignment) {
-  // A half-pressed "Re-pair" does not survive another press: its second press
-  // would otherwise land after the user has moved on to something else.
-  repair_ = RepairState{};
-
-  const Link link = frame_.Ready();
-  if (link != Link::kOk) {
-    ShowUnreachable(link);
-    return;
-  }
-
-  // The sysmodule writes the card and re-reads it (M5-3, #30); this screen
-  // sends the one assignment and draws the answer. A failing `Result` means the
-  // call did not happen, and a refused edit is a successful call carrying
-  // `kInvalid` -- `ipc::WriteOutcome` says why it has to be that way round.
-  ipc::ConfigEdit edit;
-  edit.assignments.push_back(assignment);
-  ipc::ConfigResult result;
-  const Result rc = client_.SetConfig(edit, &result);
-  if (R_FAILED(rc)) {
-    ShowUnreachable(frame_.Diagnose(rc));
-    return;
-  }
-  change_ = ChangeState{true, std::move(assignment), std::move(result)};
-
-  // Asked again rather than assumed: the row shows what the sysmodule now has in
-  // force, and a refused or failed write leaves it showing the value it had.
-  Poll();
-}
-
-void SettingsScreen::Poll() {
-  // The port and the version handshake, both of which every screen needs and
-  // none of which is this screen's own (`screen_frame.hpp`).
-  const Link link = frame_.Ready();
-  if (link != Link::kOk) {
-    ShowUnreachable(link);
-    return;
-  }
-
-  ipc::ConfigView config;
-  const Result rc = client_.GetConfig(&config);
-  if (R_FAILED(rc)) {
-    // `GetConfig` is documented never to fail -- an unconfigured console has a
-    // configuration -- so a failure is the transport or a payload this build
-    // cannot read, and which of the two is `Diagnose`'s to say.
-    ShowUnreachable(frame_.Diagnose(rc));
-    return;
-  }
-
-  config_ = config;
-  if (!config_.config.configured()) {
-    // The console lost the server the second press was going to pair with, so
-    // the first press goes with it. Only `confirming`: an outcome from a press
-    // that already happened is still what the user needs to read.
-    repair_.confirming = false;
-  }
-  Refresh();
-}
-
-void SettingsScreen::ShowUnreachable(Link link) {
-  // The confirmation and the last answer go with the session they belonged to:
-  // a half-pressed "Re-pair" surviving a sysmodule that went away would fire on
-  // the first press after it came back. Every caller of this owes that reset,
-  // which is most of why it is one function rather than five copies.
-  repair_ = RepairState{};
-  change_ = ChangeState{};
-  view_ = RenderSettingsUnreachable(link, frame_.sysmodule_interface());
-  Rebuild();
-}
-
-void SettingsScreen::Refresh() {
-  view_ = RenderSettings(config_, repair_, change_);
-  Rebuild();
-}
-
 void SettingsScreen::Rebuild() {
+  const SettingsView& shown = view();
   const int was = cursor_;
   entries_.clear();
-  for (std::size_t index = 0; index < view_.complaints.size(); ++index) {
+  for (std::size_t index = 0; index < shown.complaints.size(); ++index) {
     entries_.push_back(Entry{Entry::Kind::kComplaint, 0, index});
   }
-  for (std::size_t section = 0; section < view_.sections.size(); ++section) {
+  for (std::size_t section = 0; section < shown.sections.size(); ++section) {
     entries_.push_back(Entry{Entry::Kind::kSectionTitle, section, 0});
-    for (std::size_t row = 0; row < view_.sections[section].rows.size(); ++row) {
+    for (std::size_t row = 0; row < shown.sections[section].rows.size(); ++row) {
       entries_.push_back(Entry{Entry::Kind::kRow, section, row});
     }
   }
@@ -249,7 +168,7 @@ void SettingsScreen::Rebuild() {
     cursor_ = 0;
     for (std::size_t index = 0; index < entries_.size(); ++index) {
       const SettingsRow* row = entries_[index].kind == Entry::Kind::kRow
-                                   ? &view_.sections[entries_[index].section]
+                                   ? &shown.sections[entries_[index].section]
                                           .rows[entries_[index].index]
                                    : nullptr;
       if (row != nullptr && row->selectable) {
@@ -264,77 +183,8 @@ void SettingsScreen::Rebuild() {
   cursor_ = std::min(was, static_cast<int>(entries_.size()) - 1);
 }
 
-void SettingsScreen::PressRepair() {
-  if (view_.repair.state == ControlState::kBlocked) {
-    // Refused here rather than sent to be refused there: the screen already
-    // knows the answer (`SetRepair`), and the refusal is already under the
-    // greyed prompt. The same rule the sync screen keeps for a blocked button.
-    return;
-  }
-  // The answer to an earlier setting press is not what this button did.
-  change_ = ChangeState{};
-  if (!repair_.confirming) {
-    // The first press only asks. The action discards a working pairing and this
-    // console has no dialog to put in front of it.
-    repair_.confirming = true;
-    repair_.outcome = RepairOutcome::kNone;
-    Refresh();
-    return;
-  }
-  repair_.confirming = false;
-
-  // The port and the handshake, as before any other command.
-  const Link link = frame_.Ready();
-  if (link != Link::kOk) {
-    ShowUnreachable(link);
-    return;
-  }
-
-  // The half that can refuse for free, first. See the note in the header: a
-  // refused `StartPair` writes nothing and touches no token, so asking before
-  // discarding costs a console that cannot pair nothing at all. M1-6 (#123)
-  // built `SdEngine::StartPairing` and M1-7 (#126) the transport under it; the
-  // order outlives both, because an attempt is still refusable for want of a
-  // `server.url`, and a refusal after a discard is the thing to avoid.
-  auth::PairingStatus pairing;
-  const Result start = client_.StartPair(&pairing);
-  if (R_FAILED(start)) {
-    ipc::Error error = ipc::Error::kOk;
-    if (DecodeError(start, &error)) {
-      // A refusal the sysmodule named, which is not a transport failure --
-      // drawing `kUnavailable` as "sys-rommsync is not running" is exactly what
-      // `DecodeError` exists to prevent (#25). Nothing was discarded.
-      repair_.outcome = RepairOutcomeFor(error);
-      Refresh();
-      return;
-    }
-    ShowUnreachable(frame_.Diagnose(start));
-    return;
-  }
-
-  // A pairing really is starting, so the old token goes. `Unpair` reports its
-  // refusal as a `Result` -- it has no payload to carry one (`ipc::WriteOutcome`)
-  // -- so the same two-way split applies here.
-  const Result unpair = client_.Unpair();
-  if (R_FAILED(unpair)) {
-    ipc::Error error = ipc::Error::kOk;
-    if (DecodeError(unpair, &error)) {
-      repair_.outcome = RepairOutcome::kUnpairFailed;
-      Refresh();
-      return;
-    }
-    ShowUnreachable(frame_.Diagnose(unpair));
-    return;
-  }
-
-  // The code, the address and the countdown are the pairing screen's (#27), and
-  // it polls `GetPairState` off the attempt that has just started. Nothing is
-  // rendered here first: a frame of this screen between the press and the code
-  // would be a frame saying nothing.
-  tsl::changeTo<PairingScreen>(client_);
-}
-
 const SettingsRow* SettingsScreen::CursorRow() const {
+  const SettingsView& shown = view();
   if (cursor_ < 0 || static_cast<std::size_t>(cursor_) >= entries_.size()) {
     return nullptr;
   }
@@ -342,18 +192,19 @@ const SettingsRow* SettingsScreen::CursorRow() const {
   if (entry.kind != Entry::Kind::kRow) {
     return nullptr;
   }
-  return &view_.sections[entry.section].rows[entry.index];
+  return &shown.sections[entry.section].rows[entry.index];
 }
 
 s32 SettingsScreen::PromptRows() const {
+  const SettingsView& shown = view();
   s32 rows = 0;
   const SettingsRow* row = CursorRow();
   if (row != nullptr && row->selectable) {
     ++rows;
   }
-  if (view_.repair.state != ControlState::kInert) {
+  if (shown.repair.state != ControlState::kInert) {
     ++rows;
-    if (!view_.repair.refusal.empty()) {
+    if (!shown.repair.refusal.empty()) {
       ++rows;
     }
   }
@@ -362,6 +213,7 @@ s32 SettingsScreen::PromptRows() const {
 
 void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
                           s32 height) const {
+  const SettingsView& shown = view();
   // Nothing is drawn past the bounds `CustomDrawer` handed us, and nothing runs
   // off the right edge: a folder path is the user's own text with no length this
   // screen can assume. Every string goes through `DrawBounded`, because a width
@@ -398,9 +250,9 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     row += advance;
   };
 
-  line(view_.headline, kHeadlineFont, ColorFor(view_.tone), kHeadlineHeight);
-  line(view_.hint, kBodyFont, muted, kHintHeight);
-  line(view_.notice, kBodyFont, ColorFor(view_.notice_tone), kHintHeight);
+  line(shown.headline, kHeadlineFont, ColorFor(shown.tone), kHeadlineHeight);
+  line(shown.hint, kBodyFont, muted, kHintHeight);
+  line(shown.notice, kBodyFont, ColorFor(shown.notice_tone), kHintHeight);
 
   // The prompts are reserved *before* the list, not drawn after it: the folder
   // map alone is longer than the panel, so a loop that spent the whole
@@ -428,7 +280,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     };
 
     if (entry.kind == Entry::Kind::kComplaint) {
-      const Line& complaint = view_.complaints[entry.index];
+      const Line& complaint = shown.complaints[entry.index];
       if (clipped || row + kRowHeight > list_bottom) {
         break;
       }
@@ -442,7 +294,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
     }
 
     if (entry.kind == Entry::Kind::kSectionTitle) {
-      const SettingsSection& section = view_.sections[entry.section];
+      const SettingsSection& section = shown.sections[entry.section];
       if (clipped || row + kSectionHeight > list_bottom) {
         break;
       }
@@ -464,7 +316,7 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
       continue;
     }
 
-    const SettingsRow& entry_row = view_.sections[entry.section].rows[entry.index];
+    const SettingsRow& entry_row = shown.sections[entry.section].rows[entry.index];
     if (clipped || row + kRowHeight > list_bottom) {
       break;
     }
@@ -498,10 +350,10 @@ void SettingsScreen::Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width,
   if (cursor_row != nullptr && cursor_row->selectable) {
     line(Prompt(kGlyphA, cursor_row->press_label), kBodyFont, plain, kRowHeight);
   }
-  if (view_.repair.state != ControlState::kInert) {
-    line(Prompt(kGlyphX, view_.repair.label), kBodyFont,
-         view_.repair.state == ControlState::kLive ? plain : muted, kRowHeight);
-    line(view_.repair.refusal, kNoteFont, ColorFor(view_.repair.refusal_tone), kNoteHeight);
+  if (shown.repair.state != ControlState::kInert) {
+    line(Prompt(kGlyphX, shown.repair.label), kBodyFont,
+         shown.repair.state == ControlState::kLive ? plain : muted, kRowHeight);
+    line(shown.repair.refusal, kNoteFont, ColorFor(shown.repair.refusal_tone), kNoteHeight);
   }
 }
 

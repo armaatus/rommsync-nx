@@ -35,6 +35,17 @@ empty", "the server copy is newer", or "the user confirmed".
 4. **The server is the source of truth for conflicts** (hard rule 3), but that
    decides *which* bytes win, never whether the local copy is backed up first.
 
+## Deleting a backup
+
+A backup is deleted only when its bytes are provably somewhere else: a
+`content_hash` RomM holds for the rom, a state row `state.db` proves RomM still
+holds unmoved (#330), or a newer identical backup. The one exception is the state
+budget (`[backup] max_state_mib`, #340). It deletes save-**state** backups with no
+second copy, oldest first, beyond the newest `keep_states` of each state, and only
+those `backup::StateBackupsOf` names from `state.db`. Never extend it to a save's
+backup, never let it take a state's newest, and never decide "this is a state's"
+from a file name alone.
+
 ## Proving it
 
 An untested guarantee is not one. A change to any save-writing path needs a test

@@ -109,7 +109,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
-| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists | [The SD card is full](#the-sd-card-is-full) |
+| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; and, naming `max_state_mib`, how many of them were save-state backups the state budget removed with no other copy | [The SD card is full](#the-sd-card-is-full) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
@@ -138,7 +138,7 @@ in RomM and never come back from it. Nothing changes on the card.
 3 warn net.offline GET /api/roms: body ended early; the rom index could not be fetched: body ended early (transfer closed with 14822 bytes remaining to read)
 3 warn net.offline negotiate: connection failed; the negotiation did not complete: connection failed
 2 warn net.offline tick skipped: this build has no transport
-2 warn net.offline the console has no internet connection; the interval tick waits for the network
+2 warn net.offline the console has no network (airplane mode, or none in range); the interval tick waits for the network
 2 warn net.offline nifm answered 0x123456; read as no internet connection
 ```
 
@@ -165,22 +165,91 @@ harmless; the next one picks up where this one would have.
 4. If the detail says **host could not be resolved**, it is DNS: try the
    server's IP address in `[server] url` to confirm, then fix the name.
 
-`the console has no internet connection; the … tick waits for the network`
-is the console itself saying it is offline — airplane mode, Wi-Fi off, no
-known network in range, or a wake before Wi-Fi has reassociated. Nothing was
-sent and nothing failed: the tick (`boot`, `interval` or `on_demand`) is held,
-the console asks again every two seconds for two minutes and every thirty seconds
-after that, and the tick runs the moment Wi-Fi is
-back, with no backoff to wait out. It is written once per hold, so a console
-that sat in a bag all afternoon shows one line. If it keeps appearing while the
-console's own settings show a working connection, run the connection test under
-System Settings → Internet and include what it says in a bug report.
-`nifm answered 0x…` is the same verdict reached from an answer this client did
-not expect, and worth including in a bug report too.
+`the console has no network (…); the … tick waits for the network` is the
+console itself saying it is offline — airplane mode, Wi-Fi off, or no known
+network in range. Nothing was sent and nothing failed: the tick (`boot`,
+`interval` or `on_demand`) is held, the console asks again every two seconds
+for two minutes and every thirty seconds after that, and the tick runs the
+moment Wi-Fi is back, with no backoff to wait out. It is written once per hold,
+so a console that sat in a bag all afternoon shows one line, and nothing at all
+is sent while it holds.
+
+`nifm says the console has no internet connection; …` is a different hold: the
+console has a network, but Nintendo's connection test has not passed. That is
+also a wake before Wi-Fi has reassociated, which is why the tick waits — but it
+asks RomM directly once the hold has lasted two minutes, so a console that
+blocks Nintendo still syncs. If it keeps appearing, see
+[Sync never runs on a console that blocks Nintendo](#sync-never-runs-on-a-console-that-blocks-nintendo).
+`nifm answered 0x…` is an answer this client did not expect, read the same way;
+it is worth including in a bug report.
+
+`the socket transport did not come up (0x…); ticks wait for it, …` means the
+console's network sockets could not be opened at boot — most often because
+other sysmodules hold every `bsd:u` session the system allows (ldn_mitm and
+sys-ftpd each hold some). It is tried again on its own, less often each time,
+and `the socket transport came up on retry N` follows once one of them lets
+go. If it never does, disable a sysmodule that holds sockets and reboot, and
+include the code in a bug report.
 
 `tick skipped: this build has no transport` is a different sentence and is not
 a network problem — it is a build with no HTTP client wired in, which is not
 something a release does. If you see it on a console, that is worth reporting.
+
+---
+
+## Sync never runs on a console that blocks Nintendo
+
+**Symptom.** The console's Wi-Fi works and RomM is reachable from it — the
+browser on another device on the same network opens it — but nothing syncs, or
+every sync starts about two minutes late. The console blocks Nintendo's servers
+on purpose: Atmosphère's default emuMMC DNS block, 90DNS, a Pi-hole, or a
+network with RomM on it and no internet at all.
+
+**Log line.**
+
+```
+2 warn net.offline nifm says the console has no internet connection; the boot tick waits for the network, and asks RomM directly after 120 s
+2 info net.offline nifm says the console has no internet connection, but RomM answered; syncing without nifm
+2 warn net.offline nifm says the console has no internet connection, and RomM did not answer either: the server's version could not be read: connection failed (Connection refused)
+```
+
+**What is happening.** Before each sync the client asks the console's network
+service, nifm, whether it is online. nifm's "online" means Nintendo's own
+connection test passed, and on a console that blocks Nintendo it may never
+pass. Waiting for it would mean never syncing, so a sync held on that answer
+waits two minutes — long enough for Wi-Fi to finish reassociating after a wake
+— and then asks RomM's `/api/heartbeat` directly, once, with a five-second
+limit:
+
+- **RomM answered**: the sync runs, and the second line above is written once.
+  Later syncs ask RomM straight away rather than waiting the two minutes again,
+  for as long as it keeps answering.
+- **RomM did not answer** — or something answered that was not RomM's
+  heartbeat, such as a captive portal's sign-in page: the sync stays held and
+  nothing is recorded as a failure. RomM is asked again every two minutes, and
+  the third line is written once, with the reason, until the answer changes.
+
+Until RomM has answered, the Library screen, downloads and pairing are refused
+on such a console as they are on one that is offline; once it has, they reach
+RomM too.
+
+Airplane mode and "no network in range" are never treated this way: there
+nothing is sent at all, as
+[Nothing syncs, and nothing is reachable](#nothing-syncs-and-nothing-is-reachable)
+describes.
+
+**The fix.**
+
+1. If the second line is there, nothing is wrong: the two minutes is a one-off
+   per boot.
+2. If the third line is there, it is RomM that is unreachable, and the detail
+   after the `:` says how — the same causes as
+   [Nothing syncs, and nothing is reachable](#nothing-syncs-and-nothing-is-reachable),
+   step 2 onwards. A DNS block list that also blocks RomM's name is one: try
+   RomM's IP address in `[server] url`.
+3. If only the first line is there and it repeats after every boot, include the
+   log in a bug report together with what System Settings → Internet →
+   Connection Status says.
 
 ---
 
@@ -525,18 +594,42 @@ keep syncing throughout.
   overwritten — what the overlay's **Conflicts** screen restores from. After
   every sync that completed it is pruned to `[backup]`'s limits
   ([CONFIG.md](CONFIG.md#backup-how-much-of-backup-is-kept)): the newest ten of
-  each save, everything from the last thirty days, toward 512 MiB in all.
+  each save, everything from the last thirty days, toward 512 MiB in all; and
+  save-state backups to a 256 MiB budget of their own.
 
 ```
 31 info backup.pruned 14 of 52 backups pruned, 9437184 bytes freed; 402653184 bytes in 38 left; 6 kept past the retention rule because no other copy of their bytes could be found
 ```
 
-**A backup whose bytes exist nowhere else is never pruned**, which is what the
-last clause counts — save states mostly, since RomM keeps one copy of a state
-and no digest to compare. If the card is still full, those are what is left:
-copy any you want to keep to a computer, then delete them by hand; that is safe
-and is the fastest space you will find. Lowering `max_mib` does not remove them,
-by design.
+**A save backup whose bytes exist nowhere else is never pruned**, which is
+what the last clause counts. RomM keeps one copy of a state and no digest of
+it, so the client remembers the MD5 of each state it last synced and prunes a
+state backup holding those bytes while RomM still lists that state unchanged;
+but a backup a state *download* wrote holds the bytes that download replaced,
+which RomM no longer has. Two consoles trading a state leave one of those per
+download.
+
+**Save-state backups are the one exception: they have a budget.** Once the
+state backups hold more than `[backup] max_state_mib` (256 MiB unless you
+changed it), the oldest of them are deleted even though they are the only copy
+— never the newest three of each state (`keep_states`), and never a save
+backup. It is the one place this client deletes a backup without a second copy,
+so `backup.pruned` names it in a clause of its own:
+
+```
+31 info backup.pruned 2 of 40 backups pruned, 33554432 bytes freed; 268435456 bytes in 38 left; 2 of them save-state backups [backup] max_state_mib removed with no other copy known
+```
+
+The status screen shows a **State budget** row — *6 only copies removed* —
+once it has happened since the console started. If you would rather keep every
+state backup and clear them yourself, set `max_state_mib = 0`.
+
+If the card is still full, the unique save backups and the newest state backups
+of each state are what is left: copy any you want to keep to a computer, then
+delete them by hand (state backups are the files named `<rom id>-state-…` in
+`.backup/`); that is safe and is the fastest space you will find. Lowering
+`max_mib` does not remove them, by design; lowering `max_state_mib` or
+`keep_states` removes more state backups at the next sync that writes one.
 
 The overlay's status screen shows the same numbers on its **Backups** row, so
 you need not read the log for them: *41.2 MiB, 12 backups* is what the last

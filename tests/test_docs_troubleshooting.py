@@ -47,6 +47,11 @@ import sys
 SECTIONS = [
     "Reading the log",
     "Nothing syncs, and nothing is reachable",
+    # M11-23 (#328). Its own section rather than a paragraph above, because the
+    # console it describes is not offline at all -- it blocks Nintendo, and nifm's
+    # "no internet" is Nintendo's connection test failing -- and the users most
+    # likely to install this are the ones whose consoles do that.
+    "Sync never runs on a console that blocks Nintendo",
     "The token expired or was revoked",
     "The server URL is wrong or missing",
     "TLS fails",

@@ -38,6 +38,8 @@ account = auto                     ; auto | legacy | a 32-digit account id; see 
 keep      = 10                     ; the newest backups of each save kept, at least 1
 keep_days = 30                     ; and every one younger than this; 0 = none by age
 max_mib   = 512                    ; the size .backup/ is held to; 0 = no cap
+max_state_mib = 256                ; state backups past this go, other copy or not; 0 = off
+keep_states   = 3                  ; the newest backups of each state max_state_mib never takes
 
 ; Platform folder map: RomM platform_fs_slug -> SD folders.
 ; roms   = where downloads land (first entry is the write target)
@@ -524,25 +526,60 @@ At the end of every sync that completed, the sysmodule prunes it:
 | `keep` | `10` | the newest this many backups of each save (a rom and slot) and of each state |
 | `keep_days` | `30` | every backup younger than this many days, whatever `keep` says; `0` keeps none by age |
 | `max_mib` | `512` | while the directory is still larger than this, older backups go oldest first across every game — but never the newest of a save; `0` is no cap |
+| `max_state_mib` | `256` | the **state budget**: while state backups hold more than this, the oldest state backups go even when no other copy of their bytes exists — never a save's, and never one of the newest `keep_states` of a state; `0` is off |
+| `keep_states` | `3` | the newest this many backups of each state, which `max_state_mib` never removes |
 
-**A backup is only ever deleted when its bytes are somewhere else**, and no
-setting changes that: RomM holds a save with the same MD5 for that game (every
-upload is kept there as a version), or a newer backup of the same save holds the
-same bytes. A backup of progress that exists nowhere else — a state, which RomM
-keeps one copy of and computes no digest for; a save whose old versions RomM has
-since pruned; any game while RomM cannot be asked — stays however old it is or
-however far over `max_mib` the directory is. The `backup.pruned` line says how
-many were kept for that reason ([TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-sd-card-is-full)).
+**A backup is only ever deleted when its bytes are somewhere else** — with one
+exception, `max_state_mib`, below, which only ever applies to save states. RomM holds a save with the same MD5 for that game (every
+upload is kept there as a version), RomM still holds a state this console last
+synced with the same MD5, or a newer backup of the same save or state holds the
+same bytes. A backup of progress that exists nowhere else — a save whose old
+versions RomM has since pruned; any game while RomM cannot be asked; and most
+state backups — stays however old it is or however far over `max_mib` the
+directory is. The `backup.pruned` line says how many were kept for that reason
+([TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-sd-card-is-full)).
+
+**States are the case to know about.** RomM computes no digest for a state, so
+the client remembers one itself: the MD5 of the bytes it last uploaded or
+downloaded for each state, beside the server row's id, time and size in
+`state.db`. A state backup holding those bytes goes while RomM still lists that
+row unchanged and the sync that prunes found the state settled on both sides
+(or had just downloaded it) — never in the sync that uploaded it, and never with
+`[sync] states` off. But RomM keeps **one** copy of each state, replaced in place by
+every upload, so the bytes a state download backed up are, by then, gone from
+the server: that backup is the only copy. A console that trades states with
+another every session would grow `.backup/` by one state per download until
+the card filled.
+
+**So state backups have a budget, and it is the one place a backup is deleted
+without a second copy.** `max_state_mib` is on by default: once the state
+backups this client can name from `state.db` — a state it has synced, under
+this server — hold more than 256 MiB, the oldest of them go, oldest first, until
+they are back under it. The newest `keep_states` (3) of each state always stay,
+however far over the budget that leaves the directory, and `keep` and
+`keep_days` do not protect a state backup from it: a day of trading would
+otherwise fill a month's allowance. A **save** backup is never removed this way
+— the budget does not even count one — and neither is a backup it cannot be
+sure is a state's: one from before this console used this server, one of a
+state `state.db` no longer lists, or one whose name a save's slot could also
+have written. 256 MiB is a few dozen of the heaviest states a synced core
+writes (some are several MiB) and hundreds of a handheld's, and a console that
+does not trade states writes almost no state backups, so ordinary use never
+reaches it. Each prune that removed one says so in its `backup.pruned` line, in a
+clause naming `max_state_mib`, and the status screen shows a **State budget** row
+counting them since boot. Set `max_state_mib = 0` to keep every unique state
+backup, as before, and clear them by hand.
 
 The live save on the card is deliberately not counted as a second copy: it is
 the file the game writes next. A file in `.backup/` this client did not name —
 one you put there — is never touched.
 
-`keep` below `1`, or a value that is not a whole number, is a `warning` and the
-current value stays; a value past the maximum (1000, 3650 days, 1 TiB) is
+`keep` or `keep_states` below `1`, or a value that is not a whole number, is a
+`warning` and the current value stays; a value past the maximum (1000, 3650 days, 1 TiB) is
 clamped to it. The overlay does not edit these yet; its status screen shows
 what the last prune left on a **Backups** row, and says so when that is still
-over `max_mib`.
+over `max_mib`; a **State budget** row appears once the budget has removed a
+state backup.
 
 ### Where a rom lands
 

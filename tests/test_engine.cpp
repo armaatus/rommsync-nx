@@ -100,6 +100,8 @@
 #include <thread>
 #include <vector>
 
+#include <utime.h>
+
 #include "engine.hpp"
 #include "faulty_disk.hpp"
 #include "harness.hpp"
@@ -2082,7 +2084,7 @@ void RestoreDuringBootWait(checks::Checks& c) {
   // whole of this scenario unless something gets it out.
   console.engine.UseNetworkProbe([&probes] {
     ++probes;
-    return false;
+    return rommsync::sysmodule::NifmVerdict::kOffline;
   });
   console.engine.StartWorker();
   for (int waited = 0; waited < 200 && probes.load() == 0; ++waited) {
@@ -2908,8 +2910,11 @@ std::string Rendered(const ipc::LogTail& tail) {
 /// what these scenarios read -- a tick held for the network sends nothing.
 class Unanswered final : public http::HttpClient {
  public:
-  http::Result Send(const http::Request&) override {
+  http::Result Send(const http::Request& request) override {
     ++requests_;
+    if (request.url.find("/api/heartbeat") != std::string::npos) {
+      ++heartbeats_;
+    }
     http::Result result;
     result.error = http::Error::kConnectFailed;
     result.message = "the console has no internet connection";
@@ -2919,9 +2924,11 @@ class Unanswered final : public http::HttpClient {
     return Send(request);
   }
   int requests() const { return requests_.load(); }
+  int heartbeats() const { return heartbeats_.load(); }
 
  private:
   std::atomic<int> requests_{0};
+  std::atomic<int> heartbeats_{0};
 };
 
 /// A paired card with the boot tick as given and no interval, so every request
@@ -2960,12 +2967,14 @@ void NifmVerdicts(checks::Checks& c) {
   using rommsync::sysmodule::ClassifyNifm;
   using rommsync::sysmodule::NifmVerdict;
   c.Expect(ClassifyNifm(0, true) == NifmVerdict::kOnline, "connected is online");
-  c.Expect(ClassifyNifm(0, false) == NifmVerdict::kOffline,
-           "answered but not connected -- still associating -- is offline");
+  c.Expect(ClassifyNifm(0, false) == NifmVerdict::kNoInternet,
+           "answered but not connected -- still associating, or a console that blocks "
+           "Nintendo (#328) -- is no internet, not no network");
   c.Expect(ClassifyNifm(0xd46ed, true) == NifmVerdict::kOffline,
            "airplane mode or no network in range is offline, whatever the status left behind");
-  c.Expect(ClassifyNifm(0x2a2, true) == NifmVerdict::kOfflineUnexpected,
-           "any other failure is offline too, and the one worth a log line");
+  c.Expect(ClassifyNifm(0x2a2, true) == NifmVerdict::kUnexpected,
+           "any other failure is not offline -- only 0xd46ed is documented to mean that -- and "
+           "is the one worth a log line");
 }
 
 /// M11-5 (#289): a console that boots with no Wi-Fi does not spend its boot
@@ -2994,7 +3003,8 @@ void BootsOffline(checks::Checks& c) {
   console.engine.UseNetworkProbe(
       [&] {
         ++probes;
-        return online.load();
+        return online.load() ? rommsync::sysmodule::NifmVerdict::kOnline
+                             : rommsync::sysmodule::NifmVerdict::kOffline;
       },
       /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
       /*idle_poll=*/std::chrono::milliseconds{50});
@@ -3050,7 +3060,8 @@ void WakesOffline(checks::Checks& c) {
   console.engine.UseNetworkProbe(
       [&] {
         ++probes;
-        return online.load();
+        return online.load() ? rommsync::sysmodule::NifmVerdict::kOnline
+                             : rommsync::sysmodule::NifmVerdict::kOffline;
       },
       /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
       /*idle_poll=*/std::chrono::milliseconds{50});
@@ -3078,6 +3089,144 @@ void WakesOffline(checks::Checks& c) {
   online = true;
   c.Expect(AwaitRequests(server, 0, std::chrono::seconds{3}),
            "the tick runs once Wi-Fi is back, rather than having been spent on the race");
+}
+
+/// #328: a console whose nifm says "no internet" and whose RomM does not answer
+/// either stays held, and what it spends finding out is one heartbeat per
+/// budget -- never a tick, never a backoff.
+///
+/// The other half of `engine.nifm_unsure`, which is the console RomM answers:
+/// asking RomM is only worth it if a console that really is offline pays for
+/// it in heartbeats it can count, rather than in failed ticks.
+void NifmUnsureUnanswered(checks::Checks& c) {
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<int> probes{0};
+  std::atomic<int> opened{0};
+  std::atomic<bool> trusted{false};
+  rommsync::log::Reset();
+  Console console(c, "engine-nifm-unsure-unanswered");
+  SeedOfflineCard(c, console, /*on_boot=*/true);
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.UseNetworkProbe(
+      [&] {
+        ++probes;
+        return rommsync::sysmodule::ClassifyNifm(0, false);
+      },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.UseRommTrust([&](bool trust) {
+    opened += trust ? 1 : 0;
+    trusted = trust;
+  });
+  console.engine.StartWorker();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds{800});
+  c.Expect(opened.load() > 0, "the connector is opened for the ask, which has to get past it");
+  c.Expect(!trusted.load(),
+           "and closed again after it: a drain or a list page on this console would reach "
+           "whatever answered in RomM's place");
+  c.Expect(server.heartbeats() > 0, "RomM is asked once the hold outlasts the budget");
+  c.ExpectEq(server.requests(), server.heartbeats(), "and asked nothing but its heartbeat");
+  c.Expect(server.requests() <= 8,
+           "at most one ask per budget, not one per nifm poll: " +
+               std::to_string(server.requests()) + " in 800 ms against a 100 ms budget");
+  c.Expect(console.Status().last_sync_result == ipc::SyncResult::kNever,
+           "nothing is recorded: the asks were not the tick, which is still held");
+
+  const ipc::LogTail tail = console.Log();
+  int held = 0;
+  int unanswered = 0;
+  for (const std::string& line : tail.lines) {
+    if (line.find(" net.offline ") == std::string::npos) continue;
+    held += line.find("nifm says the console has no internet connection; the boot tick waits") !=
+            std::string::npos;
+    unanswered += line.find("RomM did not answer either") != std::string::npos;
+  }
+  c.ExpectEq(held, 1, "the hold names nifm's internet status, once:" + Rendered(tail));
+  c.ExpectEq(unanswered, 1,
+             "and RomM not answering is said once, not once per ask:" + Rendered(tail));
+}
+
+/// #333: a transport that would not come up at boot is tried again, not given
+/// up on until the next boot.
+///
+/// A co-resident set holding every `bsd:u` session makes `NetworkInitialize`
+/// fail in `__appInit`. Here it fails twice more on the worker and then comes
+/// up: the boot tick is held meanwhile -- nothing sent, nothing recorded --
+/// and runs once it does, the tries are spaced by the backoff, `StartWorker`
+/// does not wait on any of it, and the failure streak is one line naming the
+/// code.
+void TransportRetried(checks::Checks& c) {
+  // Everything the worker reaches is declared before the console, so the
+  // engine's destructor joins the worker while all of it is still alive.
+  Unanswered server;
+  std::unique_ptr<fs::FileSystem> card;
+  std::atomic<int> tries{0};
+  std::atomic<int> sent_before_up{0};
+  std::atomic<bool> on_boot_thread{false};
+  const std::thread::id boot_thread = std::this_thread::get_id();
+  std::mutex times_mutex;
+  std::vector<std::chrono::steady_clock::time_point> times;
+  Console console(c, "engine-transport-retried");
+  SeedOfflineCard(c, console, /*on_boot=*/true);
+  card = rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&server, "not-a-real-token");
+  console.engine.UseCard(card.get());
+  console.engine.UseTransport(
+      [&]() -> std::uint32_t {
+        if (std::this_thread::get_id() == boot_thread) on_boot_thread = true;
+        {
+          std::lock_guard<std::mutex> lock(times_mutex);
+          times.push_back(std::chrono::steady_clock::now());
+        }
+        sent_before_up += server.requests();
+        // 0x1E61: a made-up code, so the log line can be held to naming it.
+        // `__appInit`'s own try failed before this: `main.cpp` installs the
+        // hook only then.
+        return ++tries <= 2 ? 0x1E61u : 0u;
+      },
+      /*first_retry=*/std::chrono::milliseconds{100},
+      /*max_retry=*/std::chrono::milliseconds{150});
+
+  const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  console.engine.StartWorker();
+  const std::chrono::steady_clock::duration boot = std::chrono::steady_clock::now() - started;
+  c.Expect(boot < std::chrono::milliseconds{100},
+           "StartWorker returns at once: the transport is retried on the worker, not at boot");
+  c.Expect(AwaitRequests(server, 0, std::chrono::seconds{5}),
+           "and the held tick runs once the transport comes up");
+  c.Expect(!on_boot_thread.load(), "no try is made on the thread that started the worker");
+  c.ExpectEq(tries.load(), 3, "tried until it came up, and not once more after");
+  c.ExpectEq(sent_before_up.load(), 0,
+             "the tick sends nothing while the transport is down -- it is held, not run");
+  {
+    std::lock_guard<std::mutex> lock(times_mutex);
+    if (times.size() == 3) {
+      c.Expect(times[1] - times[0] >= std::chrono::milliseconds{90},
+               "the second try waits out the first backoff");
+      c.Expect(times[2] - times[1] >= std::chrono::milliseconds{140},
+               "and the third a longer one, capped at the ceiling");
+    }
+  }
+
+  // The tick that ran found nobody there, which is what `Unanswered` is; what
+  // matters is that it ran at all, so that and not its verdict is asserted.
+  const ipc::LogTail tail = console.Log();
+  int down = 0;
+  int up = 0;
+  for (const std::string& line : tail.lines) {
+    if (line.find(" net.offline ") == std::string::npos) continue;
+    if (line.find("transport did not come up (0x1e61)") != std::string::npos) ++down;
+    if (line.find("transport came up") != std::string::npos) ++up;
+  }
+  c.ExpectEq(down, 1, "the failure streak is said once, naming the code:" + Rendered(tail));
+  c.ExpectEq(up, 1, "and its end once:" + Rendered(tail));
+  c.Expect(Logged(tail, "came up on retry 3"), "counting the tries:" + Rendered(tail));
 }
 
 /// Every misconfiguration docs/TROUBLESHOOTING.md answers that needs no server.
@@ -3389,6 +3538,81 @@ int ServerDisabled(http::HttpClient& client, const std::string& base) {
   c.Expect(said, "and the tick ends as server_disabled:" + Rendered(tail));
 
   harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// #328: a console whose nifm has a network up but never says `Connected` --
+/// emuMMC's DNS block, 90DNS, a LAN with no internet -- still syncs when RomM
+/// answers.
+///
+/// nifm's internet status is the verdict of Nintendo's own connection test, so
+/// a console that blocks Nintendo on purpose may never pass it while the RomM
+/// on its LAN is a request away. Until this issue that console held every tick
+/// forever, one `net.offline` line and nothing else. Now, once the hold has
+/// outlasted the network budget, RomM is asked directly, and an answer runs the
+/// tick.
+int NifmUnsure(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  rommsync::log::Reset();
+  // Before the console, so the worker that calls it is joined first.
+  std::atomic<bool> trusted{false};
+  Console console(c, "engine-nifm-unsure");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = true\nstates = false\n"),
+           "the console points at the rig and syncs at boot");
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = fixture.device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+           "and is paired with it");
+
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  // nifm answers the call -- rc 0 -- with a status that is not `Connected`,
+  // for as long as the console is up.
+  console.engine.UseNetworkProbe(
+      [] { return rommsync::sysmodule::ClassifyNifm(0, false); },
+      /*budget=*/std::chrono::milliseconds{100}, /*poll=*/std::chrono::milliseconds{10},
+      /*idle_poll=*/std::chrono::milliseconds{50});
+  console.engine.UseRommTrust([&trusted](bool trust) { trusted = trust; });
+  console.engine.StartWorker();
+
+  ipc::Status status = console.Status();
+  for (int waited = 0; waited < 400 && status.last_sync_result == ipc::SyncResult::kNever;
+       ++waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+    status = console.Status();
+  }
+  c.Expect(status.last_sync_result == ipc::SyncResult::kOk,
+           std::string("the boot tick runs against the RomM that answers, rather than waiting "
+                       "for a nifm that never says Connected: ") +
+               ipc::ToString(status.last_sync_result));
+  c.Expect(status.online, "and the console is drawn as online");
+  c.Expect(trusted.load(),
+           "and the connector is left open past nifm, so a drain or a list page reaches the "
+           "RomM that answered");
+
+  const ipc::LogTail tail = console.Log();
+  bool said = false;
+  for (const std::string& line : tail.lines) {
+    said = said || (line.find(" net.offline ") != std::string::npos &&
+                    line.find("nifm") != std::string::npos);
+  }
+  c.Expect(said,
+           "the hold said it was nifm's internet status, not a missing network, it waited "
+           "on:" + Rendered(tail));
   return c.failures();
 }
 
@@ -5552,6 +5776,271 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
   c.Expect(!status.backup.truncated, "and one listing held the whole directory (#323)");
 
   harness::DeleteSave(client, base, fixture, uploaded.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// M11-25 (#330): a state backup whose bytes `state.db` pairs with a server row
+/// that has not moved -- a row this tick's states half found settled -- is
+/// pruned like a save's: the engine hands the prune the states' proof as well
+/// as the saves'. One whose bytes are nowhere else stays.
+int StateBackupPruned(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-state-pruned");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-state-pruned");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\nstates = true\n\n"
+                                     "[backup]\nkeep = 1\nkeep_days = 0\nmax_mib = 0\n"),
+           "the console points at the rig, syncing states, keeping one backup of each");
+
+  // A state this console last synced, which neither it nor RomM has moved
+  // since: the tick finds it settled, which is what makes its row a proof.
+  const std::string name = "nova.state";
+  const std::string tag = harness::UniqueSlot("engine-state-pruned");
+  const std::string held = "a state whose bytes RomM still holds " + tag;
+  const std::string unique = "a state backup whose bytes are nowhere else " + tag;
+  const std::string newest = "the newest backup of the state " + tag;
+  const std::string live = harness::StatePath(name);
+  c.Expect(console.sandbox.Write(live, held), "the state is on the card");
+  rommsync::sync::ServerState row;
+  if (!harness::UploadState(c, client, base, fixture, rom.id, "retroarch",
+                            console.sandbox.Host(live), name, &row)) {
+    harness::DeleteDevice(client, base, fixture, device_id);
+    return c.failures();
+  }
+  // A whole second the row can name, as the scan reads it.
+  const std::int64_t synced_at = 1'760'000'000;
+  {
+    struct utimbuf times;
+    times.actime = synced_at;
+    times.modtime = synced_at;
+    c.Expect(utime(console.sandbox.Host(live).c_str(), &times) == 0, "the state's mtime is set");
+  }
+  rommsync::state::Baseline baseline;
+  rommsync::state::StateRecord paired;
+  paired.rom_id = rom.id;
+  paired.file_name = name;
+  paired.emulator = "retroarch";
+  paired.content_hash = rommsync::crypto::Md5Hex(held);
+  paired.mtime = rommsync::sync::Timestamp{std::chrono::seconds{synced_at}};
+  paired.file_size_bytes = static_cast<std::int64_t>(held.size());
+  paired.server_state_id = row.id;
+  paired.server_updated_at = row.updated_at;
+  paired.server_file_size_bytes = row.file_size_bytes;
+  baseline.SetState(paired);
+  // Unbound, so adopted by this server from the epoch, as an upgraded card's is
+  // (#294): the backups below are older than any binding this tick would make.
+  console.sandbox.Write("/config/rommsync/state.db", rommsync::state::SerializeBaseline(baseline));
+
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  const std::string discriminator = rommsync::sync::StateBackupDiscriminator(name);
+  const auto backup = [&rom, &name, &discriminator, now](std::int64_t days_ago) {
+    return std::string(harness::kBackupDir) + "/" +
+           rommsync::sync::BackupNameFor(rom.id, discriminator, name,
+                                         now - days_ago * 24 * 60 * 60);
+  };
+  console.sandbox.Write(backup(300), held);
+  console.sandbox.Write(backup(200), unique);
+  console.sandbox.Write(backup(100), newest);
+
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(), "paired");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 1 && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks.ticks(), 1, "and it ran");
+
+  const ipc::LogTail log = console.Log();
+  c.ExpectEq(console.sandbox.Read(live), held, "the live state was left as it was");
+  c.Expect(!console.sandbox.Exists(backup(300)),
+           "the state backup past the count whose bytes RomM holds was pruned:" + Rendered(log));
+  c.ExpectEq(console.sandbox.Read(backup(200)), unique,
+             "the one whose bytes are nowhere else stayed, untouched");
+  c.ExpectEq(console.sandbox.Read(backup(100)), newest, "and so did the newest");
+  const ipc::EngineSnapshot status = console.engine.Snapshot();
+  c.ExpectEq(status.backup.backups, std::int64_t{2}, "two backups are left");
+  c.ExpectEq(status.backup.kept_unique, std::int64_t{1},
+             "one of them kept only because it is the only copy");
+
+  harness::DeleteState(client, base, fixture, row.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
+/// M11-26 (#340): the state budget, through the engine. `[backup]` sets it
+/// small; three backups of a state this console trades, each the only copy of
+/// its bytes, are over it, and so is an old save backup nothing else holds. The
+/// oldest state backup goes to the budget -- `state.db` is what names it a
+/// state's -- the save backup stays, and the status and the log say a sole copy
+/// was removed.
+int StateBudget(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
+           "the fixture library has nova.nes");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-state-budget");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+
+  rlog::Reset();
+  const TickLines ticks;
+  Console console(c, "engine-state-budget");
+  c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                 "[server]\nurl = " + base +
+                                     "\n\n[sync]\nenabled = true\ninterval_min = 0\n"
+                                     "on_boot = false\nstates = true\n\n"
+                                     "[backup]\nkeep = 1\nkeep_days = 0\nmax_mib = 0\n"
+                                     "max_state_mib = 1\nkeep_states = 1\n"),
+           "the console points at the rig, syncing states, with a 1 MiB state budget");
+
+  const std::string name = "nova.state";
+  const std::string tag = harness::UniqueSlot("engine-state-budget");
+  const std::string live = harness::StatePath(name);
+  const std::string held = "the live state " + tag;
+  c.Expect(console.sandbox.Write(live, held), "the state is on the card");
+  rommsync::sync::ServerState row;
+  if (!harness::UploadState(c, client, base, fixture, rom.id, "retroarch",
+                            console.sandbox.Host(live), name, &row)) {
+    harness::DeleteDevice(client, base, fixture, device_id);
+    return c.failures();
+  }
+  const std::int64_t synced_at = 1'760'000'000;
+  {
+    struct utimbuf times;
+    times.actime = synced_at;
+    times.modtime = synced_at;
+    c.Expect(utime(console.sandbox.Host(live).c_str(), &times) == 0, "the state's mtime is set");
+  }
+  rommsync::state::Baseline baseline;
+  rommsync::state::StateRecord paired;
+  paired.rom_id = rom.id;
+  paired.file_name = name;
+  paired.emulator = "retroarch";
+  paired.content_hash = rommsync::crypto::Md5Hex(held);
+  paired.mtime = rommsync::sync::Timestamp{std::chrono::seconds{synced_at}};
+  paired.file_size_bytes = static_cast<std::int64_t>(held.size());
+  paired.server_state_id = row.id;
+  paired.server_updated_at = row.updated_at;
+  paired.server_file_size_bytes = row.file_size_bytes;
+  baseline.SetState(paired);
+  console.sandbox.Write("/config/rommsync/state.db", rommsync::state::SerializeBaseline(baseline));
+
+  const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+  const std::string discriminator = rommsync::sync::StateBackupDiscriminator(name);
+  const auto backup = [&rom, &name, &discriminator, now](std::int64_t days_ago) {
+    return std::string(harness::kBackupDir) + "/" +
+           rommsync::sync::BackupNameFor(rom.id, discriminator, name,
+                                         now - days_ago * 24 * 60 * 60);
+  };
+  // Three trades' worth, 512 KiB each and each unique: 1.5 MiB against 1.
+  const auto traded = [&tag](char fill) {
+    std::string bytes = "traded " + tag + " ";
+    bytes.resize(512 * 1024, fill);
+    return bytes;
+  };
+  console.sandbox.Write(backup(3), traded('a'));
+  console.sandbox.Write(backup(2), traded('b'));
+  console.sandbox.Write(backup(1), traded('c'));
+  // A save backup older than all of them, past `keep`, and nowhere else.
+  const std::string save_backup =
+      std::string(harness::kBackupDir) + "/" +
+      rommsync::sync::BackupNameFor(rom.id, "autosave", "nova.srm", now - 300 * 24 * 60 * 60);
+  std::string save_bytes = "a save backup nowhere else " + tag;
+  save_bytes.resize(2 * 1024 * 1024, 's');
+  console.sandbox.Write(save_backup, save_bytes);
+  console.sandbox.Write(std::string(harness::kBackupDir) + "/" +
+                            rommsync::sync::BackupNameFor(rom.id, "autosave", "nova.srm",
+                                                          now - 200 * 24 * 60 * 60),
+                        "the newest save backup " + tag);
+
+  auth::StoredToken token;
+  token.server_url = base;
+  token.access_token = fixture.token;
+  token.device_id = device_id;
+  token.scopes = {"roms.read"};
+  c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(), "paired");
+  const std::unique_ptr<fs::FileSystem> card =
+      rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+  console.Boot();
+  console.engine.UseServer(&client, token.access_token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+
+  c.Expect(console.SyncNow() == ipc::SyncOutcome::kAccepted, "a tick is asked for");
+  const std::chrono::steady_clock::time_point by =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  while (ticks.ticks() < 1 && std::chrono::steady_clock::now() < by) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{25});
+  }
+  c.ExpectEq(ticks.ticks(), 1, "and it ran");
+
+  const ipc::LogTail log = console.Log();
+  c.Expect(!console.sandbox.Exists(backup(3)),
+           "the oldest state backup went to the budget:" + Rendered(log));
+  c.ExpectEq(console.sandbox.Read(backup(2)), traded('b'), "the next one stayed");
+  c.ExpectEq(console.sandbox.Read(backup(1)), traded('c'), "and so did the newest");
+  c.ExpectEq(console.sandbox.Read(save_backup), save_bytes,
+             "the save backup nowhere else stayed: the budget never takes a save's");
+  c.ExpectEq(console.sandbox.Read(live), held, "the live state was left as it was");
+  const ipc::EngineSnapshot status = console.engine.Snapshot();
+  c.ExpectEq(status.backup.state_budget_pruned, std::int64_t{1},
+             "the status counts the sole copy the budget removed");
+  bool said = false;
+  for (const std::string& line : log.lines) {
+    said = said || (line.find(" backup.pruned") != std::string::npos &&
+                    line.find("max_state_mib") != std::string::npos);
+  }
+  c.Expect(said, "and backup.pruned says so on a line of its own:" + Rendered(log));
+
+  harness::DeleteState(client, base, fixture, row.id);
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();
 }
@@ -8207,6 +8696,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"pair_commit", PairCommit},
       {"log_faults", LogsTransportFailures},
       {"server_disabled", ServerDisabled},
+      {"nifm_unsure", NifmUnsure},
       {"drains", Drains},
       {"downloading", DrainProgress},
       {"preempts", DrainPreempted},
@@ -8221,6 +8711,8 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"download_restores", DownloadRestores},
       {"server_deleted", ServerDeleted},
       {"backup_pruned", BackupPruned},
+      {"state_backup_pruned", StateBackupPruned},
+      {"state_budget", StateBudget},
       {"backup_truncated", BackupTruncated},
       {"server_switched", ServerSwitched},
       {"interop", Interop},
@@ -8289,6 +8781,10 @@ int main(int argc, char** argv) {
     BootsOffline(checks);
   } else if (scenario == "wakes_offline") {
     WakesOffline(checks);
+  } else if (scenario == "nifm_unsure_unanswered") {
+    NifmUnsureUnanswered(checks);
+  } else if (scenario == "transport_retried") {
+    TransportRetried(checks);
   } else if (scenario == "restore_race") {
     RestoreDuringSync(checks);
   } else if (scenario == "restore_polled") {

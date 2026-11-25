@@ -13,11 +13,12 @@
 // sysmodule's issues; this screen's job is to render a page that failed as a
 // page that failed, and keep the ones already loaded.
 //
-// **One command per frame, and it never blocks.** The model hands out one
-// command at a time and is told what came back; a page the engine is still
-// fetching comes back `pending` rather than waiting on the IPC thread (#31), so
-// this asks again on the next frame instead of parking a draw thread on a
-// socket.
+// **One command out at a time, and no frame waits for it.** The model hands
+// out one command at a time and is told what came back; a page the engine is
+// still fetching comes back `pending` rather than waiting on the IPC thread
+// (#31), and since M11-24 (#329) the screen does not wait for the answer
+// either: `LibraryPump` posts it and collects it on a later frame, so a held R
+// keeps moving through the rows already loaded while a page is out.
 //
 // **Nothing here has ever run.** Overlay UI is one of the few things an emulator
 // cannot exercise, so it is verified last, on hardware, after the M8-1 gate
@@ -29,6 +30,7 @@
 #include <cstdint>
 
 #include "ipc_client.hpp"
+#include "library_pump.hpp"
 #include "rommsync/ipc.hpp"
 #include "rommsync/overlay_library_model.hpp"
 #include "rommsync/overlay_scroll.hpp"
@@ -53,9 +55,9 @@ class LibraryScreen : public tsl::Gui {
 
   tsl::elm::Element* createUI() override;
 
-  /// Called once per frame by Tesla. At most one IPC command goes out per
-  /// frame; the model decides which, and answers `kNone` when the loaded pages
-  /// are enough for what is on screen.
+  /// Called once per frame by Tesla. At most one IPC command is out at a time
+  /// and no frame waits for it (#329); the model decides which, and answers
+  /// `kNone` when the loaded pages are enough for what is on screen.
   void update() override;
 
   /// Up/Down move the selection and L/R move it a page, repeating while held
@@ -71,7 +73,7 @@ class LibraryScreen : public tsl::Gui {
                    HidAnalogStickState left_stick, HidAnalogStickState right_stick) override;
 
  private:
-  /// Send at most one command, and tell the model what came back
+  /// Collect what came back, tell the model, and post its next command
   /// (`library_pump.hpp`).
   void Pump();
 
@@ -87,13 +89,9 @@ class LibraryScreen : public tsl::Gui {
   /// Draw `view_` into the bounds `CustomDrawer` hands us.
   void Draw(tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 width, s32 height) const;
 
-  IpcClient& client_;
-
-  /// The session handshake, and which of the two unreachable sentences a failed
-  /// call means. Shared with every other screen (`screen_frame.hpp`).
-  ScreenFrame frame_{client_};
-
-  LibraryBrowserModel model_;
+  /// The model, the session handshake and the line to the sysmodule
+  /// (`library_pump.hpp`).
+  LibraryPump pump_;
 
   /// What the last `Render()` produced: the rows around the selection, and
   /// rebuilt only when the model changed (`RenderLibrary`, #298). Kept rather
@@ -106,10 +104,6 @@ class LibraryScreen : public tsl::Gui {
 
   /// The held Up/Down/L/R, and how many rows it is worth this frame.
   ScrollRepeat repeat_;
-
-  /// The link the model was last told about, so a session that came back is
-  /// noticed once rather than restarting the browser every frame.
-  Link link_ = Link::kOk;
 };
 
 }  // namespace rommsync::overlay

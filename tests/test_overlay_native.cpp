@@ -26,7 +26,10 @@
 //                      destructor runs (#285).
 //   `status_pump.cpp`, `sync_pump.cpp`, `pairing_pump.cpp`
 //                      the three polling screens' IPC frames (#299).
-//   `poller.cpp`       the line those three poll through without waiting (#299).
+//   `log_pump.cpp`, `settings_pump.cpp`
+//                      the log and settings screens' IPC frames (#329).
+//   `poller.cpp`       the line every screen's frame goes through without
+//                      waiting (#299, #329).
 //
 // The far side of the wire is the *real* dispatch table -- `ipc::Dispatch` over
 // an `ipc::ServiceCore` -- and the real `Error` -> `Result` mapping the
@@ -81,10 +84,12 @@
 #include "library_pump.hpp"
 #include "lifecycle.hpp"
 #include "log_paint.hpp"
+#include "log_pump.hpp"
 #include "pairing_pump.hpp"
 #include "prompts.hpp"
 #include "result.hpp"
 #include "screen_frame.hpp"
+#include "settings_pump.hpp"
 #include "status_paint.hpp"
 #include "status_pump.hpp"
 #include "sync_pump.hpp"
@@ -1001,7 +1006,7 @@ int RunTimeout(Checks& checks) {
 /// `serviceDispatchOut` for the whole of it -- a large save on a slow card was a
 /// frozen overlay holding the user's input. Now the command answers the moment
 /// the restore is taken, and the screen polls. This drives the conflicts
-/// screen's own frame -- `PumpConflicts`, the code `ConflictsScreen::update`
+/// screen's own frame -- `ConflictsPump`, the code `ConflictsScreen::update`
 /// runs -- through the real client against an engine whose restore does not
 /// finish until the test says so, and times every frame.
 ///
@@ -1028,26 +1033,37 @@ int RunRestore(Checks& checks) {
   console.Start();
 
   overlay::IpcClient client(kTestBudget);
-  overlay::ScreenFrame frame(client);
-  overlay::ConflictsModel model;
-  overlay::Link link = overlay::Link::kOk;
+  overlay::ConflictsPump pump(client);
+  overlay::ConflictsModel& model = pump.model();
 
   // One frame, timed. What a frame costs is the claim, so every frame below
-  // goes through this.
+  // goes through this. Since #329 an answer arrives a frame or two after its
+  // command goes out, so the steps below run frames until it has.
   std::chrono::milliseconds slowest{0};
-  const auto pump = [&] {
+  const auto frame = [&] {
     const Clock::time_point start = Clock::now();
-    overlay::PumpConflicts(frame, client, model, link);
+    pump.Frame();
     slowest = std::max(slowest, Since(start));
   };
+  const auto until = [&](auto done) {
+    const Clock::time_point start = Clock::now();
+    while (!done() && Since(start) < kPatience) {
+      frame();
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return done();
+  };
 
-  pump();  // the handshake and the first page
-  checks.ExpectEq(model.loaded(), std::size_t{1}, "the history's one entry is loaded");
+  checks.Expect(until([&] { return model.loaded() == 1; }),
+                "the history's one entry is loaded");
   model.Activate();  // open it
   model.Activate();  // confirm
   model.Activate();  // press
 
-  pump();  // the restore goes out, and is answered at once
+  checks.Expect(until([&] { return engine.restore_requests == 1 && model.Render().headline.find(
+                                                                       "Restoring") !=
+                                                                   std::string::npos; }),
+                "the restore goes out and is answered at once");
   checks.ExpectEq(engine.last_restore_id, static_cast<std::int64_t>(7),
                   "the restore was asked for the entry that was open");
   overlay::ConflictsView view = model.Render();
@@ -1055,9 +1071,10 @@ int RunRestore(Checks& checks) {
                 "the screen says it is restoring rather than freezing: " + view.headline);
 
   // **The copy is still running for all of these**, and not one frame waits
-  // for it: each is one poll, answered from memory.
+  // for it: each is at most one poll, answered from memory.
   for (int frames = 0; frames < 30; ++frames) {
-    pump();
+    frame();
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   checks.Expect(slowest < kPrompt, "no frame is held while the save copies: the slowest took " +
                                        std::to_string(slowest.count()) + "ms");
@@ -1066,10 +1083,9 @@ int RunRestore(Checks& checks) {
   checks.ExpectEq(engine.restore_requests, 1, "the restore was asked for once, then polled");
 
   engine.FinishRestore();
-  pump();
+  checks.Expect(until([&] { return model.Render().headline.find("Restored") != std::string::npos; }),
+                "the outcome arrives a few frames after it finishes: " + model.Render().headline);
   view = model.Render();
-  checks.Expect(view.headline.find("Restored") != std::string::npos,
-                "the outcome arrives on the next frame after it finishes: " + view.headline);
   checks.Expect(!view.can_restore, "with the restore no longer on offer");
   checks.Expect(model.Next().kind == overlay::ConflictsModel::Command::Kind::kNone,
                 "and the polling stops");
@@ -1086,6 +1102,14 @@ constexpr std::chrono::milliseconds kFrameBound{2};
 
 /// A frame at 60 Hz, between two `update()`s.
 constexpr std::chrono::milliseconds kFramePeriod{16};
+
+/// The bound for a frame that *decodes* an answer as large as the wire allows
+/// (#329): a library page of `ipc::kMaxPageSize` rows or a whole folder map,
+/// up to `ipc::kMaxPayloadBytes` of JSON parsed and turned into rows. That is
+/// about 2 ms of CPU in this suite's unoptimised build, so `kFrameBound` --
+/// sized for a `Status` -- cannot tell it from a wait; the frame it has to fit
+/// in can, and a 300 ms answer waited for is still twenty frames over it.
+constexpr std::chrono::milliseconds kDecodeFrameBound = kFramePeriod;
 
 /// No card: the sysmodule answers in every frame these drive, so a probe that
 /// ran would be a probe the status pump should not have made.
@@ -1197,6 +1221,199 @@ int RunFrames(Checks& checks) {
                   "the press arrives, and the screen says it is starting" + Took(slowest));
     checks.Expect(slowest < kFrameBound,
                   "and no pairing frame or press waited for a 300 ms answer" + Took(slowest));
+  }
+
+  // M11-24 (#329): the library, with R held across several pages of a long
+  // platform. Every page is a `ListNext` the sysmodule takes 300 ms over --
+  // on a console, a page RomM is still serving -- and not one frame waits
+  // for it. While one is out, the held R keeps moving through the rows
+  // already loaded and comes to rest on the "Loading..." row at their edge.
+  {
+    console.engine().library_roms = 300;
+    overlay::LibraryPump pump(client);
+    overlay::LibraryBrowserModel& model = pump.model();
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return model.selected_position() == 0; }, &slowest),
+                  "the library lists its platform" + Took(slowest));
+    model.Activate();
+    // The longest run of frames on which the selection moved and no page
+    // landed: R moving through rows already loaded while the next was out.
+    int moving = 0;
+    int moved_between_pages = 0;
+    bool rested_on_loading = false;
+    checks.Expect(
+        RunFramesUntil(
+            [&] {
+              const std::size_t loaded = model.loaded_rows();
+              const int before = model.selected_position();
+              model.MoveSelection(overlay::kPageRows);
+              if (before >= 0 && model.selected_position() > before) {
+                moved_between_pages = std::max(moved_between_pages, ++moving);
+              }
+              const overlay::LibraryView view = model.Render(0, 0);
+              if (view.selected >= 0) {
+                const overlay::LibraryRow& row = view.rows[static_cast<std::size_t>(view.selected)];
+                rested_on_loading = rested_on_loading || (row.kind == overlay::RowKind::kMore &&
+                                                          row.label == "Loading...");
+              }
+              pump.Frame();
+              if (model.loaded_rows() != loaded) {
+                moving = 0;
+              }
+            },
+            [&] { return model.selected_position() >= 290; }, &slowest),
+        "a held R reaches row 290 of 300, across five pages" + Took(slowest));
+    checks.Expect(slowest < kDecodeFrameBound,
+                  "and no library frame waited for a 300 ms page" + Took(slowest));
+    checks.Expect(rested_on_loading,
+                  "a held R that outran the pages rested on the Loading... row");
+    checks.Expect(moved_between_pages >= 2,
+                  "and moved through the loaded rows, a frame at a time, while the next page "
+                  "was out: " + std::to_string(moved_between_pages) + " frames");
+    pump.Close();
+    checks.ExpectEq(model.open_cursors(), std::size_t{0},
+                    "and the screen's teardown closes every cursor it opened");
+    console.engine().library_roms = 0;
+  }
+
+  // An Enqueue out past the budget says "still applying" on its row, and is
+  // not lost: the row says queued when it lands.
+  {
+    console.engine().library_roms = 20;
+    console.sysmodule().slow_command = static_cast<int>(ipc::Command::kEnqueue);
+    console.sysmodule().delay_ms = static_cast<int>(overlay::IpcClient::kCallBudget.count()) + 300;
+    overlay::LibraryPump pump(client);
+    overlay::LibraryBrowserModel& model = pump.model();
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return model.selected_position() == 0; }, &slowest),
+                  "the library lists its platform" + Took(slowest));
+    model.Activate();
+    const auto first = [&] {
+      const overlay::LibraryView view = model.Render();
+      return view.rows.empty() ? overlay::LibraryRow{} : view.rows[0];
+    };
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return first().kind == overlay::RowKind::kRom &&
+                                              first().rom_id == 1; },
+                                 &slowest),
+                  "the platform's roms are listed" + Took(slowest));
+    model.Activate();  // download the first rom
+    bool applying = false;
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        pump.Frame();
+                        applying = applying || first().note == overlay::kStillApplying;
+                      },
+                      [&] { return first().state == overlay::RowState::kQueued; }, &slowest),
+                  "the late Enqueue lands, and the row says queued" + Took(slowest));
+    checks.Expect(applying, "while it was out past the budget, the row said still applying");
+    // The decode bound because `slowest` includes the frames that landed the
+    // platform and rom pages above; the Enqueue's own frames decode one integer.
+    checks.Expect(slowest < kDecodeFrameBound, "and no frame waited for it" + Took(slowest));
+    pump.Close();
+    console.sysmodule().slow_command = -1;
+    console.sysmodule().delay_ms = 300;
+    console.engine().library_roms = 0;
+  }
+
+  // The conflicts screen's pages, the same way.
+  {
+    for (std::int64_t id = 1; id <= 12; ++id) {
+      ipc::ConflictRow row;
+      row.entry.id = id;
+      row.entry.kind = rommsync::conflicts::EntryKind::kSave;
+      row.entry.event = rommsync::conflicts::Event::kReplaced;
+      row.entry.rom_id = id;
+      row.entry.rom_name = "Game " + std::to_string(id);
+      row.entry.file_name = "game.srm";
+      row.entry.sd_path = "/roms/gba/game.srm";
+      row.entry.backup_sd_path = "/config/rommsync/.backup/game.srm";
+      row.backup_present = true;
+      console.engine().conflicts_.push_back(row);
+    }
+    overlay::ConflictsPump pump(client);
+    overlay::ConflictsModel& model = pump.model();
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        model.MoveSelection(1);
+                        pump.Frame();
+                      },
+                      [&] { return model.loaded() == 12; }, &slowest),
+                  "the conflicts screen pages through the history" + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no conflicts frame waited for a 300 ms page" + Took(slowest));
+  }
+
+  // The log screen: its read, and Y, which writes the diagnostics bundle.
+  {
+    overlay::LogPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return Drawn(pump.view()); }, &slowest),
+                  "the log screen draws the sysmodule's log" + Took(slowest));
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressDiagnostics();
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().notice.find("Wrote") !=
+                                              std::string::npos; },
+                                 &slowest),
+                  "Y's answer is drawn: " + pump.view().notice + Took(slowest));
+    checks.Expect(slowest < kFrameBound,
+                  "and no log frame or press waited for a 300 ms answer" + Took(slowest));
+  }
+
+  // The settings screen: its read, and A on a setting, which is `SetConfig` --
+  // the write that takes the card mutex, and so the one that is slow while a
+  // download writes. Past the budget it says still applying, and lands.
+  {
+    overlay::SettingsPump pump(client);
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return Drawn(pump.view()); }, &slowest),
+                  "the settings screen draws the configuration" + Took(slowest));
+    {
+      const Clock::time_point began = Clock::now();
+      pump.PressChange(config::Assignment{"sync", "on_server_delete", "remove"});
+      slowest = std::max(slowest, Since(began));
+    }
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return pump.view().notice.find("is now") !=
+                                              std::string::npos; },
+                                 &slowest),
+                  "the write's answer is drawn: " + pump.view().notice + Took(slowest));
+    checks.Expect(console.engine().last_edit.assignments.size() == 1 &&
+                      console.engine().last_edit.assignments[0].key == "on_server_delete",
+                  "and the one assignment was sent");
+
+    console.sysmodule().slow_command = static_cast<int>(ipc::Command::kSetConfig);
+    console.sysmodule().delay_ms = static_cast<int>(overlay::IpcClient::kCallBudget.count()) + 300;
+    pump.PressChange(config::Assignment{"sync", "on_server_delete", "keep"});
+    bool applying = false;
+    bool unreachable = false;
+    checks.Expect(RunFramesUntil(
+                      [&] {
+                        pump.Frame();
+                        applying = applying || pump.view().notice == overlay::kStillApplying;
+                        unreachable = unreachable || pump.view().link != overlay::Link::kOk;
+                      },
+                      [&] { return pump.view().notice.find("keep") != std::string::npos; },
+                      &slowest),
+                  "the late write is not lost: its answer is drawn when it lands" +
+                      Took(slowest));
+    checks.Expect(applying, "while it was out past the budget, the screen said still applying");
+    checks.Expect(!unreachable, "and never that the sysmodule was not responding");
+    // The decode bound because every `GetConfig` read here carries the whole
+    // folder map; the presses themselves post and return.
+    checks.Expect(slowest < kDecodeFrameBound,
+                  "and no settings frame or press waited for any of it" + Took(slowest));
+    console.sysmodule().slow_command = -1;
+    console.sysmodule().delay_ms = 300;
   }
 
   // A write past the budget is still applying, not "not responding" (#299):
@@ -1330,19 +1547,17 @@ void RecordForeground(bool enabled) { ForegroundCalls().push_back(enabled); }
 /// the screen this is about because it is the one whose destructor talks to
 /// the sysmodule -- it closes the cursors it holds (#285).
 struct LibraryUnderTest {
-  explicit LibraryUnderTest(overlay::IpcClient& borrowed) : client(borrowed) {}
-  ~LibraryUnderTest() { overlay::CloseLibrary(frame, client, model); }
+  explicit LibraryUnderTest(overlay::IpcClient& borrowed) : pump(borrowed) {}
+  ~LibraryUnderTest() { pump.Close(); }
 
   LibraryUnderTest(const LibraryUnderTest&) = delete;
   LibraryUnderTest& operator=(const LibraryUnderTest&) = delete;
 
   /// `update()`.
-  void Frame() { overlay::PumpLibrary(frame, client, model, link); }
+  void Frame() { pump.Frame(); }
 
-  overlay::IpcClient& client;
-  overlay::ScreenFrame frame{client};
-  overlay::LibraryBrowserModel model;
-  overlay::Link link = overlay::Link::kOk;
+  overlay::LibraryPump pump;
+  overlay::LibraryBrowserModel& model = pump.model();
 };
 
 /// `tsl::Overlay`'s part: the gui stack. A private member of the **base**
@@ -1509,7 +1724,7 @@ int RunCycles(Checks& checks) {
   // stack is emptied -- after `exitServices` on every exit libtesla's loop
   // has -- so a destructor that reached `Ready()` or `Diagnose()` would
   // `smGetService` on a client that had already stopped, and nothing after it
-  // closes what it opens. The library's teardown is `CloseLibrary`, which is
+  // closes what it opens. The library's teardown is `LibraryPump::Close`, which is
   // held to retiring its frame first; any other screen may not touch the wire.
   {
     const std::filesystem::path dir(ROMMSYNC_OVERLAY_SOURCE_DIR);
@@ -1565,13 +1780,15 @@ int RunCycles(Checks& checks) {
     checks.Expect(destructors > 0, "the screen destructor grep found ~LibraryScreen to check");
 
     const std::string pump = CodeOnly(ReadWhole(dir / "library_pump.cpp"));
-    const std::size_t teardown = pump.find("void CloseLibrary(");
-    const std::size_t retired = pump.find("frame.Retire();", teardown);
-    const std::size_t ready = pump.find("frame.Ready()", teardown);
+    const std::size_t teardown = pump.find("void LibraryPump::Close(");
+    const std::size_t retired = pump.find("frame_.Retire();", teardown);
+    const std::size_t drained = pump.find("poller_.Drain()", teardown);
+    const std::size_t ready = pump.find("frame_.Ready()", teardown);
     checks.Expect(teardown != std::string::npos && retired != std::string::npos &&
-                      retired < ready,
-                  "CloseLibrary retires its frame before asking it anything, so the teardown "
-                  "only ever uses a session that is already open");
+                      retired < drained && retired < ready,
+                  "LibraryPump::Close retires its frame before asking it anything -- or "
+                  "collecting what it asked -- so the teardown only ever uses a session that "
+                  "is already open");
   }
 
   Console console;
@@ -1606,8 +1823,12 @@ int RunCycles(Checks& checks) {
           ipc::Status status;
           checks.Expect(R_SUCCEEDED(under_test->client.GetStatus(&status)),
                         "and polls: " + where);
-          for (int tick = 0; tick < 4; ++tick) {
+          // Until the first cursor is answered: since #329 a frame posts and
+          // a later one collects.
+          const Clock::time_point began = Clock::now();
+          while (library.model.open_cursors() == 0 && Since(began) < kPatience) {
             library.Frame();
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
           }
           checks.Expect(library.model.open_cursors() > 0,
                         "the library holds a cursor its destructor has to close: " + where);
@@ -1674,9 +1895,17 @@ int RunCycles(Checks& checks) {
 /// `LibraryScreen` minus the `tsl::Gui`, as #298 left it: the held key turned
 /// into rows by `ScrollRepeat`, the IPC frame, and the view re-rendered only
 /// when the model changed -- `update()` and `handleInput()` in one call.
+///
+/// Since #329 a frame posts and a later one collects, so a frame here also
+/// gives the client's worker the moment a real frame would: this fake answers
+/// a page in microseconds, and a console's frame is 16 ms. A frame on which
+/// nothing moved is one waiting on the worker, so it collects again, a
+/// millisecond at a time, for up to the rest of those 16 ms. A flat 1 ms sleep
+/// left that to the host's scheduler, and a loaded CI runner spent the
+/// difference on "Loading..." frames past the bound below (#347).
 struct LibraryOnScreen {
-  explicit LibraryOnScreen(overlay::IpcClient& borrowed) : client(borrowed) {}
-  ~LibraryOnScreen() { overlay::CloseLibrary(frame, client, model); }
+  explicit LibraryOnScreen(overlay::IpcClient& borrowed) : pump(borrowed) {}
+  ~LibraryOnScreen() { pump.Close(); }
 
   LibraryOnScreen(const LibraryOnScreen&) = delete;
   LibraryOnScreen& operator=(const LibraryOnScreen&) = delete;
@@ -1686,8 +1915,13 @@ struct LibraryOnScreen {
     if (rows != 0) {
       model.MoveSelection(rows);
     }
-    overlay::PumpLibrary(frame, client, model, link);
-    overlay::RenderLibrary(model, &view, &seen);
+    pump.Frame();
+    bool moved = overlay::RenderLibrary(model, &view, &seen);
+    for (int ms = 0; !moved && ms < 16; ++ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      pump.Frame();
+      moved = overlay::RenderLibrary(model, &view, &seen);
+    }
   }
 
   std::int64_t SelectedRom() const {
@@ -1697,10 +1931,8 @@ struct LibraryOnScreen {
     return view.rows[static_cast<std::size_t>(view.selected)].rom_id;
   }
 
-  overlay::IpcClient& client;
-  overlay::ScreenFrame frame{client};
-  overlay::LibraryBrowserModel model;
-  overlay::Link link = overlay::Link::kOk;
+  overlay::LibraryPump pump;
+  overlay::LibraryBrowserModel& model = pump.model();
   overlay::LibraryView view;
   std::uint64_t seen = ~std::uint64_t{0};
   overlay::ScrollRepeat repeat;
@@ -1712,6 +1944,11 @@ struct LibraryOnScreen {
 /// Before #298 the level stopped at row 512 with "Too many to list here", a
 /// held key moved one row per press, and every frame copied every loaded row
 /// into the view.
+/// The pages a held L may read from row 2000 back to row 1 (#339). A page of
+/// these rows is ~30 of them, so ~2000 rows read once is ~70 pages; read again
+/// from row 0 by every rewind, it was ~300.
+constexpr int kClimbPages = 100;
+
 int RunScroll(Checks& checks) {
   using ScrollClock = overlay::ScrollRepeat::Clock;
   Console console;
@@ -1799,11 +2036,23 @@ int RunScroll(Checks& checks) {
     library.Frame(overlay::ScrollKey::kNone, at());
   }
   const int up_from = frame;
+  const int begins_before = console.engine().library_begins;
+  const int nexts_before = console.engine().library_nexts;
   for (; frame < up_from + 1800 && library.model.selected_position() != 0; ++frame) {
     library.Frame(overlay::ScrollKey::kPageUp, at());
   }
   checks.ExpectEq(library.model.selected_position(), 0, "a held L gets back to row 1");
   checks.ExpectEq(library.SelectedRom(), std::int64_t{1}, "which is the first rom");
+  // Each rewind opens its cursor where the rows it gathers start (#339), so
+  // the climb reads each dropped row about once. From row 0 every time, it
+  // read ~300 pages where ~70 will do.
+  const int rewinds = console.engine().library_begins - begins_before;
+  const int climbed_pages = console.engine().library_nexts - nexts_before;
+  std::cerr << "climb back: " << rewinds << " ListBegin, " << climbed_pages << " ListNext\n";
+  checks.Expect(climbed_pages <= kClimbPages,
+                "a held L reads the rows it dropped, not the list down to them each time: " +
+                    std::to_string(climbed_pages) + " pages over " + std::to_string(rewinds) +
+                    " rewinds");
   checks.Expect(console.engine().library_cursors.size() <= 2,
                 "every cursor a rewind replaced was ended: " +
                     std::to_string(console.engine().library_cursors.size()) + " open");
@@ -1922,7 +2171,8 @@ constexpr const char* kPortableFiles[] = {
     "lifecycle.hpp",    "lifecycle.cpp",    "log_paint.hpp",      "log_paint.cpp",
     "library_pump.hpp", "library_pump.cpp", "status_pump.hpp",    "status_pump.cpp",
     "sync_pump.hpp",    "sync_pump.cpp",    "pairing_pump.hpp",   "pairing_pump.cpp",
-    "poller.hpp",       "poller.cpp",
+    "poller.hpp",       "poller.cpp",       "log_pump.hpp",       "log_pump.cpp",
+    "settings_pump.hpp", "settings_pump.cpp",
 };
 
 /// What none of them may name. `card_probe` and `ipc_client` are deliberately

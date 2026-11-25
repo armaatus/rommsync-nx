@@ -796,6 +796,26 @@ void CheckBackups(Checks& checks) {
                   std::string("\xE2\x89\xA5 612.0 MiB; over the cap"),
                   "and over the cap with no only-copies");
 
+  // #340: the state budget removed backups no other copy of was known. The
+  // one removal that is not a proof gets a row of its own, so a player who
+  // traded states can see it happened; absent, the row is not drawn at all.
+  checks.Expect(!HasLabel(under, "State budget"),
+                  "with nothing removed by the budget there is no row for it");
+  ipc::Status budget = measured;
+  budget.backup.state_budget_pruned = 6;
+  const overlay::StatusView trimmed = RenderOverWire(checks, budget);
+  checks.ExpectEq(ValueOf(trimmed, "State budget"), std::string("6 only copies removed"),
+                  "the budget's removals say what went");
+  checks.Expect(ToneOf(trimmed, "State budget") == overlay::Tone::kNeutral,
+                "in the neutral tone: the budget is doing what it is for");
+  checks.ExpectEq(ValueOf(trimmed, "Backups"), std::string("41.2 MiB, 12 backups"),
+                  "beside an unchanged Backups row");
+  ExpectNothingBlank(checks, trimmed, "a state budget row");
+  ipc::Status budget_one = budget;
+  budget_one.backup.state_budget_pruned = 1;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, budget_one), "State budget"),
+                  std::string("1 only copy removed"), "one is singular");
+
   // A worse problem keeps the hint: a held upload outranks a filling card.
   ipc::Status clock = over;
   clock.clock_trusted = false;

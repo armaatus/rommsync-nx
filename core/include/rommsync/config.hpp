@@ -174,10 +174,24 @@ const char* ToString(OnServerDelete on_server_delete);
 /// days is a month of "I want last week's"; 512 MiB is a few percent of the
 /// smallest card a Switch homebrew setup runs on. None of the three ever
 /// removes the only copy of a backup's bytes -- that is the prune's own rule,
-/// and no setting turns it off.
+/// and no setting turns it off. The state budget below is the one exception,
+/// and only ever for a save state's backup.
 inline constexpr int kDefaultBackupKeep = 10;
 inline constexpr int kDefaultBackupKeepDays = 30;
 inline constexpr int kDefaultBackupMaxMib = 512;
+
+/// The state budget (#340): the one rule that removes a backup no second copy
+/// of is known -- a save state's, never a save's (backup_prune.hpp).
+///
+/// 256 MiB is the half of `kDefaultBackupMaxMib` states may take. The largest
+/// states a synced core writes are a few MiB (a PlayStation core's, an N64's
+/// expansion-pak ones up to ~16), so it is dozens of the heaviest and hundreds
+/// of a handheld's; and a console that does not trade states makes almost no
+/// state backups at all -- a download writes one, and only a state another
+/// console moved is downloaded. Three is the newest few of each state the
+/// budget never touches: the last trade, and the two before it.
+inline constexpr int kDefaultBackupMaxStateMib = 256;
+inline constexpr int kDefaultBackupKeepStates = 3;
 
 /// The largest values a key takes; past them a value is clamped, for
 /// `interval_min`'s reason -- falling back to the default would keep *less*
@@ -193,6 +207,11 @@ struct BackupConfig {
   int keep_days = kDefaultBackupKeepDays;
   /// The directory's target size in MiB. 0 is no cap.
   int max_mib = kDefaultBackupMaxMib;
+  /// The state budget in MiB: past it, state backups beyond the newest
+  /// `keep_states` of each state go oldest first, other copy or none. 0 is off.
+  int max_state_mib = kDefaultBackupMaxStateMib;
+  /// The newest this many of each state the budget never removes. At least 1.
+  int keep_states = kDefaultBackupKeepStates;
 };
 
 /// `[sync]`.

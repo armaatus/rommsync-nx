@@ -852,6 +852,7 @@ std::string EncodeStatus(const Status& status) {
   AppendInteger(&out, "kept_unique", status.backup.kept_unique);
   AppendBool(&out, "over_cap", status.backup.over_cap);
   AppendBool(&out, "truncated", status.backup.truncated);
+  AppendInteger(&out, "state_budget_pruned", status.backup.state_budget_pruned);
   out += '}';
   AppendKey(&out, "download");
   out += '{';
@@ -904,7 +905,9 @@ Decoded<Status> DecodeStatus(std::string_view text) {
         !ReadInteger(*backup, "backups", &out->backup.backups, 0, kMaxCount, error) ||
         !ReadInteger(*backup, "kept_unique", &out->backup.kept_unique, 0, kMaxCount, error) ||
         !ReadBool(*backup, "over_cap", &out->backup.over_cap, error) ||
-        !ReadBool(*backup, "truncated", &out->backup.truncated, error)) {
+        !ReadBool(*backup, "truncated", &out->backup.truncated, error) ||
+        !ReadInteger(*backup, "state_budget_pruned", &out->backup.state_budget_pruned, 0,
+                     kMaxCount, error)) {
       return;
     }
 
@@ -1219,6 +1222,7 @@ std::string EncodeListRequest(const ListRequest& request) {
   AppendInteger(&out, "platform_id", request.platform_id);
   AppendText(&out, "search", request.search);
   AppendInteger(&out, "page_size", request.page_size);
+  AppendInteger(&out, "offset", request.offset);
   out += '}';
   return out;
 }
@@ -1234,7 +1238,10 @@ Decoded<ListRequest> DecodeListRequest(std::string_view text) {
             // Clamped by `ServiceCore::ListBegin`, not here: what the client
             // wanted is a legitimate thing to say, and a page size of zero is
             // the one value that cannot mean anything.
-            !ReadInteger(object, "page_size", &page_size, 1, kMaxRequestedPageSize, error)) {
+            !ReadInteger(object, "page_size", &page_size, 1, kMaxRequestedPageSize, error) ||
+            // Required, not defaulted to 0: a v19 overlay that sent none is
+            // refused by the interface check before it gets here (#339).
+            !ReadInteger(object, "offset", &out->offset, 0, kMaxId, error)) {
           return;
         }
         out->page_size = static_cast<std::int32_t>(page_size);
@@ -1289,6 +1296,11 @@ void WriteListPage(Out& out, const ListPage& page) {
     out += json::Quote(name);
     out += ':';
   };
+  const auto integer = [&out](std::int64_t value) {
+    char digits[24];
+    const std::to_chars_result written = std::to_chars(digits, digits + sizeof(digits), value);
+    out += std::string_view(digits, static_cast<std::size_t>(written.ptr - digits));
+  };
   out += '{';
   key("items", /*first=*/true);
   out += '[';
@@ -1307,13 +1319,9 @@ void WriteListPage(Out& out, const ListPage& page) {
         case ListValue::Type::kString:
           out += json::Quote(field.value.text);
           break;
-        case ListValue::Type::kInteger: {
-          char digits[24];
-          const std::to_chars_result written =
-              std::to_chars(digits, digits + sizeof(digits), field.value.number);
-          out += std::string_view(digits, static_cast<std::size_t>(written.ptr - digits));
+        case ListValue::Type::kInteger:
+          integer(field.value.number);
           break;
-        }
         case ListValue::Type::kBool:
           out += field.value.flag ? "true" : "false";
           break;
@@ -1326,6 +1334,8 @@ void WriteListPage(Out& out, const ListPage& page) {
   out += page.has_more ? "true" : "false";
   key("pending", false);
   out += page.pending ? "true" : "false";
+  key("start", false);
+  integer(page.start);
   out += '}';
 }
 
@@ -1391,7 +1401,10 @@ Decoded<ListPage> DecodeListPage(std::string_view text) {
           out->items.push_back(std::move(item));
         }
         if (!ReadBool(object, "has_more", &out->has_more, error) ||
-            !ReadBool(object, "pending", &out->pending, error)) {
+            !ReadBool(object, "pending", &out->pending, error) ||
+            // Required, not defaulted to 0: a page that does not say where it
+            // starts is one whose rows cannot be placed (#341).
+            !ReadInteger(object, "start", &out->start, 0, kMaxId, error)) {
           return;
         }
       });

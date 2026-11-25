@@ -603,7 +603,7 @@ phase_selftest() {
   local lst="$SCRATCH/selftest/build/rommsync-selftest.lst" symbol
   [ -s "$lst" ] || fail "no symbol listing at $lst; the checks below would pass vacuously"
   for symbol in 'sslConnectionDoHandshake' 'fsdevCommitDevice' 'rommsync::sysmodule::MakeSdCard' \
-                'rommsync::sysmodule::ConsoleIsOnline' 'rommsync::sync::RunTick(' \
+                'rommsync::sysmodule::ConsoleNetwork' 'rommsync::sync::RunTick(' \
                 'rommsync::sync::BackUpFirst(' 'rommsync::json::Parse('; do
     grep -qF "$symbol" "$lst" || fail "the selftest does not link $symbol"
   done
