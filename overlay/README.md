@@ -198,10 +198,9 @@ production RomM or a real library.
     saying how much of the log it is — *"The last N of M lines"* once a few
     ticks have run. Once there are more lines than the panel holds, hold Up:
     expect older lines to come in from the top, one row and then a repeat, and
-    to stop at the oldest line with the panel still full. Hold R to go back a
-    panel at a time to the newest line, where it stops too; L and the stick do
-    the same as L and Up. Before M11-20 (#304) the screen showed only the
-    newest lines that fit. **B** comes back to settings.
+    to stop at the oldest line with the panel still full. Hold Down back to the
+    newest line, where it stops too. L and R do the same a panel at a time, and
+    either stick does what the D-pad does. **B** comes back to settings.
 
 12. **A restore does not freeze the panel.** On the conflicts screen, restore
     an entry whose save is large (a few MiB is enough on a slow card). Expect
