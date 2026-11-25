@@ -6609,11 +6609,11 @@ int Upgrade(http::HttpClient& client, const std::string& base) {
              std::string(game.rom_file) + ": rc1's row is still in tico-srm, as rc1 left it");
   }
   const std::string state_db = console.sandbox.Read("/config/rommsync/state.db");
-  // Version 4 since #294, bound from the epoch: rc1's rows are adopted by the
+  // Version 5 since #348 (4 since #294), bound from the epoch: rc1's rows are adopted by the
   // server the console is configured for, not set aside.
-  c.Expect(state_db.rfind("rommsync-state 4 0 ", 0) == 0 &&
+  c.Expect(state_db.rfind("rommsync-state 5 0 ", 0) == 0 &&
                state_db.find("\"tico-srm\"") == std::string::npos,
-           "state.db is version 4, adopted, with nothing left under the old slot:\n" + state_db);
+           "state.db is version 5, adopted, with nothing left under the old slot:\n" + state_db);
 
   // The second tick: nothing to send.
   TickOnce(console, ticks, c, "the second tick");

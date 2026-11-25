@@ -348,7 +348,7 @@ void StateDbRc2(checks::Checks& c) {
 
   const std::string written = rs::state::SerializeBaseline(read.value);
   c.ExpectEq(written.substr(0, written.find('\n')),
-             std::string("rommsync-state 4 0 https://romm.lan:8443/romm"),
+             std::string("rommsync-state 5 0 https://romm.lan:8443/romm"),
              "state.db rc2: written back bound");
   const rs::state::LoadedBaseline again = rs::state::ParseBaseline(written);
   c.Expect(again.value.size() == 4 && again.value.server() == "https://romm.lan:8443/romm",
