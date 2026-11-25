@@ -1834,14 +1834,17 @@ std::int64_t ScrollToRow2000(Checks& checks, overlay::LibraryBrowserModel& model
   return view.selected < top ? 0 : model.selected_position() - (view.selected - top);
 }
 
-void CheckClimbingBackIsOnePage(Checks& checks) {
-  overlay::LibraryBrowserModel model;
-  LongLibrary library;
-  library.roms = 2500;
+/// Climb `kRewindRows` above the window of `library` at row 2000, a row a
+/// frame, and hold it to one `ListBegin` and a `ListNext` per page of what it
+/// gathers. `dropped` is the 1-based rom that is on no place -- stepped past or
+/// unreadable -- or 0; every row the selection stands on is the rom at its
+/// place either way. Answers the place it climbed to.
+int ClimbsBackInOnePage(Checks& checks, overlay::LibraryBrowserModel& model,
+                        LongLibrary& library, int dropped, const std::string& what) {
   // The window's first row, which is where the rows dropped above it end.
   const std::int64_t first = ScrollToRow2000(checks, model, library);
   checks.Expect(first > overlay::kRewindRows,
-                "rows were dropped above the window on the way down: it starts at " +
+                what + ": rows were dropped above the window on the way down: it starts at " +
                     std::to_string(first));
 
   // Up a row a frame, past the window's top and through the rows gathered
@@ -1855,18 +1858,36 @@ void CheckClimbingBackIsOnePage(Checks& checks) {
     if (model.selected_position() > target) {
       model.MoveSelection(-1);
     }
-    consistent = consistent && SelectionIsConsistent(model);
+    consistent = consistent && SelectionIsConsistent(model, dropped);
   }
-  checks.ExpectEq(model.selected_position(), target, "the selection climbed above the window");
-  checks.Expect(consistent, "and every row it stood on was the rom at its place");
-  checks.ExpectEq(library.begins, 1, "one ListBegin for the rows dropped above the window");
-  checks.ExpectEq(library.last_offset, first - overlay::kRewindRows,
-                  "at the first row of the rows it gathers, not at row 0");
+  for (int settle = 0; settle < 40; ++settle) {
+    library.Answer(checks, model);
+    consistent = consistent && SelectionIsConsistent(model, dropped);
+  }
+  checks.ExpectEq(model.selected_position(), target,
+                  what + ": the selection climbed above the window");
+  checks.Expect(consistent, what + ": and every row it stood on was the rom at its place");
+  checks.ExpectEq(library.begins, 1,
+                  what + ": one ListBegin for the rows dropped above the window");
+  // The sysmodule's row of the first place gathered: a rom on no place above
+  // it puts that row one past the place (#345).
+  const std::int64_t place = first - overlay::kRewindRows;
+  const std::int64_t row = place + (dropped > 0 && dropped <= place ? 1 : 0);
+  checks.ExpectEq(library.last_offset, row,
+                  what + ": at the sysmodule's row of the first place it gathers, not at row 0");
   const int pages = overlay::kRewindRows / ipc::kMaxPageSize;
   checks.Expect(library.nexts <= pages + 2,
-                "and a ListNext per page of them, not ~" +
+                what + ": and a ListNext per page of them, not ~" +
                     std::to_string(first / ipc::kMaxPageSize) + " from the top: " +
                     std::to_string(library.nexts));
+  return target;
+}
+
+void CheckClimbingBackIsOnePage(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  LongLibrary library;
+  library.roms = 2500;
+  ClimbsBackInOnePage(checks, model, library, 0, "a clean level");
 }
 
 /// A page lost at row 2000 re-opens its cursor at the window, not at row 0
@@ -1911,23 +1932,15 @@ void CheckALostPageReopensAtTheWindow(Checks& checks) {
 }
 
 /// A level that dropped an item it could not read counts its places in the
-/// rows it read, which the sysmodule's offset does not: its rewind opens at
-/// row 0 and reads down, as it did before #339, rather than land every row
-/// one place off.
-void CheckAnUnreadableItemRewindsFromTheTop(Checks& checks) {
+/// rows it read, and the sysmodule's offset counts every row. Its rewind opens
+/// at the sysmodule's row for the place it wants (#345) -- before, it opened at
+/// row 0 and read the list down to the window, as it did before #339.
+void CheckAnUnreadableItemClimbsBackInOnePage(Checks& checks) {
   overlay::LibraryBrowserModel model;
   LongLibrary library;
   library.roms = 2500;
   library.unreadable = 10;
-  const std::int64_t first = ScrollToRow2000(checks, model, library);
-  checks.Expect(first > overlay::kRewindRows, "rows were dropped above the window");
-  library.begins = 0;
-  for (int frame = 0; frame < 2000 && library.begins == 0; ++frame) {
-    library.Answer(checks, model);
-    model.MoveSelection(-1);
-  }
-  checks.ExpectEq(library.begins, 1, "climbing above the window rewinds");
-  checks.ExpectEq(library.last_offset, std::int64_t{0}, "from row 0");
+  ClimbsBackInOnePage(checks, model, library, library.unreadable, "an unreadable rom above");
 }
 
 /// A rom the producer steps past above the window (#248) is a row in the
@@ -1940,29 +1953,8 @@ void CheckARomSteppedPastAboveTheWindowKeepsItsPlaces(Checks& checks) {
   LongLibrary library;
   library.roms = 2500;
   library.skipped = 10;
-  const std::int64_t first = ScrollToRow2000(checks, model, library);
-  checks.Expect(first > overlay::kRewindRows,
-                "rows were dropped above the window: it starts at " + std::to_string(first));
-  checks.Expect(SelectionIsConsistent(model, library.skipped),
-                "the selection on the way down is the rom at its place");
-
-  // Up a row a frame, past the window's top and through the rows a rewind
-  // gathers above it.
-  bool consistent = true;
-  const int target = static_cast<int>(first) - overlay::kRewindRows + overlay::kPrefetchRows;
-  for (int frame = 0; frame < 4000 && model.selected_position() != target; ++frame) {
-    library.Answer(checks, model);
-    if (model.selected_position() > target) {
-      model.MoveSelection(-1);
-    }
-    consistent = consistent && SelectionIsConsistent(model, library.skipped);
-  }
-  for (int settle = 0; settle < 40; ++settle) {
-    library.Answer(checks, model);
-    consistent = consistent && SelectionIsConsistent(model, library.skipped);
-  }
-  checks.ExpectEq(model.selected_position(), target, "the selection climbed above the window");
-  checks.Expect(consistent, "and every row it stood on was the rom at its place");
+  const int target =
+      ClimbsBackInOnePage(checks, model, library, library.skipped, "a rom stepped past above");
 
   // A enqueues the rom drawn under the selection, and that is the rom at the
   // place it stands on.
@@ -1976,33 +1968,107 @@ void CheckARomSteppedPastAboveTheWindowKeepsItsPlaces(Checks& checks) {
                 "and A enqueues that rom: " + std::to_string(press.rom_id));
 }
 
-/// A page that does not start where this level's places say it should is a
-/// list whose rows they no longer match (#341). On a cursor opened at an
-/// offset, that cursor is ended and the level read again from row 0 -- where
-/// places are counted in what was handed over, as they were before #339.
-void CheckAStepOnARewindReadsFromTheTop(Checks& checks) {
+/// A rom stepped past above the window moves the row a lost page re-opens at
+/// (#345): the window's first place is a row past it, and opening at the place
+/// would hand every row over one place off.
+void CheckALostPageReopensPastARomSteppedPast(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  LongLibrary library;
+  library.roms = 4000;
+  library.skipped = 10;
+  const std::int64_t first = ScrollToRow2000(checks, model, library);
+
+  model.MoveSelection(overlay::kMaxLoadedRows);
+  const Command page = model.Next();
+  checks.Expect(page.kind == Command::Kind::kListNext, "a page is out at the window's end");
+  model.OnLost();
+  const Command end = model.Next();
+  checks.Expect(end.kind == Command::Kind::kListEnd, "the cursor whose place is unknown is ended");
+  model.OnEnded();
+  const Command begin = model.Next();
+  checks.Expect(begin.kind == Command::Kind::kListBegin, "and the list opened again");
+  checks.ExpectEq(begin.request.offset, first + 1,
+                  "at the sysmodule's row of the window's first place, a row past it");
+  library.cursors[7100] =
+      LongLibrary::Open{begin.request.kind, static_cast<int>(begin.request.offset)};
+  model.OnCursor(7100);
+  model.MoveSelection(-1);
+  bool consistent = true;
+  for (int frame = 0; frame < 40; ++frame) {
+    library.Answer(checks, model);
+    consistent = consistent && SelectionIsConsistent(model, library.skipped);
+  }
+  checks.Expect(consistent, "every row it re-read landed on its own place");
+}
+
+/// A step first seen on a cursor opened at an offset (#341): the first row a
+/// rewind gathers turns out too large to send. The cursor's places are still
+/// its own count from a place whose row was known, so it reads on rather than
+/// being ended for a re-read from row 0 (#345), and what it gathers lands on
+/// the places the step gives them. The step is remembered: a cursor opened at
+/// the gathered rows later opens a row past it.
+void CheckAStepOnARewindKeepsItsPlaces(Checks& checks) {
   overlay::LibraryBrowserModel model;
   LongLibrary library;
   library.roms = 2500;
   const std::int64_t first = ScrollToRow2000(checks, model, library);
-  // The first row the rewind gathers turns out too large to send.
-  library.skipped = static_cast<int>(first) - overlay::kRewindRows + 1;
+  const int from = static_cast<int>(first) - overlay::kRewindRows;
+  library.skipped = from + 1;
   library.begins = 0;
   ipc::Cursor rewind = 0;
-  for (int frame = 0; frame < 4000 && library.begins < 2; ++frame) {
+  bool consistent = true;
+  const int target = from + overlay::kPrefetchRows;
+  for (int frame = 0; frame < 4000 && model.selected_position() != target; ++frame) {
     const ipc::Cursor before = library.next_cursor;
     library.Answer(checks, model);
     if (rewind == 0 && library.next_cursor != before) {
       rewind = before;
-      checks.ExpectEq(library.last_offset, first - overlay::kRewindRows,
+      checks.ExpectEq(library.last_offset, std::int64_t{from},
                       "the rewind opens at the rows it gathers");
     }
-    model.MoveSelection(-1);
+    if (model.selected_position() > target) {
+      model.MoveSelection(-1);
+    }
+    // Above the window, where the rows are the ones the rewind gathered. The
+    // window's own rows were drawn before the step was there, and are the list
+    // changing under a cursor until they are read again.
+    const int at = model.selected_position();
+    if (at >= 0 && at < first) {
+      consistent = consistent && SelectionIsConsistent(model, library.skipped);
+    }
   }
-  checks.ExpectEq(library.begins, 2, "the page that starts a row late re-opens the list");
-  checks.ExpectEq(library.last_offset, std::int64_t{0}, "from row 0");
-  checks.Expect(rewind != 0 && library.cursors.count(rewind) == 0,
-                "and the cursor whose rows it could not place is ended");
+  for (int settle = 0; settle < 40; ++settle) {
+    library.Answer(checks, model);
+  }
+  checks.ExpectEq(model.selected_position(), target, "the selection climbed above the window");
+  checks.ExpectEq(library.begins, 1, "the step re-opens nothing");
+  checks.Expect(rewind != 0 && library.cursors.count(rewind) == 1,
+                "the rewind's cursor reads on past it");
+  checks.Expect(consistent, "and every row gathered above the window is the rom at its place");
+
+  const overlay::LibraryView view = model.Render(0, 0);
+  const std::int64_t drawn =
+      view.selected >= 0 ? view.rows[static_cast<std::size_t>(view.selected)].rom_id : 0;
+  model.Activate();
+  const Command press = model.Next();
+  checks.Expect(press.kind == Command::Kind::kEnqueue && press.rom_id == drawn &&
+                    drawn == RomAt(target, library.skipped),
+                "A enqueues the rom drawn, the rom at its place: " + std::to_string(press.rom_id));
+  model.OnEnqueued(1);
+
+  // A page lost at the window's end re-opens at the window's first place --
+  // `from`, since the rows gathered went above it -- a row past the step.
+  model.MoveSelection(overlay::kMaxLoadedRows);
+  const Command page = model.Next();
+  checks.Expect(page.kind == Command::Kind::kListNext, "a page is out at the window's end");
+  model.OnLost();
+  const Command end = model.Next();
+  checks.Expect(end.kind == Command::Kind::kListEnd, "the cursor whose place is unknown is ended");
+  model.OnEnded();
+  const Command begin = model.Next();
+  checks.Expect(begin.kind == Command::Kind::kListBegin, "and the list opened again");
+  checks.ExpectEq(begin.request.offset, std::int64_t{from + 1},
+                  "at the row past the step the rewind saw");
 }
 
 /// What a screen renders is the rows around the selection, and only when
@@ -2218,9 +2284,10 @@ int main() {
   CheckRow2000IsReachable(checks);
   CheckClimbingBackIsOnePage(checks);
   CheckALostPageReopensAtTheWindow(checks);
-  CheckAnUnreadableItemRewindsFromTheTop(checks);
+  CheckAnUnreadableItemClimbsBackInOnePage(checks);
   CheckARomSteppedPastAboveTheWindowKeepsItsPlaces(checks);
-  CheckAStepOnARewindReadsFromTheTop(checks);
+  CheckALostPageReopensPastARomSteppedPast(checks);
+  CheckAStepOnARewindKeepsItsPlaces(checks);
   CheckRenderIsASliceOnChange(checks);
   CheckQueueRowUsesEveryPinnedField(checks);
   CheckLibraryScreenWritesNothing(checks);
