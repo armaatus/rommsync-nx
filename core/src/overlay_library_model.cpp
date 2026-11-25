@@ -911,7 +911,8 @@ void LibraryBrowserModel::OnUnreachable(Link link, std::uint32_t sysmodule_inter
   enqueue_wanted_ = 0;
 }
 
-void LibraryBrowserModel::OnLinkRestored() {
+void LibraryBrowserModel::OnLinkRestored(bool same_session) {
+  (void)same_session;
   link_ = Link::kOk;
   // Everything loaded came off cursors held by a session that has gone. Asking
   // the new one to continue them would be asking about cursor numbers it never

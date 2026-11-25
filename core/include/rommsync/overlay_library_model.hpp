@@ -288,9 +288,16 @@ class LibraryBrowserModel {
   void OnUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 
   /// The link came back. Everything loaded is dropped and the browser starts
-  /// again at the platform list: the cursors belonged to a session that is
-  /// gone, and a page from before it is not a page this one would answer with.
-  void OnLinkRestored();
+  /// again at the platform list: a page from before it is not a page the
+  /// sysmodule would answer with now.
+  ///
+  /// `same_session` is whether the session the cursors were opened on is the
+  /// one that came back -- only `kNotResponding` leaves it alone
+  /// (`ScreenFrame::Diagnose`). If it is, every cursor the model held is still
+  /// open on the sysmodule, and each gets a `ListEnd` before the browser starts
+  /// again (#343): #31 caps how many may be open, and the TTL is slow. If it is
+  /// not, they went with the session and there is nothing to end.
+  void OnLinkRestored(bool same_session);
 
   /// Move the selection by `delta` rows, clamped at both ends. Also what asks
   /// for the next page: the model fetches ahead of the selection rather than on

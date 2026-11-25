@@ -130,7 +130,7 @@ bool LibraryPump::SendNext() {
     // away, so the browser starts again rather than asking the new session
     // about cursor numbers it never issued.
     link_ = Link::kOk;
-    model_.OnLinkRestored();
+    model_.OnLinkRestored(false);
   }
   // One command out at a time. The model answers `kNone` as soon as the loaded
   // pages cover what is on screen, so a browser sitting still costs nothing.

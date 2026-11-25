@@ -818,7 +818,7 @@ void CheckUnreachable(Checks& checks) {
     checks.Expect(model.Next().kind == Command::Kind::kNone,
                  "and sends nothing at a sysmodule that is not answering");
 
-    model.OnLinkRestored();
+    model.OnLinkRestored(false);
     const Command reopened = model.Next();
     checks.Expect(reopened.kind == Command::Kind::kListBegin,
                   "a link that came back starts the browser again");
@@ -1359,6 +1359,93 @@ void CheckALostEnqueueMayHaveBeenQueued(Checks& checks) {
   model.OnEnqueued(1);
   checks.ExpectEq(ListRows(model.Render())[1].note, may,
                   "an answer arriving after it was given up on changes nothing");
+}
+
+/// The cursors `Next()` hands out `ListEnd` for until it asks for something
+/// else, answered as landed. Bounded, so a model that never stops fails here
+/// rather than hanging the suite.
+std::vector<ipc::Cursor> EndsBefore(overlay::LibraryBrowserModel& model, Command* after) {
+  std::vector<ipc::Cursor> ended;
+  for (int turn = 0; turn < 16; ++turn) {
+    *after = model.Next();
+    if (after->kind != Command::Kind::kListEnd) {
+      break;
+    }
+    ended.push_back(after->cursor);
+    model.OnEnded();
+  }
+  return ended;
+}
+
+/// A link that comes back after `kNotResponding` is the same session (#343):
+/// `ScreenFrame::Diagnose` does not reopen it for a call that is merely slow,
+/// so every cursor the browser held is still open on the sysmodule, and only a
+/// `ListEnd` -- or the TTL, much later -- gives one of #31's few slots back.
+/// After a transport failure the session was reopened and they went with it.
+void CheckARestoredSessionEndsTheCursorsItHeld(Checks& checks) {
+  for (const bool same_session : {true, false}) {
+    const std::string which = same_session ? " (same session)" : " (reopened)";
+    overlay::LibraryBrowserModel model;
+    Begin(checks, model, 381);
+    Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 381,
+            "the platform page");
+    model.Activate();
+    Begin(checks, model, 382);
+    Deliver(checks, model, Page(checks, {Rom(1, "Tetris", 1024)}, false), 382, "the rom page");
+    checks.ExpectEq(model.open_cursors(), std::size_t{2}, "two levels, two cursors" + which);
+
+    model.OnUnreachable(overlay::Link::kNotResponding);
+    checks.Expect(model.Next().kind == Command::Kind::kNone,
+                  "nothing is sent while the link is down" + which);
+    model.OnLinkRestored(same_session);
+
+    Command after;
+    std::vector<ipc::Cursor> ended = EndsBefore(model, &after);
+    std::sort(ended.begin(), ended.end());
+    const std::vector<ipc::Cursor> expected =
+        same_session ? std::vector<ipc::Cursor>{381, 382} : std::vector<ipc::Cursor>{};
+    checks.Expect(ended == expected,
+                  "each level's cursor is ended exactly when the session is the same one" +
+                      which + ": ended " + std::to_string(ended.size()));
+    checks.Expect(after.kind == Command::Kind::kListBegin &&
+                      after.request.kind == ipc::ListKind::kPlatforms,
+                  "and then the browser starts again at the platform list" + which);
+  }
+}
+
+/// A `ListBegin` the `Poller` gave up on can still be answered (#343): the call
+/// was slow, not lost, and the cursor it opened is real. Nothing asked for it
+/// any more -- `OnUnreachable` already cleared what was out -- so it is ended
+/// rather than dropped, and survives the link coming back to be ended.
+void CheckAnUnaskedForCursorIsEnded(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 391);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 391,
+          "the platform page");
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kListBegin, "A opens the platform");
+  model.OnUnreachable(overlay::Link::kNotResponding);
+  model.OnCursor(392);  // the late answer
+  checks.ExpectEq(model.open_cursors(), std::size_t{2},
+                  "the late cursor is counted, beside the platform list's own");
+  model.OnLinkRestored(true);
+  Command after;
+  std::vector<ipc::Cursor> ended = EndsBefore(model, &after);
+  std::sort(ended.begin(), ended.end());
+  checks.Expect(ended == std::vector<ipc::Cursor>{391, 392},
+                "both are ended once the link is back: ended " + std::to_string(ended.size()));
+  checks.Expect(after.kind == Command::Kind::kListBegin, "before the browser starts again");
+
+  // And with the link up: a cursor nobody asked for is a cursor all the same.
+  overlay::LibraryBrowserModel idle;
+  Begin(checks, idle, 393);
+  Deliver(checks, idle, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 393,
+          "the platform page");
+  checks.Expect(idle.Next().kind == Command::Kind::kNone, "a browser sitting still");
+  idle.OnCursor(394);
+  const Command end = idle.Next();
+  checks.Expect(end.kind == Command::Kind::kListEnd && end.cursor == 394,
+                "ends a cursor it never asked for");
 }
 
 /// A page that lands does not move the selection onto a row under it.
@@ -2124,6 +2211,8 @@ int main() {
   CheckALostPageReopensTheLevel(checks);
   CheckALateEnqueueSaysApplying(checks);
   CheckALostEnqueueMayHaveBeenQueued(checks);
+  CheckARestoredSessionEndsTheCursorsItHeld(checks);
+  CheckAnUnaskedForCursorIsEnded(checks);
   CheckHeldKeyRepeats(checks);
   CheckHeldScrollKey(checks);
   CheckRow2000IsReachable(checks);
