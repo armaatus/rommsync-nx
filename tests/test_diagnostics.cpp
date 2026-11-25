@@ -139,7 +139,8 @@ void Sections(checks::Checks& checks) {
        {"overlay = 0.9.0", "libultrahand = v2.5.4", "sysmodule = 0.9.0", "libnx = 4.10.0-1",
         "hos = 19.0.1", "atmosphere = not read: no spl: grant", "emummc = unknown",
         "auth = paired", "queue_depth = 3", "last_sync_result = partial",
-        "state.db = 3 rows", "states = true", "measured = no (not measured yet"}) {
+        "state.db = 3 rows", "states = true", "measured = no (not measured yet",
+        "aside_files = 0"}) {
     checks.Expect(text.find(expected) != std::string::npos,
                   std::string("the bundle says \"") + expected + "\"");
   }
@@ -153,11 +154,13 @@ void Sections(checks::Checks& checks) {
   bundle.engine.backup.over_cap = true;
   bundle.engine.backup.state_budget_pruned = 3;
   bundle.engine.backup.state_orphans = 4;
+  bundle.engine.backup.aside_files = 5;
   bundle.written_at += 1;
   text = WriteAndRead(checks, dir, bundle);
   for (const char* expected : {"measured = yes", "bytes = 5242880", "backups = 12",
                                "kept_unique = 2", "over_cap = yes",
-                               "state_budget_pruned = 3", "state_orphans = 4"}) {
+                               "state_budget_pruned = 3", "state_orphans = 4",
+                               "aside_files = 5"}) {
     checks.Expect(text.find(expected) != std::string::npos,
                   std::string("backup usage is #316's numbers: \"") + expected + "\"");
   }
@@ -170,7 +173,7 @@ void Sections(checks::Checks& checks) {
   text = WriteAndRead(checks, dir, bundle);
   for (const char* expected : {"bytes = at least 5242880", "backups = at least 12",
                                "kept_unique = at least 2", "truncated = yes",
-                               "state_orphans = at least 4"}) {
+                               "state_orphans = at least 4", "aside_files = 5"}) {
     checks.Expect(text.find(expected) != std::string::npos,
                   std::string("a listing cut short says its numbers are a floor: \"") + expected +
                       "\"");

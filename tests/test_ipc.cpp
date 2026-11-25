@@ -95,6 +95,7 @@ ipc::Status LoadedStatus() {
   status.backup.truncated = true;
   status.backup.state_budget_pruned = 6;
   status.backup.state_orphans = 11;
+  status.backup.aside_files = 17;
   status.download.state = ipc::DownloadState::kVerifying;
   status.download.rom_id = 42;
   status.download.fs_name = "Some Game (USA).gba";
@@ -240,9 +241,9 @@ int Version() {
   // `ListRequest` gained a required `offset`. 21 since #341: a `ListPage`
   // gained a required `start`. 22 since M11-26 (#340): and
   // `backup.state_budget_pruned`. 23 since M11-27 (#346): and
-  // `backup.state_orphans`. What is frozen is command 0's *encoding*,
+  // `backup.state_orphans`. 24 since #332: and `backup.aside_files`. What is frozen is command 0's *encoding*,
   // asserted above -- not the number in it.
-  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{23},
+  checks.ExpectEq(static_cast<std::uint64_t>(ipc::kVersion), std::uint64_t{24},
                   "the interface version this build speaks");
   checks.ExpectEq(static_cast<int>(ipc::Command::kGetInterfaceVersion), 0,
                   "GetInterfaceVersion is command 0");
@@ -388,6 +389,8 @@ int RoundTrip() {
                     "backup.state_budget_pruned survives (#340)");
     checks.ExpectEq(back.value.backup.state_orphans, sent.backup.state_orphans,
                     "backup.state_orphans survives (#346)");
+    checks.ExpectEq(back.value.backup.aside_files, sent.backup.aside_files,
+                    "backup.aside_files survives (#332)");
     checks.ExpectEq(std::string(ipc::ToString(back.value.download.state)),
                     std::string(ipc::ToString(sent.download.state)), "the download state survives");
     checks.ExpectEq(back.value.download.rom_id, sent.download.rom_id, "its rom_id survives");

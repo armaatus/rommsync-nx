@@ -105,6 +105,13 @@ struct RecoveryReport {
   /// rather than removing it either (#293).
   std::size_t previous_left = 0;
 
+  /// `<file>.old.<n>`: a `.old` a later commit set aside rather than remove
+  /// (#293), in a swept folder or a count-only one. **Counted and never
+  /// touched** (#332), for `previous_left`'s reason -- one may be a player's own
+  /// file. Counted because once a file has all sixteen (`io::CommitStaged`)
+  /// every later commit to it fails, and nothing else says why.
+  std::size_t aside_left = 0;
+
   /// Leftovers the card would not let go of, and directories that would not
   /// list -- plus, when this is a tick's report rather than a bare sweep's,
   /// anything else the tick's preparation could not do. Never fatal: a tick runs
@@ -140,8 +147,14 @@ struct RecoveryReport {
 /// and its rename would cost a setting the user had just changed. Sweeping only
 /// directories nothing else writes to is the whole reason this takes a list
 /// rather than deciding for itself.
+///
+/// `count_only` are listed for `aside_left` and nothing else: no file in them is
+/// removed or renamed, and a listing that fails is not a warning. That is how
+/// `/config/rommsync` is counted (#332) without being swept -- its records'
+/// commits set `.old` files aside exactly as a save's do.
 RecoveryReport RecoverStaging(fs::FileSystem& files,
-                              const std::vector<std::string>& directories);
+                              const std::vector<std::string>& directories,
+                              const std::vector<std::string>& count_only = {});
 
 /// How a tick ended, as the thing that schedules the next one needs it.
 ///

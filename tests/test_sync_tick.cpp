@@ -298,6 +298,58 @@ void Recovery(rig::Checks& checks) {
                   "...and reports the one file it will never act on, every time");
 }
 
+// --- aside --------------------------------------------------------------------
+//
+// #332. The `<file>.old.<n>` a commit sets a foreign `.old` aside under (#293)
+// are counted by the sweep -- in the swept folders and in the count-only ones
+// (`/config/rommsync`, whose records fail to commit just the same once all 16
+// are taken) -- and never touched: they may be a player's own files.
+
+void Aside(rig::Checks& checks) {
+  Sandbox sandbox(checks, "tick-aside");
+  const std::unique_ptr<fs::FileSystem> files =
+      rommsync::host::MakeNativeFileSystem(sandbox.root().string());
+
+  sandbox.SeedSave(SavePath("game.srm"), "the save\n");
+  const std::string old = io::PreviousPathFor(SavePath("game.srm"));
+  sandbox.Write(old + ".1", "set aside once\n");
+  sandbox.Write(old + ".2", "set aside twice\n");
+  // Not the shape a commit makes, so not counted: no digits, a letter in them,
+  // a bare `.old.`, and a `.old` itself (that one is `previous_left`).
+  sandbox.Write(old + ".x", "a name a player chose\n");
+  sandbox.Write(old + ".1a", "another\n");
+  sandbox.Write(old + ".", "and another\n");
+  sandbox.Write(old, "a .old beside its save\n");
+  sandbox.Write(std::string(harness::kBackupDir) + "/7-m2-7-1757000000.srm.old.1",
+                "a backup's aside\n");
+
+  // The records' folder: listed for asides only. Its `.tmp` is the overlay's
+  // `config.ini` mid-write, and a sweep that removed it would cost a setting.
+  sandbox.MakeDirs("/config/rommsync");
+  sandbox.Write("/config/rommsync/state.db.old.3", "an older state.db\n");
+  sandbox.Write("/config/rommsync/config.ini.tmp", "a setting being written\n");
+  sandbox.MakeDirs("/config/rommsync/state.db.old.4");
+
+  const std::map<std::string, std::string> before = Snapshot(sandbox);
+  const sync::RecoveryReport report =
+      sync::RecoverStaging(*files, {harness::kSavesDir, harness::kBackupDir, "/never/created"},
+                           {"/config/rommsync", "/never/either"});
+
+  checks.ExpectEq(report.aside_left, std::size_t{4},
+                  "two beside the save, one in .backup/ and one beside state.db are counted");
+  checks.ExpectEq(report.previous_left, std::size_t{1}, "the .old is still its own count");
+  checks.ExpectEq(report.total(), std::size_t{0}, "and nothing was acted on");
+  checks.Expect(report.warnings.empty(),
+                "with nothing to complain about: " +
+                    (report.warnings.empty() ? std::string() : report.warnings[0]));
+  checks.Expect(Snapshot(sandbox) == before,
+                "every file is byte-for-byte what it was -- the config folder's .tmp included");
+
+  const sync::RecoveryReport plain = sync::RecoverStaging(*files, {harness::kSavesDir});
+  checks.ExpectEq(plain.aside_left, std::size_t{2},
+                  "a sweep given no count-only folder counts only what it swept");
+}
+
 // --- durable ------------------------------------------------------------------
 //
 // The platform hook hard rule 2 depends on. `io::CopyAtomically` is how a save's
@@ -4495,9 +4547,11 @@ int main(int argc, char** argv) {
       scenario == "offline" || scenario == "rescan" || scenario == "canceled" ||
       scenario == "disabled" || scenario == "unsupported" || scenario == "newer_rule" ||
       scenario == "newer_bounds" || scenario == "migrated_kept" || scenario == "too_large" ||
-      scenario == "clock") {
+      scenario == "clock" || scenario == "aside") {
     if (scenario == "recovery") {
       Recovery(checks);
+    } else if (scenario == "aside") {
+      Aside(checks);
     } else if (scenario == "durable") {
       Durable(checks);
     } else if (scenario == "backupdir") {

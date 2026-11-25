@@ -67,7 +67,8 @@ void Discard(const std::string& path, const std::string& sd_path, std::size_t* c
 }  // namespace
 
 RecoveryReport RecoverStaging(fs::FileSystem& files,
-                              const std::vector<std::string>& directories) {
+                              const std::vector<std::string>& directories,
+                              const std::vector<std::string>& /*count_only*/) {
   RecoveryReport report;
   for (const std::string& directory : directories) {
     const fs::Listing listing = files.List(directory);

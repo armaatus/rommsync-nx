@@ -511,6 +511,13 @@ struct BackupUsage {
   /// longer lists (`PruneReport::state_orphans`, #346). Where a full card's
   /// space went when the state budget cannot reach it.
   std::int64_t state_orphans = 0;
+
+  /// `<file>.old.<n>` files the last tick's sweep counted, in the save folders,
+  /// `.backup/` and `/config/rommsync` (`RecoveryReport::aside_left`, #332).
+  /// Not a prune's number and not only `.backup/`'s: here because this is the
+  /// struct the diagnostics bundle's `[backup]` already reads. Zero until a
+  /// tick has swept, and never a floor.
+  std::int64_t aside_files = 0;
 };
 
 /// Everything the status screen needs, in one call.
