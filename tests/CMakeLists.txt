@@ -1975,6 +1975,7 @@ set(SELFTEST_JUDGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_selftest_judge.py")
 foreach(scenario
         judge   # pass, fail, missing and skipped rows; malformed reports refused
         pairs   # --pairs N counts distinct HOS/Atmosphere pairs among passing reports
+        nifm    # an unsure nifm passes as WARN when the heartbeat answers; no network fails
         rows    # the NRO writes exactly the judged rows; its heap budget is the sysmodule's
         roots   # the NRO writes only under sdmc:/config/rommsync-selftest/
         gate)   # the launch gate's note, the plan's PRE-02 and the judge cite each other
