@@ -2688,6 +2688,7 @@ set(ENGINE_RIG_SCENARIOS
   state_budget  # #340: past [backup] max_state_mib the oldest sole-copy state backup goes; saves never
   backup_truncated  # #323: a .backup/ past one listing draws its Backups row as a floor
   server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
+  server_reinstalled  # #331: the same with RomM reinstalled behind the same URL and paired again
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
   placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save

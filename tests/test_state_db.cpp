@@ -1256,6 +1256,123 @@ void NoBaselineIsBoundFromNow(checks::Checks& c) {
   c.ExpectEq(loaded.value.bound_since(), std::int64_t{1760000000}, "from now");
 }
 
+// --- #331: a RomM reinstalled at the same URL is another server ----------------
+
+/// A server is its URL and, once the console has paired, the device RomM minted
+/// for it: a `uuid4` RomM draws when it creates the row, which a reinstall's
+/// fresh database draws again and an upgrade in place keeps.
+void AServerIsItsUrlAndItsDevice(checks::Checks& c) {
+  c.ExpectEq(binding::InstanceOf("HTTP://A.example:8080/", "http://a.example:8080", "dev-a"),
+             std::string("http://a.example:8080#dev-a"),
+             "the identity, then # and the device pairing handed back");
+  c.ExpectEq(binding::InstanceOf("http://a.example:8080", "http://a.example:8080", ""),
+             std::string("http://a.example:8080"), "an unpaired console knows only the URL");
+  c.ExpectEq(binding::InstanceOf("http://a.example:8080", "http://b.example", "dev-b"),
+             std::string("http://a.example:8080"),
+             "and a token paired with another server says nothing about this one");
+  c.ExpectEq(binding::InstanceOf("http://a.example", "http://a.example", "a b#c"),
+             std::string("http://a.example#a%20b%23c"), "the device is one token, # and all");
+  c.ExpectEq(binding::InstanceOf("", "", "dev-a"), std::string(), "no URL is still no server");
+
+  c.Expect(binding::SameServer("http://a.example#dev-a", "http://a.example#dev-a"),
+           "the same URL and device are the same server");
+  c.Expect(!binding::SameServer("http://a.example#dev-a", "http://a.example#dev-b"),
+           "a device RomM minted again behind the same URL is another server");
+  c.Expect(binding::SameServer("http://a.example", "http://a.example#dev-a"),
+           "a record from before #331 names no device, and is the URL's");
+  c.Expect(binding::SameServer("http://a.example#dev-a", "http://a.example"),
+           "and a console not paired yet cannot tell, so it decides nothing");
+  c.Expect(!binding::SameServer("http://a.example#dev-a", "http://b.example#dev-a"),
+           "another URL is another server, whatever the device");
+  c.Expect(!binding::SameServer("http://a.example", "http://a.example:8080"),
+           "a URL that only starts the same is another URL");
+  c.ExpectEq(binding::TagOf("http://a.example#dev-a"), binding::TagOf("http://a.example"),
+             "a conflict's tag is still the URL's: #317's rows stay their server's");
+}
+
+/// The acceptance's core: a baseline synced against the RomM that was there
+/// before a reinstall is set aside when the console pairs with the new one at
+/// the same URL, under a name that tells the two apart.
+void AReinstalledServersBaselineIsSetAside(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("reinstalled.db");
+  const std::string aside = path.string() + ".http-a.example-8080-dev-a";
+  std::error_code ignored;
+  std::filesystem::remove(aside, ignored);
+
+  state::Baseline baseline;
+  state::SaveRecord kept = Full();
+  kept.deleted_on_server = true;
+  kept.server_updated_at.reset();
+  kept.server_content_hash.reset();
+  baseline.Set(kept);
+  baseline.BindTo("http://a.example:8080#dev-a", 1750000000);
+  c.Expect(state::SaveBaseline(path.string(), baseline).ok(), "the old install's baseline");
+  const std::string written = ReadWhole(path.string());
+
+  state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  c.ExpectEq(loaded.value.server(), std::string("http://a.example:8080#dev-a"),
+             "the header carries the device");
+  const std::string line =
+      state::BindToServer(&loaded, path.string(), "http://a.example:8080#dev-b", 1760000000);
+  c.Expect(loaded.value.empty(), "none of the old install's rows is read against the new one");
+  c.ExpectEq(loaded.value.bound_since(), std::int64_t{1760000000}, "bound from now");
+  c.ExpectEq(ReadWhole(aside), written, "set aside whole, under a name with the old device");
+  c.Expect(line.find(aside) != std::string::npos, "and the log line says where -- " + line);
+}
+
+/// What must not be a switch: this build meeting a card an older one bound by
+/// URL alone, and a console between pairings. An upgrade of RomM in place keeps
+/// its database and so its device, which is the same identity outright.
+void AnUpgradeKeepsTheBaseline(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("upgraded.db");
+  state::Baseline baseline;
+  baseline.Set(Full());
+  baseline.BindTo("http://a.example:8080", 1750000000);
+  c.Expect(state::SaveBaseline(path.string(), baseline).ok(), "a baseline bound before #331");
+
+  state::LoadedBaseline loaded = state::LoadBaseline(path.string());
+  c.ExpectEq(state::BindToServer(&loaded, path.string(), "http://a.example:8080#dev-a", 1760000000),
+             std::string(), "the URL's baseline is adopted by its device with nothing to say");
+  c.Expect(loaded.value.Find(12, std::optional<std::string>("autosave")) != nullptr,
+           "its rows stand");
+  c.ExpectEq(loaded.value.bound_since(), std::int64_t{1750000000}, "from when they were bound");
+  c.ExpectEq(loaded.value.server(), std::string("http://a.example:8080#dev-a"),
+             "and the next write names the device");
+  c.Expect(std::filesystem::exists(path), "nothing is set aside");
+
+  state::LoadedBaseline unpaired;
+  unpaired.value = loaded.value;
+  c.ExpectEq(state::BindToServer(&unpaired, path.string(), "http://a.example:8080", 1770000000),
+             std::string(), "a console between pairings decides nothing");
+  c.ExpectEq(unpaired.value.server(), std::string("http://a.example:8080#dev-a"),
+             "and forgets no device");
+}
+
+/// `queue.json` and `play.db` follow the same rule through `server.id`.
+void TheMarkerKnowsTheDeviceToo(checks::Checks& c) {
+  const std::filesystem::path marker = FreshPath("server.id");
+  const std::filesystem::path record = FreshPath("queue.json");
+  const std::string aside = record.string() + ".http-a.example-dev-a";
+  std::error_code ignored;
+  std::filesystem::remove(aside, ignored);
+  WriteWhole(marker.string(), "http://a.example\n");
+  WriteWhole(record.string(), "the queue");
+
+  binding::Rebound bound =
+      binding::BindRecords(marker.string(), {record.string()}, "http://a.example#dev-a");
+  c.Expect(bound.bound && !bound.rebound, "a marker from before #331 is adopted by the device");
+  c.ExpectEq(ReadWhole(marker.string()), std::string("http://a.example#dev-a\n"),
+             "and names it from now");
+  bound = binding::BindRecords(marker.string(), {record.string()}, "http://a.example");
+  c.Expect(bound.bound && !bound.rebound, "unpaired, the records stay");
+  c.ExpectEq(ReadWhole(marker.string()), std::string("http://a.example#dev-a\n"),
+             "and the marker keeps its device");
+  bound = binding::BindRecords(marker.string(), {record.string()}, "http://a.example#dev-b");
+  c.Expect(bound.bound && bound.rebound, "paired with a reinstalled RomM, they are set aside");
+  c.ExpectEq(ReadWhole(aside), std::string("the queue"), "under the old device's name");
+  c.ExpectEq(bound.previous, std::string("http://a.example#dev-a"), "which is the old server");
+}
+
 void ALostBaselineCostsTimeNotCorrectness(checks::Checks& c) {
   const std::filesystem::path path = FreshPath("garbage.db");
   WriteWhole(path.string(), "\x01\x02 not a state.db at all\n");
@@ -1309,5 +1426,9 @@ int main() {
   AnotherServersBaselineIsSetAside(c);
   AnInterruptedCommitIsSetAsideToo(c);
   NoBaselineIsBoundFromNow(c);
+  AServerIsItsUrlAndItsDevice(c);
+  AReinstalledServersBaselineIsSetAside(c);
+  AnUpgradeKeepsTheBaseline(c);
+  TheMarkerKnowsTheDeviceToo(c);
   return c.failures() == 0 ? 0 : 1;
 }

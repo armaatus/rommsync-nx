@@ -64,6 +64,14 @@ std::string IdentityOf(std::string_view server_url) {
   return identity;
 }
 
+std::string InstanceOf(std::string_view server_url, std::string_view, std::string_view) {
+  return IdentityOf(server_url);
+}
+
+bool SameServer(std::string_view recorded, std::string_view current) {
+  return recorded == current;
+}
+
 std::string ArchiveSuffix(std::string_view identity) {
   std::string suffix;
   for (const char byte : identity) {

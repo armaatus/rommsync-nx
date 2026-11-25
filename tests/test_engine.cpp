@@ -7078,7 +7078,15 @@ class Intercepting final : public http::HttpClient {
 /// the one a user makes with the console off -- `config.ini` edited by hand,
 /// then a boot -- because that is the path no command of this engine's ever
 /// sees.
-int ServerSwitched(http::HttpClient& client, const std::string& base) {
+///
+/// #331 runs the same story at the *same* URL: `reinstalled` is RomM wiped and
+/// installed again behind it. What a console can see of that is all this
+/// drives -- its token refused, a pairing again, and a device id RomM draws
+/// afresh (`uuid4`, on a database that no longer has the old row); an upgrade
+/// in place keeps the database and so the id. The rig's RomM is not itself
+/// wiped: that takes its volume, its scan and the token every other test reads,
+/// mid-suite. A device row of its own stands in for the new database's.
+int SwitchedTo(http::HttpClient& client, const std::string& base, bool reinstalled) {
   rig::Checks c;
   harness::Fixture fixture;
   if (!harness::LoadFixture(&fixture)) {
@@ -7090,7 +7098,8 @@ int ServerSwitched(http::HttpClient& client, const std::string& base) {
     c.Expect(false, "the rig is on 127.0.0.1, so localhost is another spelling of it: " + base);
     return c.failures();
   }
-  const std::string other = base.substr(0, loopback) + "localhost" + base.substr(loopback + 9);
+  const std::string other =
+      reinstalled ? base : base.substr(0, loopback) + "localhost" + base.substr(loopback + 9);
   harness::Rom rom;
   c.Expect(harness::FindRom(client, base, fixture, "nova.nes", &rom),
            "the fixture library has nova.nes");
@@ -7211,8 +7220,8 @@ int ServerSwitched(http::HttpClient& client, const std::string& base) {
                "the kept save is offered to the new server, which never deleted it" +
                    Rendered(second.Log()));
     const std::vector<std::int64_t> uploaded = ours();
-    c.Expect(first.sandbox.Exists("/config/rommsync/state.db." + binding::ArchiveSuffix(
-                                                                       binding::IdentityOf(base))),
+    c.Expect(first.sandbox.Exists("/config/rommsync/state.db." +
+                                  binding::ArchiveSuffix(binding::InstanceOf(base, base, device_id))),
              "and the first server's state.db is set aside under its name, not deleted");
     for (const std::int64_t id : uploaded) {
       harness::DeleteSave(client, base, fixture, id);
@@ -7223,6 +7232,13 @@ int ServerSwitched(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+int ServerSwitched(http::HttpClient& client, const std::string& base) {
+  return SwitchedTo(client, base, /*reinstalled=*/false);
+}
+
+int ServerReinstalled(http::HttpClient& client, const std::string& base) {
+  return SwitchedTo(client, base, /*reinstalled=*/true);
+}
 
 /// A status from "the server", with a body that is none of RomM's shapes.
 http::Result Answered(int status) {
@@ -8728,6 +8744,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"state_budget", StateBudget},
       {"backup_truncated", BackupTruncated},
       {"server_switched", ServerSwitched},
+      {"server_reinstalled", ServerReinstalled},
       {"interop", Interop},
       {"upgrade", Upgrade},
       {"placement", Placement},
