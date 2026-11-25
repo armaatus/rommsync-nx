@@ -747,7 +747,8 @@ same skew, reported against #261.
 **Steps.** [overlay/README.md](../overlay/README.md#manual-verification-m8-2)
 steps 1-17, in order, in handheld and then docked: the status, settings, sync,
 library, conflicts, pairing and log screens; re-pair; the hide/show, cycling,
-library-exit, busy-sysmodule and hold-to-repeat steps.
+library-exit, busy-sysmodule and hold-to-repeat steps. Step 11 includes
+scrolling the log both ways, to its oldest line and back to its newest (#304).
 
 **Pass.** Every step draws what it names. Any layout constant that had to move
 is recorded, with the screen file it is in.
