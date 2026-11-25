@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -320,22 +321,98 @@ void LibraryBrowserModel::Reopen(Level& level) {
   level.page_error = ipc::Error::kOk;
 }
 
-std::int64_t LibraryBrowserModel::StartOf(const Level& level) {
+LibraryBrowserModel::Start LibraryBrowserModel::StartOf(const Level& level) {
   // A rewind, or a reclaimed cursor catching up to its window, opens at the
-  // first row it has a use for: `rewind_from` (which `Reopen` sets to `first`
+  // first place it has a use for: `rewind_from` (which `Reopen` sets to `first`
   // when nothing is being gathered). Reading down to it from row 0 was ~1500
   // rows at row 2000 of a platform, a RomM page per 64 of them.
   //
-  // Not once an item was dropped unread, though: places here count the rows
-  // this build could read, and the sysmodule's offset counts every row, so the
-  // two would disagree by however many were dropped above. From row 0 they
-  // agree, which is what the list did before the offset existed. A rom the
-  // sysmodule stepped past as too large to send even alone (#248) is the same
-  // disagreement, seen as a page that started late (`drifted`, #341).
-  if (level.first == 0 || level.unreadable_items > 0 || level.drifted) {
-    return 0;
+  // At the sysmodule's row for it, which is not the place once a row above it
+  // was no place here: an item this build dropped unread, or a rom stepped past
+  // as too large to send even alone (#248). Opened at the place, every row
+  // would land as many places off (#341, #345).
+  if (level.first == 0) {
+    return {};
   }
-  return level.rewind_from;
+  const std::optional<std::int64_t> row = RowOf(level, level.rewind_from);
+  if (!row) {
+    // Past what `gaps` remembers. From row 0 places count what was handed
+    // over, which is what the list did before the offset existed.
+    return {};
+  }
+  return {level.rewind_from, *row};
+}
+
+std::optional<std::int64_t> LibraryBrowserModel::RowOf(const Level& level, int place) {
+  std::int64_t row = place;
+  for (const RowGap& gap : level.gaps) {
+    if (gap.row > row) {
+      break;
+    }
+    row += gap.rows;
+  }
+  if (row >= level.mapped_below) {
+    return std::nullopt;
+  }
+  return row;
+}
+
+void LibraryBrowserModel::ClearGaps(Level& level, std::int64_t from, std::int64_t to) {
+  std::vector<RowGap>& gaps = level.gaps;
+  for (std::size_t i = 0; i < gaps.size();) {
+    RowGap& gap = gaps[i];
+    const std::int64_t end = gap.row + gap.rows;
+    if (end <= from || gap.row >= to) {
+      ++i;
+      continue;
+    }
+    // What lies outside the rows passed is still known; only the rows the
+    // cursor went over are its to say.
+    const bool before = gap.row < from;
+    const bool after = end > to;
+    if (before && after) {
+      gap.rows = from - gap.row;
+      if (gaps.size() < kMaxRowGaps) {
+        gaps.insert(gaps.begin() + static_cast<std::ptrdiff_t>(i) + 1, RowGap{to, end - to});
+      } else {
+        level.mapped_below = std::min(level.mapped_below, to);
+      }
+      return;
+    }
+    if (before) {
+      gap.rows = from - gap.row;
+      ++i;
+    } else if (after) {
+      gap = RowGap{to, end - to};
+      ++i;
+    } else {
+      gaps.erase(gaps.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+  }
+}
+
+void LibraryBrowserModel::AddGap(Level& level, std::int64_t row, std::int64_t rows) {
+  std::vector<RowGap>& gaps = level.gaps;
+  const auto next = std::find_if(gaps.begin(), gaps.end(),
+                                 [row](const RowGap& gap) { return gap.row > row; });
+  // Runs that touch are one: a page this build cannot read at all is one gap.
+  const bool joins_previous = next != gaps.begin() && std::prev(next)->row +
+                                                          std::prev(next)->rows == row;
+  const bool joins_next = next != gaps.end() && row + rows == next->row;
+  if (joins_previous && joins_next) {
+    std::prev(next)->rows += rows + next->rows;
+    gaps.erase(next);
+  } else if (joins_previous) {
+    std::prev(next)->rows += rows;
+  } else if (joins_next) {
+    next->row = row;
+    next->rows += rows;
+  } else if (gaps.size() < kMaxRowGaps) {
+    gaps.insert(next, RowGap{row, rows});
+  } else {
+    // No room: every place whose row is past this one opens at row 0.
+    level.mapped_below = std::min(level.mapped_below, row);
+  }
 }
 
 bool LibraryBrowserModel::HasMoreRow(const Level& level) {
@@ -504,7 +581,9 @@ LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
       return command;
     }
     command.kind = Command::Kind::kListBegin;
-    level.request.offset = StartOf(level);
+    const Start start = StartOf(level);
+    level.request.offset = start.row;
+    level.start_place = start.place;
     command.request = level.request;
     level.loading = true;
     issued_ = command.kind;
@@ -582,8 +661,9 @@ void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
   // A fresh cursor starts where it was asked to (#339), so whatever is on
   // screen from there down is about to be said again. Counting from that place
   // is what routes the second telling onto the rows it repeats rather than
-  // after them (`Level`).
-  level.consumed = static_cast<int>(level.request.offset);
+  // after them (`Level`) -- the place, not the row it was opened at, which a
+  // row above that is no place here puts ahead of it (#345).
+  level.consumed = level.start_place;
   level.served = level.request.offset;
   level.has_more = true;
 }
@@ -613,23 +693,21 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
     return;
   }
 
-  if (page.start != level.served) {
-    // The sysmodule counts rows this level was never handed: it stepped past a
-    // rom too large to send (#248). Places here count what was handed over, so
-    // from this page down they are a row behind its rows (#341).
-    level.drifted = true;
-    if (level.request.offset > 0) {
-      // And this cursor took its offset for a place, so its rows would land
-      // that far off -- A on one of them enqueuing the rom beside it. Ended,
-      // and the level read again from row 0 (`StartOf`). A cursor opened at
-      // row 0 has nothing to correct: its places are its own count, as they
-      // were before #339, and ending it would only meet the step again.
-      closing_.push_back(level.cursor);
-      Reopen(level);
-      return;
-    }
+  // The rows this page passed are the cursor's to say about (`gaps`, #345). A
+  // page that starts past `served` is the sysmodule counting rows this level
+  // was never handed -- it stepped past a rom too large to send (#248), and
+  // from here down places are that many rows behind its rows (#341). The
+  // cursor's own places stay right: they count what was handed over from a
+  // place whose row was known, so it reads on. A `start` short of `served` is
+  // no producer's, and is read as `served`.
+  const std::int64_t start = std::max(page.start, level.served);
+  const std::int64_t past = start + static_cast<std::int64_t>(page.items.size());
+  ClearGaps(level, level.served, past);
+  if (start > level.served) {
+    AddGap(level, level.served, start - level.served);
   }
-  level.served = page.start + static_cast<std::int64_t>(page.items.size());
+  level.served = past;
+  std::int64_t next_row = start;
 
   // Was the selection resting on the `kMore` row? `MoveSelection` lets it,
   // because that row is how a user reaches "Loading..." and "press A to try
@@ -643,6 +721,7 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
   const bool was_on_more = !level.rows.empty() && level.selected >= Tail(level);
 
   for (const ipc::ListItem& item : page.items) {
+    const std::int64_t item_row = next_row++;
     LibraryRow row;
     bool read = false;
     switch (level.kind) {
@@ -673,6 +752,9 @@ void LibraryBrowserModel::OnPage(const ipc::ListPage& page) {
       if (level.consumed == Tail(level)) {
         ++level.unreadable_items;
       }
+      // A row there and no place here, which a cursor opened below it has to
+      // know to open at the right row (#345).
+      AddGap(level, item_row, 1);
       continue;
     }
     // Routed by its place in the list (`Level`).
