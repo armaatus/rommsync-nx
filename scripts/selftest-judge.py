@@ -14,10 +14,13 @@ what the row asks. It is what the launch gate's `selftest` row
 Each report gets one line per row the NRO is expected to write,
 
     PASS     net.tls                 pass  TLSv1.3, verified against the CertStore
+    WARN     net.nifm                pass  no internet: rc=0x00000000, ... status 2
     FAIL     proto.tick              fail  tick ended partial: 1 operation failed
     MISSING  footprint.heap          the report has no such row
 
-and then `VERDICT PASS|FAIL <file> (<HOS>/<AMS>)`. A report that is not one the
+and then `VERDICT PASS|FAIL <file> (<HOS>/<AMS>)`. `WARN` is a pass worth reading:
+`net.nifm` on a console whose nifm will not say Connected, but whose RomM
+answered the heartbeat anyway (#328, #342). A report that is not one the
 NRO could have written -- not JSON, a schema this script does not know, an
 unknown result, a row twice -- is `MALFORMED <file>: <why>` and is not judged at
 all: a half-written file off a console that crashed is evidence of a crash, not
@@ -66,7 +69,7 @@ ROWS = (
     ("card.fat32_ceiling", REQUIRED, "exfat", "a file past 4 GiB is refused before writing"),
     ("card.long_unicode_path", REQUIRED, None, "a long, non-ASCII path round-trips"),
     # 3. Network and TLS.
-    ("net.nifm", REQUIRED, None, "nifm says the console is online"),
+    ("net.nifm", REQUIRED, None, "nifm says online, or RomM answers past an unsure nifm"),
     ("net.dns", REQUIRED, None, "the server's host resolves"),
     ("net.tls", REQUIRED, None, "a verified TLS request to the server answers"),
     ("net.tls13_only", OPTIONAL, None, "a TLS 1.3-only listener answers, when one is named"),
@@ -83,6 +86,20 @@ ROWS = (
 )
 
 RESULTS = ("pass", "fail", "skip", "na")
+
+# What `net.nifm`'s `value` says nifm answered (selftest/source/network.cpp,
+# sysmodule/source/http/nifm_verdict.hpp). The engine syncs past the unsure two
+# once RomM answers a heartbeat (#328), so a console that blocks Nintendo --
+# emuMMC's DNS block, 90DNS, a LAN with no internet -- is judged by whether its
+# heartbeat row passed (#342). `no_network` is 0xd46ed, airplane mode or no
+# network in range: the engine sends nothing past it, so nothing was tested,
+# whatever the row's own result says. A row with no `value` is judged like any
+# other required row.
+NIFM_UNSURE = ("no_internet", "unexpected")
+NIFM_FAILS = ("no_network", "no_transport")
+NIFM_VERDICTS = ("online",) + NIFM_UNSURE + NIFM_FAILS
+# The row whose request is the heartbeat: `GET /api/heartbeat`, verified.
+HEARTBEAT_ROW = "net.tls"
 CONSOLE_FIELDS = ("hos", "ams", "emummc", "sd_format")
 
 
@@ -139,6 +156,17 @@ def judge_row(spec: tuple, row: dict, console: dict) -> bool:
     return False
 
 
+def judge_nifm(row: dict, by_id: dict, passed: bool) -> str:
+    """`PASS`, `WARN` or `FAIL` for `net.nifm`, given what the plain rule said."""
+    verdict = row.get("value")
+    if verdict in NIFM_FAILS:
+        return "FAIL"
+    if verdict in NIFM_UNSURE:
+        answered = by_id.get(HEARTBEAT_ROW, {}).get("result") == "pass"
+        return "WARN" if answered else "FAIL"
+    return "PASS" if passed else "FAIL"
+
+
 def judge(path: str, report: dict) -> bool:
     console = report["console"]
     by_id = report["_by_id"]
@@ -151,9 +179,12 @@ def judge(path: str, report: dict) -> bool:
             ok = False
             continue
         passed = judge_row(spec, row, console)
-        ok = ok and passed
+        label = "PASS" if passed else "FAIL"
+        if row_id == "net.nifm":
+            label = judge_nifm(row, by_id, passed)
+        ok = ok and label != "FAIL"
         detail = str(row.get("detail", ""))
-        print(f"{'PASS' if passed else 'FAIL':<8} {row_id:<24}{row['result']:<5} {detail}")
+        print(f"{label:<8} {row_id:<24}{row['result']:<5} {detail}")
     known = {spec[0] for spec in ROWS}
     for row_id in by_id:
         if row_id not in known:

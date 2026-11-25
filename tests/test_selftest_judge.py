@@ -25,6 +25,7 @@ docs/HARDWARE_TEST_PLAN.md's PRE-02, not a claim made here.
            the plan cites the judge, and the row stays a console row.
 """
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
@@ -119,11 +120,17 @@ def scenario_nifm() -> None:
     expect(judge("nifm-no-network-passed.json"), 1,
            r"^FAIL +net\.nifm .*no network", r"^VERDICT FAIL",
            what="a no-network verdict written as pass")
-    # The verdicts the judge reads are the ones the NRO writes.
-    text = "\n".join(sources().values())
-    for verdict in ("online", "no_network", "no_internet", "unexpected", "no_transport"):
-        if f'"{verdict}"' not in text:
-            fail(f"the NRO never writes the nifm verdict {verdict}")
+    # The verdicts the judge reads are exactly the ones the NRO writes: one the
+    # judge did not know would fall through to the plain rule unnoticed.
+    spec = importlib.util.spec_from_file_location("selftest_judge", JUDGE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    judged = set(module.NIFM_VERDICTS)
+    with open(os.path.join(SOURCE, "network.cpp"), encoding="utf-8") as f:
+        network = f.read()
+    written = set(re.findall(r'"(online|no_[a-z_]+|unexpected)"', network))
+    if judged != written:
+        fail(f"the judge reads nifm verdicts {sorted(judged)}, the NRO writes {sorted(written)}")
     print("ok: an unsure nifm passes as WARN when the heartbeat answers; no network fails")
 
 

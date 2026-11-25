@@ -96,7 +96,7 @@ measurement. The rows, in the order they run:
 | `card.backup_then_commit` | `sync::BackUpFirst` then an overwrite: the backup holds the old bytes |
 | `card.fat32_ceiling` | on FAT32, the card backend caps a file at 4 GiB; `na` on exFAT |
 | `card.long_unicode_path` | a ~250-byte Japanese/accented path is made, listed and read back |
-| `net.nifm` | nifm says online |
+| `net.nifm` | nifm does not say *no network*. The text opens with the verdict, which `value` carries: `online`; `no internet` (rc 0, not Connected); `unexpected 0x…` (an undocumented code); `no network` (0xd46ed: airplane mode, none in range); `no transport`. The judge passes `no internet` and `unexpected` as `WARN` only when `net.tls` passes -- a console that blocks Nintendo, which the sysmodule syncs on once RomM answers ([TROUBLESHOOTING.md](../docs/TROUBLESHOOTING.md#sync-never-runs-on-a-console-that-blocks-nintendo)). The rows after it reach RomM past such a nifm, as the engine does once its heartbeat is answered |
 | `net.dns` | the server's host resolves |
 | `net.tls` | a verified request to `/api/heartbeat` answers 2xx |
 | `platform.clock` | `sync::CheckClock` trusts the clock against the server's `Date` |
@@ -121,7 +121,8 @@ scripts/selftest-judge.py --pairs 2 docs/selftest/report-*.json   # the launch g
 scripts/selftest-judge.py --rows                                  # what is judged
 ```
 
-One line per row -- `PASS`, `FAIL`, or `MISSING` -- then `VERDICT PASS|FAIL`.
+One line per row -- `PASS`, `WARN` (a pass worth reading: `net.nifm` past an
+unsure nifm), `FAIL`, or `MISSING` -- then `VERDICT PASS|FAIL`.
 A report that is not one this NRO could have written is `MALFORMED` and exit 2.
 `--pairs N` needs N distinct HOS/Atmosphere pairs among the passing reports.
 The judge's `ROWS` table is the contract: `ctest -R selftest.rows` holds this

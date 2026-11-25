@@ -364,7 +364,9 @@ does not, and the tick runs once the boot wait's two minutes are out (#328):
 rather than two minutes late.
 
 **Answers.** What nifm reports with Nintendo blocked -- the selftest's nifm
-row, its `rc` and `status`, in each cell -- which #328 could not know. Written
+row, its verdict (`online`, `no internet`, `unexpected 0x…`), `rc` and
+`status`, in each cell -- which #328 could not know. The judge passes an unsure
+verdict as `WARN` when the heartbeat row passes (#342). Written
 into #328 and into the cell's row of #310's matrix.
 
 ---
