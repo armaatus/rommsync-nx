@@ -1365,6 +1365,9 @@ set(PRUNE_UNIT_SCENARIOS
   orphans  # #346: a previous server's state backups go past orphan_days; saves never
   orphan_names  # #346: a set-aside state.db names states in the window it was bound
   orphans_crash  # #346: a power cut mid-orphan-prune removes a subset of what the prune removes
+  dropped_orphans  # #348: a dropped state's backups go past orphan_days; saves never
+  dropped_names  # #348: a dropped state names its backups up to when it went, shadowed by any row
+  dropped_crash  # #348: a power cut mid-orphan-prune of a dropped state removes a subset
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})

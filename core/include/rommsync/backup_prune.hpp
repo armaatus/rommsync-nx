@@ -99,8 +99,14 @@
 // server's states (`SetAsideStateBackupsOf`). So after the budget, such a
 // backup older than `orphan_days` goes, oldest first, beyond the newest
 // `keep_states` of its state -- by proof, or without one, counted apart as
-// `orphan_pruned`. A backup **no** `state.db` names -- a state this one has
-// dropped, a server whose set-aside file is gone -- is never removed: without
+// `orphan_pruned`.
+//
+// So does one of a state this server's `state.db` let go (#348): the file
+// remembers the last states it dropped and when (`state::DroppedState`), and
+// `DroppedStateBackupsOf` names their backups up to that second -- unless a
+// row of the file holds the same group, which is then a save's or the
+// budget's. A backup **no** `state.db` names -- a state dropped past that
+// memory, a server whose set-aside file is gone -- is never removed: without
 // a `state.db` only its name says it is a state's. It is counted, by that name,
 // as `state_orphans`, for a report and nothing else.
 //
@@ -164,9 +170,10 @@ struct Retention {
   /// The newest this many of each state the budget never removes. At least one.
   int keep_states = config::kDefaultBackupKeepStates;
 
-  /// The orphan bound (#346): a state backup of a previous server older than
-  /// this many days goes, beyond the newest `keep_states` of its state, with no
-  /// other copy shown. Zero is off. See the header.
+  /// The orphan bound (#346): a state backup of a previous server, or of a
+  /// state `state.db` dropped (#348), older than this many days goes, beyond
+  /// the newest `keep_states` of its state, with no other copy shown. Zero is
+  /// off. See the header.
   int orphan_days = config::kDefaultBackupOrphanDays;
 };
 
@@ -220,6 +227,12 @@ IsStateBackup StateBackupsOf(const state::Baseline& baseline);
 IsStateBackup SetAsideStateBackupsOf(fs::FileSystem& files, const std::string& state_sd_path,
                                      std::int64_t server_since, const state::Baseline& current);
 
+/// The state backups of a state `baseline` dropped (#348): those
+/// `StateBackupsOf` would name were its `DroppedState` still a row, taken no
+/// later than it went, and under no group a row of `baseline` -- a save's, or
+/// a state's, which the budget ranks -- also holds. Null when it remembers none.
+IsStateBackup DroppedStateBackupsOf(const state::Baseline& baseline);
+
 struct PruneOptions {
   std::string backup_dir = sync::kBackupDir;
   Retention retention;
@@ -250,6 +263,10 @@ struct PruneOptions {
   /// Which backups from before `server_since` the orphan bound may remove
   /// (#346): `SetAsideStateBackupsOf`'s. Null is none.
   IsStateBackup is_previous_state_backup;
+
+  /// ...and which from `server_since` on (#348): `DroppedStateBackupsOf`'s.
+  /// Null is none.
+  IsStateBackup is_dropped_state_backup;
 };
 
 struct PruneReport {
@@ -287,8 +304,9 @@ struct PruneReport {
   /// each state are never removed.
   std::int64_t state_bytes_after = 0;
 
-  /// Of `pruned`, state backups of a previous server the orphan bound removed
-  /// with no other copy of their bytes shown (#346).
+  /// Of `pruned`, state backups of a previous server (#346) or of a dropped
+  /// state (#348) the orphan bound removed with no other copy of their bytes
+  /// shown.
   std::size_t orphan_pruned = 0;
 
   /// Left after the prune: backups under a state's discriminator (`state-`)

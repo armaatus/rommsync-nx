@@ -120,8 +120,12 @@ class Pruner {
     }
     // Last, and only over states: the one pass that removes without a proof.
     if (keep.max_state_bytes > 0 && options_.is_state_backup) Budget(order, keep);
-    // Then a previous server's, which the budget cannot rank, by age (#346).
-    if (keep.orphan_days > 0 && options_.is_previous_state_backup) Orphans(order, keep, now);
+    // Then what the budget cannot rank, by age: a previous server's (#346),
+    // and a state this server's `state.db` dropped (#348).
+    if (keep.orphan_days > 0) {
+      Orphans(order, keep, now, true, options_.is_previous_state_backup);
+      Orphans(order, keep, now, false, options_.is_dropped_state_backup);
+    }
     for (const Backup& backup : backups_) {
       if (!backup.removed && backup.parsed.discriminator.rfind("state-", 0) == 0 &&
           !(!Previous(backup) && options_.is_state_backup &&
@@ -208,18 +212,23 @@ class Pruner {
     report_->state_bytes_after = state_total;
   }
 
-  /// The orphan bound (#346): a previous server's state backups that a
-  /// set-aside `state.db` names, older than `orphan_days`, go oldest first
-  /// beyond the newest `keep_states` of their state -- by proof when there is
-  /// one, without one when there is not. See the header.
-  void Orphans(const std::vector<std::size_t>& order, const Retention& keep, std::int64_t now) {
+  /// The orphan bound: the state backups `named` names on one side of
+  /// `server_since` -- a previous server's by a set-aside `state.db` (#346),
+  /// or this one's by a state it dropped (#348) -- older than `orphan_days`, go
+  /// oldest first beyond the newest `keep_states` of their state -- by proof
+  /// when there is one, without one when there is not. See the header.
+  void Orphans(const std::vector<std::size_t>& order, const Retention& keep, std::int64_t now,
+               bool previous, const IsStateBackup& named) {
+    if (!named) return;
     const std::size_t keep_states = static_cast<std::size_t>(std::max(keep.keep_states, 1));
-    RankStates(true, options_.is_previous_state_backup);
+    RankStates(previous, named);
     const std::int64_t old_before = now - static_cast<std::int64_t>(keep.orphan_days) * kSecondsPerDay;
     for (const std::size_t at : order) {
       const Backup& backup = backups_[at];
-      if (backup.removed || backup.unremovable || !Previous(backup) ||
-          backup.state_rank <= keep_states || backup.parsed.unix_seconds >= old_before) {
+      // `named` again: this side's ranks include the budget's.
+      if (backup.removed || backup.unremovable || Previous(backup) != previous ||
+          backup.state_rank <= keep_states || backup.parsed.unix_seconds >= old_before ||
+          !named(backup.parsed, sync::ExtensionOf(backup.name))) {
         continue;
       }
       if (Take(at) == Taken::kUnproven) ++report_->orphan_pruned;
@@ -433,6 +442,11 @@ std::string GroupKey(std::int64_t rom_id, std::string_view discriminator,
   return key;
 }
 
+/// The group a state download or restore of `file_name` names its backups in.
+std::string StateGroup(std::int64_t rom_id, const std::string& file_name) {
+  return GroupKey(rom_id, sync::StateBackupDiscriminator(file_name), sync::ExtensionOf(file_name));
+}
+
 }  // namespace
 
 IsStateBackup StateBackupsOf(const state::Baseline& baseline) {
@@ -441,8 +455,7 @@ IsStateBackup StateBackupsOf(const state::Baseline& baseline) {
   // its name, and its name's extension.
   std::vector<std::string> states;
   for (const auto& [key, row] : baseline.state_rows()) {
-    states.push_back(GroupKey(row.rom_id, sync::StateBackupDiscriminator(row.file_name),
-                              sync::ExtensionOf(row.file_name)));
+    states.push_back(StateGroup(row.rom_id, row.file_name));
   }
   if (states.empty()) return nullptr;
   // A save's slot is whatever some client chose, so one can be spelled
@@ -503,8 +516,11 @@ IsStateBackup SetAsideStateBackupsOf(fs::FileSystem& files, const std::string& s
     Era era;
     era.since = set_aside.bound_since();
     for (const auto& [key, row] : set_aside.state_rows()) {
-      era.states.push_back(GroupKey(row.rom_id, sync::StateBackupDiscriminator(row.file_name),
-                                    sync::ExtensionOf(row.file_name)));
+      era.states.push_back(StateGroup(row.rom_id, row.file_name));
+    }
+    // And the states it had dropped (#348): that server's too, in its window.
+    for (const state::DroppedState& dropped : set_aside.dropped_states()) {
+      era.states.push_back(StateGroup(dropped.rom_id, dropped.file_name));
     }
     std::sort(era.states.begin(), era.states.end());
     any = any || !era.states.empty();
@@ -550,6 +566,41 @@ IsStateBackup SetAsideStateBackupsOf(fs::FileSystem& files, const std::string& s
   };
 }
 
+IsStateBackup DroppedStateBackupsOf(const state::Baseline& baseline) {
+  if (baseline.dropped_states().empty()) return nullptr;
+  // A group a row holds is not the dropped state's alone: a save's slot can be
+  // spelled `state-Game`, and a live state's backups are the budget's to rank.
+  std::vector<std::string> rows;
+  for (const auto& [key, row] : baseline.rows()) {
+    rows.push_back(GroupKey(row.rom_id, sync::SlotBackupDiscriminator(row.slot), {}));
+  }
+  for (const auto& [key, row] : baseline.state_rows()) {
+    rows.push_back(StateGroup(row.rom_id, row.file_name));
+  }
+  std::sort(rows.begin(), rows.end());
+  // The state's group, beside the second it went.
+  std::vector<std::string> groups;
+  std::vector<std::int64_t> when;
+  for (const state::DroppedState& each : baseline.dropped_states()) {
+    groups.push_back(StateGroup(each.rom_id, each.file_name));
+    when.push_back(each.dropped);
+  }
+  return [rows = std::move(rows), groups = std::move(groups), when = std::move(when)](
+             const BackupName& name, std::string_view extension) {
+    const std::string group = GroupKey(name.rom_id, name.discriminator, extension);
+    if (std::binary_search(rows.begin(), rows.end(), group) ||
+        std::binary_search(rows.begin(), rows.end(),
+                           GroupKey(name.rom_id, name.discriminator, {}))) {
+      return false;
+    }
+    // Up to the second it went: a backup after it is not known to be its.
+    for (std::size_t at = 0; at < groups.size(); ++at) {
+      if (groups[at] == group && name.unix_seconds <= when[at]) return true;
+    }
+    return false;
+  };
+}
+
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options) {
   PruneReport report;
   Pruner(files, options, &report).Run();
@@ -571,8 +622,8 @@ std::string Describe(const PruneReport& report) {
   }
   if (report.orphan_pruned > 0) {
     line += "; " + std::to_string(report.orphan_pruned) +
-            " of them save-state backups of a previous server [backup] orphan_days removed with "
-            "no other copy known";
+            " of them save-state backups of a previous server or a dropped state [backup] "
+            "orphan_days removed with no other copy known";
   }
   if (report.state_orphans > 0) {
     line += "; " + std::to_string(report.state_orphans) +

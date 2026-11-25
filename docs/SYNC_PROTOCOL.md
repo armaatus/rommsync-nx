@@ -856,9 +856,23 @@ removes such a backup older than that, oldest first, beyond the newest
 `keep_states` of its state: by proof when there is one, and otherwise without
 one, counted as `PruneReport::orphan_pruned` and named in a clause of
 `backup.pruned`; `Status.backup.state_budget_pruned` counts both kinds of sole
-copy removed. **A backup no `state.db` names is never removed**: one of a state
-this server's `state.db` dropped, or from a server whose set-aside file is gone,
-cannot be told from a save's backup without trusting its name. It is only
+copy removed.
+
+**So is one of a state this server's `state.db` dropped (#348).** A state row
+let go — by `TrimStates` or `sync_finish`'s bounds, or erased when its bytes
+could not be read back — is remembered in the file as a `"kind":"dropped"` line
+(`state::DroppedState`, version 5): its rom, its name and the second it went,
+the newest `state::kMaxDroppedStates` (16) of them, not counted as rows and
+let go first when the file is at `kMaxStateBytes`. A row of the same state
+takes it back. `backup::DroppedStateBackupsOf` names its backups taken up to
+that second, under no group a row of the file also holds, and the orphan bound
+removes them as it does a previous server's (`prune.dropped_orphans`,
+`prune.dropped_crash`). A set-aside file's dropped states name that server's
+backups in its window too.
+
+**A backup no `state.db` names is never removed**: one of a state dropped past
+that memory, or from a server whose set-aside file is gone, cannot be told
+from a save's backup without trusting its name. It is only
 counted, by its `state-` name, as `PruneReport::state_orphans` — in
 `backup.pruned`, `Status.backup.state_orphans` and the diagnostics bundle — so
 a full card says where its space went. A power cut leaves a subset of the

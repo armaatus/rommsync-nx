@@ -2781,10 +2781,12 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   // server's rom id, so this one's digests are not its proof (#294).
   options.server_since = bound_since;
   // A previous server's state backups, by the `state.db` set aside when the
-  // console left it (#346): the orphan bound's, never a name's.
+  // console left it (#346), and this one's of a state it dropped (#348): the
+  // orphan bound's, never a name's.
   if (options.retention.orphan_days > 0) {
     options.is_previous_state_backup =
         backup::SetAsideStateBackupsOf(*inputs.files, sync::kStateSdPath, bound_since, stored);
+    options.is_dropped_state_backup = backup::DroppedStateBackupsOf(stored);
   }
   const backup::PruneReport report = backup::Prune(*inputs.files, options);
   // A prune that could not read or remove something is asked again next tick,
