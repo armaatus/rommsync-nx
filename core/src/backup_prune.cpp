@@ -410,6 +410,11 @@ IsStateBackup StateBackupsOf(const state::Baseline& baseline) {
   };
 }
 
+IsStateBackup SetAsideStateBackupsOf(fs::FileSystem&, const std::string&, std::int64_t,
+                                     const state::Baseline&) {
+  return nullptr;  // #346: stub, so the failing tests compile
+}
+
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options) {
   PruneReport report;
   Pruner(files, options, &report).Run();

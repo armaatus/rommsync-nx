@@ -193,6 +193,12 @@ inline constexpr int kDefaultBackupMaxMib = 512;
 inline constexpr int kDefaultBackupMaxStateMib = 256;
 inline constexpr int kDefaultBackupKeepStates = 3;
 
+/// The orphan bound (#346): a previous server's state backups, which the state
+/// budget cannot rank, go past this many days -- beyond `keep_states` of each
+/// state, and only those a set-aside `state.db` names. Half a year, because it
+/// removes sole copies of progress on a server the console may yet go back to.
+inline constexpr int kDefaultBackupOrphanDays = 180;
+
 /// The largest values a key takes; past them a value is clamped, for
 /// `interval_min`'s reason -- falling back to the default would keep *less*
 /// than a user asking for a lot.
@@ -212,6 +218,9 @@ struct BackupConfig {
   int max_state_mib = kDefaultBackupMaxStateMib;
   /// The newest this many of each state the budget never removes. At least 1.
   int keep_states = kDefaultBackupKeepStates;
+  /// Past this many days, a previous server's state backups beyond the newest
+  /// `keep_states` go, other copy or none (#346). 0 is off.
+  int orphan_days = kDefaultBackupOrphanDays;
 };
 
 /// `[sync]`.

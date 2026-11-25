@@ -149,6 +149,11 @@ struct Retention {
 
   /// The newest this many of each state the budget never removes. At least one.
   int keep_states = config::kDefaultBackupKeepStates;
+
+  /// The orphan bound (#346): a state backup of a previous server older than
+  /// this many days goes, beyond the newest `keep_states` of its state, with no
+  /// other copy shown. Zero is off. See the header.
+  int orphan_days = config::kDefaultBackupOrphanDays;
 };
 
 /// `[backup]` as a `Retention`.
@@ -190,6 +195,17 @@ using IsStateBackup = std::function<bool(const BackupName& name, std::string_vie
 /// the name alone is not enough.
 IsStateBackup StateBackupsOf(const state::Baseline& baseline);
 
+/// The state backups of a previous server (#346): those a `state.db` that a
+/// server move set aside beside `state_sd_path` -- `<state.db>.<server>[.<n>]`,
+/// `binding::Archive`'s -- names as `StateBackupsOf` would, taken in the window
+/// that file was bound for: from its `bound_since` to the next set-aside file's,
+/// or to `server_since`. Never a backup from `server_since` on, and never one
+/// under a discriminator a save row of `current` or of any set-aside file holds
+/// for the rom. Null when no set-aside file names a state, or `server_since` is
+/// zero (no server move to have set one aside).
+IsStateBackup SetAsideStateBackupsOf(fs::FileSystem& files, const std::string& state_sd_path,
+                                     std::int64_t server_since, const state::Baseline& current);
+
 struct PruneOptions {
   std::string backup_dir = sync::kBackupDir;
   Retention retention;
@@ -216,6 +232,10 @@ struct PruneOptions {
   /// `server_since` is never one -- its rom id is another server's, and its
   /// name proves nothing against this console's `state.db`.
   IsStateBackup is_state_backup;
+
+  /// Which backups from before `server_since` the orphan bound may remove
+  /// (#346): `SetAsideStateBackupsOf`'s. Null is none.
+  IsStateBackup is_previous_state_backup;
 };
 
 struct PruneReport {
@@ -252,6 +272,16 @@ struct PruneReport {
   /// it did not run. It can stay over the budget: the newest `keep_states` of
   /// each state are never removed.
   std::int64_t state_bytes_after = 0;
+
+  /// Of `pruned`, state backups of a previous server the orphan bound removed
+  /// with no other copy of their bytes shown (#346).
+  std::size_t orphan_pruned = 0;
+
+  /// Left after the prune: backups under a state's discriminator (`state-`)
+  /// that the state budget does not count -- another server's, or a state
+  /// `state.db` no longer lists. A count from the name, for a report only:
+  /// nothing is ever removed on it.
+  std::size_t state_orphans = 0;
 };
 
 /// Apply the retention rule to `options.backup_dir`. See the header.

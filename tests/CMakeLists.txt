@@ -1361,6 +1361,9 @@ set(PRUNE_UNIT_SCENARIOS
   state_budget_off  # #340: with the budget at 0, nothing unique goes
   state_budget_names  # #340: only a backup state.db names a state's counts against the budget
   state_budget_crash  # #340: a power cut mid-budget removes a subset of what the prune removes
+  orphans  # #346: a previous server's state backups go past orphan_days; saves never
+  orphan_names  # #346: a set-aside state.db names states in the window it was bound
+  orphans_crash  # #346: a power cut mid-orphan-prune removes a subset of what the prune removes
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})

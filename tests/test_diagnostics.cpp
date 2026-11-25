@@ -152,11 +152,12 @@ void Sections(checks::Checks& checks) {
   bundle.engine.backup.kept_unique = 2;
   bundle.engine.backup.over_cap = true;
   bundle.engine.backup.state_budget_pruned = 3;
+  bundle.engine.backup.state_orphans = 4;
   bundle.written_at += 1;
   text = WriteAndRead(checks, dir, bundle);
   for (const char* expected : {"measured = yes", "bytes = 5242880", "backups = 12",
                                "kept_unique = 2", "over_cap = yes",
-                               "state_budget_pruned = 3"}) {
+                               "state_budget_pruned = 3", "state_orphans = 4"}) {
     checks.Expect(text.find(expected) != std::string::npos,
                   std::string("backup usage is #316's numbers: \"") + expected + "\"");
   }
@@ -168,7 +169,8 @@ void Sections(checks::Checks& checks) {
   bundle.written_at += 1;
   text = WriteAndRead(checks, dir, bundle);
   for (const char* expected : {"bytes = at least 5242880", "backups = at least 12",
-                               "kept_unique = at least 2", "truncated = yes"}) {
+                               "kept_unique = at least 2", "truncated = yes",
+                               "state_orphans = at least 4"}) {
     checks.Expect(text.find(expected) != std::string::npos,
                   std::string("a listing cut short says its numbers are a floor: \"") + expected +
                       "\"");

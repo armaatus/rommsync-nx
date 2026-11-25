@@ -305,6 +305,14 @@ void BackupRetentionIsReadAndChecked(checks::Checks& c) {
   c.Expect(Complaint(no_states, "backup", "keep_states") != nullptr, "and says so");
   const config::LoadResult vast = parse("max_state_mib = 99999999");
   c.ExpectEq(vast.value.backup.max_state_mib, config::kMaxBackupMaxMib, "past the ceiling clamps");
+
+  // #346: the orphan bound, a previous server's state backups by age.
+  c.ExpectEq(defaults.orphan_days, 180, "a previous server's state backups go after half a year");
+  const config::LoadResult orphans = parse("orphan_days = 0");
+  c.Expect(orphans.value.backup.orphan_days == 0 && orphans.diagnostics.empty(),
+           "it is read, and 0 turns it off: " + orphans.DescribeDiagnostics());
+  const config::LoadResult ages = parse("orphan_days = 99999");
+  c.ExpectEq(ages.value.backup.orphan_days, config::kMaxBackupKeepDays, "past the ceiling clamps");
 }
 
 // --- the happy path ----------------------------------------------------------
@@ -1175,6 +1183,10 @@ void TheShippedExampleParses(checks::Checks& c) {
              "so is [backup] max_state_mib (#340)");
   c.ExpectEq(result.value.backup.keep_states, defaults.backup.keep_states,
              "and [backup] keep_states");
+  c.ExpectEq(result.value.backup.orphan_days, defaults.backup.orphan_days,
+             "and [backup] orphan_days (#346)");
+  c.Expect(example.find("\norphan_days") != std::string::npos,
+           "which the shipped example spells out too: it removes sole copies as well");
   c.Expect(example.find("\nmax_state_mib") != std::string::npos,
            "which the shipped example spells out: it is the one setting that removes sole copies");
   // The folder map is commented out, so the built-in one survives a copy whole.

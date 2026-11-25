@@ -501,6 +501,12 @@ struct BackupUsage {
   /// not a proof. Since boot rather than the last prune's, because a trade
   /// removes about one per prune and the row is there to say it happens at all.
   std::int64_t state_budget_pruned = 0;
+
+  /// Left after the last prune: backups under a state's name that no
+  /// `state.db` of this server counts -- another server's, or a state it no
+  /// longer lists (`PruneReport::state_orphans`, #346). Where a full card's
+  /// space went when the state budget cannot reach it.
+  std::int64_t state_orphans = 0;
 };
 
 /// Everything the status screen needs, in one call.
