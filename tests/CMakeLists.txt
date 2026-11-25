@@ -2796,7 +2796,8 @@ target_compile_definitions(test_sleep_connect PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-sleep"
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 
-foreach(scenario dns connect handshake)
+# #335 adds a lookup whose first cancel is lost, and one nobody cancels.
+foreach(scenario dns dns_lost_cancel dns_deadline connect handshake)
   add_test(NAME sleep.${scenario} COMMAND test_sleep_connect ${scenario})
   set_tests_properties(sleep.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
