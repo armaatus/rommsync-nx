@@ -796,7 +796,8 @@ ctest --test-dir build --output-on-failure
   comparison on literals, chosen so that a string compare — which reads 4.9 as
   newer than 4.10 — fails it. Those three never skip. `toolchain.libnx` asks the
   pinned image's package database for its libnx and requires 4.10.0 or later
-  (HOS 21.0.0's TLS ABI); it skips without the image, like `switch.builds`, and
+  (HOS 21.0.0's TLS ABI), and exactly the libnx DEVELOPMENT.md's HOS 23
+  resolver finding names as checked (#334); it skips without the image, like `switch.builds`, and
   the `switch-build` job runs it on every push, as a step and with the rest of
   the `toolchain` label.
 - The `boot.*` group is the sysmodule's `__appInit`, which nothing off a console

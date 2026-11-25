@@ -79,7 +79,8 @@ Neither input to the Switch build is ours, and neither announces a break (#199):
 `ctest -R toolchain` holds both: `toolchain.pins` that every file naming the
 image names the pin (the canary alone excepted), `toolchain.submodule` that the
 gitlink is the recorded tag's commit, and `toolchain.libnx` that the pinned
-image's libnx is at least `LIBNX_FLOOR` (4.10.0, HOS 21.0.0's TLS ABI). The
+image's libnx is at least `LIBNX_FLOOR` (4.10.0, HOS 21.0.0's TLS ABI) and is
+the one [DNS on HOS 23](#dns-on-hos-23) was checked against. The
 `switch-build` job runs that last check in the container on every push.
 
 **Moving the image.** Pick a dated tag from
@@ -90,7 +91,9 @@ toolchain.pins` then lists every other line that still names the old one
 the README and CLAUDE.md). `docker pull` the new tag and run `ctest -R
 'toolchain|switch|package|npdm'`: the libnx floor and the real cross-compiles
 are the part that says the move is safe. Put the new libnx version
-(`scripts/toolchain.sh libnx` prints it) in the commit message.
+(`scripts/toolchain.sh libnx` prints it) in the commit message. A new libnx
+also turns `toolchain.libnx` red until [DNS on HOS 23](#dns-on-hos-23) is
+re-checked against it.
 
 **Moving libultrahand.** Only to a tag. `git -C overlay/lib/libultrahand fetch
 --tags && git -C overlay/lib/libultrahand checkout vX.Y.Z`, stage the gitlink,
@@ -111,6 +114,80 @@ has tagged past the pin, and exits 0 whatever it finds, offline included. The
 annotation, and `ctest -R toolchain.upstream` runs it locally, passing when the
 pin is behind and skipping when GitHub cannot be reached. Warn-only on purpose:
 a new tag is news, and the move above is a reviewed change of its own (#297).
+
+### DNS on HOS 23
+
+<!-- hos23-resolver: checked against libnx 4.12.0 -->
+
+HOS 23.0.0 rewrote the resolver behind `sfdnsres` and added commands for it.
+Whether the pinned libnx still resolves names there was established off-console,
+from sources, on 2026-11-25 (#334). **libnx 4.12.0 is enough; the floor stays
+4.10.0.**
+
+- **What changed.** In 23.0.0 `bsdsocket`'s BIND-derived resolver was replaced
+  by c-ares, behind new async commands: 100-104 (`QueryAddrInfoRequestWithOptions`,
+  `QueryNameInfoRequestWithOptions`, `FetchAddrInfoRequestWithOptions`,
+  `FetchNameInfoRequestWithOptions`, `CancelQuery`) and 16 (`ReportTelemetry`),
+  all `[23.0.0+]` on switchbrew. Nintendo's own sysmodules moved to them; `nim`
+  built against SDK 23.3.0 issues no legacy command at all. The legacy commands
+  were **added to, not removed**: switchbrew marks none of 0-15 as removed, and
+  says `GetAddrInfoRequest` "on newer versions ... calls the same vfunc as
+  `GetAddrInfoRequestWithOptions`, except with fixed Options", so the old
+  command is a front for the new backend.
+- **What libnx speaks.** No libnx release wraps the new commands, and none has
+  to. `nx/source/services/sfdnsres.c` is unchanged since its 2019 rewrite; in
+  4.12.0, and on `master` 27 commits past it, `getaddrinfo` is command 6
+  (`GetAddrInfoRequest`), `resolverCancel` is command 9 (`CancelRequest`), and
+  `resolverGetCancelHandle` draws a random non-zero `u32` client-side (command 8
+  only if the RNG returns zero), so the handle costs no IPC and is in practice
+  never zero. The release notes from 4.10.0 to 4.12.0 have no resolver entry.
+  So there is no "first libnx that speaks HOS 23's resolver": every libnx since
+  2019 sends the same legacy commands, which still answer.
+- **The evidence the legacy path resolves on 23.x.** The 1.12.1 release
+  notes of Atmosphère say `dns.mitm` stopped redirecting on 23.0.0 because it "simply [was] not
+  intercepting the new commands" -- it intercepted only 2, 6, 10 and 12, and
+  homebrew kept hitting those: the PR that found it reports the (homebrew)
+  90DNS tester still resolving, and still redirected, on 23.0.0 while system
+  traffic went around it. A homebrew `getaddrinfo` on 23.x is a working lookup.
+- **Older libnx.** It sends the same commands, so it would resolve, or fail,
+  the same way -- no new hang is introduced below 4.12.0. It is moot: below
+  4.10.0 the build breaks on HOS 21.0.0's TLS ABI first (`LIBNX_FLOOR`).
+- **A side effect worth knowing.** Because `sys-rommsync` uses the legacy
+  commands, an Atmosphère `hosts` file redirects its lookups on every
+  Atmosphère version -- on 23.x before 1.12.1 it redirected *only* homebrew's.
+  A wildcard rule meant for Nintendo's hosts that also matches the RomM name
+  breaks rommsync while the console's own services carry on.
+
+**What no source confirms** -- left to #310's HOS 23.x row, on a console:
+that `CancelRequest` (9) still cancels a legacy `GetAddrInfoRequest` now that
+the request runs on c-ares (switchbrew documents neither command beyond its
+table row), which is what #290's `ResolveCancellable` in
+`sysmodule/source/http/ssl_http_client.cpp` relies on; and how a lookup fails on
+23.x when the name does not resolve or the network drops mid-query (clean `EAI_*`
+or a long wait). A cancel that no longer lands degrades to the pre-#290 lookup
+-- `ResolveBlocking` checks the token before it asks and after the answer, and
+nothing during the call -- so a
+lookup in flight when the console sleeps would hold the quiesce until `sfdnsres`
+answers. That is what the LIFE-03 half of the row looks for.
+
+`toolchain.libnx` holds this section to the pin: it fails when the image's
+libnx is not the version in the marker above, so moving the pin means
+re-reading libnx's `resolver.c` and `sfdnsres.c` against the points here and
+moving the marker.
+
+Sources:
+[libnx releases](https://github.com/switchbrew/libnx/releases) (v4.10.0-v4.12.0);
+[libnx `sfdnsres.c` history](https://github.com/switchbrew/libnx/commits/master/nx/source/services/sfdnsres.c);
+[libnx `resolver.c` at v4.12.0](https://github.com/switchbrew/libnx/blob/v4.12.0/nx/source/runtime/resolver.c);
+[libnx v4.12.0...master](https://github.com/switchbrew/libnx/compare/v4.12.0...master);
+[switchbrew, Sockets services -- sfdnsres](https://switchbrew.org/wiki/Sockets_services#sfdnsres);
+the Atmosphère release notes for
+[1.12.0](https://github.com/Atmosphere-NX/Atmosphere/releases/tag/1.12.0),
+[1.12.1](https://github.com/Atmosphere-NX/Atmosphere/releases/tag/1.12.1) and
+[1.12.2](https://github.com/Atmosphere-NX/Atmosphere/releases/tag/1.12.2);
+[Atmosphère PR #2865](https://github.com/Atmosphere-NX/Atmosphere/pull/2865), the
+22.5.0/23.0.0 `bsdsocket` and `nim` diff, and
+[issue #2863](https://github.com/Atmosphere-NX/Atmosphere/issues/2863).
 
 ### The toolchain's ctest entries
 
