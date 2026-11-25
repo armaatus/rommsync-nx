@@ -1898,7 +1898,11 @@ int RunCycles(Checks& checks) {
 ///
 /// Since #329 a frame posts and a later one collects, so a frame here also
 /// gives the client's worker the moment a real frame would: this fake answers
-/// a page in microseconds, and a console's frame is 16 ms.
+/// a page in microseconds, and a console's frame is 16 ms. A frame on which
+/// nothing moved is one waiting on the worker, so it collects again, a
+/// millisecond at a time, for up to the rest of those 16 ms. A flat 1 ms sleep
+/// left that to the host's scheduler, and a loaded CI runner spent the
+/// difference on "Loading..." frames past the bound below (#347).
 struct LibraryOnScreen {
   explicit LibraryOnScreen(overlay::IpcClient& borrowed) : pump(borrowed) {}
   ~LibraryOnScreen() { pump.Close(); }
@@ -1912,8 +1916,12 @@ struct LibraryOnScreen {
       model.MoveSelection(rows);
     }
     pump.Frame();
-    overlay::RenderLibrary(model, &view, &seen);
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    bool moved = overlay::RenderLibrary(model, &view, &seen);
+    for (int ms = 0; !moved && ms < 16; ++ms) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      pump.Frame();
+      moved = overlay::RenderLibrary(model, &view, &seen);
+    }
   }
 
   std::int64_t SelectedRom() const {
