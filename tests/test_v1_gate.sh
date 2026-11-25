@@ -356,6 +356,18 @@ $out"
   [ "$status" -eq 1 ] || fail "expected exit 1 for a failing row, got $status"
   echo "ok: a failing test fails the row that named it"
 
+  # 2b. The backup row names the state and restore paths' window tests one by
+  #     one, so a scenario added beside `states.crash` is not evidence until it
+  #     is listed (#336). The execute ones arrive through `^execute\.`.
+  for t in states.late_write states.stale_write states.stale_place conflicts.late_write; do
+    transcript "$build" "$t" "***Failed" > "$dir/backup-red"
+    out="$(ROMMSYNC_GATE_TRANSCRIPT="$dir/backup-red" "$GATE" --build-dir "$build" 2>&1)"
+    echo "$out" | grep -q "^\[FAIL\] backup " \
+      || fail "a failing $t did not fail the backup row:
+$out"
+  done
+  echo "ok: a backup's window tests are the backup row's evidence"
+
   # 3. The one this file is really for. `rig.smoke` skips whenever RomM is not
   #    running, and most of this gate is written against RomM -- so a run that
   #    skipped is a run that demonstrated nothing, and must not read as a pass.
