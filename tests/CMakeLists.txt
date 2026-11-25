@@ -2704,6 +2704,7 @@ set(ENGINE_RIG_SCENARIOS
   keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
   keep_local_switched  # #317: a Keep local armed against one server sends no overwrite=true to the next
   keep_local_reinstalled  # #352: a conflict recorded under one device is never overwrite=true after a re-pair as another
+  keep_local_unpaired  # #352: the same with an Unpair before the re-pair and no settings change between
   play_off     # #301: [sync] play_sessions = off sends no session and never writes play.db
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)

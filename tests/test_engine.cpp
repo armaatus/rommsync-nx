@@ -8200,7 +8200,11 @@ int KeepLocalSwitched(http::HttpClient& client, const std::string& base) {
 /// sync off, so the choice waits armed. The console pairs again at the same
 /// URL and is handed another device: the waiting choice is dropped, a second
 /// press is refused, and the next tick sends nothing with `overwrite=true`.
-int KeepLocalReinstalled(http::HttpClient& client, const std::string& base) {
+///
+/// `unpaired` runs the same with an Unpair first and no settings change before
+/// the pairing: the tag is kept across the Unpair, so the device the pairing
+/// hands back is still weighed against the one the choice was armed under.
+int ReinstalledAfter(http::HttpClient& client, const std::string& base, bool unpaired) {
   rig::Checks c;
   harness::Fixture fixture;
   if (!harness::LoadFixture(&fixture)) {
@@ -8276,6 +8280,11 @@ int KeepLocalReinstalled(http::HttpClient& client, const std::string& base) {
   c.Expect(console.KeepLocalOf(entry_id) == ipc::KeepLocalState::kWaiting,
            "and the choice waits, armed, for a tick");
 
+  if (unpaired) {
+    c.Expect(console.Call(ipc::Command::kUnpair, ipc::EncodeEmpty(), &response) ==
+                 ipc::Error::kOk,
+             "the console is unpaired");
+  }
   // Paired again at the same URL, as after a reinstall: another device.
   const auth::PairingStatus showing = BeginAndShow(console, c);
   const http::Result approved = rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
@@ -8307,6 +8316,14 @@ int KeepLocalReinstalled(http::HttpClient& client, const std::string& base) {
   harness::DeleteArchivalCopies(client, base, fixture, rom.id);
   harness::DeleteDevice(client, base, fixture, device_id);
   return c.failures();
+}
+
+int KeepLocalReinstalled(http::HttpClient& client, const std::string& base) {
+  return ReinstalledAfter(client, base, /*unpaired=*/false);
+}
+
+int KeepLocalUnpaired(http::HttpClient& client, const std::string& base) {
+  return ReinstalledAfter(client, base, /*unpaired=*/true);
 }
 
 /// #273, through the real engine against RomM 5.4.0: the ways a Keep local is
@@ -8938,6 +8955,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"keep_local_overtaken", KeepLocalOvertaken},
       {"keep_local_switched", KeepLocalSwitched},
       {"keep_local_reinstalled", KeepLocalReinstalled},
+      {"keep_local_unpaired", KeepLocalUnpaired},
       {"play_off", PlaySessionsOff},
       {"ca_file", CaFile},
   };
