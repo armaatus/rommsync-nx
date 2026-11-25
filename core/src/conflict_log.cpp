@@ -657,7 +657,7 @@ StoreResult History::Append(Entry entry) {
   return result;
 }
 
-StoreResult History::Claim(std::uint64_t server) {
+StoreResult History::Claim(std::uint64_t server, std::uint64_t /*from*/) {
   bool stamped = false;
   if (server != 0) {
     for (Entry& entry : entries_) {

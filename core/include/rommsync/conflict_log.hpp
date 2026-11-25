@@ -423,7 +423,7 @@ class History {
   /// engine claims them for the server its records were bound to when it first
   /// reads them. Nothing to stamp writes nothing; a zero `server` stamps
   /// nothing. As with `Append`, the stamps stand in memory if the write fails.
-  StoreResult Claim(std::uint64_t server);
+  StoreResult Claim(std::uint64_t server, std::uint64_t from = 0);
 
 
  private:

@@ -2407,6 +2407,64 @@ std::vector<std::int64_t> SeedSaveConflicts(checks::Checks& c, Console& console,
   return ids;
 }
 
+/// #352, with no server: a conflict tagged by its URL alone -- by a build from
+/// before conflict tags named the device -- is the device's the records were
+/// bound to (`server.id`), as a URL-only `state.db` or marker is the first
+/// device's (#331). A card configured for server B and paired as device B:
+///
+///   1. its marker names device B: the row is B's, and Keep local is taken;
+///   2. its marker names device A -- RomM was reinstalled and the console paired
+///      again since: the row is A's, and Keep local is refused.
+void KeepLocalUrlTagged(checks::Checks& c) {
+  const std::string b = "https://b.example";
+  const auto run = [&](const std::string& name, const std::string& marked, bool taken) {
+    Console console(c, name);
+    const std::vector<std::int64_t> ids = SeedSaveConflicts(c, console, 1);
+    c.Expect(console.sandbox.Write("/config/rommsync/config.ini",
+                                   "[server]\nurl = " + b + "\n\n[sync]\nenabled = false\n"),
+             "a card configured for server B, with sync switched off");
+    auth::StoredToken token;
+    token.server_url = b;
+    token.access_token = "a token";
+    token.device_id = "dev-b";
+    token.scopes = {"roms.read"};
+    c.Expect(auth::SaveToken(console.directory + auth::kTokenFileName, token).ok(),
+             "paired as device B");
+    c.Expect(console.sandbox.Write("/config/rommsync/server.id",
+                                   binding::InstanceOf(b, b, marked) + "\n"),
+             "whose records were bound to device " + marked);
+    {
+      conflicts::History history(console.directory + conflicts::kHistoryFileName);
+      history.Load();
+      c.Expect(history.Claim(binding::TagOf(binding::IdentityOf(b))).ok(),
+               "its conflict tagged by the URL alone");
+    }
+    const std::unique_ptr<fs::FileSystem> card =
+        rommsync::host::MakeNativeFileSystem(console.sandbox.root().string());
+    console.Boot();
+    console.engine.UseCard(card.get());
+    console.engine.StartWorker();
+    std::string response;
+    console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(ids[0]), &response);
+    const ipc::RestoreState pressed = console.AwaitRestore(ids[0]);
+    if (taken) {
+      c.Expect(pressed.report.ok(), std::string("a URL's row is the bound device's, and Keep "
+                                                "local on it is taken: ") +
+                                        conflicts::ToString(pressed.report.outcome) + " -- " +
+                                        pressed.report.message);
+    } else {
+      c.Expect(pressed.report.outcome == conflicts::RestoreOutcome::kNotAConflict,
+               std::string("a URL's row from before the re-pair is device A's, and refused: ") +
+                   conflicts::ToString(pressed.report.outcome) + " -- " +
+                   pressed.report.message);
+      c.ExpectEq(console.sandbox.Read(harness::SavePath(CancelFile(1))), CancelServer(1),
+                 "nothing was written");
+    }
+  };
+  run("engine-keep-local-url-mine", "dev-b", /*taken=*/true);
+  run("engine-keep-local-url-theirs", "dev-a", /*taken=*/false);
+}
+
 void KeepLocalCancel(checks::Checks& c) {
   rlog::Reset();
   Console console(c, "engine-keep-local-cancel");
@@ -8130,6 +8188,127 @@ int KeepLocalSwitched(http::HttpClient& client, const std::string& base) {
   return c.failures();
 }
 
+/// #352's acceptance, through the real engine against RomM 5.4.0: a conflict
+/// recorded under one device is never sent with `overwrite=true` once the
+/// console has paired again as another at the same URL -- what a RomM
+/// reinstalled behind it looks like (#331). As `server_reinstalled`, the rig's
+/// RomM is not wiped; the pairing's own device row stands in for the new
+/// database's, and the conflict's rom id still names the same game, which is
+/// the worst case: an override carried across would land.
+///
+/// The conflict, as `keep_local_switched` makes one, and Keep local on it with
+/// sync off, so the choice waits armed. The console pairs again at the same
+/// URL and is handed another device: the waiting choice is dropped, a second
+/// press is refused, and the next tick sends nothing with `overwrite=true`.
+int KeepLocalReinstalled(http::HttpClient& client, const std::string& base) {
+  rig::Checks c;
+  harness::Fixture fixture;
+  if (!harness::LoadFixture(&fixture)) {
+    std::cerr << "no fixture token; run ./.venv/bin/python server/testing/provision.py\n";
+    return 1;
+  }
+  harness::Rom rom;
+  c.Expect(harness::FindRom(client, base, fixture, "240pee_mb.gba", &rom),
+           "the fixture library has 240pee_mb.gba");
+  if (rom.id == 0) {
+    return c.failures();
+  }
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  const std::string device_id =
+      harness::CreateDevice(c, client, base, fixture, "engine-keep-local-reinstalled");
+  if (device_id.empty()) {
+    return c.failures();
+  }
+  const std::string stamp = harness::UniqueSlot("keep-local-reinstalled");
+
+  rlog::Reset();
+  const TickLines ticks;
+  Intercepting wire(client);
+  Console console(c, "engine-keep-local-reinstalled");
+  if (!PointAtTheRig(console, c, base, fixture, device_id)) {
+    return c.failures();
+  }
+  const std::string save = "/tico/saves/gba/240pee_mb.srm";
+  console.sandbox.MakeDirs("/tico/saves/gba");
+  console.sandbox.SeedSave(save, "the switch's save, first synced " + stamp + "\n");
+
+  const std::unique_ptr<fs::FileSystem> card = Card(console);
+  console.engine.UsePairingBackend(Backend(client));
+  console.Boot();
+  console.engine.UseServer(&wire, fixture.token);
+  console.engine.UseCard(card.get());
+  console.engine.StartWorker();
+  const auto overrides = [&wire] { return wire.Asked(http::Method::kPost, "overwrite=true"); };
+
+  TickOnce(console, ticks, c, "the first tick");
+  harness::PassASecond();
+  {
+    const std::string staged = console.sandbox.Host("/config/rommsync/other.srm");
+    rig::WriteFile(staged, "the other device's progress, under gpsp " + stamp + "\n");
+    harness::Save written;
+    c.Expect(harness::UploadSave(client, base, fixture, rom.id, "autosave", "gpsp", staged,
+                                 "240pee_mb.srm", /*with_device=*/false, &written),
+             "another device writes the slot under gpsp");
+  }
+  harness::PassASecond();
+  const std::string mine = "the switch played on: the copy the player keeps " + stamp + "\n";
+  console.sandbox.Reseed(save, mine);
+  TickOnce(console, ticks, c, "the conflict's tick");
+
+  std::string response;
+  console.Call(ipc::Command::kListConflicts, ipc::EncodeConflictQuery(ipc::ConflictQuery{}),
+               &response);
+  std::int64_t entry_id = 0;
+  for (const ipc::ConflictRow& row : ipc::DecodeConflictPage(response).value.entries) {
+    if (row.entry.rom_id == rom.id && row.entry.event == conflicts::Event::kConflict) {
+      entry_id = row.entry.id;
+    }
+  }
+  c.Expect(entry_id != 0, "the conflict is on the conflicts screen");
+
+  c.Expect(console.SetEnabled(false).enabled == false, "sync is switched off");
+  console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(entry_id), &response);
+  const ipc::RestoreState kept = console.AwaitRestore(entry_id);
+  c.Expect(kept.report.ok(), std::string("Keep local put the console's bytes back: ") +
+                                 conflicts::ToString(kept.report.outcome) + " -- " +
+                                 kept.report.message);
+  c.Expect(console.KeepLocalOf(entry_id) == ipc::KeepLocalState::kWaiting,
+           "and the choice waits, armed, for a tick");
+
+  // Paired again at the same URL, as after a reinstall: another device.
+  const auth::PairingStatus showing = BeginAndShow(console, c);
+  const http::Result approved = rig::ApproveDeviceCode(client, base, showing.user_code, Scopes());
+  c.Expect(approved.successful(), "RomM approves the pairing again -- HTTP " +
+                                      std::to_string(approved.response.status));
+  const auth::PairingStatus granted = Terminal(console, c);
+  c.Expect(granted.state == auth::PairingState::kApproved,
+           std::string("and the console is paired: ") + auth::ToString(granted.state));
+  const auth::LoadedToken paired = auth::LoadToken(console.directory + auth::kTokenFileName);
+  c.Expect(paired.ok() && !paired.value.device_id.empty() && paired.value.device_id != device_id,
+           "as another device than the one the conflict was recorded under");
+
+  c.Expect(console.KeepLocalOf(entry_id) == ipc::KeepLocalState::kOpen,
+           std::string("the choice armed against the first device is dropped: ") +
+               ipc::ToString(console.KeepLocalOf(entry_id)));
+  console.Call(ipc::Command::kKeepLocal, ipc::EncodeEntryId(entry_id), &response);
+  const ipc::RestoreState again = console.AwaitRestore(entry_id);
+  c.Expect(again.report.outcome == conflicts::RestoreOutcome::kNotAConflict,
+           std::string("and Keep local on the first device's conflict is refused: ") +
+               conflicts::ToString(again.report.outcome) + " -- " + again.report.message);
+
+  c.Expect(console.SetEnabled(true).enabled, "sync is switched back on");
+  TickOnce(console, ticks, c, "the new device's first tick");
+  c.Expect(overrides().empty(),
+           "nothing goes up with overwrite=true -- the conflict was the first device's" +
+               Rendered(console.Log()));
+
+  ClearSlots(client, base, fixture, rom.id);
+  harness::DeleteArchivalCopies(client, base, fixture, rom.id);
+  harness::DeleteDevice(client, base, fixture, device_id);
+  return c.failures();
+}
+
 /// #273, through the real engine against RomM 5.4.0: the ways a Keep local is
 /// spent without the override going up.
 ///
@@ -8758,6 +8937,7 @@ const RigScenario* FindRigScenario(const std::string& name) {
       {"keep_local", KeepLocalChoice},
       {"keep_local_overtaken", KeepLocalOvertaken},
       {"keep_local_switched", KeepLocalSwitched},
+      {"keep_local_reinstalled", KeepLocalReinstalled},
       {"play_off", PlaySessionsOff},
       {"ca_file", CaFile},
   };
@@ -8827,6 +9007,8 @@ int main(int argc, char** argv) {
     KeepLocalGuards(checks);
   } else if (scenario == "keep_local_server") {
     KeepLocalServer(checks);
+  } else if (scenario == "keep_local_url_tagged") {
+    KeepLocalUrlTagged(checks);
   } else if (scenario == "keep_local_cancel") {
     KeepLocalCancel(checks);
   } else if (scenario == "diagnostics") {

@@ -1286,8 +1286,12 @@ void AServerIsItsUrlAndItsDevice(checks::Checks& c) {
            "another URL is another server, whatever the device");
   c.Expect(!binding::SameServer("http://a.example", "http://a.example:8080"),
            "a URL that only starts the same is another URL");
-  c.ExpectEq(binding::TagOf("http://a.example#dev-a"), binding::TagOf("http://a.example"),
-             "a conflict's tag is still the URL's: #317's rows stay their server's");
+  // #352: a conflict's tag is its whole server, so Keep local on a row recorded
+  // before a reinstall is refused by the RomM paired after it.
+  c.Expect(binding::TagOf("http://a.example#dev-a") != binding::TagOf("http://a.example#dev-b"),
+           "a conflict's tag tells two devices behind one URL apart");
+  c.Expect(binding::TagOf("http://a.example#dev-a") != binding::TagOf("http://a.example"),
+           "and a row tagged by its URL alone, before #352, from either");
 }
 
 /// The acceptance's core: a baseline synced against the RomM that was there

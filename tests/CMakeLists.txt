@@ -2620,6 +2620,7 @@ set(ENGINE_SCENARIOS
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
   keep_local_guards  # #273/#275: Keep local held under a game, refused past four waiting
   keep_local_server  # #317: Keep local is refused on another server's conflict, and dropped by a switch
+  keep_local_url_tagged  # #352: a conflict tagged by URL alone is the bound device's, not a re-paired one's
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   diagnostics  # #304: Y on the log screen writes a redacted bundle beside config.ini
@@ -2702,6 +2703,7 @@ set(ENGINE_RIG_SCENARIOS
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
   keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
   keep_local_switched  # #317: a Keep local armed against one server sends no overwrite=true to the next
+  keep_local_reinstalled  # #352: a conflict recorded under one device is never overwrite=true after a re-pair as another
   play_off     # #301: [sync] play_sessions = off sends no session and never writes play.db
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
