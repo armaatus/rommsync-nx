@@ -1018,8 +1018,13 @@ void LibraryBrowserModel::OnLinkRestored(bool same_session) {
       }
     }
   }
+  // A closed model stays closed: a teardown restores the link only to end
+  // what is held (#349), and a reset browser would open the platform list
+  // again behind the last `ListEnd`, a cursor nobody is left to end.
+  const bool closed = closed_;
   Reset();
   closing_ = std::move(held);
+  closed_ = closed;
 }
 
 void LibraryBrowserModel::MoveSelection(int delta) {

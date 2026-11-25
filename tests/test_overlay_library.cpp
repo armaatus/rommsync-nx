@@ -1448,6 +1448,33 @@ void CheckAnUnaskedForCursorIsEnded(Checks& checks) {
                 "ends a cursor it never asked for");
 }
 
+/// A screen closed while not responding (#349): the teardown restores the link
+/// once the handshake answers, so the cursors are ended -- and the model,
+/// closed, must then ask for nothing, not start the browser again behind them.
+void CheckAClosedModelRestoredOnlyEndsItsCursors(Checks& checks) {
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 401);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 401,
+          "the platform page");
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kListBegin, "A opens the platform");
+  model.OnUnreachable(overlay::Link::kNotResponding);
+  model.Close();
+  checks.Expect(model.Next().kind == Command::Kind::kNone,
+                "closed behind a down link, it sends nothing");
+  model.OnCursor(402);  // the late answer, drained by the teardown
+  model.OnLinkRestored(true);
+  Command after;
+  std::vector<ipc::Cursor> ended = EndsBefore(model, &after);
+  std::sort(ended.begin(), ended.end());
+  checks.Expect(ended == std::vector<ipc::Cursor>{401, 402},
+                "both cursors are ended once the link is back: ended " +
+                    std::to_string(ended.size()));
+  checks.Expect(after.kind == Command::Kind::kNone,
+                "and then nothing: a closed model does not open the platform list again");
+  checks.ExpectEq(model.open_cursors(), std::size_t{0}, "and it holds none");
+}
+
 /// A page that lands does not move the selection onto a row under it.
 ///
 /// The `kMore` row is addressed by the index one past the last loaded row, and
@@ -2325,6 +2352,7 @@ int main() {
   CheckALostEnqueueMayHaveBeenQueued(checks);
   CheckARestoredSessionEndsTheCursorsItHeld(checks);
   CheckAnUnaskedForCursorIsEnded(checks);
+  CheckAClosedModelRestoredOnlyEndsItsCursors(checks);
   CheckHeldKeyRepeats(checks);
   CheckHeldScrollKey(checks);
   CheckRow2000IsReachable(checks);

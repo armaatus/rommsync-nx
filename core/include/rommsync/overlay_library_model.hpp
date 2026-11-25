@@ -301,6 +301,9 @@ class LibraryBrowserModel {
   /// open on the sysmodule, and each gets a `ListEnd` before the browser starts
   /// again (#343): #31 caps how many may be open, and the TTL is slow. If it is
   /// not, they went with the session and there is nothing to end.
+  ///
+  /// A model that was `Close()`d stays closed: it hands out the `ListEnd`s and
+  /// then nothing, which is what a teardown restoring the link wants (#349).
   void OnLinkRestored(bool same_session);
 
   /// Move the selection by `delta` rows, clamped at both ends. Also what asks
