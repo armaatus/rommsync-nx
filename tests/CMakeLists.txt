@@ -2863,7 +2863,7 @@ endforeach()
 # second raise left seven files quoting the intermediate value -- two of them
 # already corrected once in the same branch.
 set(HEAP_BUDGET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_heap_budget.py")
-foreach(scenario IN ITEMS rows pinned margin dirs prose footprint)
+foreach(scenario IN ITEMS rows pinned margin dirs prose footprint overlay)
   add_test(NAME heap.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${HEAP_BUDGET_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")

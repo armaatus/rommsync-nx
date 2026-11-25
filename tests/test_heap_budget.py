@@ -15,7 +15,7 @@ byte count by a `static_assert`. That closes the loop in both directions: the
 compiler catches a constant that moved away from its row, and this catches a
 row -- or a margin -- that moved away from the arithmetic.
 
-Five phases, one CTest entry each, so a red run names what broke:
+Seven phases, one CTest entry each, so a red run names what broke:
 
   rows      every row's hex and KiB agree, and the terms sum to the peak row.
   pinned    every row's constant exists, is summed into `kHeapPeak`, and is
@@ -32,6 +32,10 @@ Five phases, one CTest entry each, so a red run names what broke:
             records, and measures off the linked image, covers what the tree
             alone can add up, and the two documents a developer and a user read
             quote that number and no other.
+  overlay   the overlay's share of nx-ovlloader's 4 MiB heap (#337): the
+            terms in `overlay/source/heap_budget.hpp` are the ones
+            docs/DEVELOPMENT.md quotes, in bytes. The terms themselves are held
+            by `switch.builds` (the image) and `overlay.scroll` (the heap).
 """
 import argparse
 import re
@@ -383,6 +387,42 @@ def phase_footprint(repo):
     return 0
 
 
+OVERLAY_BUDGET = "overlay/source/heap_budget.hpp"
+OVERLAY_DOC = "docs/DEVELOPMENT.md"
+# `inline constexpr std::size_t kImageBudget = 0xDC000;`
+OVERLAY_TERM = r"inline\s+constexpr\s+std::size_t\s+%s\s*=\s*(0x[0-9A-Fa-f]+)\s*;"
+
+
+def phase_overlay(repo):
+    source = read(repo, OVERLAY_BUDGET)
+    doc = read(repo, OVERLAY_DOC)
+    failures = 0
+    values = {}
+    for name in ("kFootprintBudget", "kImageBudget", "kHeapPeakBudget", "kWorkerStackBudget"):
+        found = re.search(OVERLAY_TERM % name, source)
+        if found is None:
+            failures += fail("no `inline constexpr std::size_t %s = 0x...;` in %s (#337)"
+                             % (name, OVERLAY_BUDGET))
+            continue
+        values[name] = int(found.group(1), 16)
+    if failures:
+        return 1
+    # The total as the section's lead sentence states it, and each term as its
+    # table row does: a number moved in the header and not on the page fails.
+    quotes = ["{:,} bytes".format(values["kFootprintBudget"])]
+    quotes += ["{:,} (`{}`)".format(values[name], name)
+               for name in ("kImageBudget", "kHeapPeakBudget", "kWorkerStackBudget")]
+    for quote in quotes:
+        if quote not in doc:
+            failures += fail("%s does not quote %s, as %s states it (#337)"
+                             % (OVERLAY_DOC, quote, OVERLAY_BUDGET))
+    if failures:
+        return 1
+    print("ok: %s quotes the overlay's budget of %s bytes and its three terms"
+          % (OVERLAY_DOC, "{:,}".format(values["kFootprintBudget"])))
+    return 0
+
+
 PHASES = {
     "rows": phase_rows,
     "pinned": phase_pinned,
@@ -390,6 +430,7 @@ PHASES = {
     "dirs": phase_dirs,
     "prose": phase_prose,
     "footprint": phase_footprint,
+    "overlay": phase_overlay,
 }
 
 

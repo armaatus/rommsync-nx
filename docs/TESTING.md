@@ -860,7 +860,10 @@ ctest --test-dir build --output-on-failure
   2500-rom platform until row 2000, asserts the heap stays flat past the
   library's 512-row window and that a still frame allocates nothing, then holds
   L back to row 1 through the re-reads, each opened at the rows it gathers
-  rather than at row 0 (#339) -- at most `kClimbPages` pages for the climb. The far side is the **real** `ipc::Dispatch` over a real
+  rather than at row 0 (#339) -- at most `kClimbPages` pages for the climb --
+  and holds the overlay's peak heap over the whole walk to `kHeapPeakBudget`,
+  its term of the budget in `overlay/source/heap_budget.hpp` (#337,
+  [DEVELOPMENT.md](DEVELOPMENT.md#what-the-overlay-costs)). The far side is the **real** `ipc::Dispatch` over a real
   `ipc::ServiceCore`, answering through the **real** `sysmodule::ToResult` --
   split into `sysmodule/source/ipc/result.cpp` so the overlay's `DecodeError` is
   held against the mapping that ships rather than against a copy of it. So an

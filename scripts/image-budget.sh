@@ -2,6 +2,7 @@
 # The sysmodule's memory budget, measured off the linked image (M9-15, #204).
 #
 #   scripts/image-budget.sh [--root DIR] [--image-budget BYTES] [--ovl-budget BYTES]
+#                           [--ovl-image-budget BYTES] [--footprint BYTES]
 #
 # Run inside devkitpro/devkita64, after `make -C sysmodule` and `make -C overlay`:
 # the `switch-build` CI job runs it over its checkout, and `ctest -R
@@ -41,10 +42,18 @@
 #                 sysmodule's pool at all: nx-ovlloader reads the whole file
 #                 into its own heap, and see the ceiling below for why that
 #                 needs one.
+#   overlay image the overlay's three LOAD segments, paged as the sysmodule's
+#                 are, `.bss` included, under `kImageBudget`
+#                 (overlay/source/heap_budget.hpp, #337): what nx-ovlloader maps
+#                 out of its heap (4 MiB by default) before the overlay
+#                 allocates anything.
+#                 Read out of the header, not stated here, because the header
+#                 is where it is one term of a budget whose heap term
+#                 `overlay.scroll` holds on the host.
 #
-# `--image-budget` and `--ovl-budget` exist so a test can show each ceiling
-# bites. The CI step passes no flag, and `ctest -R switch.ci_requires_artifacts`
-# refuses one.
+# `--image-budget`, `--ovl-budget` and `--ovl-image-budget` exist so a test can
+# show each ceiling bites. The CI step passes no flag, and `ctest -R
+# switch.ci_requires_artifacts` refuses one.
 set -euo pipefail
 
 # The budget for the whole mapped image: 2.25 MiB.
@@ -117,10 +126,14 @@ while [ $# -gt 0 ]; do
     --ovl-budget)
       [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--ovl-budget takes a byte count" >&2; exit 2; }
       OVL_BUDGET="$2"; shift 2 ;;
+    --ovl-image-budget)
+      [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--ovl-image-budget takes a byte count" >&2; exit 2; }
+      OVL_IMAGE_BUDGET="$2"; shift 2 ;;
     --footprint)
       [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "--footprint takes a byte count" >&2; exit 2; }
       RESIDENT_FOOTPRINT="$2"; shift 2 ;;
-    *) echo "usage: $0 [--root DIR] [--image-budget BYTES] [--ovl-budget BYTES] [--footprint BYTES]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--root DIR] [--image-budget BYTES] [--ovl-budget BYTES]" \
+            "[--ovl-image-budget BYTES] [--footprint BYTES]" >&2; exit 2 ;;
   esac
 done
 
@@ -130,11 +143,12 @@ OVERLAY="$ROOT/overlay/ovl-rommsync.elf"
 OVL="$ROOT/overlay/ovl-rommsync.ovl"
 MAIN="$ROOT/sysmodule/source/main.cpp"
 NPDM="$ROOT/sysmodule/sys-rommsync.json"
+OVL_HEAP_BUDGET="$ROOT/overlay/source/heap_budget.hpp"
 
 failures=0
 error() { echo "::error::$*" >&2; failures=$(( failures + 1 )); }
 
-for file in "$SYSMODULE" "$OVERLAY" "$OVL" "$MAIN" "$NPDM"; do
+for file in "$SYSMODULE" "$OVERLAY" "$OVL" "$MAIN" "$NPDM" "$OVL_HEAP_BUDGET"; do
   [ -s "$file" ] || { echo "::error::no $file; build sysmodule and overlay first" >&2; exit 1; }
 done
 [ -x "$BIN/aarch64-none-elf-size" ] ||
@@ -148,12 +162,18 @@ section() {
 # The LOAD segments' in-memory sizes, each rounded up to the 4 KiB page the
 # loader maps it in. Exactly three, because an NSO has exactly three segments;
 # a linker script that produced another shape is one this sum no longer models.
-segments="$("$BIN/aarch64-none-elf-readelf" -lW "$SYSMODULE" | awk '$1 == "LOAD" { print $6 }')"
-count="$(grep -c . <<<"$segments" || true)"
-if [ "$count" -ne 3 ]; then
-  echo "::error::$SYSMODULE has $count LOAD segments, not the three an NSO maps" >&2
-  exit 1
-fi
+# An NRO -- the overlay -- has the same three.
+load_segments() {
+  local segments count
+  segments="$("$BIN/aarch64-none-elf-readelf" -lW "$1" | awk '$1 == "LOAD" { print $6 }')"
+  count="$(grep -c . <<<"$segments" || true)"
+  if [ "$count" -ne 3 ]; then
+    echo "::error::$1 has $count LOAD segments, not the three an NSO or NRO maps" >&2
+    exit 1
+  fi
+  printf '%s\n' "$segments"
+}
+segments="$(load_segments "$SYSMODULE")"
 mapped=0
 names=(text rodata data+bss)
 i=0
@@ -174,6 +194,19 @@ main_stack="$(sed -n 's/^[[:space:]]*"main_thread_stack_size":[[:space:]]*"\(0x[
 [ -n "$main_stack" ] || { echo "::error::no main_thread_stack_size in $NPDM" >&2; exit 1; }
 main_stack=$(( main_stack ))
 resident=$(( mapped + main_stack + TLS_BYTES ))
+
+# The overlay's image, paged the same way, against its term of heap_budget.hpp.
+ovl_segments="$(load_segments "$OVERLAY")"
+ovl_mapped=0
+while read -r memsz; do
+  bytes=$(( memsz ))
+  ovl_mapped=$(( ovl_mapped + ((bytes + 0xFFF) & ~0xFFF) ))
+done <<<"$ovl_segments"
+if [ -z "${OVL_IMAGE_BUDGET:-}" ]; then
+  OVL_IMAGE_BUDGET="$(sed -n 's/^inline constexpr std::size_t kImageBudget = \(0x[0-9A-Fa-f]*\);.*/\1/p' "$OVL_HEAP_BUDGET")"
+  [ -n "$OVL_IMAGE_BUDGET" ] || { echo "::error::no kImageBudget in $OVL_HEAP_BUDGET" >&2; exit 1; }
+  OVL_IMAGE_BUDGET=$(( OVL_IMAGE_BUDGET ))
+fi
 
 bss="$(section "$SYSMODULE" .bss)"
 eh="$(section "$SYSMODULE" .eh_frame)"
@@ -213,6 +246,10 @@ fi
 if [ "$ovl_text" -gt "$TEXT_CEILING" ]; then
   error "the overlay's .text is $ovl_text bytes, past $TEXT_CEILING -- is switch.mk still -Os? (#200)"
 fi
+if [ "$ovl_mapped" -gt "$OVL_IMAGE_BUDGET" ]; then
+  error "the overlay maps $ovl_mapped bytes of nx-ovlloader's heap, past the" \
+        "$OVL_IMAGE_BUDGET kImageBudget gives its image (overlay/source/heap_budget.hpp, #337)"
+fi
 if [ "$ovl_bytes" -gt "$OVL_BUDGET" ]; then
   error "ovl-rommsync.ovl is $ovl_bytes bytes, past the $OVL_BUDGET nx-ovlloader's" \
         "heap is budgeted to read (scripts/image-budget.sh, #211)"
@@ -236,6 +273,7 @@ report() {
   echo "| sysmodule \`.text\` | $text | $TEXT_CEILING |"
   echo "| overlay \`.text\` | $ovl_text | $TEXT_CEILING |"
   echo "| overlay \`.ovl\` (file) | $ovl_bytes | $OVL_BUDGET |"
+  echo "| overlay image, paged (\`kImageBudget\`) | $ovl_mapped | $OVL_IMAGE_BUDGET |"
 }
 report
 # The same numbers as benchmark-action's `customSmallerIsBetter` JSON, for the
@@ -263,3 +301,4 @@ fi
 echo "ok: the sysmodule maps $mapped of its $IMAGE_BUDGET-byte budget" \
      "($(( IMAGE_BUDGET - mapped )) bytes to spare)"
 echo "ok: the sysmodule's resident footprint is $resident of the $RESIDENT_FOOTPRINT recorded"
+echo "ok: the overlay maps $ovl_mapped of the $OVL_IMAGE_BUDGET kImageBudget gives its image"

@@ -149,8 +149,9 @@ What they read out of the built files, beyond the build succeeding:
 - **The NPDM** against the SVCs the linked sysmodule issues (`npdm.svcs`), and
   **toolbox.json's `tid`** against the program id read back out of that NPDM
   (`package.builds`).
-- **The release zip's layout**, the image budget, and the `.ovl`'s 1 MiB
-  ceiling (`scripts/image-budget.sh`).
+- **The release zip's layout**, the image budget, the `.ovl`'s 1 MiB
+  ceiling, and the overlay image's term of its heap budget
+  ([below](#what-the-overlay-costs)) (`scripts/image-budget.sh`).
 
 The overlay has no NPDM: it runs inside nx-ovlloader's process, with
 nx-ovlloader's capabilities, so an SVC or service question about `ovl-rommsync`
@@ -396,6 +397,58 @@ naming the code. Drains and list pages answer connect-failed meanwhile, as
 they did before. Only the sockets are waited for: `ssl` refused on its own is
 not retried, since a plain `http://` RomM still syncs without it. The M12 co-resident run (NET-08) is where how often it
 happens is seen.
+
+### What the overlay costs
+
+The overlay has no pool of its own. nx-ovlloader reads the `.ovl` into a heap
+that is 4 MiB unless the user raised it, maps the image there with its `.bss`,
+and hands the overlay what is left as its own heap. Running out of it does not
+show up as a size anywhere: the overlay fails as a short read at load (#211), or
+as an allocation that does not return. Until #337 nothing off-console failed as
+the overlay grew towards it.
+
+**What this build may cost of that heap is 1,310,720 bytes (1.25 MiB),
+`kFootprintBudget` in `overlay/source/heap_budget.hpp`.** It was measured at
+956,116 bytes when it was set, which leaves ~346 KiB of headroom. No single test
+can see all of it: the image exists only in the devkitPro container, and the
+heap only in a host test. So each term is held by the test that can measure it,
+against its share of the budget:
+
+| term | budget | measured | held by |
+|---|---:|---:|---|
+| the linked image: text, rodata, data and `.bss`, each paged | 901,120 (`kImageBudget`) | 647,168 | `switch.builds`, through `scripts/image-budget.sh` |
+| the peak of `operator new`, on the worst screen | 393,216 (`kHeapPeakBudget`) | 292,564 | `overlay.scroll` |
+| `IpcClient`'s worker stack | 16,384 (`kWorkerStackBudget`) | 16,384 | a `static_assert` in `ipc_client.cpp` |
+
+The worst screen is the Library at row 2000 of a 2,500-rom platform. Its window
+holds `kMaxLoadedRows` rows, and no other screen holds a list. `overlay.scroll`
+counts everything the client and the screen allocate, from before the client
+opens to the end of a climb back to row 1. It does not count what the fake
+sysmodule allocates while it answers on the client's worker thread, because on
+a console that is the sysmodule's heap (`count_new::Elsewhere`). The heap term
+is a host measurement: libc++ on macOS keeps a string of up to 22 bytes inline,
+and the console's libstdc++ keeps 15. A console can therefore hold somewhat more
+for the same rows, and the headroom is there for that first.
+
+**What the number does not count.** It is only the part this repo's code
+decides, so treat it as a floor and not as the bill:
+
+- **The framebuffer.** libtesla asks libnx for two 448x720 RGBA4444 buffers,
+  about 1.3 MiB, and libnx allocates them from this same heap.
+- **libtesla's and libultrahand's own allocations.** These are the font, the
+  theme and the toast slots, and the `tsl::elm` tree each screen builds, which
+  no host test reaches. They change between libultrahand releases, and nothing
+  in this repo pins their size.
+- **Anything allocated with `malloc` rather than `new`**, such as the buffer
+  behind a `FILE` that `config::LoadConfig` reads `config.ini` through. The
+  worker's stack is the one such allocation that is counted, as a term of its
+  own.
+
+The ~2.75 MiB left beside the budget is for those three. Whether they really fit
+there is a reading on a console: **HARDWARE_TEST_PLAN's MEM-03**, every screen
+with nx-ovlloader's heap at 4 MiB, is the real check, and this budget is only what can fail
+before it. Moving the budget is an edit to `heap_budget.hpp` and to this page,
+in one change, with the reason written beside the number.
 
 ## Repo build layout
 
