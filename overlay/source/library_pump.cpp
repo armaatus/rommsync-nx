@@ -126,11 +126,13 @@ bool LibraryPump::SendNext() {
     if (!poller_.linked() || !client_.open() || !frame_.checked()) {
       return false;
     }
-    // The session came back. Everything loaded belonged to the one that went
-    // away, so the browser starts again rather than asking the new session
-    // about cursor numbers it never issued.
+    // The link came back, and the browser starts again. If nothing but
+    // `kNotResponding` was seen since it went, the session was never reopened
+    // (`ScreenFrame::Diagnose`) and the cursors the model held are still open
+    // on it, to be ended first (#343).
     link_ = Link::kOk;
-    model_.OnLinkRestored(false);
+    model_.OnLinkRestored(same_session_);
+    same_session_ = true;
   }
   // One command out at a time. The model answers `kNone` as soon as the loaded
   // pages cover what is on screen, so a browser sitting still costs nothing.
@@ -148,7 +150,7 @@ void LibraryPump::Answered(ipc::Command command, Result rc) {
   if (R_FAILED(rc)) {
     const Link link = Failed(frame_, model_, rc);
     if (link != Link::kOk) {
-      link_ = link;
+      Lost(link);
     }
     return;
   }
@@ -192,7 +194,16 @@ void LibraryPump::Answered(ipc::Command command, Result rc) {
 
 void LibraryPump::Unreachable(Link link) {
   model_.OnUnreachable(link, frame_.sysmodule_interface());
+  Lost(link);
+}
+
+void LibraryPump::Lost(Link link) {
   link_ = link;
+  // Every link since the last restore counts, not only the latest: a transport
+  // failure reopens the session, and the handshake on the new one can then
+  // run past the budget and be the `kNotResponding` the restore follows.
+  // `kUnreadable` counts against it too, because `Reopen` answers it as well.
+  same_session_ = same_session_ && link == Link::kNotResponding;
 }
 
 void LibraryPump::Close() {

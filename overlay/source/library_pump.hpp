@@ -67,6 +67,9 @@ class LibraryPump {
   /// Draw `link` instead, and remember it was drawn.
   void Unreachable(Link link);
 
+  /// Remember `link` was lost, and whether the session may have gone with it.
+  void Lost(Link link);
+
   IpcClient& client_;
   ScreenFrame frame_{client_};
   Poller poller_{frame_, client_, Poller::kSendsOnly};
@@ -75,6 +78,11 @@ class LibraryPump {
   /// The link the model was last told about, so a session that came back is
   /// noticed once rather than restarting the browser every frame.
   Link link_ = Link::kOk;
+
+  /// Whether every link lost since the last restore was `kNotResponding`, so
+  /// the session the model's cursors are open on is the one that comes back
+  /// (#343).
+  bool same_session_ = true;
 };
 
 /// How many rows around the selection the screen is handed (#298): the two of

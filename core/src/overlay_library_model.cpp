@@ -455,8 +455,8 @@ LibraryBrowserModel::Command LibraryBrowserModel::Next() {
 LibraryBrowserModel::Command LibraryBrowserModel::NextCommand() {
   Command command;
   if (link_ != Link::kOk) {
-    // Nothing to send and nothing to close: the session those cursors belonged
-    // to is what went away. `OnLinkRestored` starts again.
+    // Nothing is sent at a link that is down, not even a `ListEnd`.
+    // `OnLinkRestored` starts again, and ends what is still open (#343).
     issued_ = Command::Kind::kNone;
     return command;
   }
@@ -556,6 +556,14 @@ void LibraryBrowserModel::OnCursor(ipc::Cursor cursor) {
   // level decodes to no rows at all and starts that level counting toward
   // `kMaxEmptyPages`.
   if (issued_ != Command::Kind::kListBegin) {
+    // Nothing asked for it: a `ListBegin` the screen gave up on as not
+    // responding, answered late (#343). The cursor is real all the same, and
+    // on this session, so it is ended rather than left to the TTL. If the link
+    // is still down, `OnLinkRestored(true)` keeps it queued for that.
+    if (cursor != 0) {
+      closing_.push_back(cursor);
+      ++revision_;
+    }
     return;
   }
   issued_ = Command::Kind::kNone;
@@ -912,12 +920,24 @@ void LibraryBrowserModel::OnUnreachable(Link link, std::uint32_t sysmodule_inter
 }
 
 void LibraryBrowserModel::OnLinkRestored(bool same_session) {
-  (void)same_session;
   link_ = Link::kOk;
-  // Everything loaded came off cursors held by a session that has gone. Asking
-  // the new one to continue them would be asking about cursor numbers it never
-  // issued -- which is `kBadCursor` at best and somebody else's list at worst.
+  // The pages are not continued either way: a cursor read past a page nobody
+  // saw, or one a reopened session never issued, is not a list to resume.
+  // But on the same session every cursor is still open, and costs one of #31's
+  // few slots until the TTL (#343), so each is ended before anything is opened
+  // -- `NextCommand` drains `closing_` first. A reopened session took them with
+  // it, and a `ListEnd` for one is `kBadCursor` at best.
+  std::vector<ipc::Cursor> held;
+  if (same_session) {
+    held = std::move(closing_);
+    for (const Level& level : stack_) {
+      if (level.cursor != 0) {
+        held.push_back(level.cursor);
+      }
+    }
+  }
   Reset();
+  closing_ = std::move(held);
 }
 
 void LibraryBrowserModel::MoveSelection(int delta) {

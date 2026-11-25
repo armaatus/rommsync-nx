@@ -240,7 +240,9 @@ class LibraryBrowserModel {
   Command Next();
 
   /// `ListBegin` answered `cursor`. A cursor for a level that has been left
-  /// since, or answered after `Close()`, is queued for `ListEnd` (#329).
+  /// since, or answered after `Close()`, is queued for `ListEnd` (#329); so is
+  /// one nothing is waiting for any more -- a `ListBegin` given up on as not
+  /// responding, answered late -- the one exception to the rule above (#343).
   void OnCursor(ipc::Cursor cursor);
 
   /// `ListNext` answered `page`.
