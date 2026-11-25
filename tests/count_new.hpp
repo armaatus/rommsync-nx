@@ -55,6 +55,12 @@ struct Counters {
   std::atomic<std::int64_t> outstanding_bytes{0};
   std::atomic<std::int64_t> peak_bytes{0};    ///< highest `outstanding_bytes` since `ResetPeak`
 
+  /// `outstanding_bytes` and its peak again, less every block allocated under
+  /// an `Elsewhere`: what this side of a host test holds, when the other side
+  /// of it is a fake of another process running on the same thread (#337).
+  std::atomic<std::int64_t> here_bytes{0};
+  std::atomic<std::int64_t> here_peak_bytes{0}; ///< highest `here_bytes` since `ResetPeak`
+
   /// `FailAt`'s countdown: the allocation that takes it from 1 to 0 fails.
   /// Zero or less is disarmed.
   std::atomic<std::int64_t> fail_countdown{0};
@@ -69,6 +75,8 @@ struct Snapshot {
   std::int64_t outstanding = 0;
   std::int64_t outstanding_bytes = 0;
   std::int64_t peak_bytes = 0;
+  std::int64_t here_bytes = 0;
+  std::int64_t here_peak_bytes = 0;
 };
 
 inline Snapshot Now() {
@@ -78,6 +86,8 @@ inline Snapshot Now() {
   snapshot.outstanding = counters.outstanding.load(std::memory_order_relaxed);
   snapshot.outstanding_bytes = counters.outstanding_bytes.load(std::memory_order_relaxed);
   snapshot.peak_bytes = counters.peak_bytes.load(std::memory_order_relaxed);
+  snapshot.here_bytes = counters.here_bytes.load(std::memory_order_relaxed);
+  snapshot.here_peak_bytes = counters.here_peak_bytes.load(std::memory_order_relaxed);
   return snapshot;
 }
 
@@ -87,7 +97,24 @@ inline void ResetPeak() {
   Counters& counters = Get();
   counters.peak_bytes.store(counters.outstanding_bytes.load(std::memory_order_relaxed),
                             std::memory_order_relaxed);
+  counters.here_peak_bytes.store(counters.here_bytes.load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
 }
+
+/// While one is alive on a thread, what that thread allocates is counted as
+/// always but kept out of `here_bytes` -- and stays out until it is freed, on
+/// whichever thread frees it, because each block remembers which it was.
+///
+/// For a fake of another process that a host test runs in-line: the overlay's
+/// fake sysmodule answers on the overlay's own IPC worker, and a page it builds
+/// is the sysmodule's heap on a console, not the overlay's (#337). Nests.
+class Elsewhere {
+ public:
+  Elsewhere();
+  ~Elsewhere();
+  Elsewhere(const Elsewhere&) = delete;
+  Elsewhere& operator=(const Elsewhere&) = delete;
+};
 
 /// curl's "fail allocation N on run N" (#250): the `n`th allocation from now
 /// fails, once, and every one after it succeeds again. `n <= 0` disarms.
