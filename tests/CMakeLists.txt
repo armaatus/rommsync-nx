@@ -993,6 +993,7 @@ set(EXECUTE_UNIT_SCENARIOS
   naming   # the backup path carries the slot, so one rom's two saves are two files
   staging  # the streamed copy and the two-rename commit an overwrite goes through
   foreign_old # #293: a <save>.old the commit did not write survives it
+  aside_full # #332: all 16 .old.<n> names taken refuses the commit and touches nothing
   counting # no-op, a downgraded action, and the two refusals that need no server
   crash_model # M9-14: a power cut at every call of an overwrite, and the replay's own check
   overwrite # #232: overwrite=false unless Keep local, and a 409 named as a newer save in the slot
@@ -1361,6 +1362,9 @@ set(PRUNE_UNIT_SCENARIOS
   state_budget_off  # #340: with the budget at 0, nothing unique goes
   state_budget_names  # #340: only a backup state.db names a state's counts against the budget
   state_budget_crash  # #340: a power cut mid-budget removes a subset of what the prune removes
+  orphans  # #346: a previous server's state backups go past orphan_days; saves never
+  orphan_names  # #346: a set-aside state.db names states in the window it was bound
+  orphans_crash  # #346: a power cut mid-orphan-prune removes a subset of what the prune removes
 )
 foreach(scenario IN LISTS PRUNE_UNIT_SCENARIOS)
   add_test(NAME prune.${scenario} COMMAND test_backup_prune ${scenario})
@@ -1665,6 +1669,7 @@ target_compile_definitions(test_sync_tick PRIVATE
 
 set(TICK_UNIT_SCENARIOS
   recovery   # the .part / .tmp / .old a crash leaves, and the backup it must not touch
+  aside      # #332: the .old.<n> a commit set aside are counted, never touched
   durable    # the backup's bytes are on the card before the rename publishes them
   backupdir  # .backup/ made on a first boot, which core/ could not do until now
   offline    # an unreachable server: the card is byte-for-byte what it was
@@ -1970,6 +1975,7 @@ set(SELFTEST_JUDGE_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_selftest_judge.py")
 foreach(scenario
         judge   # pass, fail, missing and skipped rows; malformed reports refused
         pairs   # --pairs N counts distinct HOS/Atmosphere pairs among passing reports
+        nifm    # an unsure nifm passes as WARN when the heartbeat answers; no network fails
         rows    # the NRO writes exactly the judged rows; its heap budget is the sysmodule's
         roots   # the NRO writes only under sdmc:/config/rommsync-selftest/
         gate)   # the launch gate's note, the plan's PRE-02 and the judge cite each other
@@ -2614,6 +2620,7 @@ set(ENGINE_SCENARIOS
   restore_boot_wait  # M9-6: a restore does not wait out the worker's boot wait for the network
   keep_local_guards  # #273/#275: Keep local held under a game, refused past four waiting
   keep_local_server  # #317: Keep local is refused on another server's conflict, and dropped by a switch
+  keep_local_url_tagged  # #352: a conflict tagged by URL alone is the bound device's, not a re-paired one's
   keep_local_cancel  # #279: a held Keep local withdrawn writes nothing; a landed one stands
   keep_local_cancel_race  # #279: a cancel during the landing's copy answers landed, not cancelled
   diagnostics  # #304: Y on the log screen writes a redacted bundle beside config.ini
@@ -2683,6 +2690,7 @@ set(ENGINE_RIG_SCENARIOS
   state_budget  # #340: past [backup] max_state_mib the oldest sole-copy state backup goes; saves never
   backup_truncated  # #323: a .backup/ past one listing draws its Backups row as a floor
   server_switched  # #294: a save kept off one RomM is uploaded to the next, its state.db set aside
+  server_reinstalled  # #331: the same with RomM reinstalled behind the same URL and paired again
   interop      # #236: RetroArch's Cloud Sync save reaches Tico's folder, and the Switch's reaches RetroArch
   upgrade      # #236: rc1's state.db and tico-srm rows: no data lost, no duplicate upload
   placement    # #237: a first-time restore lands in Tico's folder under the rom's name, and stays one save
@@ -2695,6 +2703,8 @@ set(ENGINE_RIG_SCENARIOS
   keep_local         # #249: Keep local is the one upload with overwrite=true, and only once
   keep_local_overtaken  # #273/#275/#279: held under a game then landed; superseded and overtaken unsent; a late cancel
   keep_local_switched  # #317: a Keep local armed against one server sends no overwrite=true to the next
+  keep_local_reinstalled  # #352: a conflict recorded under one device is never overwrite=true after a re-pair as another
+  keep_local_unpaired  # #352: the same with an Unpair before the re-pair and no settings change between
   play_off     # #301: [sync] play_sessions = off sends no session and never writes play.db
 )
 foreach(scenario IN LISTS ENGINE_RIG_SCENARIOS)
@@ -2789,7 +2799,8 @@ target_compile_definitions(test_sleep_connect PRIVATE
   ROMMSYNC_TEST_SCRATCH="${CMAKE_CURRENT_BINARY_DIR}/scratch-sleep"
   ROMMSYNC_FIXTURE_AUTH="${CMAKE_SOURCE_DIR}/server/testing/fixture-auth.env")
 
-foreach(scenario dns connect handshake)
+# #335 adds a lookup whose first cancel is lost, and one nobody cancels.
+foreach(scenario dns dns_lost_cancel dns_deadline connect handshake)
   add_test(NAME sleep.${scenario} COMMAND test_sleep_connect ${scenario})
   set_tests_properties(sleep.${scenario} PROPERTIES TIMEOUT 60)
 endforeach()
@@ -2858,7 +2869,7 @@ endforeach()
 # second raise left seven files quoting the intermediate value -- two of them
 # already corrected once in the same branch.
 set(HEAP_BUDGET_TEST "${CMAKE_CURRENT_SOURCE_DIR}/test_heap_budget.py")
-foreach(scenario IN ITEMS rows pinned margin dirs prose footprint)
+foreach(scenario IN ITEMS rows pinned margin dirs prose footprint overlay)
   add_test(NAME heap.${scenario}
            COMMAND ${Python3_EXECUTABLE} "${HEAP_BUDGET_TEST}" ${scenario}
                    --repo "${CMAKE_SOURCE_DIR}")

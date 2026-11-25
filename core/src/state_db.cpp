@@ -941,6 +941,15 @@ std::string BindToServer(LoadedBaseline* loaded, const std::string& path, std::s
     loaded->value.BindTo(std::string(server), adopted ? 0 : now_unix);
     return {};
   }
+  if (binding::SameServer(loaded->value.server(), server)) {
+    // One of the two names no device (#331). Bound by URL alone, before #331,
+    // the rows are this device's from when they were bound; a console between
+    // pairings keeps the device it knew.
+    if (server.find('#') != std::string_view::npos) {
+      loaded->value.BindTo(std::string(server), loaded->value.bound_since());
+    }
+    return {};
+  }
   // Another server's rows. Set aside rather than removed -- they are that
   // server's history, and the player may go back to it -- and never read here.
   const std::string old = loaded->value.server();

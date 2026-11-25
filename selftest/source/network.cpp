@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -59,14 +60,47 @@ void RunNetwork(Run& run) {
   u32 strength = 0;
   NifmInternetConnectionStatus status = {};
   const ::Result nifm = nifmGetInternetConnectionStatus(&type, &strength, &status);
+  // The verdict goes in `value`, which the judge reads (#342): no internet and
+  // an undocumented code pass there only if the heartbeat below answers, the
+  // console #328 syncs on; no network fails, as nothing past it is ever sent.
+  // It is classified from this one reading, so it cannot disagree with
+  // the rc and status printed beside it -- NET-09 records all three. The
+  // engine's own probe asks again, and a different answer is said, not hidden.
   using rommsync::sysmodule::NifmVerdict;
-  const bool online = rommsync::sysmodule::NetworkReady() &&
-                      rommsync::sysmodule::ConsoleNetwork() == NifmVerdict::kOnline;
-  char text[160];
-  std::snprintf(text, sizeof(text), "%s: rc=0x%08x, type %d, strength %u, status %d",
-                online ? "online" : "offline", nifm, static_cast<int>(type), strength,
-                static_cast<int>(status));
-  report.Row("net.nifm", online ? Outcome::kPass : Outcome::kFail, text);
+  const bool ready = rommsync::sysmodule::NetworkReady();
+  const NifmVerdict verdict =
+      ready ? rommsync::sysmodule::ClassifyNifm(
+                  nifm, status == NifmInternetConnectionStatus_Connected)
+            : NifmVerdict::kOffline;
+  const auto name = [](NifmVerdict v) {
+    return v == NifmVerdict::kOffline      ? "no_network"
+           : v == NifmVerdict::kNoInternet ? "no_internet"
+           : v == NifmVerdict::kUnexpected ? "unexpected"
+                                           : "online";
+  };
+  const char* value = ready ? name(verdict) : "no_transport";
+  std::string said = value;
+  std::replace(said.begin(), said.end(), '_', ' ');
+  char text[96];
+  if (verdict == NifmVerdict::kUnexpected) {
+    std::snprintf(text, sizeof(text), " 0x%08x", nifm);
+    said += text;
+  }
+  std::snprintf(text, sizeof(text), ": rc=0x%08x, type %d, strength %u, status %d", nifm,
+                static_cast<int>(type), strength, static_cast<int>(status));
+  said += text;
+  if (ready) {
+    const NifmVerdict again = rommsync::sysmodule::ConsoleNetwork();
+    if (again != verdict) said += std::string("; ConsoleNetwork() then read ") + name(again);
+  }
+  report.Row("net.nifm", verdict == NifmVerdict::kOffline ? Outcome::kFail : Outcome::kPass,
+             said, std::string("\"") + value + "\"");
+
+  // The connector refuses an unsure nifm until RomM has answered through it
+  // (#328); in the sysmodule only the engine's heartbeat ask opens it. Finding
+  // out whether RomM answers is this whole stage's job, so it is opened here --
+  // never past no network, which the connector refuses whatever this says.
+  rommsync::sysmodule::TrustRommPastNifm(true);
 
   // DNS, through sfdnsres -- the call M11-6 (#290) bounds with an abort.
   const std::string host = HostOf(run.config.url);

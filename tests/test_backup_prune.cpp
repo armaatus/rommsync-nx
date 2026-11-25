@@ -33,6 +33,13 @@
 //              server's backup, never
 //   state_budget_crash  a power cut at every call of a budget prune removes a
 //              subset of what the whole prune removes, and nothing else
+//   orphans    #346: a previous server's state backups a set-aside state.db
+//              names go past `orphan_days`, oldest first, beyond the newest
+//              `keep_states`; saves, and what no state.db names, never
+//   orphan_names  each set-aside state.db speaks for the window it was bound
+//              in, and a save row anywhere shadows a state
+//   orphans_crash  a power cut at every call of an orphan prune removes a
+//              subset of what the whole prune removes, and nothing else
 //   server     against the real RomM: a save's digest is listed for its rom,
 //              and a state's is while its row has not moved
 #include <algorithm>
@@ -53,6 +60,7 @@
 #include "rommsync/backup_prune.hpp"
 #include "rommsync/host/native_file_system.hpp"
 #include "rommsync/md5.hpp"
+#include "rommsync/sync_finish.hpp"
 
 namespace {
 
@@ -943,6 +951,269 @@ void StateBudgetCrash(checks::Checks& c) {
              "no power cut removes more than the prune would: " + verdict.first);
 }
 
+/// A `state.db` a server move set aside (`binding::Archive`), bound to its
+/// server from `since`, written beside the live one as `state.db.<suffix>`.
+void SetAside(Sandbox& sandbox, const std::string& suffix, state::Baseline baseline,
+              std::int64_t since) {
+  baseline.BindTo("http://" + suffix, since);
+  const state::StoreResult stored =
+      state::SaveBaseline(sandbox.Host(std::string(sync::kStateSdPath) + "." + suffix), baseline);
+  if (!stored.ok()) std::cerr << "could not set aside state.db." << suffix << "\n";
+}
+
+std::vector<Seeded> SeedRun(Sandbox& sandbox, std::int64_t rom_id, const std::string& discriminator,
+                            const std::string& file_name, const std::vector<int>& days_ago) {
+  std::vector<Seeded> run;
+  for (const int days : days_ago) {
+    run.push_back(Seed(sandbox, rom_id, discriminator, kNow - days * kDay,
+                       Bytes(days, 2048) + discriminator + file_name, 0, file_name));
+  }
+  return run;
+}
+
+std::size_t Left(Sandbox& sandbox, const std::vector<Seeded>& run) {
+  std::size_t count = 0;
+  for (const Seeded& seeded : run) count += sandbox.Exists(seeded.sd_path) ? 1 : 0;
+  return count;
+}
+
+/// The acceptance test (#346). This console synced with an old server for
+/// years, then moved to a new one 400 days ago: the old `state.db` was set
+/// aside, and the backups it took there are under that server's rom ids. The
+/// state budget cannot rank any of them -- nor a state this server's `state.db`
+/// has since dropped -- so on #340's rule they stay forever. Past
+/// `orphan_days`, a previous server's state backups a set-aside `state.db`
+/// names go, oldest first, beyond the newest `keep_states` of each state; no
+/// save backup and nothing that file cannot name is touched.
+void Orphans(checks::Checks& c) {
+  for (const bool off : {false, true}) {
+    Sandbox sandbox(c, off ? "prune-orphans-off" : "prune-orphans");
+    const std::int64_t since = kNow - 400 * kDay;
+    state::Baseline current;
+    KnowState(&current, 4, "Game.state");
+    KnowSave(&current, 4, "autosave");
+    state::Baseline old;
+    KnowState(&old, 9, "Old.state");
+    KnowState(&old, 9, "Old.state1");
+    KnowSave(&old, 9, "autosave");
+    // A state the old server's own save slot shadows: the two cannot be told apart.
+    KnowState(&old, 6, "Clash.state");
+    KnowSave(&old, 6, "state-Clash");
+    SetAside(sandbox, "old.example", old, kNow - 1000 * kDay);
+
+    const std::vector<Seeded> traded =
+        SeedRun(sandbox, 9, "state-Old", "Old.state", {900, 850, 800, 750, 700});
+    const std::vector<Seeded> slot = SeedRun(sandbox, 9, "state-Old", "Old.state1", {950});
+    const std::vector<Seeded> clash = SeedRun(sandbox, 6, "state-Clash", "Clash.state",
+                                              {900, 880, 860, 840, 820});
+    std::vector<int> save_days;
+    for (int i = 0; i < 12; ++i) save_days.push_back(990 - i * 10);
+    const std::vector<Seeded> saves = SeedRun(sandbox, 9, "autosave", "game.srm", save_days);
+    // A save slot that reads like the state's, under a save's extension.
+    const std::vector<Seeded> lookalike =
+        SeedRun(sandbox, 9, "state-Old", "game.srm", {980, 970, 960, 955});
+    // From before the set-aside file was bound: a server no file on the card names.
+    const std::vector<Seeded> ancient = SeedRun(sandbox, 9, "state-Old", "Old.state", {1100});
+    // A previous server's state the set-aside file does not know.
+    const std::vector<Seeded> lost =
+        SeedRun(sandbox, 11, "state-Lost", "Lost.state", {900, 890, 880, 870});
+    // This server's: a state `state.db` has since dropped. Nothing names it.
+    const std::vector<Seeded> gone =
+        SeedRun(sandbox, 7, "state-Gone", "Gone.state", {390, 370, 350, 330});
+
+    backup::PruneOptions options;
+    options.backup_dir = kBackupDir;
+    options.retention = backup::RetentionFor(config::Defaults().backup);
+    if (off) options.retention.orphan_days = 0;
+    options.now = []() { return Moment(kNow); };
+    FakeServer server;  // knows nothing: every backup here is the only copy
+    options.server_digests = server.Callback();
+    options.server_since = since;
+    options.is_state_backup = backup::StateBackupsOf(current);
+    const std::unique_ptr<fs::FileSystem> files =
+        host::MakeNativeFileSystem(sandbox.root().string());
+    options.is_previous_state_backup =
+        backup::SetAsideStateBackupsOf(*files, sync::kStateSdPath, since, current);
+    const backup::PruneReport report = backup::Prune(*files, options);
+    const std::string line = backup::Describe(report);
+    const std::string why = off ? "orphan_days = 0: " : "";
+
+    const std::size_t went = off ? 0 : 2;
+    c.ExpectEq(report.orphan_pruned, went, why + "the orphan bound's removals: " + line);
+    c.ExpectEq(report.pruned, went, why + "and nothing else went");
+    for (std::size_t i = 0; i < traded.size(); ++i) {
+      const bool gone_now = !sandbox.Exists(traded[i].sd_path);
+      c.Expect(gone_now == (i < went),
+               why + "old trade " + std::to_string(i) + (i < went ? " went" : " stayed"));
+    }
+    c.ExpectEq(Left(sandbox, slot), slot.size(), why + "another slot's newest stays, however old");
+    c.ExpectEq(Left(sandbox, clash), clash.size(), why + "a state a save's slot shadows stays");
+    for (const Seeded& save : saves) {
+      c.ExpectEq(sandbox.Read(save.sd_path), save.bytes, why + "no save backup is touched");
+    }
+    c.ExpectEq(Left(sandbox, lookalike), lookalike.size(),
+               why + "nor a save backup whose slot reads like a state's");
+    c.ExpectEq(Left(sandbox, ancient), ancient.size(),
+               why + "nor one older than the set-aside file's server");
+    c.ExpectEq(Left(sandbox, lost), lost.size(), why + "nor a state no state.db names");
+    c.ExpectEq(Left(sandbox, gone), gone.size(),
+               why + "nor a state this server's state.db dropped: nothing names it");
+
+    // What is left under a state's name that the budget cannot count: the
+    // previous server's 3 + 1 + 5 + 4 (the lookalike: a count from the name) +
+    // 1 + 4, and this server's dropped 4.
+    const std::size_t orphans = 22 + 2 - went;
+    c.ExpectEq(report.state_orphans, orphans, why + "the orphans left are counted: " + line);
+    c.Expect(line.find("; " + std::to_string(orphans) + " save-state backups left that max_state_mib cannot count") !=
+                 std::string::npos,
+             why + "and the log says so: " + line);
+    if (!off) {
+      c.Expect(line.find("; 2 of them save-state backups of a previous server [backup] "
+                         "orphan_days removed with no other copy known") != std::string::npos,
+               "the removals are named apart from every proven one: " + line);
+    }
+  }
+}
+
+/// `SetAsideStateBackupsOf`, at its edges: each set-aside file speaks for the
+/// window it was bound in, a save row anywhere shadows a state, and a file that
+/// is not a server move's -- an interrupted commit's `.tmp` -- names nothing.
+void OrphanNames(checks::Checks& c) {
+  Sandbox sandbox(c, "prune-orphan-names");
+  const std::int64_t since = kNow - 100 * kDay;
+  state::Baseline first;
+  KnowState(&first, 9, "Old.state");
+  KnowState(&first, 4, "Shadowed.state");
+  SetAside(sandbox, "first.example", first, kNow - 1000 * kDay);
+  state::Baseline second;
+  KnowState(&second, 9, "Other.state");
+  SetAside(sandbox, "second.example.1", second, kNow - 600 * kDay);
+  state::Baseline torn;
+  KnowState(&torn, 12, "Torn.state");
+  torn.BindTo("http://torn", kNow - 900 * kDay);
+  state::SaveBaseline(sandbox.Host(std::string(sync::kStateSdPath) + ".tmp"), torn);
+  state::Baseline current;
+  KnowSave(&current, 4, "state-Shadowed");
+
+  const std::unique_ptr<fs::FileSystem> files =
+      host::MakeNativeFileSystem(sandbox.root().string());
+  const backup::IsStateBackup named =
+      backup::SetAsideStateBackupsOf(*files, sync::kStateSdPath, since, current);
+  c.Expect(named != nullptr, "set-aside files that name states answer");
+  if (named == nullptr) return;
+  const auto at = [](std::int64_t rom, const std::string& discriminator, std::int64_t days_ago) {
+    backup::BackupName name;
+    name.rom_id = rom;
+    name.discriminator = discriminator;
+    name.unix_seconds = kNow - days_ago * kDay;
+    return name;
+  };
+  c.Expect(named(at(9, "state-Old", 800), ".state"), "the first file names its state in its time");
+  c.Expect(!named(at(9, "state-Old", 500), ".state"), "but not in the second file's");
+  c.Expect(named(at(9, "state-Other", 500), ".state"), "which names its own");
+  c.Expect(!named(at(9, "state-Other", 800), ".state"), "and only from when it was bound");
+  c.Expect(!named(at(9, "state-Old", 1100), ".state"), "before every file is no one's");
+  c.Expect(!named(at(9, "state-Old", 50), ".state"), "and from server_since on is this server's");
+  c.Expect(!named(at(9, "state-Old", 800), ".srm"), "a save's extension is not a state's");
+  c.Expect(!named(at(4, "state-Shadowed", 800), ".state"), "a save row anywhere shadows a state");
+  c.Expect(!named(at(12, "state-Torn", 800), ".state"), "an interrupted commit's file names nothing");
+  const backup::IsStateBackup unbound =
+      backup::SetAsideStateBackupsOf(*files, sync::kStateSdPath, 0, current);
+  c.Expect(unbound == nullptr || !unbound(at(9, "state-Old", 800), ".state"),
+           "with no server move there is no previous server");
+
+  // Two servers that both had a rom 9 `Shared.state`: `keep_states` would rank
+  // their backups as one state's, so neither file names it.
+  {
+    Sandbox shared_box(c, "prune-orphan-names-shared");
+    state::Baseline one;
+    KnowState(&one, 9, "Shared.state");
+    KnowState(&one, 9, "Old.state");
+    SetAside(shared_box, "one.example", one, kNow - 1000 * kDay);
+    state::Baseline two;
+    KnowState(&two, 9, "Shared.state");
+    SetAside(shared_box, "two.example", two, kNow - 600 * kDay);
+    const std::unique_ptr<fs::FileSystem> shared_files =
+        host::MakeNativeFileSystem(shared_box.root().string());
+    const backup::IsStateBackup shared =
+        backup::SetAsideStateBackupsOf(*shared_files, sync::kStateSdPath, since, current);
+    c.Expect(shared != nullptr && shared(at(9, "state-Old", 800), ".state"),
+             "a state one file alone names is still named");
+    c.Expect(shared != nullptr && !shared(at(9, "state-Shared", 800), ".state") &&
+                 !shared(at(9, "state-Shared", 500), ".state"),
+             "a state two files name is neither's");
+
+    // A set-aside file that will not read hides its saves and its window.
+    shared_box.Write(std::string(sync::kStateSdPath) + ".broken.example", "not a state.db");
+    const backup::IsStateBackup broken =
+        backup::SetAsideStateBackupsOf(*shared_files, sync::kStateSdPath, since, current);
+    c.Expect(broken == nullptr || !broken(at(9, "state-Old", 800), ".state"),
+             "one unreadable set-aside file and nothing is named");
+  }
+}
+
+/// Every power cut of an orphan prune removes a subset of what the whole prune
+/// removes, and nothing else.
+void OrphansCrash(checks::Checks& c) {
+  Sandbox sandbox(c, "prune-orphans-crash");
+  const std::int64_t since = kNow - 400 * kDay;
+  state::Baseline old;
+  KnowState(&old, 9, "Old.state");
+  SetAside(sandbox, "old.example", old, kNow - 1000 * kDay);
+  SeedRun(sandbox, 9, "state-Old", "Old.state", {900, 850, 800, 750, 700});
+  SeedRun(sandbox, 9, "autosave", "game.srm", {900, 800});
+
+  backup::PruneOptions options;
+  options.backup_dir = kBackupDir;
+  options.retention.keep = 1;
+  options.retention.keep_days = 0;
+  options.retention.max_bytes = 0;
+  options.retention.keep_states = 1;
+  options.retention.orphan_days = 180;
+  options.now = []() { return Moment(kNow); };
+  options.server_since = since;
+  const std::unique_ptr<fs::FileSystem> files =
+      host::MakeNativeFileSystem(sandbox.root().string());
+  options.is_previous_state_backup =
+      backup::SetAsideStateBackupsOf(*files, sync::kStateSdPath, since, state::Baseline{});
+
+  std::set<std::string> before;
+  for (const auto& entry : std::filesystem::directory_iterator(sandbox.Host(kBackupDir))) {
+    before.insert(entry.path().filename().string());
+  }
+  crash::Recorder recorder(sandbox.root(), {});
+  const backup::PruneReport report = backup::Prune(*files, options);
+  c.ExpectEq(report.orphan_pruned, std::size_t{4},
+             "the orphan bound took four: " + backup::Describe(report));
+  std::set<std::string> removed;
+  for (const std::string& name : before) {
+    if (!sandbox.Exists(std::string(kBackupDir) + "/" + name)) {
+      removed.insert(crash::RelativeOf(kBackupDir) + "/" + name);
+    }
+  }
+  c.ExpectEq(removed.size(), std::size_t{4}, "four files left the card");
+
+  const crash::Judge subset = [removed](const crash::Tree& after,
+                                        const crash::Snapshot& prior) -> std::string {
+    for (const auto& [path, bytes] : prior.files) {
+      if (removed.count(path) != 0) continue;
+      const auto found = after.find(path);
+      if (found == after.end()) return path + " is gone, and the prune would have kept it";
+      if (found->second != bytes) return path + " holds other bytes than it did";
+    }
+    for (const auto& [path, bytes] : after) {
+      if (prior.files.count(path) == 0) return path + " appeared from nowhere";
+    }
+    return {};
+  };
+  const crash::Verdict verdict = crash::Replay(recorder, {kBackupDir}, {kBackupDir},
+                                               rig::ScratchDir() + "/crash-prune-orphans", subset);
+  c.Expect(verdict.unmodelled.empty(), "the model followed every call: " + verdict.unmodelled);
+  c.Expect(verdict.points > 1, "the prune made calls to cut");
+  c.ExpectEq(verdict.failures, std::size_t{0},
+             "no power cut removes more than the prune would: " + verdict.first);
+}
+
 void StateProven(checks::Checks& c) {
   state::Baseline baseline;
   const auto row = [&baseline](std::int64_t rom_id, const std::string& name) {
@@ -1132,6 +1403,12 @@ int main(int argc, char** argv) {
       StateBudgetNames(checks);
     } else if (scenario == "state_budget_crash") {
       StateBudgetCrash(checks);
+    } else if (scenario == "orphans") {
+      Orphans(checks);
+    } else if (scenario == "orphan_names") {
+      OrphanNames(checks);
+    } else if (scenario == "orphans_crash") {
+      OrphansCrash(checks);
     } else {
       std::cerr << "unknown scenario " << scenario << "\n";
       return 2;

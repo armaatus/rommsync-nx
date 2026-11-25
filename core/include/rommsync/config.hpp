@@ -174,8 +174,8 @@ const char* ToString(OnServerDelete on_server_delete);
 /// days is a month of "I want last week's"; 512 MiB is a few percent of the
 /// smallest card a Switch homebrew setup runs on. None of the three ever
 /// removes the only copy of a backup's bytes -- that is the prune's own rule,
-/// and no setting turns it off. The state budget below is the one exception,
-/// and only ever for a save state's backup.
+/// and no setting turns it off. The state budget and the orphan bound below are
+/// the exceptions, and only ever for a save state's backup.
 inline constexpr int kDefaultBackupKeep = 10;
 inline constexpr int kDefaultBackupKeepDays = 30;
 inline constexpr int kDefaultBackupMaxMib = 512;
@@ -192,6 +192,12 @@ inline constexpr int kDefaultBackupMaxMib = 512;
 /// budget never touches: the last trade, and the two before it.
 inline constexpr int kDefaultBackupMaxStateMib = 256;
 inline constexpr int kDefaultBackupKeepStates = 3;
+
+/// The orphan bound (#346): a previous server's state backups, which the state
+/// budget cannot rank, go past this many days -- beyond `keep_states` of each
+/// state, and only those a set-aside `state.db` names. Half a year, because it
+/// removes sole copies of progress on a server the console may yet go back to.
+inline constexpr int kDefaultBackupOrphanDays = 180;
 
 /// The largest values a key takes; past them a value is clamped, for
 /// `interval_min`'s reason -- falling back to the default would keep *less*
@@ -212,6 +218,9 @@ struct BackupConfig {
   int max_state_mib = kDefaultBackupMaxStateMib;
   /// The newest this many of each state the budget never removes. At least 1.
   int keep_states = kDefaultBackupKeepStates;
+  /// Past this many days, a previous server's state backups beyond the newest
+  /// `keep_states` go, other copy or none (#346). 0 is off.
+  int orphan_days = kDefaultBackupOrphanDays;
 };
 
 /// `[sync]`.

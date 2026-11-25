@@ -197,20 +197,35 @@ own header, because the tick that writes it can still be running against the
 old one; `queue.json` and `play.db` are resident, so a marker beside them,
 `server.id`, records theirs, and their formats did not move. A card with no
 record of its server — every card from before #294 — is adopted by the one it
-is configured for. A server is its URL (`binding::IdentityOf`): RomM 5.4
-exposes no instance id, so one RomM reached by two URLs costs a first sync,
-and two RomMs behind one URL are not told apart. The backup prune
+is configured for. A server is its URL and, once paired, the device RomM
+minted for this console (`binding::InstanceOf`, #331): RomM 5.4 exposes no
+instance id, but a device id is a `uuid4` its database draws when pairing
+creates the row, so an upgrade in place keeps it and a reinstall behind the
+same URL — whose fresh database refuses the old token, so the console pairs
+again — hands back another, and the records are set aside as for any other
+server. A record bound by URL alone, from before #331, is adopted by the
+device that pairs first — so a reinstall made before the client was upgraded
+goes unseen — and an older build reads a record naming a device as another
+server's and sets it aside; a console between pairings decides nothing. One RomM reached by two
+URLs is still two servers: a URL change discards the token, so nothing knows
+the device until the re-pair, and the cost is a first sync. Pairing as another
+RomM user, or after the device was deleted in RomM, is a new device too, and
+costs the same. The backup prune
 (`backup::PruneOptions::server_since`) never removes a backup older than the
 binding on the new server's word.
 
 `conflicts.db` is not set aside: its entries point at backups on this card, and
 a plain restore of one is a local copy whichever server is configured. Instead
 each entry names the server its tick ran against (`Entry::server`, a digest of
-the identity, #317), and Keep local — which asks that server to take the
-bytes with `overwrite=true` — is refused on an entry from another. Rows written
-before #317 are claimed at boot for the server `server.id` named. A
-`server.url` change also drops every armed or held Keep local, which are
-in-memory keys of the old server's rom ids.
+the identity, URL and device since #352), and Keep local — which asks that
+server to take the bytes with `overwrite=true` — is refused on an entry from
+another, a RomM reinstalled behind the same URL included. Rows written before
+#317 are claimed at boot for the server `server.id` named, and so are rows
+tagged by that server's URL alone, before #352: they are the device the marker
+names, not one the console has paired as since — with #331's limit, that a
+reinstall made before the upgrade is not seen. A `server.url` change, and a
+pairing that hands back another device, also drop every armed or held Keep
+local, which are in-memory keys of the old server's rom ids.
 
 **The two halves on one card.** The IPC contract has its own version
 (`ipc::kVersion`): when it differs the overlay draws "sysmodule unreachable" and

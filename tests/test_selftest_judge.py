@@ -25,6 +25,7 @@ docs/HARDWARE_TEST_PLAN.md's PRE-02, not a claim made here.
            the plan cites the judge, and the row stays a console row.
 """
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
@@ -98,6 +99,39 @@ def scenario_pairs() -> None:
     expect(judge("--pairs", "2", "pass-21.0.0-ams-1.10.1.json", "fail-tick.json"),
            1, r"^VERDICT FAIL", what="a failing report does not count as a pair")
     print("ok: --pairs counts distinct HOS/Atmosphere pairs among passing reports")
+
+
+def scenario_nifm() -> None:
+    # #342: a console that blocks Nintendo -- emuMMC's DNS block, 90DNS, a LAN
+    # with no internet -- may never hear nifm say Connected, and #328 syncs on
+    # it once RomM answers. The heartbeat row is that answer.
+    expect(judge("nifm-no-internet.json"), 0,
+           r"^WARN +net\.nifm .*no internet", r"^VERDICT PASS .*nifm-no-internet",
+           what="nifm says no internet, and the heartbeat answers")
+    expect(judge("nifm-unexpected.json"), 0,
+           r"^WARN +net\.nifm .*unexpected 0x", what="an undocumented nifm code, heartbeat answers")
+    expect(judge("nifm-no-internet-unanswered.json"), 1,
+           r"^FAIL +net\.nifm .*no internet", r"^FAIL +net\.tls ", r"^VERDICT FAIL",
+           what="nifm says no internet, and the heartbeat does not answer")
+    # 0xd46ed is airplane mode or no network in range: nothing past it was
+    # tested, whatever the row's own result says.
+    expect(judge("nifm-no-network.json"), 1,
+           r"^FAIL +net\.nifm .*no network", r"^VERDICT FAIL", what="nifm says no network")
+    expect(judge("nifm-no-network-passed.json"), 1,
+           r"^FAIL +net\.nifm .*no network", r"^VERDICT FAIL",
+           what="a no-network verdict written as pass")
+    # The verdicts the judge reads are exactly the ones the NRO writes: one the
+    # judge did not know would fall through to the plain rule unnoticed.
+    spec = importlib.util.spec_from_file_location("selftest_judge", JUDGE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    judged = set(module.NIFM_VERDICTS)
+    with open(os.path.join(SOURCE, "network.cpp"), encoding="utf-8") as f:
+        network = f.read()
+    written = set(re.findall(r'"(online|no_[a-z_]+|unexpected)"', network))
+    if judged != written:
+        fail(f"the judge reads nifm verdicts {sorted(judged)}, the NRO writes {sorted(written)}")
+    print("ok: an unsure nifm passes as WARN when the heartbeat answers; no network fails")
 
 
 def judged_rows() -> set:
@@ -197,8 +231,8 @@ def scenario_gate() -> None:
     print("ok: the gate's note, the plan's PRE-02 and the judge cite each other")
 
 
-SCENARIOS = {"judge": scenario_judge, "pairs": scenario_pairs, "rows": scenario_rows,
-             "roots": scenario_roots, "gate": scenario_gate}
+SCENARIOS = {"judge": scenario_judge, "pairs": scenario_pairs, "nifm": scenario_nifm,
+             "rows": scenario_rows, "roots": scenario_roots, "gate": scenario_gate}
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

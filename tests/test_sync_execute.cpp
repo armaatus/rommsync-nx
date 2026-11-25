@@ -390,6 +390,50 @@ void ForeignOld(rig::Checks& checks) {
                 "including the .old the commit set aside");
 }
 
+// --- aside_full ---------------------------------------------------------------
+//
+// #332. Every `.old.<n>` name `CommitStaged` may set a foreign `.old` aside
+// under is taken: the commit refuses, consumes what it staged, and leaves the
+// save, the `.old` and all sixteen set-aside files exactly as they were. It
+// never makes room by removing one -- they may be a player's own files.
+
+void AsideFull(rig::Checks& checks) {
+  Sandbox sandbox(checks, "execute-aside-full");
+  const std::string directory = sandbox.Host("/retroarch/saves");
+  std::filesystem::create_directories(directory);
+  const std::string save = directory + "/Game.srm";
+  const std::string manual = io::PreviousPathFor(save);
+  const std::string staged = io::TempPathFor(save);
+
+  checks.Expect(rig::WriteFile(save, "the save before\n"), "a save is on the card");
+  checks.Expect(rig::WriteFile(manual, "a .old nothing wrote\n"), "a foreign .old beside it");
+  for (int index = 1; index <= 16; ++index) {
+    checks.Expect(rig::WriteFile(manual + "." + std::to_string(index),
+                                 "set aside " + std::to_string(index) + "\n"),
+                  "aside name " + std::to_string(index) + " is taken");
+  }
+  checks.Expect(rig::WriteFile(staged, "the verified bytes\n"), "a download is staged");
+
+  const io::WriteResult committed = io::CommitStaged(staged, save);
+  checks.Expect(committed.error == io::WriteError::kCommitFailed,
+                std::string("the commit fails as commit_failed: ") +
+                    io::ToString(committed.error));
+  checks.Expect(committed.message.find("every name to set it aside under is taken") !=
+                    std::string::npos,
+                "and says every aside name is taken: " + committed.message);
+  checks.Expect(!std::filesystem::exists(staged), "the staged file is removed");
+  checks.ExpectEq(rig::ReadFile(save), std::string("the save before\n"),
+                  "the save is untouched");
+  checks.ExpectEq(rig::ReadFile(manual), std::string("a .old nothing wrote\n"),
+                  "and so is the .old");
+  for (int index = 1; index <= 16; ++index) {
+    checks.ExpectEq(rig::ReadFile(manual + "." + std::to_string(index)),
+                    "set aside " + std::to_string(index) + "\n",
+                    "and set-aside file " + std::to_string(index));
+  }
+  checks.Expect(!std::filesystem::exists(manual + ".17"), "and no seventeenth is invented");
+}
+
 // --- crash_model --------------------------------------------------------------
 //
 // M9-14 (#203). `staging` proves the two primitives an overwrite goes through
@@ -3592,7 +3636,8 @@ int main(int argc, char** argv) {
   if (scenario == "naming" || scenario == "staging" || scenario == "counting" ||
       scenario == "crash_model" || scenario == "overwrite" || scenario == "content_hash" ||
       scenario == "delete" || scenario == "crash_delete" || scenario == "isolated" ||
-      scenario == "late_write" || scenario == "declined" || scenario == "foreign_old") {
+      scenario == "late_write" || scenario == "declined" || scenario == "foreign_old" ||
+      scenario == "aside_full") {
     if (scenario == "naming") {
       Naming(checks);
     } else if (scenario == "overwrite") {
@@ -3603,6 +3648,8 @@ int main(int argc, char** argv) {
       Staging(checks);
     } else if (scenario == "foreign_old") {
       ForeignOld(checks);
+    } else if (scenario == "aside_full") {
+      AsideFull(checks);
     } else if (scenario == "crash_model") {
       CrashModel(checks);
     } else if (scenario == "delete") {

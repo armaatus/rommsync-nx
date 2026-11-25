@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "http/lookup_watch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
@@ -618,8 +619,10 @@ void SdEngine::Load(const std::string& config_dir) {
   // console was off has them for another (#294). Here and not in
   // `AdoptConfigLocked`, which `SetConfig` also runs, on the IPC thread: a
   // change made there is the worker's to apply (`RunWorker`), because `play_`
-  // is the worker's alone.
-  BindResidentRecords(binding::IdentityOf(ConfigSnapshot()->server.url));
+  // is the worker's alone. With the device the token names, so a RomM
+  // reinstalled behind the same URL is another server once paired (#331).
+  BindResidentRecords(
+      binding::InstanceOf(ConfigSnapshot()->server.url, token_.server_url, token_.device_id));
 }
 
 void SdEngine::UsePairingBackend(PairingBackend backend) {
@@ -649,7 +652,12 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
     previous_config_ = config_;
     config_ = std::make_shared<const config::Config>(std::move(loaded.value));
   }
-  server_tag_ = binding::TagOf(binding::IdentityOf(ConfigSnapshot()->server.url));
+  // With no token, only at boot: after `Unpair` the tag keeps the device it
+  // left, and a URL change has set the new URL's already (#352).
+  if (!token_.device_id.empty() || server_tag_ == 0) {
+    server_tag_ = binding::TagOf(
+        binding::InstanceOf(ConfigSnapshot()->server.url, token_.server_url, token_.device_id));
+  }
   // Before anything can send a request on this configuration (#288).
   if (ca_trust_) {
     ca_trust_(ConfigSnapshot()->server.ca_file);
@@ -700,8 +708,11 @@ void SdEngine::BindResidentRecords(const std::string& server) {
     if (rebound.rebound) {
       owner = rebound.previous.empty() ? std::string_view("unknown:") : rebound.previous;
     }
+    // Rows tagged by the URL alone, before #352, are the owner's device's too:
+    // the device `server.id` named, so a re-pair since gives them nothing.
     std::lock_guard<std::mutex> history(history_mutex_);
-    const conflicts::StoreResult claimed = history_.Claim(binding::TagOf(owner));
+    const conflicts::StoreResult claimed = history_.Claim(
+        binding::TagOf(owner), binding::TagOf(owner.substr(0, owner.find('#'))));
     if (!claimed.ok()) {
       log::Warn(log::Event::kServerVersion,
                 "the conflict history could not be marked with its server (" + claimed.message +
@@ -1429,7 +1440,9 @@ void SdEngine::RunWorker() {
     // play buffer is this thread's alone. Ahead of everything below, because a
     // drain or a tick is what would read them against the new server. The
     // URL is compared in memory, so a pass with nothing changed reads nothing.
-    if (const std::string server = binding::IdentityOf(ConfigSnapshot()->server.url);
+    // A pairing landing moves it too: the device is part of it (#331).
+    if (const std::string server = binding::InstanceOf(ConfigSnapshot()->server.url,
+                                                       token_.server_url, token_.device_id);
         !server.empty() && server != records_server_ && clock_->Steady() >= records_retry_due_) {
       lock.unlock();
       BindResidentRecords(server);
@@ -1884,9 +1897,22 @@ void SdEngine::Quiesce() {
   // inside `download::Drain` and not inside `sync::RunTick`, so no save byte and
   // no rom byte is on its way to the card. A worker that was never started has
   // nothing to wait for.
-  const bool parked = quiesced_.wait_until(lock, deadline, [this] {
-    return (worker_parked_ || !worker_live_) && !pairing_busy_;
-  });
+  //
+  // In slices, re-sending the cancel of a name lookup that has not returned
+  // (#335): the one `CancelTickLocked` sent may have landed before `sfdnsres`
+  // held the request, and lost. On the console this is the thread that keeps
+  // the lookups' deadlines too, and it is not keeping them while it is here
+  // (`lookup_watch.hpp`).
+  static_assert(kLookupResend * kLookupResends == kQuiesceBudget,
+                "a lookup's cancel is re-sent for as long as a quiesce waits, and no longer");
+  const auto back = [this] { return (worker_parked_ || !worker_live_) && !pairing_busy_; };
+  bool parked = back();
+  while (!parked) {
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    if (now >= deadline) break;
+    Lookups().Fire(now);
+    parked = quiesced_.wait_until(lock, std::min(deadline, now + kLookupResend), back);
+  }
   // Read apart rather than derived from `parked`, because the two are
   // independent and the budget can run out with both of them false. Collapsing
   // them costs the half of the reason that is not reported, in the one line a
@@ -2053,10 +2079,13 @@ namespace {
 /// changes, because the change is as often a hand edit with the console off,
 /// and because a tick still running against the old server when the overlay
 /// moves it writes its rows bound to that server: the next one sets them aside.
-state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config) {
+/// The server is the URL and the device `token` names (#331), so a RomM
+/// reinstalled behind the URL, which the console pairs with afresh, is another.
+state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config,
+                                      const auth::StoredToken& token) {
   state::LoadedBaseline loaded = state::LoadBaseline(path);
   const std::string rebound = state::BindToServer(
-      &loaded, path, binding::IdentityOf(config.server.url),
+      &loaded, path, binding::InstanceOf(config.server.url, token.server_url, token.device_id),
       static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
                                     std::chrono::system_clock::now().time_since_epoch())
                                     .count()));
@@ -2663,8 +2692,10 @@ SdEngine::TickRun SdEngine::RunOneTick() {
     return rom == nullptr ? std::string() : rom->fs_name_no_ext;
   };
   // The server this tick runs against, which is the one its rom ids are of
-  // (#317), even if `server.url` moves before it ends.
-  record.server = binding::TagOf(binding::IdentityOf(inputs.config->server.url));
+  // (#317), even if `server.url` moves before it ends -- the device too, so a
+  // RomM reinstalled behind the URL never takes these rows' Keep local (#352).
+  record.server = binding::TagOf(binding::InstanceOf(
+      inputs.config->server.url, inputs.token.server_url, inputs.token.device_id));
 
   SavesTally tally;
   const sync::TickResult tick = RunSavesHalf(inputs, library, &options, &found, record, &tally);
@@ -2749,6 +2780,12 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   // A backup from before this console synced with this server names another
   // server's rom id, so this one's digests are not its proof (#294).
   options.server_since = bound_since;
+  // A previous server's state backups, by the `state.db` set aside when the
+  // console left it (#346): the orphan bound's, never a name's.
+  if (options.retention.orphan_days > 0) {
+    options.is_previous_state_backup =
+        backup::SetAsideStateBackupsOf(*inputs.files, sync::kStateSdPath, bound_since, stored);
+  }
   const backup::PruneReport report = backup::Prune(*inputs.files, options);
   // A prune that could not read or remove something is asked again next tick,
   // rather than waiting for the next backup to be written.
@@ -2769,12 +2806,15 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
     backup_usage_.truncated = report.truncated;
     // Since boot rather than this prune's (#340). A removal means a backup was
     // found, so it never misses this branch.
-    backup_usage_.state_budget_pruned += static_cast<std::int64_t>(report.budget_pruned);
+    backup_usage_.state_budget_pruned +=
+        static_cast<std::int64_t>(report.budget_pruned + report.orphan_pruned);
+    backup_usage_.state_orphans = static_cast<std::int64_t>(report.state_orphans);
   }
   log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
   // A cut listing is logged even with nothing else to say: it is what explains
   // the status screen's `≥` (#323).
-  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap || report.truncated) {
+  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap || report.truncated ||
+      report.state_orphans > 0) {
     log::Info(log::Event::kBackupPruned, backup::Describe(report));
   }
 }
@@ -3020,7 +3060,7 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   fs::FileSystem& files = *inputs.files;
   TickScan found;
   found.baseline_path = files.Resolve(sync::kStateSdPath);
-  found.loaded = LoadBaselineFor(found.baseline_path, config);
+  found.loaded = LoadBaselineFor(found.baseline_path, config, inputs.token);
   found.bound_since = found.loaded.value.bound_since();
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -3166,6 +3206,8 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
     }
   }
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
+  // Counted for `.old.<n>` only, never swept, for the reason above (#332).
+  options.aside_dir = kConfigSdDir;
   // The scan's records go here, before the plan arrives: everything the rest of
   // the tick reads of them is in `reported`, `targets` and the options above,
   // and held to the end they were a third copy of every save beside the plan --
@@ -3225,6 +3267,25 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
                                         found->reported, found->targets,
                                         std::move(found->loaded.value), *options);
   ObserveAnswer(tick.answer);
+  // The sweep's `.old.<n>` count, for `Snapshot` and the diagnostics bundle
+  // (#332). A cancel can come before the sweep, whose zero would be no count.
+  if (tick.outcome != sync::TickOutcome::kCanceled) {
+    const auto aside = static_cast<std::int64_t>(tick.recovered.aside_left);
+    std::int64_t was = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      was = backup_usage_.aside_files;
+      backup_usage_.aside_files = aside;
+    }
+    // Outside the lock, because a sink writes to the card; and when the count
+    // grows rather than every tick, because the log keeps only its tail.
+    if (aside > was) {
+      log::Warn(log::Event::kFileAside,
+                std::to_string(aside) +
+                    " files named <file>.old.<n> are set aside; at 16 for one file its commits "
+                    "fail (docs/TROUBLESHOOTING.md)");
+    }
+  }
   const std::vector<std::int64_t>& fresh = found->fresh;
   if (tick.totals.plans > 0 && tick.outcome != sync::TickOutcome::kCanceled && !fresh.empty()) {
     // Asked for, and done -- unless it was asked again for, or a plan never
@@ -3382,7 +3443,8 @@ sync::StateSyncReport SdEngine::RunStatesHalf(const TickInputs& inputs,
   // own copy on the way out, and `SyncStates` advances the same file. Reading
   // it back is one small file and is what keeps the two halves from writing
   // over each other's rows.
-  state::Baseline baseline = LoadBaselineFor(found.baseline_path, *inputs.config).value;
+  state::Baseline baseline =
+      LoadBaselineFor(found.baseline_path, *inputs.config, inputs.token).value;
   sync::StateSyncOptions state_options;
   state_options.backup_dir = sync::kBackupDir;
   state_options.cancel = inputs.cancel.get();
@@ -3743,8 +3805,15 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     }
     // Once a pairing (#228): the first tick on these credentials asks the
     // server which RomM it is, rather than trusting what an earlier pairing's
-    // server said.
-    ForgetServerLocked(/*different_server=*/false);
+    // server said. Handed another device, it is another RomM (#331) -- one
+    // reinstalled behind the URL -- and the Keep local choices armed against
+    // the last go with it, as a URL change drops them (#352). `Unpair` leaves
+    // the tag alone, so a re-pair as the same device keeps them; a console's
+    // first pairing after an unpaired boot drops any, which sends nothing.
+    const std::uint64_t tag = binding::TagOf(
+        binding::InstanceOf(ConfigSnapshot()->server.url, record.server_url, record.device_id));
+    ForgetServerLocked(/*different_server=*/tag != server_tag_);
+    server_tag_ = tag;
   }
   // A paired console usually has a tick due: `[sync] on_boot` fired long before
   // there were credentials to fire it with -- and a queue too, if a drain gave

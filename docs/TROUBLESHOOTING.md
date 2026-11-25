@@ -109,7 +109,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
-| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; and, naming `max_state_mib`, how many of them were save-state backups the state budget removed with no other copy | [The SD card is full](#the-sd-card-is-full) |
+| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; and, naming `max_state_mib`, how many of them were save-state backups the state budget removed with no other copy; naming `orphan_days`, how many were a previous server's state backups removed by age; and how many state backups are left that the budget cannot count | [The SD card is full](#the-sd-card-is-full) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
@@ -117,6 +117,7 @@ and a log is not worth it. A save is never in that position; see
 | `net.tls_clock` | a TLS failure the console's clock is the likely cause of | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 | `ipc.error` | the service the overlay talks to met a kernel error, dropped the overlay's connections and carried on — or, after several in a row, stopped | [The overlay's connection failed](#the-overlays-connection-failed) |
 | `diagnostics.bundle` | the diagnostics file was written, and where — or why the card refused it | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
+| `file.aside` | files named `<file>.old.<n>` are on the card, and how many — written when the count grows | [Files named .old.1, .old.2 and so on](#files-named-old1-old2-and-so-on) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -613,8 +614,8 @@ download.
 state backups hold more than `[backup] max_state_mib` (256 MiB unless you
 changed it), the oldest of them are deleted even though they are the only copy
 — never the newest three of each state (`keep_states`), and never a save
-backup. It is the one place this client deletes a backup without a second copy,
-so `backup.pruned` names it in a clause of its own:
+backup. It is one of the two places this client deletes a backup without a
+second copy (the other is below), so `backup.pruned` names it in a clause of its own:
 
 ```
 31 info backup.pruned 2 of 40 backups pruned, 33554432 bytes freed; 268435456 bytes in 38 left; 2 of them save-state backups [backup] max_state_mib removed with no other copy known
@@ -623,6 +624,20 @@ so `backup.pruned` names it in a clause of its own:
 The status screen shows a **State budget** row — *6 only copies removed* —
 once it has happened since the console started. If you would rather keep every
 state backup and clear them yourself, set `max_state_mib = 0`.
+
+The budget cannot count state backups taken against **a server this console has
+since left**, nor those of a state its `state.db` no longer lists. The first
+kind go once older than `[backup] orphan_days` (180 days), beyond the newest
+three of each state, in a clause naming `orphan_days`; the second kind are
+never deleted, because nothing on the card proves they are not a save's. The
+log counts what is left of both:
+
+```
+31 info backup.pruned 3 of 61 backups pruned, 6291456 bytes freed; 520093696 bytes in 58 left; 3 of them save-state backups of a previous server [backup] orphan_days removed with no other copy known; 21 save-state backups left that max_state_mib cannot count
+```
+
+and the diagnostics bundle's `[backup]` section has the same count as
+`state_orphans`. Those are the `<rom id>-state-…` files to look at first.
 
 If the card is still full, the unique save backups and the newest state backups
 of each state are what is left: copy any you want to keep to a computer, then
@@ -644,6 +659,53 @@ counting only what was listed, and `backup.pruned` ends with "the directory
 holds more than one listing shows". The diagnostics bundle says the same:
 *at least* before each count, and `truncated = yes`.
 Clearing out old backups by hand, as above, brings it back under.
+
+---
+
+## Files named .old.1, .old.2 and so on
+
+**Symptom.** Files such as `Game.srm.old.1` or `state.db.old.2` appear beside
+your saves, in `.backup/` or in `sdmc:/config/rommsync/`, and stay there. Or one
+save, or the sync baseline, stops being written at all.
+
+**Log line.**
+
+```
+12 warn file.aside 3 files named <file>.old.<n> are set aside; at 16 for one file its commits fail (docs/TROUBLESHOOTING.md)
+13 error save.failed download rom 1234, slot autosave: the verified bytes could not be put in place: sdmc:/retroarch/saves/Game.srm.old: is not this commit's to remove, and every name to set it aside under is taken
+```
+
+**What is happening.** Every file this client writes — a save, `state.db`,
+`token.dat`, `queue.json` — is written beside itself first and then swapped in,
+with the previous version parked as `<file>.old` for an instant and deleted
+once the swap is done. If that delete fails, or you made a `<file>.old` of your
+own, the next write finds a `.old` it did not make. It never deletes one it did
+not make — it could be your own copy — so it renames it to the first free name
+from `<file>.old.1` to `<file>.old.16` and carries on.
+
+The client never deletes these files. Each sync of your saves counts them
+before it starts: `file.aside` gives the count when it grows, and the
+diagnostics bundle's `[backup]` section has the last count as `aside_files` —
+in the save folders, `.backup/` and `sdmc:/config/rommsync/` together (zero
+until the first sync since boot). Once **all sixteen** names are taken for one
+file, every later write to that file fails with the second line above — for a
+save the save keeps the bytes it had, and for `state.db` the baseline is not
+stored — until you make room.
+
+**The fix.** Look at the files by hand. Each `.old.<n>` is an earlier version
+of the file it is named after (or a copy you made yourself):
+
+- Beside a save, it is a previous version of that save. Copy any you want to
+  keep to a computer; the save's backups in `.backup/` are separate and the
+  **Conflicts** screen restores from those, not from these.
+- Beside `state.db`, `queue.json` or `play.db`, it is an older copy of the
+  client's own record and is safe to delete.
+- Beside `token.dat` or `device.dat`, it is an older credential: delete it, and
+  never attach it to a bug report.
+
+Deleting `.old.<n>` files is always safe for the client: nothing reads them.
+Do not delete the plain `<file>.old` while `<file>` itself is missing — that one
+is the only copy, and the next sync puts it back.
 
 ---
 

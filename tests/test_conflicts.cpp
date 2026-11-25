@@ -1328,6 +1328,16 @@ void ServerTagged(checks::Checks& c) {
     c.Expect(claimed != nullptr && claimed->server == a,
              "an entry from before #317 is the claiming server's");
     c.Expect(own != nullptr && own->server == b, "and a stamped one keeps its server");
+    // #352: a row tagged by its URL alone is the device's that claims it from
+    // that URL; one of another server's is not.
+    const std::uint64_t device = a + 1;
+    c.Expect(history.Claim(device, a).ok(), "a claim from the URL's tag is written");
+    conflicts::History again(path);
+    again.Load();
+    c.Expect(again.Find(old_id) != nullptr && again.Find(old_id)->server == device,
+             "a row tagged by the URL is the device's that pairs there");
+    c.Expect(again.Find(other_id) != nullptr && again.Find(other_id)->server == b,
+             "and another server's row is still that server's");
   }
 
   // Keep local against the server it was recorded on works; against another it

@@ -45,6 +45,10 @@ USER_FACING = [
     "docs/TROUBLESHOOTING.md",
     "docs/SECURITY.md",
     "docs/INTEROP.md",
+    "docs/PRIVACY.md",
+    "docs/LICENSING.md",
+    "docs/CONFIG.md",
+    "overlay/README.md",
     "packaging/README.txt.in",
 ]
 

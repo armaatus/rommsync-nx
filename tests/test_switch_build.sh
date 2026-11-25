@@ -250,6 +250,15 @@ check_image_budget() {
   grep -q 'ovl-rommsync.ovl is .* past the' <<<"$out" ||
     { echo "$out" >&2; fail "a 4 KiB .ovl ceiling failed, but not on the .ovl's size"; }
 
+  # The overlay image's term of its heap budget, the same way (#337): read out
+  # of overlay/source/heap_budget.hpp, so a ceiling that read nothing would pass.
+  out="$(image_budget --ovl-image-budget 4096 2>&1)" &&
+    { echo "$out" >&2; fail "a 4 KiB overlay image budget passed; kImageBudget is not held"; }
+  grep -q 'the overlay maps .* past the' <<<"$out" ||
+    { echo "$out" >&2; fail "a 4 KiB overlay image budget failed, but not on the overlay's image"; }
+  grep -q 'ok: the overlay maps .* of the [0-9]* kImageBudget' <<<"$(image_budget 2>&1)" ||
+    fail "image-budget.sh did not hold the overlay's image to kImageBudget"
+
   # The resident footprint (#296), both ways: a recorded number under what the
   # build costs fails, and so does one so far over it that it has stopped being
   # the measurement the docs and the M12 co-resident run are given.

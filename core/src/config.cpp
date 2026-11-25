@@ -456,7 +456,7 @@ void ApplyTico(const ParseState& state, int line, std::string_view key, std::str
   config->tico = std::move(*tico);
 }
 
-/// `[backup]` (#292, #340): whole numbers, each with a floor and a ceiling.
+/// `[backup]` (#292, #340, #346): whole numbers, each with a floor and a ceiling.
 void ApplyBackup(const ParseState& state, int line, std::string_view key, std::string_view value,
                  Config* config, Diagnostics* diags) {
   int* target = nullptr;
@@ -479,6 +479,10 @@ void ApplyBackup(const ParseState& state, int line, std::string_view key, std::s
     // copy on or off, so it takes the same zero `max_mib` does.
     target = &config->backup.max_state_mib;
     ceiling = kMaxBackupMaxMib;
+  } else if (key == "orphan_days") {
+    // #346: zero is off, as `max_state_mib`'s is.
+    target = &config->backup.orphan_days;
+    ceiling = kMaxBackupKeepDays;
   } else if (key == "keep_states") {
     // One, for `keep`'s reason: the newest backup of a state always stays.
     target = &config->backup.keep_states;

@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 
+#include "heap_budget.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/config.hpp"
 #include "rommsync/core.hpp"
@@ -47,6 +48,8 @@ namespace {
 /// an overlay heap that libultrahand sizes at 4 MiB on a console that has not
 /// been given more.
 constexpr std::size_t kWorkerStackBytes = 0x4000;
+static_assert(kWorkerStackBytes <= kWorkerStackBudget,
+              "the worker's stack is a term of the overlay's heap budget (heap_budget.hpp)");
 static_assert(kWorkerStackBytes % 0x1000 == 0,
               "a thread stack must be page-aligned or __syscall_thread_create returns EINVAL");
 

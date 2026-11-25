@@ -8,6 +8,16 @@ What the release zip is licensed under, and why. The short version:
 | `exefs.nsp` (sys-rommsync, the sysmodule) | **MIT** | it links nothing that reaches it under the GPL |
 | this repository's own source | **MIT** | [`LICENSE`](../LICENSE) |
 
+`rommsync-selftest.nro`, the on-console selftest (M12-1, #306), is not in the
+zip: testers get it as `switch-build`'s CI artifact
+([HARDWARE_TEST_PLAN](HARDWARE_TEST_PLAN.md) PRE-02). It is **MIT** for the
+sysmodule's reason. It links `core/`, the sysmodule's HTTP and card backends,
+libnx, newlib and the GCC runtime, and no libultrahand or portlibs
+([`selftest/Makefile`](../selftest/Makefile)). The notices it owes are the
+sysmodule's rows of `THIRD_PARTY_NOTICES.txt`; the artifact holds the four
+binaries and no notices file, so a tester who wants them reads them from a
+release zip.
+
 The zip ships all of it under `config/rommsync/`: `LICENSE` (MIT),
 `COPYING.GPL-2.0`, and `THIRD_PARTY_NOTICES.txt`, which
 [`scripts/notices.sh`](../scripts/notices.sh) generates from

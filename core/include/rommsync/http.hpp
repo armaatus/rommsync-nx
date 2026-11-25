@@ -192,7 +192,10 @@ class CancelToken {
   /// `abort` runs under the token's lock, on whichever thread cancels -- the
   /// quiescing one, holding the engine's own lock. So it must be short, must
   /// take no lock that is held around a `Cancel`, and must never cancel this
-  /// token itself: one IPC that tells a service to stop, and nothing more.
+  /// token itself: one IPC that tells a service to stop, and nothing more --
+  /// or the `Cancel` of a token made for one blocking call inside this one's
+  /// request, whose own `Abort` is that IPC (the sysmodule's name lookup,
+  /// #335). Its lock is only ever taken inside this one's, never around it.
   class Abort {
    public:
     Abort(const CancelToken* token, void (*abort)(void*), void* context) {

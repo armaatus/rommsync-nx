@@ -21,6 +21,10 @@
 #                                image, so it skips without it; the
 #                                `switch-build` CI job runs the same check as a
 #                                step, and this entry with the `toolchain` label.
+#                                It also holds the HOS 23 resolver finding to the
+#                                libnx it was established for (#334): the image's
+#                                libnx must be the one DEVELOPMENT.md says it was
+#                                checked against, so moving the pin re-checks it.
 #
 # `pins`, `submodule` and `floor` read the tree only, so they never skip.
 set -uo pipefail
@@ -233,6 +237,23 @@ phase_libnx() {
   missing="$(toolchain_missing)" && skip "$missing"
   toolchain_run "$REPO_ROOT/scripts" 'bash toolchain.sh libnx' ||
     fail "$DEVKITPRO_IMAGE's libnx is not one toolchain.sh accepts (output above)"
+
+  # HOS 23.0.0 rebuilt sfdnsres around c-ares while libnx kept the old commands.
+  # That those still resolve, and cancel, is a reading of one libnx release's
+  # sources, not a property of every release after it.
+  local doc="$REPO_ROOT/docs/DEVELOPMENT.md" checked here
+  checked="$(sed -nE 's/^<!-- hos23-resolver: checked against libnx ([0-9.]+) -->$/\1/p' "$doc")"
+  [ -n "$checked" ] ||
+    fail "DEVELOPMENT.md records no libnx the HOS 23 resolver finding was checked against (#334)"
+  here="$(toolchain_run "$REPO_ROOT/scripts" 'dkp-pacman -Q libnx')" ||
+    fail "cannot ask $DEVKITPRO_IMAGE which libnx it carries"
+  here="${here#libnx }"
+  here="${here%%-*}"
+  [ "$here" = "$checked" ] ||
+    fail "the pin carries libnx $here, but the HOS 23 resolver finding was checked" \
+         "against $checked: re-read libnx's resolver per" \
+         "docs/DEVELOPMENT.md#dns-on-hos-23 and move the marker (#334)"
+  echo "ok: the HOS 23 resolver finding was checked against this libnx, $here"
 }
 
 case "${1:-}" in

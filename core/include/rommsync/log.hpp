@@ -240,6 +240,12 @@ enum class Event {
   /// The diagnostics bundle was written, or could not be (M11-20, #304): the
   /// file's path, which is the file the user was told to attach.
   kDiagnostics,
+
+  /// The tick's sweep counted `<file>.old.<n>` files (#332): a `.old` a commit
+  /// set aside rather than remove (#293). One file with all sixteen can no
+  /// longer be committed, and these are never deleted for the user -- one may
+  /// be theirs. Written when the count grows, not every tick.
+  kFileAside,
 };
 
 /// Every event, in declaration order. The guide and the emitted set are both
@@ -254,7 +260,7 @@ inline constexpr std::array kAllEvents = {
     Event::kServerVersion, Event::kServerUnsupported,
     Event::kSyncHeld,    Event::kSaveDeleted, Event::kBackupPruned, Event::kRemoteInstall,
     Event::kPlayRecorded, Event::kTerminated, Event::kClockSkew, Event::kNetTlsClock,
-    Event::kIpcError,   Event::kDiagnostics,
+    Event::kIpcError,   Event::kDiagnostics, Event::kFileAside,
 };
 
 /// Stable tag -- `net.offline`. Never null.

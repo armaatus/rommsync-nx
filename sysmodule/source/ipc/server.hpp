@@ -11,12 +11,13 @@
 // manually-launched build first, never as an auto-boot sysmodule and never on
 // hardware before the gate (sysmodule/AGENTS.md).
 //
-// ## Why the port is registered before `smExit`
+// ## Why the port is registered inside `__appInit`
 //
-// A registered port outlives the `sm` session that registered it, so a resident
-// process does not hold an `sm` handle for the life of the console just to keep
-// its own service name. `main.cpp` registers inside `__appInit`, where `sm` is
-// still up, and hands the handle here.
+// A registered port outlives the `sm` session that registered it, so the port
+// does not depend on `sm` staying open. It stays open anyway: since M9-1 (#195)
+// `main.cpp` holds the session for the life of the process, because libnx
+// re-opens `sfdnsres` off it on every `getaddrinfo`. `main.cpp` registers
+// inside `__appInit`, where `sm` is up, and hands the handle here.
 #pragma once
 
 #include <switch.h>

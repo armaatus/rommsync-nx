@@ -320,7 +320,7 @@ TickResult RunTick(http::HttpClient& client, fs::FileSystem& files,
   // litter and puts back a save an interrupted commit parked, so it is right to
   // do even on a tick that turns out to be offline. It writes no backup, no
   // save and no `state.db`.
-  result.recovered = RecoverStaging(files, options.recover_dirs);
+  result.recovered = RecoverStaging(files, options.recover_dirs, options.aside_dir);
 
   if (result.recovered.saves_restored > 0) {
     // A save the scan could not have seen is back on the card, so `reported` is

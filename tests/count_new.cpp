@@ -6,10 +6,18 @@
 // caller asked for, so that the eight `delete`s which are not told a size can
 // still take the right number of bytes off `outstanding_bytes`. The header is
 // as wide as the block's alignment (never less than the default new alignment),
-// which keeps the pointer handed out aligned the way the caller asked.
+// which keeps the pointer handed out aligned the way the caller asked. The word
+// below the size says whether the block counts in `here_bytes` (`Elsewhere`).
 #include "count_new.hpp"
 
 namespace count_new {
+
+namespace {
+thread_local int elsewhere_depth = 0;
+}  // namespace
+
+Elsewhere::Elsewhere() { ++elsewhere_depth; }
+Elsewhere::~Elsewhere() { --elsewhere_depth; }
 
 Counters& Get() {
   // Constant-initialised, so it exists before the first static constructor that
@@ -31,6 +39,8 @@ namespace count_new {
 namespace {
 
 constexpr std::size_t kDefaultAlignment = __STDCPP_DEFAULT_NEW_ALIGNMENT__;
+static_assert(kDefaultAlignment >= 2 * sizeof(std::size_t),
+              "the header holds the size and the here/elsewhere word");
 
 std::size_t HeaderFor(std::size_t alignment) {
   return alignment < kDefaultAlignment ? kDefaultAlignment : alignment;
@@ -64,6 +74,8 @@ void* Allocate(std::size_t size, std::size_t alignment) noexcept {
   }
   auto* user = static_cast<unsigned char*>(block) + header;
   *reinterpret_cast<std::size_t*>(user - sizeof(std::size_t)) = size;
+  const bool here = elsewhere_depth == 0;
+  *reinterpret_cast<std::size_t*>(user - 2 * sizeof(std::size_t)) = here ? 1 : 0;
 
   Counters& counters = Get();
   counters.allocations.fetch_add(1, std::memory_order_relaxed);
@@ -76,6 +88,16 @@ void* Allocate(std::size_t size, std::size_t alignment) noexcept {
   while (now > peak &&
          !counters.peak_bytes.compare_exchange_weak(peak, now, std::memory_order_relaxed)) {
   }
+  if (here) {
+    const std::int64_t held =
+        counters.here_bytes.fetch_add(static_cast<std::int64_t>(size),
+                                      std::memory_order_relaxed) +
+        static_cast<std::int64_t>(size);
+    std::int64_t high = counters.here_peak_bytes.load(std::memory_order_relaxed);
+    while (held > high && !counters.here_peak_bytes.compare_exchange_weak(
+                              high, held, std::memory_order_relaxed)) {
+    }
+  }
   return user;
 }
 
@@ -85,7 +107,11 @@ void Release(void* pointer, std::size_t alignment) noexcept {
   }
   auto* user = static_cast<unsigned char*>(pointer);
   const std::size_t size = *reinterpret_cast<std::size_t*>(user - sizeof(std::size_t));
+  const bool here = *reinterpret_cast<std::size_t*>(user - 2 * sizeof(std::size_t)) != 0;
   Counters& counters = Get();
+  if (here) {
+    counters.here_bytes.fetch_sub(static_cast<std::int64_t>(size), std::memory_order_relaxed);
+  }
   counters.deallocations.fetch_add(1, std::memory_order_relaxed);
   counters.outstanding.fetch_sub(1, std::memory_order_relaxed);
   counters.outstanding_bytes.fetch_sub(static_cast<std::int64_t>(size),

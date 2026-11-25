@@ -80,6 +80,7 @@
 #include "card_probe.hpp"
 #include "conflicts_pump.hpp"
 #include "draw_list.hpp"
+#include "heap_budget.hpp"
 #include "ipc_client.hpp"
 #include "library_pump.hpp"
 #include "lifecycle.hpp"
@@ -187,6 +188,9 @@ class HostSysmodule : public hostswitch::Server {
 
   Result Handle(u32 command_id, const void* request, std::size_t request_size, void* response,
                 std::size_t capacity, u64* length) override {
+    // The sysmodule's heap on a console, not the overlay's, though it runs on
+    // the overlay's worker here: `overlay.scroll` holds the overlay's own (#337).
+    const count_new::Elsewhere sysmodule_side;
     ++calls;
     hold.Pass();
     const int slow = slow_command.load();
@@ -1318,6 +1322,57 @@ int RunFrames(Checks& checks) {
     console.engine().library_roms = 0;
   }
 
+  // #343: a `ListBegin` held past `kBudgetsBeforeStuck` budgets is reported as
+  // not responding, and the session is left alone (#209). When it lands at
+  // last, the cursor it opened and the platform list's own are both still open
+  // on the sysmodule -- the browser starting again must end them, not leave
+  // them to the TTL while it opens a third.
+  {
+    console.engine().library_roms = 20;
+    console.engine().library_cursors.clear();
+    console.sysmodule().slow_command = -1;
+    console.sysmodule().delay_ms = 0;
+    overlay::IpcClient quick(kTestBudget);
+    overlay::LibraryPump pump(quick);
+    overlay::LibraryBrowserModel& model = pump.model();
+    std::chrono::milliseconds slowest{0};
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return model.selected_position() == 0; }, &slowest),
+                  "the library lists its platform" + Took(slowest));
+    console.sysmodule().hold.Arm();
+    model.Activate();
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] { return model.Render().link == overlay::Link::kNotResponding; },
+                                 &slowest),
+                  "a ListBegin stuck for twenty budgets is reported as not responding" +
+                      Took(slowest));
+    console.sysmodule().hold.Release();
+    // Back, and settled on the platform list again: its page read, which is
+    // the last thing the restart sends, holding its one new cursor.
+    checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                 [&] {
+                                   const overlay::LibraryView view = model.Render();
+                                   return view.link == overlay::Link::kOk &&
+                                          view.level == overlay::LibraryLevel::kPlatforms &&
+                                          model.loaded_rows() > 0 &&
+                                          model.selected_position() == 0 &&
+                                          model.open_cursors() == 1;
+                                 },
+                                 &slowest),
+                  "when it lands, the link is back and the platform list is read again" +
+                      Took(slowest));
+    checks.ExpectEq(console.engine().library_cursors.size(), model.open_cursors(),
+                    "and the sysmodule holds no cursor the screen does not: the late one and "
+                    "the one from before were ended");
+    checks.Expect(slowest < kDecodeFrameBound, "and no frame waited for any of it" + Took(slowest));
+    pump.Close();
+    checks.ExpectEq(console.engine().library_cursors.size(), std::size_t{0},
+                    "so the teardown leaves none open on the sysmodule");
+    quick.Shutdown();
+    console.sysmodule().delay_ms = 300;
+    console.engine().library_roms = 0;
+  }
+
   // The conflicts screen's pages, the same way.
   {
     for (std::int64_t id = 1; id <= 12; ++id) {
@@ -1954,6 +2009,15 @@ int RunScroll(Checks& checks) {
   Console console;
   console.engine().library_roms = 2500;
   console.Start();
+  // What the overlay holds of its heap, from before it opens anything to the
+  // end of the walk (#337). `ResetPeak` below starts a new peak for the
+  // window's own bound, so the high-water mark is kept across it here.
+  const count_new::Snapshot closed = count_new::Now();
+  count_new::ResetPeak();
+  std::int64_t held_peak = 0;
+  const auto keep_peak = [&held_peak] {
+    held_peak = std::max(held_peak, count_new::Now().here_peak_bytes);
+  };
   // A generous budget: this is about rows, not time, and a loaded host must not
   // turn a page into "not responding".
   overlay::IpcClient client(std::chrono::milliseconds{2000});
@@ -1980,6 +2044,7 @@ int RunScroll(Checks& checks) {
       // (Not the selection's place: a held R outruns the pages, and rides the
       // "Loading..." row, which is no place in the list.)
       baseline = count_new::Now();
+      keep_peak();
       count_new::ResetPeak();
     }
   }
@@ -2056,6 +2121,23 @@ int RunScroll(Checks& checks) {
   checks.Expect(console.engine().library_cursors.size() <= 2,
                 "every cursor a rewind replaced was ended: " +
                     std::to_string(console.engine().library_cursors.size()) + " open");
+  // The overlay's share of the loader's heap (#337): the most it held at once,
+  // client and screen together, from row 0 to 2000 and back. Its image's share
+  // is `scripts/image-budget.sh`'s; heap_budget.hpp adds the two up.
+  if (count_new::kActive) {
+    keep_peak();
+    const std::int64_t peak = held_peak - closed.here_bytes;
+    std::cerr << "overlay heap peak: " << peak << " of " << overlay::kHeapPeakBudget
+              << " bytes (heap_budget.hpp)\n";
+    checks.Expect(peak <= static_cast<std::int64_t>(overlay::kHeapPeakBudget),
+                  "the Library's heap peak, " + std::to_string(peak) +
+                      " bytes, is within kHeapPeakBudget, " +
+                      std::to_string(overlay::kHeapPeakBudget) +
+                      ": past it, the overlay's share of nx-ovlloader's 4 MiB is spent");
+  } else {
+    std::cerr << "kHeapPeakBudget NOT checked: a sanitizer replaces operator new "
+                 "(count_new.hpp)\n";
+  }
   return checks.failures();
 }
 

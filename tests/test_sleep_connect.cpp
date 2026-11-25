@@ -14,6 +14,8 @@
 //
 //   dns       -- the lookup blocks the way the console's `sfdnsres` request does,
 //                until something cancels it from another thread
+//   dns_lost_cancel -- ...and the first cancel it is sent is lost, the way one
+//                that lands before `sfdnsres` holds the request may be (#335)
 //   connect   -- a real connect to a listener whose backlog is full, so the SYN
 //                is never answered
 //   handshake -- a real connection to a server that never answers the hello,
@@ -23,6 +25,12 @@
 // `power_fake.hpp`, as PSC delivers it, and what is asserted is the issue's
 // goal: the acknowledgement goes out well inside the budget, with no open in
 // flight, and without the `power.sleep` line that says it went out early.
+//
+// And one scenario with no sleep in it at all (#335):
+//
+//   dns_deadline -- a lookup that never answers and that nobody cancels ends at
+//                the request's connect timeout, as a timeout, because the keeper
+//                cancels it there through the same `Abort`
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -38,6 +46,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -45,6 +54,7 @@
 #include "engine.hpp"
 #include "harness.hpp"
 #include "http/http_wire.hpp"
+#include "http/lookup_watch.hpp"
 #include "http/posix_connection.hpp"
 #include "power.hpp"
 #include "power_fake.hpp"
@@ -149,6 +159,86 @@ bool BlockingLookup(const std::string&, std::uint32_t*, const http::CancelToken*
                                [] { return g_lookup.aborted; });
   return false;
 }
+
+/// A lookup that loses the first cancel it is sent and honours the second: one
+/// that landed after the token was read but before `sfdnsres` held the request,
+/// which names a handle the service does not know yet (#335). Ten seconds, so a
+/// lookup nobody cancels again outlasts `kQuiesceBudget`.
+struct Losing {
+  std::mutex mutex;
+  std::condition_variable aborted_cv;
+  int aborts = 0;
+};
+Losing g_losing;
+
+void LoseFirstAbort(void*) {
+  std::lock_guard<std::mutex> lock(g_losing.mutex);
+  ++g_losing.aborts;
+  g_losing.aborted_cv.notify_all();
+}
+
+bool LosingLookup(const std::string&, std::uint32_t*, const http::CancelToken* cancel) {
+  const http::CancelToken::Abort abort(cancel, LoseFirstAbort, nullptr);
+  std::unique_lock<std::mutex> lock(g_losing.mutex);
+  if (cancel != nullptr && cancel->canceled()) return false;
+  g_losing.aborted_cv.wait_for(lock, http::kDefaultConnectTimeout,
+                               [] { return g_losing.aborts >= 2; });
+  return false;
+}
+
+/// The keeper the PSC watcher is on the console (`power_psc.cpp`): waits as long
+/// as `Fire` says, or until `Arm` wakes it.
+class Keeper {
+ public:
+  Keeper() {
+    sysmodule::Lookups().Keep(&Keeper::Wake, this);
+    thread_ = std::thread([this] { Run(); });
+  }
+
+  ~Keeper() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    changed_.notify_all();
+    thread_.join();
+    sysmodule::Lookups().Keep(nullptr, nullptr);
+  }
+
+  Keeper(const Keeper&) = delete;
+  Keeper& operator=(const Keeper&) = delete;
+
+ private:
+  static void Wake(void* self) {
+    Keeper* keeper = static_cast<Keeper*>(self);
+    std::lock_guard<std::mutex> lock(keeper->mutex_);
+    keeper->woken_ = true;
+    keeper->changed_.notify_all();
+  }
+
+  void Run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stop_) {
+      woken_ = false;
+      lock.unlock();
+      const std::optional<sysmodule::LookupWatch::Clock::duration> next =
+          sysmodule::Lookups().Fire(sysmodule::LookupWatch::Clock::now());
+      lock.lock();
+      const auto looked = [this] { return stop_ || woken_; };
+      if (next.has_value()) {
+        changed_.wait_for(lock, *next, looked);
+      } else {
+        changed_.wait(lock, looked);
+      }
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool stop_ = false;
+  bool woken_ = false;
+  std::thread thread_;
+};
 
 // --- connect -----------------------------------------------------------------
 
@@ -338,6 +428,44 @@ void Dns(checks::Checks& c) {
   SleepsDuringOpen(c, "sleep-dns", "http://romm.invalid", plain);
 }
 
+void DnsLostCancel(checks::Checks& c) {
+  sysmodule::PlainConnector plain(LosingLookup);
+  SleepsDuringOpen(c, "sleep-dns-lost", "http://romm.invalid", plain);
+  std::lock_guard<std::mutex> lock(g_losing.mutex);
+  c.Expect(g_losing.aborts >= 2,
+           "the lost cancel was sent again: " + std::to_string(g_losing.aborts) + " sent");
+}
+
+/// No sleep and no cancel: only the request's own connect timeout, which the
+/// lookup used not to read at all.
+void DnsDeadline(checks::Checks& c) {
+  rlog::Reset();
+  Keeper keeper;
+  sysmodule::PlainConnector plain(BlockingLookup);
+  const std::unique_ptr<http::HttpClient> client = sysmodule::MakeWireHttpClient(plain);
+
+  constexpr std::chrono::milliseconds kConnectBudget{400};
+  http::Request request;
+  request.url = "http://romm.invalid/api/heartbeat";
+  request.connect_timeout = kConnectBudget;
+  const std::chrono::steady_clock::time_point asked = std::chrono::steady_clock::now();
+  const http::Result result = client->Send(request);
+  const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - asked);
+
+  c.ExpectEq(static_cast<int>(result.error), static_cast<int>(http::Error::kTimeout),
+             std::string("the request fails as a timeout, not a name that does not exist: ") +
+                 http::ToString(result.error) + " -- " + result.message);
+  c.Expect(took < kConnectBudget + std::chrono::milliseconds{600},
+           "within the " + std::to_string(kConnectBudget.count()) +
+               "ms connect budget and a slice or two: took " + std::to_string(took.count()) +
+               "ms");
+  c.Expect(result.message.find("resolving") != std::string::npos,
+           "and it says the lookup is what ran out: " + result.message);
+  std::lock_guard<std::mutex> lock(g_lookup.mutex);
+  c.Expect(g_lookup.aborted, "through the lookup's own cancel, the one a sleep fires");
+}
+
 void Connect(checks::Checks& c) {
   FullBacklog backlog;
   if (!backlog.Fill()) {
@@ -367,6 +495,10 @@ int main(int argc, char** argv) {
   checks::Checks checks;
   if (scenario == "dns") {
     Dns(checks);
+  } else if (scenario == "dns_lost_cancel") {
+    DnsLostCancel(checks);
+  } else if (scenario == "dns_deadline") {
+    DnsDeadline(checks);
   } else if (scenario == "connect") {
     Connect(checks);
   } else if (scenario == "handshake") {

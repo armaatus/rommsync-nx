@@ -58,6 +58,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -240,7 +242,9 @@ class LibraryBrowserModel {
   Command Next();
 
   /// `ListBegin` answered `cursor`. A cursor for a level that has been left
-  /// since, or answered after `Close()`, is queued for `ListEnd` (#329).
+  /// since, or answered after `Close()`, is queued for `ListEnd` (#329); so is
+  /// one nothing is waiting for any more -- a `ListBegin` given up on as not
+  /// responding, answered late -- the one exception to the rule above (#343).
   void OnCursor(ipc::Cursor cursor);
 
   /// `ListNext` answered `page`.
@@ -276,6 +280,7 @@ class LibraryBrowserModel {
   /// asked for again on a fresh cursor -- the old one is ended, because its
   /// place in the list is no longer known -- and an `Enqueue` is not sent again:
   /// it may have landed, and a press the user did not make is not one to send.
+  /// Its row says `kMayHaveBeenQueued` (#344).
   void OnLost();
 
   /// The command did not reach the sysmodule, or its answer could not be read.
@@ -287,9 +292,16 @@ class LibraryBrowserModel {
   void OnUnreachable(Link link, std::uint32_t sysmodule_interface = 0);
 
   /// The link came back. Everything loaded is dropped and the browser starts
-  /// again at the platform list: the cursors belonged to a session that is
-  /// gone, and a page from before it is not a page this one would answer with.
-  void OnLinkRestored();
+  /// again at the platform list: a page from before it is not a page the
+  /// sysmodule would answer with now.
+  ///
+  /// `same_session` is whether the session the cursors were opened on is the
+  /// one that came back -- only `kNotResponding` leaves it alone
+  /// (`ScreenFrame::Diagnose`). If it is, every cursor the model held is still
+  /// open on the sysmodule, and each gets a `ListEnd` before the browser starts
+  /// again (#343): #31 caps how many may be open, and the TTL is slow. If it is
+  /// not, they went with the session and there is nothing to end.
+  void OnLinkRestored(bool same_session);
 
   /// Move the selection by `delta` rows, clamped at both ends. Also what asks
   /// for the next page: the model fetches ahead of the selection rather than on
@@ -352,6 +364,13 @@ class LibraryBrowserModel {
   std::size_t open_cursors() const;
 
  private:
+  /// A run of the sysmodule's rows, `rows` long from `row`, that a level holds
+  /// no place for: what puts its places behind those rows (#345).
+  struct RowGap {
+    std::int64_t row = 0;
+    std::int64_t rows = 0;
+  };
+
   /// One level of the stack: a list, as much of it as is held.
   ///
   /// **The rows are a window, not the list** (#298). `rows[0]` is row `first`
@@ -369,9 +388,10 @@ class LibraryBrowserModel {
   /// (where it replaces the row it is a fresher copy of), or at its end. A
   /// reclaimed cursor is re-opened the same way -- at the window, gathering
   /// nothing -- which is why a page off a fresh cursor cannot double the rows
-  /// already drawn. A level that dropped an item it could not read, or was
-  /// handed a page that did not start where its places said (#341), opens at
-  /// row 0 instead and reads down (`StartOf`).
+  /// already drawn. A place is not always the sysmodule's row: an item this
+  /// build could not read, and a rom the sysmodule stepped past (#341), are
+  /// rows there and no place here, so a cursor opens at the row its place maps
+  /// to (`gaps`, #345).
   struct Level {
     LibraryLevel kind = LibraryLevel::kPlatforms;
 
@@ -402,15 +422,24 @@ class LibraryBrowserModel {
 
     /// The sysmodule's row of the next item the cursor hands over (#341).
     /// Not `consumed`: an item this build cannot read is a row there and no
-    /// place here. A page whose `start` is not this is one the sysmodule
-    /// counted rows ahead of -- it stepped past a rom too large to send (#248)
-    /// -- and from there down the places here are not its rows.
+    /// place here. A page whose `start` is past this is one the sysmodule
+    /// counted rows ahead of -- it stepped past a rom too large to send (#248).
     std::int64_t served = 0;
 
-    /// A page has started somewhere other than `served`. Kept for the life of
-    /// the level, as `unreadable_items` is, and for its reason: every later
-    /// cursor opens at row 0, where places count what was handed over.
-    bool drifted = false;
+    /// The place `request.offset` is, which `OnCursor` counts from.
+    int start_place = 0;
+
+    /// The sysmodule's rows that are no place here, sorted and disjoint: the
+    /// roms it stepped past and the items this build could not read (#345).
+    /// What maps a place to the row a cursor opens at (`RowOf`). Each cursor
+    /// is the authority on the rows it passed, so a page rewrites the gaps in
+    /// its own rows rather than adding to them.
+    std::vector<RowGap> gaps;
+
+    /// Every gap below this row is in `gaps`; one at or past it may not be.
+    /// Lowered when `kMaxRowGaps` leaves no room, and a place whose row is
+    /// past it opens at row 0, where places count what was handed over.
+    std::int64_t mapped_below = std::numeric_limits<std::int64_t>::max();
 
     /// The cursor would hand over more. True until a page says otherwise, so a
     /// level that has loaded nothing yet still asks for its first page.
@@ -460,17 +489,31 @@ class LibraryBrowserModel {
   /// Push `level` with a fresh id.
   void Push(Level level);
 
-  /// The row for `rom_id` in `level` says *still applying* (#329).
-  void MarkApplying(Level* level, std::int64_t rom_id);
+  /// The row for `rom_id` in `level` says `note`, neutrally: *still applying*
+  /// (#329), or *may have been queued* (#344).
+  void MarkPending(Level* level, std::int64_t rom_id, const char* note);
 
   /// Re-open `level` from the start of the list, catching up to its window
   /// rather than redrawing it: what a reclaimed cursor and a lost page share.
   static void Reopen(Level& level);
 
-  /// The row a fresh cursor for `level` should start at (#339): the first one
-  /// it has a use for, so a rewind reads the rows it dropped rather than the
-  /// list down to them.
-  static std::int64_t StartOf(const Level& level);
+  /// Where a fresh cursor for `level` should start (#339): the first place it
+  /// has a use for, so a rewind reads the rows it dropped rather than the list
+  /// down to them, and the sysmodule's row for that place (#345).
+  struct Start {
+    int place = 0;
+    std::int64_t row = 0;
+  };
+  static Start StartOf(const Level& level);
+
+  /// The sysmodule's row of `place`, or nothing when `gaps` cannot say (#345).
+  static std::optional<std::int64_t> RowOf(const Level& level, int place);
+
+  /// The rows `[from, to)` a cursor just passed are no place here exactly
+  /// where `gaps` says after this: the old gaps in them are cleared, and
+  /// `AddGap` records the ones this page showed.
+  static void ClearGaps(Level& level, std::int64_t from, std::int64_t to);
+  static void AddGap(Level& level, std::int64_t row, std::int64_t rows);
 
   /// Whether this level draws the `kMore` row under its loaded ones.
   ///
@@ -608,6 +651,24 @@ inline constexpr int kRewindRows = kMaxLoadedRows / 2;
 /// forever would have the overlay asking sixty times a second with nothing to
 /// draw for it. The list ends with the reason on the `kMore` row instead.
 inline constexpr int kMaxEmptyPages = 4;
+
+/// How many runs of rows that are no place -- stepped past, or unreadable --
+/// one level remembers to map its places to the sysmodule's rows (#345).
+///
+/// Bounded for `kMaxLoadedRows`'s reason. Adjacent rows are one run, so a page
+/// this build cannot read at all costs one; a level with more than this many
+/// separate ones is a contract mismatch, and past the last it remembers, its
+/// cursors open at row 0 and read down, as they did before #339.
+inline constexpr std::size_t kMaxRowGaps = static_cast<std::size_t>(ipc::kMaxPageSize);
+
+/// What a row says when its `Enqueue` was answered to nobody (#344).
+///
+/// Not *still applying*: nothing re-reads the queue behind a lost answer, so
+/// that would stand on the row until the screen closed. Not a failure either:
+/// the press may well have landed, and sending it again could queue the rom
+/// twice. So it says what is known -- maybe -- and where the answer is: the
+/// Downloads level, Y on this same screen.
+inline constexpr const char* kMayHaveBeenQueued = "May have been queued -- check Downloads";
 
 /// The sentence a refused `Enqueue` gets, and how it should read.
 ///

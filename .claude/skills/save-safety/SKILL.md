@@ -39,12 +39,14 @@ empty", "the server copy is newer", or "the user confirmed".
 
 A backup is deleted only when its bytes are provably somewhere else: a
 `content_hash` RomM holds for the rom, a state row `state.db` proves RomM still
-holds unmoved (#330), or a newer identical backup. The one exception is the state
-budget (`[backup] max_state_mib`, #340). It deletes save-**state** backups with no
-second copy, oldest first, beyond the newest `keep_states` of each state, and only
-those `backup::StateBackupsOf` names from `state.db`. Never extend it to a save's
-backup, never let it take a state's newest, and never decide "this is a state's"
-from a file name alone.
+holds unmoved (#330), or a newer identical backup. There are two exceptions. The
+state budget (`[backup] max_state_mib`, #340) deletes save-**state** backups with
+no second copy, oldest first, beyond the newest `keep_states` of each state, and
+only those `backup::StateBackupsOf` names from `state.db`. The orphan bound
+(`[backup] orphan_days`, #346) does the same past an age for a previous server's,
+and only those `backup::SetAsideStateBackupsOf` names from the `state.db` a server
+move set aside. Never extend either to a save's backup, never let either take a
+state's newest, and never decide "this is a state's" from a file name alone.
 
 ## Proving it
 

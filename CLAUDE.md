@@ -15,10 +15,13 @@ idea to a merged PR — this file is the short form of it.
 2. **Back up before overwriting a save.** Every path that overwrites a save file
    writes a backup *first* and writes atomically, and a save's backup is deleted
    only when its bytes provably exist elsewhere (on RomM, or in a newer backup).
-   The one exception is save-**state** backups past `[backup] max_state_mib` (on
-   by default, #340): the oldest beyond the newest `keep_states` of each state
-   are deleted with no second copy. It never applies to a save's backup, never to
-   one of a state's newest, and only to backups `state.db` names as a state's.
+   There are two exceptions, both for save-**state** backups only: past
+   `[backup] max_state_mib` (on by default, #340), the oldest beyond the newest
+   `keep_states` of each state are deleted with no second copy; and past
+   `[backup] orphan_days` (#346), so is a previous server's, beyond the same
+   newest `keep_states`. Neither ever applies to a save's backup, nor to one of a
+   state's newest, and each only to backups a `state.db` names as a state's:
+   this server's, or one a server move set aside.
    This is the one guarantee standing between a bug and a player's destroyed
    save. It is tested, not assumed — see [docs/SYNC_PROTOCOL.md](docs/SYNC_PROTOCOL.md).
 3. **The server is the source of truth** for sync conflicts.

@@ -11,12 +11,19 @@
 //
 // ## What a server is
 //
-// Its normalised `[server] url`, scheme and host lower-cased. RomM 5.4 exposes
-// no instance id -- `GET /api/heartbeat` carries a version and the server's
-// configuration, nothing that names the installation -- so two RomMs behind one
-// URL are one server to this client, and one RomM reached by two URLs is two.
-// The second costs a first sync, which backs up before it overwrites; the first
-// is the one case this cannot see.
+// Its normalised `[server] url`, scheme and host lower-cased -- and, once the
+// console has paired, `#` and the device id pairing handed back (`InstanceOf`,
+// #331). RomM 5.4 exposes no instance id -- `GET /api/heartbeat` carries a
+// version and the server's configuration, nothing that names the installation
+// -- but a device id is a `uuid4` RomM's database draws when pairing creates
+// the row. An upgrade in place keeps the database and so the id; a reinstall
+// behind the same URL refuses the old token, the console pairs again, and the
+// id it gets is another. A record with no device -- bound before #331, or by a
+// console between pairings -- is the URL's (`SameServer`).
+//
+// One RomM reached by two URLs is still two: a URL change discards the token,
+// so no device is known until the re-pair, and the cost is a first sync, which
+// backs up before it overwrites.
 //
 // ## Two ways a record is bound
 //
@@ -54,6 +61,19 @@ inline constexpr std::size_t kMaxMarkerBytes = 1024;
 /// empty URL -- an unconfigured console is bound to nothing.
 std::string IdentityOf(std::string_view server_url);
 
+/// The identity of the RomM installation `server_url` names, as a console
+/// paired with it knows it (#331): `IdentityOf(server_url)`, then `#` and
+/// `device_id` encoded the same way, `#` included. The URL's alone when
+/// `device_id` is empty or `paired_url` -- the server the token was granted
+/// by -- is another server's.
+std::string InstanceOf(std::string_view server_url, std::string_view paired_url,
+                       std::string_view device_id);
+
+/// Whether a record bound to `recorded` may be read as `current`'s: the same
+/// identity, or the same URL where either side names no device -- a record
+/// from before #331, or a console not paired yet, which can tell nothing.
+bool SameServer(std::string_view recorded, std::string_view current);
+
 /// The suffix a record bound to `identity` is set aside under: the identity
 /// with everything but letters, digits, `.` and `-` turned to `-`, runs of `-`
 /// collapsed, and at most 64 characters -- a FAT32 name a person can still read
@@ -62,7 +82,10 @@ std::string ArchiveSuffix(std::string_view identity);
 
 /// A number for `identity`, for a record that carries its server on every row
 /// (`conflicts::Entry::server`, #317): the first eight bytes of the identity's
-/// MD5, never zero. Zero for an empty identity -- no server.
+/// MD5, never zero. Zero for an empty identity -- no server. Of the whole
+/// identity, device and all (#352): a row recorded before a reinstall is not
+/// the RomM paired after it. Rows tagged before #352 carry the URL's, and the
+/// engine gives them to the device `server.id` names (`History::Claim`).
 std::uint64_t TagOf(std::string_view identity);
 
 /// What `Archive` did.

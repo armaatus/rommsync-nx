@@ -428,6 +428,30 @@ void Counts(checks::Checks& c) {
   }
   c.Expect(count_new::Now().peak_bytes - after.outstanding_bytes >= 4096,
            "is gone again, and the peak remembers it");
+
+  // `here_bytes` (#337): a block made under `Elsewhere` is counted everywhere
+  // else, kept out of `here_bytes` and its peak, and stays out when it is freed
+  // after the scope has closed -- as a fake sysmodule's page is, by the overlay.
+  count_new::ResetPeak();
+  const count_new::Snapshot calm = count_new::Now();
+  char* theirs = nullptr;
+  {
+    const count_new::Elsewhere apart;
+    theirs = new char[3000];
+  }
+  auto* ours = new char[500];
+  const count_new::Snapshot both = count_new::Now();
+  c.ExpectEq(both.outstanding_bytes - calm.outstanding_bytes, std::int64_t{3500},
+             "both blocks are outstanding");
+  c.ExpectEq(both.here_bytes - calm.here_bytes, std::int64_t{500},
+             "and only the one made outside Elsewhere is here");
+  c.ExpectEq(both.here_peak_bytes - calm.here_bytes, std::int64_t{500},
+             "nor does the other reach the here peak");
+  delete[] theirs;
+  c.ExpectEq(count_new::Now().here_bytes - calm.here_bytes, std::int64_t{500},
+             "freeing the other, outside the scope, takes nothing off here");
+  delete[] ours;
+  c.ExpectEq(count_new::Now().here_bytes, calm.here_bytes, "and freeing ours gives it back");
 }
 
 /// The rule, on series whose answer is known before it is asked.
