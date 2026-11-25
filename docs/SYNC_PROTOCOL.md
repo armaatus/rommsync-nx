@@ -819,7 +819,7 @@ them.
 Each removal is one `remove()` of bytes already proven elsewhere, so a power cut
 leaves a subset of the removals and nothing else; `prune.crash` replays it.
 
-**The state budget is the one removal without a proof (#340).** Two consoles
+**The state budget is the first removal without a proof (#340).** Two consoles
 trading a state would otherwise grow `.backup/` by one sole copy per download
 until the card filled and every download failed `backup_failed`. So, last in
 the prune and over state backups only, `[backup] max_state_mib` (256 MiB by
@@ -842,6 +842,27 @@ one `remove()`, so a power cut leaves a subset of what the whole prune removes
 (`prune.state_budget_crash`). Each prune that used it says so in a clause of
 its `backup.pruned` line naming `max_state_mib`, and `Status.backup.state_budget_pruned`
 counts the removals since boot for the overlay's **State budget** row.
+
+**A previous server's state backups are bounded by age (#346).** The budget
+counts nothing from before `server_since`, and #294 begins `state.db` again at a
+server move, so those backups would stay forever. But the move sets the old file
+aside as `state.db.<server>[.<n>]` (`binding::Archive`), and that file names the
+old server's states exactly as `StateBackupsOf` names this one's
+(`backup::SetAsideStateBackupsOf`). Each set-aside file speaks for the window it
+was bound in — from its `bound_since` to the next one's, or to `server_since` —
+and a save row of any `state.db` on the card shadows a group, since rom ids are
+reused between servers. After the budget, `[backup] orphan_days` (180, `0` off)
+removes such a backup older than that, oldest first, beyond the newest
+`keep_states` of its state: by proof when there is one, and otherwise without
+one, counted as `PruneReport::orphan_pruned` and named in a clause of
+`backup.pruned`; `Status.backup.state_budget_pruned` counts both kinds of sole
+copy removed. **A backup no `state.db` names is never removed**: one of a state
+this server's `state.db` dropped, or from a server whose set-aside file is gone,
+cannot be told from a save's backup without trusting its name. It is only
+counted, by its `state-` name, as `PruneReport::state_orphans` — in
+`backup.pruned`, `Status.backup.state_orphans` and the diagnostics bundle — so
+a full card says where its space went. A power cut leaves a subset of the
+removals (`prune.orphans_crash`).
 
 #### A write after the backup (#263)
 

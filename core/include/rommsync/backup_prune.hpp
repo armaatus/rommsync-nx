@@ -1,5 +1,6 @@
 // Keeping `.backup/` bounded without ever deleting the only copy of a save
-// (M11-8, #292), and a save state's only past an explicit budget (#340).
+// (M11-8, #292), and a save state's only past an explicit budget (#340) or,
+// a previous server's, an explicit age (#346).
 //
 // Hard rule 2 writes a backup before every overwrite, and until this nothing
 // removed one. Two devices alternating on one game make a backup per download,
@@ -89,6 +90,19 @@
 // `server_since` is never counted: its rom id is another server's. Each removal
 // is still one `remove()`, so a power cut leaves a subset of what the whole
 // prune removes.
+//
+// ## The orphan bound: a previous server's states, by age (#346)
+//
+// The budget cannot rank a backup from before `server_since`, and `state.db`
+// began again at the server move (#294), so those would stay forever. But the
+// move set the old file aside beside the new one, and it still names the old
+// server's states (`SetAsideStateBackupsOf`). So after the budget, such a
+// backup older than `orphan_days` goes, oldest first, beyond the newest
+// `keep_states` of its state -- by proof, or without one, counted apart as
+// `orphan_pruned`. A backup **no** `state.db` names -- a state this one has
+// dropped, a server whose set-aside file is gone -- is never removed: without
+// a `state.db` only its name says it is a state's. It is counted, by that name,
+// as `state_orphans`, for a report and nothing else.
 //
 // ## When it runs, and what a power cut does to it
 //

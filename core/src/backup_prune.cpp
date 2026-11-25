@@ -120,6 +120,15 @@ class Pruner {
     }
     // Last, and only over states: the one pass that removes without a proof.
     if (keep.max_state_bytes > 0 && options_.is_state_backup) Budget(order, keep);
+    // Then a previous server's, which the budget cannot rank, by age (#346).
+    if (keep.orphan_days > 0 && options_.is_previous_state_backup) Orphans(order, keep, now);
+    for (const Backup& backup : backups_) {
+      if (!backup.removed && backup.parsed.discriminator.rfind("state-", 0) == 0 &&
+          !(!Previous(backup) && options_.is_state_backup &&
+            options_.is_state_backup(backup.parsed, sync::ExtensionOf(backup.name)))) {
+        ++report_->state_orphans;
+      }
+    }
     report_->over_cap = keep.max_bytes > 0 && total_ > keep.max_bytes;
     report_->bytes_after = total_;
   }
@@ -186,46 +195,89 @@ class Pruner {
   /// without one when there is not. See the header.
   void Budget(const std::vector<std::size_t>& order, const Retention& keep) {
     const std::size_t keep_states = static_cast<std::size_t>(std::max(keep.keep_states, 1));
-    // A state's own rank, counted over what is still on the card and what the
-    // budget counts: a save backup that happens to share a group, or one from
-    // before this server, must not stand in for one of a state's newest. And
-    // per extension, not per group: RetroArch's slots of one game, `.state1`
-    // and `.state2`, share the discriminator `state-Game` and are two states.
-    std::int64_t state_total = 0;
+    std::int64_t state_total = RankStates(false, options_.is_state_backup);
+    for (const std::size_t at : order) {
+      if (state_total <= keep.max_state_bytes) break;
+      Backup& backup = backups_[at];
+      if (backup.removed || backup.unremovable || backup.state_rank <= keep_states) continue;
+      const Taken taken = Take(at);
+      if (taken == Taken::kNot) continue;
+      if (taken == Taken::kUnproven) ++report_->budget_pruned;
+      state_total -= backup.size;
+    }
+    report_->state_bytes_after = state_total;
+  }
+
+  /// The orphan bound (#346): a previous server's state backups that a
+  /// set-aside `state.db` names, older than `orphan_days`, go oldest first
+  /// beyond the newest `keep_states` of their state -- by proof when there is
+  /// one, without one when there is not. See the header.
+  void Orphans(const std::vector<std::size_t>& order, const Retention& keep, std::int64_t now) {
+    const std::size_t keep_states = static_cast<std::size_t>(std::max(keep.keep_states, 1));
+    RankStates(true, options_.is_previous_state_backup);
+    const std::int64_t old_before = now - static_cast<std::int64_t>(keep.orphan_days) * kSecondsPerDay;
+    for (const std::size_t at : order) {
+      const Backup& backup = backups_[at];
+      if (backup.removed || backup.unremovable || !Previous(backup) ||
+          backup.state_rank <= keep_states || backup.parsed.unix_seconds >= old_before) {
+        continue;
+      }
+      if (Take(at) == Taken::kUnproven) ++report_->orphan_pruned;
+    }
+  }
+
+  /// Named before `server_since`: another server's, or one nothing names (#294).
+  bool Previous(const Backup& backup) const {
+    return backup.parsed.unix_seconds < options_.server_since;
+  }
+
+  /// Rank what `named` counts -- this server's backups, or with `previous`
+  /// those from before it -- newest first from 1, and return their bytes.
+  ///
+  /// Counted over what is still on the card and what `named` counts: a save
+  /// backup that happens to share a group, or one of the other side of
+  /// `server_since`, must not stand in for one of a state's newest. And per
+  /// extension, not per group: RetroArch's slots of one game, `.state1` and
+  /// `.state2`, share the discriminator `state-Game` and are two states.
+  std::int64_t RankStates(bool previous, const IsStateBackup& named) {
+    std::int64_t bytes = 0;
     for (const std::vector<std::size_t>& members : members_) {
       for (std::size_t i = 0; i < members.size(); ++i) {
         Backup& backup = backups_[members[i]];
         const std::string_view extension = sync::ExtensionOf(backup.name);
-        if (backup.removed || backup.parsed.unix_seconds < options_.server_since ||
-            !options_.is_state_backup(backup.parsed, extension)) {
+        if (backup.removed || Previous(backup) != previous ||
+            !named(backup.parsed, extension)) {
           continue;
         }
         backup.state_rank = 1;
         for (std::size_t newer = 0; newer < i; ++newer) {
           const Backup& other = backups_[members[newer]];
-          if (other.state_rank > 0 && sync::ExtensionOf(other.name) == extension) {
+          // The budget's ranks stay set; the other side of `server_since`
+          // must not count towards this side's newest.
+          if (other.state_rank > 0 && Previous(other) == previous &&
+              sync::ExtensionOf(other.name) == extension) {
             ++backup.state_rank;
           }
         }
-        state_total += backup.size;
+        bytes += backup.size;
       }
     }
-    for (const std::size_t at : order) {
-      if (state_total <= keep.max_state_bytes) break;
-      Backup& backup = backups_[at];
-      if (backup.removed || backup.unremovable || backup.state_rank <= keep_states) continue;
-      // A copy that is provably elsewhere goes as one: only what is left --
-      // which `Offer` has counted as kept -- is the budget's to answer for.
-      if (!backup.kept) Offer(at);
-      if (backup.unremovable) continue;
-      if (!backup.removed) {
-        if (!Remove(at)) continue;
-        --report_->kept_unique;
-        ++report_->budget_pruned;
-      }
-      state_total -= backup.size;
-    }
-    report_->state_bytes_after = state_total;
+    return bytes;
+  }
+
+  enum class Taken { kNot, kProven, kUnproven };
+
+  /// Remove `at` for the budget or the orphan bound: as a proven copy when
+  /// `Offer` finds one elsewhere, and otherwise without one. Only what is left
+  /// -- which `Offer` has counted as kept -- is theirs to answer for.
+  Taken Take(std::size_t at) {
+    Backup& backup = backups_[at];
+    if (!backup.kept) Offer(at);
+    if (backup.unremovable) return Taken::kNot;
+    if (backup.removed) return Taken::kProven;
+    if (!Remove(at)) return Taken::kNot;
+    --report_->kept_unique;
+    return Taken::kUnproven;
   }
 
   /// Remove `at` if its bytes are provably somewhere else; otherwise keep it.
@@ -360,6 +412,7 @@ Retention RetentionFor(const config::BackupConfig& backup) {
   retention.max_bytes = std::int64_t{backup.max_mib} * 1024 * 1024;
   retention.max_state_bytes = std::int64_t{backup.max_state_mib} * 1024 * 1024;
   retention.keep_states = backup.keep_states;
+  retention.orphan_days = backup.orphan_days;
   return retention;
 }
 
@@ -410,9 +463,91 @@ IsStateBackup StateBackupsOf(const state::Baseline& baseline) {
   };
 }
 
-IsStateBackup SetAsideStateBackupsOf(fs::FileSystem&, const std::string&, std::int64_t,
-                                     const state::Baseline&) {
-  return nullptr;  // #346: stub, so the failing tests compile
+IsStateBackup SetAsideStateBackupsOf(fs::FileSystem& files, const std::string& state_sd_path,
+                                     std::int64_t server_since, const state::Baseline& current) {
+  if (server_since <= 0) return nullptr;
+  const std::size_t slash = state_sd_path.rfind('/');
+  const std::string dir = state_sd_path.substr(0, slash);
+  const std::string prefix = state_sd_path.substr(slash + 1) + ".";
+  // One per set-aside file: from when it was bound, the states it names. A
+  // file naming none still ends the window of the one before it.
+  struct Era {
+    std::int64_t since = 0;
+    std::vector<std::string> states;
+    std::vector<std::string> kept;  ///< of `states`, those no other file names
+  };
+  std::vector<Era> eras;
+  std::vector<std::string> saves;
+  // A save row of any server on the card shadows a group: rom ids are reused
+  // between servers, and a slot can be spelled `state-Game`.
+  const auto add_saves = [&saves](const state::Baseline& baseline) {
+    for (const auto& [key, row] : baseline.rows()) {
+      saves.push_back(GroupKey(row.rom_id, sync::SlotBackupDiscriminator(row.slot), {}));
+    }
+  };
+  add_saves(current);
+  bool any = false;
+  for (const fs::Entry& entry : files.List(dir).entries) {
+    if (entry.is_directory || entry.name.rfind(prefix, 0) != 0) continue;
+    // An interrupted commit's `.tmp` and `.old` are this server's file, not a
+    // server move's (`binding::Archive` never writes either).
+    const std::string_view tail = std::string_view(entry.name).substr(entry.name.size() - 4);
+    if (tail == ".tmp" || tail == ".old") continue;
+    const state::LoadedBaseline loaded = state::LoadBaseline(files.Resolve(dir + "/" + entry.name));
+    // A set-aside file that will not read hides its save rows and its window:
+    // nothing is then known well enough to remove.
+    if (loaded.version == 0) return nullptr;
+    const state::Baseline& set_aside = loaded.value;
+    if (set_aside.bound_since() >= server_since) continue;
+    add_saves(set_aside);
+    Era era;
+    era.since = set_aside.bound_since();
+    for (const auto& [key, row] : set_aside.state_rows()) {
+      era.states.push_back(GroupKey(row.rom_id, sync::StateBackupDiscriminator(row.file_name),
+                                    sync::ExtensionOf(row.file_name)));
+    }
+    std::sort(era.states.begin(), era.states.end());
+    any = any || !era.states.empty();
+    eras.push_back(std::move(era));
+  }
+  if (!any) return nullptr;
+  // A state two set-aside files both name is two servers' (rom ids are
+  // reused), and `keep_states` ranks a state across every file's window: a
+  // newer server's backups would push an older one's newest out. Neither is
+  // named, so each named state's backups are one server's.
+  for (Era& era : eras) {
+    std::vector<std::string> own;
+    for (const std::string& key : era.states) {
+      bool shared = false;
+      for (const Era& other : eras) {
+        shared = shared || (&other != &era &&
+                            std::binary_search(other.states.begin(), other.states.end(), key));
+      }
+      if (!shared) own.push_back(key);
+    }
+    era.kept = std::move(own);
+  }
+  for (Era& era : eras) era.states = std::move(era.kept);
+  std::sort(saves.begin(), saves.end());
+  return [eras = std::move(eras), saves = std::move(saves), server_since](
+             const BackupName& name, std::string_view extension) {
+    if (name.unix_seconds >= server_since ||
+        std::binary_search(saves.begin(), saves.end(),
+                           GroupKey(name.rom_id, name.discriminator, {}))) {
+      return false;
+    }
+    // The file bound last before the backup was taken. Unsorted, and scanned
+    // whole: there are a handful, and a sort costs the image a page.
+    const Era* era = nullptr;
+    for (const Era& each : eras) {
+      if (each.since <= name.unix_seconds && (era == nullptr || each.since > era->since)) {
+        era = &each;
+      }
+    }
+    return era != nullptr &&
+           std::binary_search(era->states.begin(), era->states.end(),
+                              GroupKey(name.rom_id, name.discriminator, extension));
+  };
 }
 
 PruneReport Prune(fs::FileSystem& files, const PruneOptions& options) {
@@ -433,6 +568,15 @@ std::string Describe(const PruneReport& report) {
   if (report.budget_pruned > 0) {
     line += "; " + std::to_string(report.budget_pruned) +
             " of them save-state backups [backup] max_state_mib removed with no other copy known";
+  }
+  if (report.orphan_pruned > 0) {
+    line += "; " + std::to_string(report.orphan_pruned) +
+            " of them save-state backups of a previous server [backup] orphan_days removed with "
+            "no other copy known";
+  }
+  if (report.state_orphans > 0) {
+    line += "; " + std::to_string(report.state_orphans) +
+            " save-state backups left that max_state_mib cannot count";
   }
   if (report.over_cap) line += "; still over the size cap";
   if (report.truncated) line += "; the directory holds more than one listing shows";

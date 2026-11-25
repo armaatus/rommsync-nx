@@ -177,6 +177,7 @@ std::string Header(const Bundle& bundle) {
     Line(&out, "truncated", YesNo(b.truncated));
     // Since boot, and never a floor: it counts removals, not what a listing saw.
     Line(&out, "state_budget_pruned", b.state_budget_pruned);
+    Line(&out, "state_orphans", at_least + std::to_string(b.state_orphans));
   }
 
   out += "\n[crash_reports]\n";

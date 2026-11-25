@@ -1064,7 +1064,7 @@ void Orphans(checks::Checks& c) {
     // 1 + 4, and this server's dropped 4.
     const std::size_t orphans = 22 + 2 - went;
     c.ExpectEq(report.state_orphans, orphans, why + "the orphans left are counted: " + line);
-    c.Expect(line.find("; " + std::to_string(orphans) + " save-state backups no state.db counts") !=
+    c.Expect(line.find("; " + std::to_string(orphans) + " save-state backups left that max_state_mib cannot count") !=
                  std::string::npos,
              why + "and the log says so: " + line);
     if (!off) {
@@ -1121,6 +1121,35 @@ void OrphanNames(checks::Checks& c) {
       backup::SetAsideStateBackupsOf(*files, sync::kStateSdPath, 0, current);
   c.Expect(unbound == nullptr || !unbound(at(9, "state-Old", 800), ".state"),
            "with no server move there is no previous server");
+
+  // Two servers that both had a rom 9 `Shared.state`: `keep_states` would rank
+  // their backups as one state's, so neither file names it.
+  {
+    Sandbox shared_box(c, "prune-orphan-names-shared");
+    state::Baseline one;
+    KnowState(&one, 9, "Shared.state");
+    KnowState(&one, 9, "Old.state");
+    SetAside(shared_box, "one.example", one, kNow - 1000 * kDay);
+    state::Baseline two;
+    KnowState(&two, 9, "Shared.state");
+    SetAside(shared_box, "two.example", two, kNow - 600 * kDay);
+    const std::unique_ptr<fs::FileSystem> shared_files =
+        host::MakeNativeFileSystem(shared_box.root().string());
+    const backup::IsStateBackup shared =
+        backup::SetAsideStateBackupsOf(*shared_files, sync::kStateSdPath, since, current);
+    c.Expect(shared != nullptr && shared(at(9, "state-Old", 800), ".state"),
+             "a state one file alone names is still named");
+    c.Expect(shared != nullptr && !shared(at(9, "state-Shared", 800), ".state") &&
+                 !shared(at(9, "state-Shared", 500), ".state"),
+             "a state two files name is neither's");
+
+    // A set-aside file that will not read hides its saves and its window.
+    shared_box.Write(std::string(sync::kStateSdPath) + ".broken.example", "not a state.db");
+    const backup::IsStateBackup broken =
+        backup::SetAsideStateBackupsOf(*shared_files, sync::kStateSdPath, since, current);
+    c.Expect(broken == nullptr || !broken(at(9, "state-Old", 800), ".state"),
+             "one unreadable set-aside file and nothing is named");
+  }
 }
 
 /// Every power cut of an orphan prune removes a subset of what the whole prune

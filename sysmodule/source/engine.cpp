@@ -2749,6 +2749,12 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   // A backup from before this console synced with this server names another
   // server's rom id, so this one's digests are not its proof (#294).
   options.server_since = bound_since;
+  // A previous server's state backups, by the `state.db` set aside when the
+  // console left it (#346): the orphan bound's, never a name's.
+  if (options.retention.orphan_days > 0) {
+    options.is_previous_state_backup =
+        backup::SetAsideStateBackupsOf(*inputs.files, sync::kStateSdPath, bound_since, stored);
+  }
   const backup::PruneReport report = backup::Prune(*inputs.files, options);
   // A prune that could not read or remove something is asked again next tick,
   // rather than waiting for the next backup to be written.
@@ -2769,12 +2775,15 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
     backup_usage_.truncated = report.truncated;
     // Since boot rather than this prune's (#340). A removal means a backup was
     // found, so it never misses this branch.
-    backup_usage_.state_budget_pruned += static_cast<std::int64_t>(report.budget_pruned);
+    backup_usage_.state_budget_pruned +=
+        static_cast<std::int64_t>(report.budget_pruned + report.orphan_pruned);
+    backup_usage_.state_orphans = static_cast<std::int64_t>(report.state_orphans);
   }
   log::WriteEach(log::Level::kWarn, log::Event::kBackupPruned, report.warnings);
   // A cut listing is logged even with nothing else to say: it is what explains
   // the status screen's `≥` (#323).
-  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap || report.truncated) {
+  if (report.pruned > 0 || report.kept_unique > 0 || report.over_cap || report.truncated ||
+      report.state_orphans > 0) {
     log::Info(log::Event::kBackupPruned, backup::Describe(report));
   }
 }

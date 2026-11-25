@@ -109,7 +109,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
-| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; and, naming `max_state_mib`, how many of them were save-state backups the state budget removed with no other copy | [The SD card is full](#the-sd-card-is-full) |
+| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; and, naming `max_state_mib`, how many of them were save-state backups the state budget removed with no other copy; naming `orphan_days`, how many were a previous server's state backups removed by age; and how many state backups are left that the budget cannot count | [The SD card is full](#the-sd-card-is-full) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
@@ -613,8 +613,8 @@ download.
 state backups hold more than `[backup] max_state_mib` (256 MiB unless you
 changed it), the oldest of them are deleted even though they are the only copy
 — never the newest three of each state (`keep_states`), and never a save
-backup. It is the one place this client deletes a backup without a second copy,
-so `backup.pruned` names it in a clause of its own:
+backup. It is one of the two places this client deletes a backup without a
+second copy (the other is below), so `backup.pruned` names it in a clause of its own:
 
 ```
 31 info backup.pruned 2 of 40 backups pruned, 33554432 bytes freed; 268435456 bytes in 38 left; 2 of them save-state backups [backup] max_state_mib removed with no other copy known
@@ -623,6 +623,20 @@ so `backup.pruned` names it in a clause of its own:
 The status screen shows a **State budget** row — *6 only copies removed* —
 once it has happened since the console started. If you would rather keep every
 state backup and clear them yourself, set `max_state_mib = 0`.
+
+The budget cannot count state backups taken against **a server this console has
+since left**, nor those of a state its `state.db` no longer lists. The first
+kind go once older than `[backup] orphan_days` (180 days), beyond the newest
+three of each state, in a clause naming `orphan_days`; the second kind are
+never deleted, because nothing on the card proves they are not a save's. The
+log counts what is left of both:
+
+```
+31 info backup.pruned 3 of 61 backups pruned, 6291456 bytes freed; 520093696 bytes in 58 left; 3 of them save-state backups of a previous server [backup] orphan_days removed with no other copy known; 21 save-state backups left that max_state_mib cannot count
+```
+
+and the diagnostics bundle's `[backup]` section has the same count as
+`state_orphans`. Those are the `<rom id>-state-…` files to look at first.
 
 If the card is still full, the unique save backups and the newest state backups
 of each state are what is left: copy any you want to keep to a computer, then

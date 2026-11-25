@@ -174,8 +174,8 @@ const char* ToString(OnServerDelete on_server_delete);
 /// days is a month of "I want last week's"; 512 MiB is a few percent of the
 /// smallest card a Switch homebrew setup runs on. None of the three ever
 /// removes the only copy of a backup's bytes -- that is the prune's own rule,
-/// and no setting turns it off. The state budget below is the one exception,
-/// and only ever for a save state's backup.
+/// and no setting turns it off. The state budget and the orphan bound below are
+/// the exceptions, and only ever for a save state's backup.
 inline constexpr int kDefaultBackupKeep = 10;
 inline constexpr int kDefaultBackupKeepDays = 30;
 inline constexpr int kDefaultBackupMaxMib = 512;

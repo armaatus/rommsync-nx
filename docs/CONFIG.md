@@ -40,6 +40,7 @@ keep_days = 30                     ; and every one younger than this; 0 = none b
 max_mib   = 512                    ; the size .backup/ is held to; 0 = no cap
 max_state_mib = 256                ; state backups past this go, other copy or not; 0 = off
 keep_states   = 3                  ; the newest backups of each state max_state_mib never takes
+orphan_days   = 180                ; a previous server's state backups past this go too; 0 = off
 
 ; Platform folder map: RomM platform_fs_slug -> SD folders.
 ; roms   = where downloads land (first entry is the write target)
@@ -527,10 +528,11 @@ At the end of every sync that completed, the sysmodule prunes it:
 | `keep_days` | `30` | every backup younger than this many days, whatever `keep` says; `0` keeps none by age |
 | `max_mib` | `512` | while the directory is still larger than this, older backups go oldest first across every game — but never the newest of a save; `0` is no cap |
 | `max_state_mib` | `256` | the **state budget**: while state backups hold more than this, the oldest state backups go even when no other copy of their bytes exists — never a save's, and never one of the newest `keep_states` of a state; `0` is off |
-| `keep_states` | `3` | the newest this many backups of each state, which `max_state_mib` never removes |
+| `keep_states` | `3` | the newest this many backups of each state, which `max_state_mib` and `orphan_days` never remove |
+| `orphan_days` | `180` | the **orphan bound**: a previous server's state backups older than this many days go even when no other copy of their bytes exists — only those the `state.db` set aside when the console left that server names, never a save's, and never one of the newest `keep_states` of a state; `0` is off |
 
 **A backup is only ever deleted when its bytes are somewhere else** — with one
-exception, `max_state_mib`, below, which only ever applies to save states. RomM holds a save with the same MD5 for that game (every
+pair of exceptions, `max_state_mib` and `orphan_days`, below, which only ever apply to save states. RomM holds a save with the same MD5 for that game (every
 upload is kept there as a version), RomM still holds a state this console last
 synced with the same MD5, or a newer backup of the same save or state holds the
 same bytes. A backup of progress that exists nowhere else — a save whose old
@@ -551,8 +553,8 @@ the server: that backup is the only copy. A console that trades states with
 another every session would grow `.backup/` by one state per download until
 the card filled.
 
-**So state backups have a budget, and it is the one place a backup is deleted
-without a second copy.** `max_state_mib` is on by default: once the state
+**So state backups have a budget, and it is the first of the two places a backup
+is deleted without a second copy.** `max_state_mib` is on by default: once the state
 backups this client can name from `state.db` — a state it has synced, under
 this server — hold more than 256 MiB, the oldest of them go, oldest first, until
 they are back under it. The newest `keep_states` (3) of each state always stay,
@@ -569,6 +571,20 @@ reaches it. Each prune that removed one says so in its `backup.pruned` line, in 
 clause naming `max_state_mib`, and the status screen shows a **State budget** row
 counting them since boot. Set `max_state_mib = 0` to keep every unique state
 backup, as before, and clear them by hand.
+
+**A previous server's state backups are bounded by age instead.** The budget
+cannot count a backup taken against a server this console has since left: its
+rom id is that server's. When `[server] url` moves, the old `state.db` is set
+aside beside the new one as `state.db.<old server>`, and that file still names
+the old server's states. Once such a backup is older than `orphan_days` (180),
+it goes, oldest first, beyond the newest `keep_states` of its state — the
+second and last removal without a second copy, and again never a save's. A
+backup no `state.db` on the card names — one of a state this server's
+`state.db` has dropped, or from a server whose set-aside file is gone — is
+never removed: it cannot be told from a save's backup by its name alone. The
+`backup.pruned` line counts what is left of both kinds that the budget cannot
+reach (*save-state backups left that max_state_mib cannot count*), so a full
+card shows where its space went. Set `orphan_days = 0` to keep them all.
 
 The live save on the card is deliberately not counted as a second copy: it is
 the file the game writes next. A file in `.backup/` this client did not name —

@@ -207,7 +207,10 @@ inline constexpr const char* kServiceName = "rommsync";
 /// **22** since M11-26 (#340), which added `state_budget_pruned` to `Status`'s
 /// `backup` -- a required field, so a v22 overlay reading a v21 sysmodule's
 /// `Status` fails to decode it.
-inline constexpr std::uint32_t kVersion = 22;
+///
+/// **23** since M11-27 (#346), which added `state_orphans` to `Status`'s
+/// `backup` -- required, for the same reason.
+inline constexpr std::uint32_t kVersion = 23;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///
@@ -496,10 +499,11 @@ struct BackupUsage {
   /// than drawing it as the total.
   bool truncated = false;
 
-  /// State backups the state budget (`[backup] max_state_mib`, #340) removed
-  /// since boot with no other copy of their bytes shown: the one removal that is
-  /// not a proof. Since boot rather than the last prune's, because a trade
-  /// removes about one per prune and the row is there to say it happens at all.
+  /// State backups the state budget (`[backup] max_state_mib`, #340) or the
+  /// orphan bound (`orphan_days`, #346) removed since boot with no other copy
+  /// of their bytes shown: the removals that are not a proof. Since boot rather
+  /// than the last prune's, because a trade removes about one per prune and the
+  /// row is there to say it happens at all.
   std::int64_t state_budget_pruned = 0;
 
   /// Left after the last prune: backups under a state's name that no
