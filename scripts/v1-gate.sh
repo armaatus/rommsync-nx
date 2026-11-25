@@ -208,6 +208,15 @@ T
       # every allocation it makes, one child each, judged old-or-new after the
       # death. lazyfs's nightly check on the replay's model (`lazyfs.overwrite`)
       # is not here: it needs Linux and FUSE, and skips anywhere this runs.
+      #
+      # A backup only covers the bytes it copied, so the window either side of
+      # it is evidence too. `execute.late_write`, `execute.stale_fetch` and
+      # `execute.stale_place` are in `^execute\.`; the state and restore paths
+      # name theirs: a write between the backup and the commit stays on the card
+      # (`states.late_write`, `conflicts.late_write`, #270), and one between the
+      # scan and the backup fails the operation rather than leaving the only
+      # copy under `.backup/` (`states.stale_write`, #286; `states.stale_place`,
+      # a placement onto a path the scan found empty, #318).
       cat <<'T'
 ^harness\.backup$
 ^oom\.tick$
@@ -215,7 +224,11 @@ T
 ^states\.overwrite$
 ^states\.keeps_both$
 ^states\.crash$
+^states\.late_write$
+^states\.stale_write$
+^states\.stale_place$
 ^conflicts\.crash$
+^conflicts\.late_write$
 ^tick\.newer_download$
 ^tick\.newer_conflict$
 ^tick\.migrated$
