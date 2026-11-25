@@ -1389,9 +1389,9 @@ class SdEngine : public ipc::Engine, public power::Sink {
 
   /// The server `queue.json` and `play.db` were last held to
   /// (`BindResidentRecords`, #294) -- an identity, compared with
-  /// `config.ini`'s each pass of the worker so the card is read only when the
-  /// URL moved. Written by `Load`, before the worker exists, and then by the
-  /// worker alone.
+  /// `config.ini`'s and the token's each pass of the worker so the card is read
+  /// only when the URL or the paired device moved (#331). Written by `Load`,
+  /// before the worker exists, and then by the worker alone.
   std::string records_server_;
 
   /// When the worker may try again after a binding the card would not settle.

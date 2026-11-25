@@ -33,6 +33,12 @@ std::string_view Trimmed(std::string_view text) {
   return text;
 }
 
+/// An identity's URL: all of it before `#`, which no configured URL holds
+/// (`config.cpp` refuses a fragment) and `InstanceOf` encodes in a device.
+std::string_view UrlOf(std::string_view identity) {
+  return identity.substr(0, identity.find('#'));
+}
+
 }  // namespace
 
 std::string IdentityOf(std::string_view server_url) {
@@ -64,12 +70,24 @@ std::string IdentityOf(std::string_view server_url) {
   return identity;
 }
 
-std::string InstanceOf(std::string_view server_url, std::string_view, std::string_view) {
-  return IdentityOf(server_url);
+std::string InstanceOf(std::string_view server_url, std::string_view paired_url,
+                       std::string_view device_id) {
+  std::string identity = IdentityOf(server_url);
+  if (!device_id.empty() && !identity.empty() && IdentityOf(paired_url) == identity) {
+    identity += '#';
+    // No `#` after this one, so `UrlOf` finds it.
+    for (const char byte : IdentityOf(device_id)) {
+      identity += byte == '#' ? std::string_view("%23") : std::string_view(&byte, 1);
+    }
+  }
+  return identity;
 }
 
 bool SameServer(std::string_view recorded, std::string_view current) {
-  return recorded == current;
+  const std::string_view url = UrlOf(recorded);
+  // The same URL, and one side's whole identity is that URL: it names no device.
+  return recorded == current ||
+         (url == UrlOf(current) && (url.size() == recorded.size() || url.size() == current.size()));
 }
 
 std::string ArchiveSuffix(std::string_view identity) {
@@ -139,6 +157,9 @@ Archived Archive(const std::string& path, std::string_view identity) {
 }
 
 std::uint64_t TagOf(std::string_view identity) {
+  // The URL's alone: `server_tag_` is known before the token is, and rows
+  // tagged before #331 carry the URL's.
+  identity = UrlOf(identity);
   if (identity.empty()) {
     return 0;
   }
@@ -169,11 +190,14 @@ Rebound BindRecords(const std::string& marker, const std::vector<std::string>& r
     return rebound;
   }
   const std::string current(identity);
-  if (read == io::BoundedRead::kOk && Trimmed(text) == current) {
+  const bool same = read == io::BoundedRead::kOk && SameServer(Trimmed(text), current);
+  // Rewritten only to name a device it did not (#331): a console between
+  // pairings cannot tell, and must not forget the one it knew.
+  if (same && (Trimmed(text) == current || UrlOf(current).size() == current.size())) {
     rebound.bound = true;
     return rebound;
   }
-  if (read != io::BoundedRead::kMissing) {
+  if (!same && read != io::BoundedRead::kMissing) {
     // Another server's, or a marker that names none: the records were written
     // against something that is not this server.
     const std::string old(Trimmed(read == io::BoundedRead::kOk ? text : std::string()));

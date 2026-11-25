@@ -871,6 +871,13 @@ the old server starts its history afresh too, and the set-aside files are there
 for a person to look at. A save you kept on the card after deleting it in the
 old RomM (`on_server_delete = keep`) is offered to the new one.
 
+The same happens with the `url` unchanged when RomM was reinstalled behind it:
+the new install does not know this console's pairing, so you pair again, and
+the device RomM hands back is a new one. The set-aside name then carries the
+old device too, as far as 64 characters allow
+(`state.db.http-192.168.1.5-8080-<device id>`). Upgrading RomM in place keeps
+the pairing and the history.
+
 If the write itself cannot happen — no card, a full one — the answer says so and
 your settings are unchanged: the file is committed with the same two-rename
 write the token and device records use, so an interrupted one leaves your

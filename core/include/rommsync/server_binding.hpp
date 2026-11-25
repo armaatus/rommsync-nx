@@ -11,12 +11,19 @@
 //
 // ## What a server is
 //
-// Its normalised `[server] url`, scheme and host lower-cased. RomM 5.4 exposes
-// no instance id -- `GET /api/heartbeat` carries a version and the server's
-// configuration, nothing that names the installation -- so two RomMs behind one
-// URL are one server to this client, and one RomM reached by two URLs is two.
-// The second costs a first sync, which backs up before it overwrites; the first
-// is the one case this cannot see.
+// Its normalised `[server] url`, scheme and host lower-cased -- and, once the
+// console has paired, `#` and the device id pairing handed back (`InstanceOf`,
+// #331). RomM 5.4 exposes no instance id -- `GET /api/heartbeat` carries a
+// version and the server's configuration, nothing that names the installation
+// -- but a device id is a `uuid4` RomM's database draws when pairing creates
+// the row. An upgrade in place keeps the database and so the id; a reinstall
+// behind the same URL refuses the old token, the console pairs again, and the
+// id it gets is another. A record with no device -- bound before #331, or by a
+// console between pairings -- is the URL's (`SameServer`).
+//
+// One RomM reached by two URLs is still two: a URL change discards the token,
+// so no device is known until the re-pair, and the cost is a first sync, which
+// backs up before it overwrites.
 //
 // ## Two ways a record is bound
 //
@@ -75,7 +82,9 @@ std::string ArchiveSuffix(std::string_view identity);
 
 /// A number for `identity`, for a record that carries its server on every row
 /// (`conflicts::Entry::server`, #317): the first eight bytes of the identity's
-/// MD5, never zero. Zero for an empty identity -- no server.
+/// MD5, never zero. Zero for an empty identity -- no server. Of the URL alone,
+/// any device dropped: a row's tag is known before the token is, and rows
+/// tagged before #331 carry the URL's.
 std::uint64_t TagOf(std::string_view identity);
 
 /// What `Archive` did.

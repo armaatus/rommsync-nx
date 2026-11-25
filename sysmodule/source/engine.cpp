@@ -618,8 +618,10 @@ void SdEngine::Load(const std::string& config_dir) {
   // console was off has them for another (#294). Here and not in
   // `AdoptConfigLocked`, which `SetConfig` also runs, on the IPC thread: a
   // change made there is the worker's to apply (`RunWorker`), because `play_`
-  // is the worker's alone.
-  BindResidentRecords(binding::IdentityOf(ConfigSnapshot()->server.url));
+  // is the worker's alone. With the device the token names, so a RomM
+  // reinstalled behind the same URL is another server once paired (#331).
+  BindResidentRecords(
+      binding::InstanceOf(ConfigSnapshot()->server.url, token_.server_url, token_.device_id));
 }
 
 void SdEngine::UsePairingBackend(PairingBackend backend) {
@@ -1429,7 +1431,9 @@ void SdEngine::RunWorker() {
     // play buffer is this thread's alone. Ahead of everything below, because a
     // drain or a tick is what would read them against the new server. The
     // URL is compared in memory, so a pass with nothing changed reads nothing.
-    if (const std::string server = binding::IdentityOf(ConfigSnapshot()->server.url);
+    // A pairing landing moves it too: the device is part of it (#331).
+    if (const std::string server = binding::InstanceOf(ConfigSnapshot()->server.url,
+                                                       token_.server_url, token_.device_id);
         !server.empty() && server != records_server_ && clock_->Steady() >= records_retry_due_) {
       lock.unlock();
       BindResidentRecords(server);
@@ -2053,10 +2057,13 @@ namespace {
 /// changes, because the change is as often a hand edit with the console off,
 /// and because a tick still running against the old server when the overlay
 /// moves it writes its rows bound to that server: the next one sets them aside.
-state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config) {
+/// The server is the URL and the device `token` names (#331), so a RomM
+/// reinstalled behind the URL, which the console pairs with afresh, is another.
+state::LoadedBaseline LoadBaselineFor(const std::string& path, const config::Config& config,
+                                      const auth::StoredToken& token) {
   state::LoadedBaseline loaded = state::LoadBaseline(path);
   const std::string rebound = state::BindToServer(
-      &loaded, path, binding::IdentityOf(config.server.url),
+      &loaded, path, binding::InstanceOf(config.server.url, token.server_url, token.device_id),
       static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
                                     std::chrono::system_clock::now().time_since_epoch())
                                     .count()));
@@ -3029,7 +3036,7 @@ SdEngine::TickScan SdEngine::ScanForTick(const TickInputs& inputs,
   fs::FileSystem& files = *inputs.files;
   TickScan found;
   found.baseline_path = files.Resolve(sync::kStateSdPath);
-  found.loaded = LoadBaselineFor(found.baseline_path, config);
+  found.loaded = LoadBaselineFor(found.baseline_path, config, inputs.token);
   found.bound_since = found.loaded.value.bound_since();
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -3412,7 +3419,8 @@ sync::StateSyncReport SdEngine::RunStatesHalf(const TickInputs& inputs,
   // own copy on the way out, and `SyncStates` advances the same file. Reading
   // it back is one small file and is what keeps the two halves from writing
   // over each other's rows.
-  state::Baseline baseline = LoadBaselineFor(found.baseline_path, *inputs.config).value;
+  state::Baseline baseline =
+      LoadBaselineFor(found.baseline_path, *inputs.config, inputs.token).value;
   sync::StateSyncOptions state_options;
   state_options.backup_dir = sync::kBackupDir;
   state_options.cancel = inputs.cancel.get();

@@ -4449,8 +4449,10 @@ int DrainRepointed(http::HttpClient& client, const std::string& base) {
   // may name another game there. Set aside with the queue it was in.
   c.ExpectEq(console.Status().queue_depth, std::int64_t{0},
              "and the queue, the old server's rom ids, is not carried to the new one");
-  c.Expect(console.sandbox.Exists("/config/rommsync/queue.json." +
-                                  binding::ArchiveSuffix(binding::IdentityOf(base))),
+  // The old server's name, with the device it was paired as since #331.
+  c.Expect(console.sandbox.Exists(
+               "/config/rommsync/queue.json." +
+               binding::ArchiveSuffix(binding::InstanceOf(base, base, fixture.device_id))),
            "it is set aside under the old server's name");
   return c.failures();
 }

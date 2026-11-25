@@ -197,9 +197,20 @@ own header, because the tick that writes it can still be running against the
 old one; `queue.json` and `play.db` are resident, so a marker beside them,
 `server.id`, records theirs, and their formats did not move. A card with no
 record of its server — every card from before #294 — is adopted by the one it
-is configured for. A server is its URL (`binding::IdentityOf`): RomM 5.4
-exposes no instance id, so one RomM reached by two URLs costs a first sync,
-and two RomMs behind one URL are not told apart. The backup prune
+is configured for. A server is its URL and, once paired, the device RomM
+minted for this console (`binding::InstanceOf`, #331): RomM 5.4 exposes no
+instance id, but a device id is a `uuid4` its database draws when pairing
+creates the row, so an upgrade in place keeps it and a reinstall behind the
+same URL — whose fresh database refuses the old token, so the console pairs
+again — hands back another, and the records are set aside as for any other
+server. A record bound by URL alone, from before #331, is adopted by the
+device that pairs first — so a reinstall made before the client was upgraded
+goes unseen — and an older build reads a record naming a device as another
+server's and sets it aside; a console between pairings decides nothing. One RomM reached by two
+URLs is still two servers: a URL change discards the token, so nothing knows
+the device until the re-pair, and the cost is a first sync. Pairing as another
+RomM user, or after the device was deleted in RomM, is a new device too, and
+costs the same. `conflicts.db`'s tags stay the URL's (`TagOf`). The backup prune
 (`backup::PruneOptions::server_since`) never removes a backup older than the
 binding on the new server's word.
 

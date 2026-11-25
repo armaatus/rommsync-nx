@@ -82,7 +82,9 @@
 //
 // A rom id means something only on the RomM that issued it, so the rows are
 // held to that server: the header names it, `rommsync-state 4 <bound since>
-// <server>` (`binding::IdentityOf`), and `BindToServer` sets aside a file that
+// <server>` (`binding::InstanceOf`: the URL, and since #331 `#<device>`; a
+// header with no device is the URL's and is adopted by the device, with no
+// format change), and `BindToServer` sets aside a file that
 // names another rather than read its rows -- a `deleted_on_server` mark from
 // the old server would otherwise keep a save from ever reaching the new one.
 // rc2's version 3 is the same rows with no server named; it is read, and
