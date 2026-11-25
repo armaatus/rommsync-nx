@@ -75,12 +75,14 @@ IMAGE_BUDGET=$(( 2304 * 1024 ))
 # 24 KiB over it, so a small change does not have to restate it. Raised one page,
 # from 2,342,912, when #340's state budget (+2,432 bytes of text) and #341
 # (+~256) together took the text segment past 0x91000 to 0x91100: the
-# maintainer accepted the page rather than a second trim (#338). Growth past it
+# maintainer accepted the page rather than a second trim (#338). Raised another
+# page, from 2,347,008, when #332's aside count took the text from 0x91e40 to
+# 0x92040, 64 bytes past 0x92000 (#338 again). Growth past it
 # is the same decision as the image budget's, and moving it is an edit here and
 # in the two documents `ctest -R heap.footprint` holds to it. A footprint that
 # falls more than RESIDENT_SLACK under it fails too: then the number the docs
 # give the M12 co-resident run is no longer what the build costs.
-RESIDENT_FOOTPRINT=$(( 2347008 ))
+RESIDENT_FOOTPRINT=$(( 2351104 ))
 RESIDENT_SLACK=$(( 64 * 1024 ))
 # One page: a thread's TLS slot is 0x200 bytes, eight to a page, and the main
 # thread, the pairing thread, the worker and the PSC watcher are four.

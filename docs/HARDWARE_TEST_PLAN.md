@@ -624,7 +624,7 @@ module and nx-ovlloader at 4 MB. Read `svcGetResourceLimitCurrentValue` on the
 System limit before and after enabling `sys-rommsync`. Play a game for an hour
 with sync on a short interval.
 
-**Pass.** The delta is within the resident footprint of 2,347,008 bytes
+**Pass.** The delta is within the resident footprint of 2,351,104 bytes
 ([DEVELOPMENT.md](DEVELOPMENT.md#what-the-process-costs-the-pool),
 `scripts/image-budget.sh`); every module keeps working; no fatal (M11-12, #296).
 

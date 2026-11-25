@@ -333,10 +333,11 @@ whole life, measured off the linked image in `devkitpro/devkita64:20260219`:
 | the TLS page its four threads share | 4,096 | `TLS_BYTES` |
 | `ssl` | 0 | the `ssl` sysmodule's own process ([M0-1](#m0-1-the-measurement-and-the-decision)) |
 
-**The resident footprint is 2,347,008 bytes (2.24 MiB), what this build
+**The resident footprint is 2,351,104 bytes (2.24 MiB), what this build
 measures.** It was recorded 24 KiB over the build that set it (#296), and raised
 one page from 2,342,912 when #340 and #341 together took the text segment past a
-page boundary (#338). It is one number, and it is held: `switch.builds`
+page boundary, and another from 2,347,008 when #332 did the same (#338). It is
+one number, and it is held: `switch.builds`
 fails when the linked image plus the stack and the TLS page is over it, or more
 than 64 KiB under it -- a number that stopped being a measurement -- and
 `heap.footprint` fails when this page or INSTALL quotes any other. Moving it is

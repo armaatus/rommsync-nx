@@ -56,7 +56,7 @@ you have installed homebrew on a Switch before and have never seen RomM.
   the only supported way to turn `sys-rommsync` on. rommsync-nx does not ship
   its own boot switch.
 - **Room for one more sysmodule.** `sys-rommsync` is built to a resident
-  footprint of at most 2,347,008 bytes (2.24 MiB) for as long as it runs, out of
+  footprint of at most 2,351,104 bytes (2.24 MiB) for as long as it runs, out of
   the memory Atmosphère sets aside for every custom sysmodule together — 7 MB on
   Horizon 21 and 22, an experimental 16 MB on 23.0.0 with Atmosphère 1.12.x —
   shared with nx-ovlloader's overlay heap and anything else you run beside it
