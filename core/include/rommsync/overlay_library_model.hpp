@@ -276,6 +276,7 @@ class LibraryBrowserModel {
   /// asked for again on a fresh cursor -- the old one is ended, because its
   /// place in the list is no longer known -- and an `Enqueue` is not sent again:
   /// it may have landed, and a press the user did not make is not one to send.
+  /// Its row says `kMayHaveBeenQueued` (#344).
   void OnLost();
 
   /// The command did not reach the sysmodule, or its answer could not be read.
@@ -460,8 +461,9 @@ class LibraryBrowserModel {
   /// Push `level` with a fresh id.
   void Push(Level level);
 
-  /// The row for `rom_id` in `level` says *still applying* (#329).
-  void MarkApplying(Level* level, std::int64_t rom_id);
+  /// The row for `rom_id` in `level` says `note`, neutrally: *still applying*
+  /// (#329), or *may have been queued* (#344).
+  void MarkPending(Level* level, std::int64_t rom_id, const char* note);
 
   /// Re-open `level` from the start of the list, catching up to its window
   /// rather than redrawing it: what a reclaimed cursor and a lost page share.
@@ -608,6 +610,15 @@ inline constexpr int kRewindRows = kMaxLoadedRows / 2;
 /// forever would have the overlay asking sixty times a second with nothing to
 /// draw for it. The list ends with the reason on the `kMore` row instead.
 inline constexpr int kMaxEmptyPages = 4;
+
+/// What a row says when its `Enqueue` was answered to nobody (#344).
+///
+/// Not *still applying*: nothing re-reads the queue behind a lost answer, so
+/// that would stand on the row until the screen closed. Not a failure either:
+/// the press may well have landed, and sending it again could queue the rom
+/// twice. So it says what is known -- maybe -- and where the answer is: the
+/// Downloads level, Y on this same screen.
+inline constexpr const char* kMayHaveBeenQueued = "May have been queued -- check Downloads";
 
 /// The sentence a refused `Enqueue` gets, and how it should read.
 ///

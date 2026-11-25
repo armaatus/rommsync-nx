@@ -834,18 +834,18 @@ void LibraryBrowserModel::OnApplying() {
     // "Loading...", and the rows above it are still the library.
     return;
   }
-  MarkApplying(Issued(), enqueueing_);
+  MarkPending(Issued(), enqueueing_, kStillApplying);
 }
 
-void LibraryBrowserModel::MarkApplying(Level* level, std::int64_t rom_id) {
+void LibraryBrowserModel::MarkPending(Level* level, std::int64_t rom_id, const char* note) {
   if (level == nullptr) {
     return;
   }
   for (LibraryRow& row : level->rows) {
     if (row.kind == RowKind::kRom && row.rom_id == rom_id) {
-      // Neutral: the sysmodule is busy, not gone, and the press will land
-      // (#299's sentence). The answer replaces it.
-      row.note = kStillApplying;
+      // Neutral either way: the sysmodule is busy, not gone (#299's sentence),
+      // and a lost answer says nothing about whether the press took.
+      row.note = note;
       row.tone = Tone::kNeutral;
       ++revision_;
       return;
@@ -884,9 +884,10 @@ void LibraryBrowserModel::OnLost() {
       }
       return;
     case Command::Kind::kEnqueue:
-      // Not sent again: it may have landed. The row says it is applying, and a
-      // second press is the user's to make -- a duplicate answers `kQueued`.
-      MarkApplying(level, enqueueing_);
+      // Not sent again: it may have landed. No answer is coming to replace
+      // *still applying*, so the row says so instead (#344), and a second
+      // press is the user's to make -- a duplicate answers `kQueued`.
+      MarkPending(level, enqueueing_, kMayHaveBeenQueued);
       enqueueing_ = 0;
       enqueue_wanted_ = 0;
       return;

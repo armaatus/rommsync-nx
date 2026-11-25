@@ -1316,7 +1316,6 @@ void CheckALateEnqueueSaysApplying(Checks& checks) {
   model.OnEnqueued(1);
   checks.ExpectEq(overlay::ToString(ListRows(model.Render())[0].state),
                   overlay::ToString(overlay::RowState::kQueued), "and queued once it lands");
-
 }
 
 /// An `Enqueue` whose answer went to nobody (#344). Nothing re-reads the queue
@@ -1325,6 +1324,8 @@ void CheckALateEnqueueSaysApplying(Checks& checks) {
 /// it *may* have been queued, neutrally, and where to look -- whether the press
 /// had already been reported late or was lost inside the budget.
 void CheckALostEnqueueMayHaveBeenQueued(Checks& checks) {
+  // Spelled out rather than `overlay::kMayHaveBeenQueued`: the sentence is
+  // what the player reads, and a rewording should have to change it here too.
   const std::string may = "May have been queued -- check Downloads";
   overlay::LibraryBrowserModel model;
   Begin(checks, model, 371);
