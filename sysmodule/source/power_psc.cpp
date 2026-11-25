@@ -11,9 +11,12 @@
 // before the M8-1 gate, never on hardware (sysmodule/AGENTS.md).
 #include <switch.h>
 
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 
+#include "http/lookup_watch.hpp"
 #include "power.hpp"
 #include "rommsync/log.hpp"
 #include "sized_thread.hpp"
@@ -48,6 +51,7 @@ constexpr u32 kDependencies[] = {PscPmModuleId_Fs};
 class PscModule final : public Module {
  public:
   ~PscModule() override {
+    Lookups().Keep(nullptr, nullptr);
     if (!open_) {
       // Nothing was registered, so there is nothing to unregister. Asking anyway
       // would be an IPC on a zeroed `Service`, which answers an error nobody
@@ -76,6 +80,11 @@ class PscModule final : public Module {
       return false;
     }
     open_ = true;
+    // The keeper of the name lookups' deadlines (#335), because this is the one
+    // thread that is always parked in a `waitMulti` and never opens a
+    // connection itself. Autoclear: one wake is one look at `Fire`.
+    ueventCreate(&lookups_, /*autoclear=*/true);
+    Lookups().Keep(&PscModule::WakeForLookups, this);
     return true;
   }
 
@@ -89,11 +98,27 @@ class PscModule final : public Module {
       // Two objects rather than one, so `Stop()` can end this. Nothing on the
       // console calls it -- `main` never leaves its service loop -- but a wait
       // with no way out is a destructor that cannot run, and this class has one.
-      const Result rc = waitMulti(&signalled, UINT64_MAX, waiterForEvent(&module_.event),
-                                  waiterForUEvent(&stop_));
+      //
+      // A third, and a timeout, for the name lookups (#335): `Fire` cancels the
+      // ones past their deadline and says how long until it is owed another
+      // look, and nothing when no lookup is in flight -- so the wait is
+      // unbounded again exactly when there is nothing to keep, a sleep included.
+      const std::optional<LookupWatch::Clock::duration> next =
+          Lookups().Fire(LookupWatch::Clock::now());
+      const u64 timeout =
+          next.has_value()
+              ? static_cast<u64>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(*next).count())
+              : UINT64_MAX;
+      const Result rc = waitMulti(&signalled, timeout, waiterForEvent(&module_.event),
+                                  waiterForUEvent(&stop_), waiterForUEvent(&lookups_));
       if (signalled == 1) {
         // `Stop()`. Nothing failed; the caller is going away.
         return false;
+      }
+      if (signalled == 2 || rc == KERNELRESULT(TimedOut)) {
+        // A lookup was armed, or one fell due. Not PSC: back to `Fire`.
+        continue;
       }
       if (R_FAILED(rc)) {
         Surrender("the sleep watcher's wait failed", rc);
@@ -133,6 +158,11 @@ class PscModule final : public Module {
   void Stop() override { ueventSignal(&stop_); }
 
  private:
+  /// `LookupWatch::Arm`'s wake: back to `Fire`, from whichever thread armed.
+  static void WakeForLookups(void* self) {
+    ueventSignal(&static_cast<PscModule*>(self)->lookups_);
+  }
+
   /// Give up being a PSC module, out loud, and **unregister** on the way.
   ///
   /// The one thing worse than a console that does not know it is sleeping is a
@@ -150,10 +180,14 @@ class PscModule final : public Module {
       pscPmModuleClose(&module_);
       open_ = false;
     }
+    // Nor does this thread keep the lookups' deadlines any more: they are kept
+    // only while a sleep is quiesced, as they were before #335.
+    Lookups().Keep(nullptr, nullptr);
   }
 
   PscPmModule module_{};
   UEvent stop_{};
+  UEvent lookups_{};
   bool open_ = false;
 };
 

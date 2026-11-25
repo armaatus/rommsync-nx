@@ -82,12 +82,25 @@ void CancelLookup(void* handle) {
 /// lookup from the quiescing thread. `ResolveBlocking` reads the token before
 /// it asks, which covers a cancel that landed before the hook was armed.
 ///
-/// **What no console has confirmed** (#43's list): that a handle taken before
-/// the call cancels the call, which is what libnx documents
+/// The token is the lookup's own since #335 (`ConnectTo`): the request's cancel
+/// reaches it, and so does the request's connect timeout, which `LookupWatch`'s
+/// keeper fires through this same hook. A cancel that lands after the token was
+/// read but before `sfdnsres` holds the request may be lost; the watch sends it
+/// again every slice until the lookup returns (`lookup_watch.hpp`).
+///
+/// In libnx 4.12.0 `getaddrinfo` is `sfdnsres` command 6 and `resolverCancel`
+/// command 9, and `resolverGetCancelHandle` makes the handle up on the client
+/// -- a random number -- asking the service for one only when that comes out
+/// zero. So a zero handle is one the service also answered with zero, which
+/// should not happen; it arms nothing, and that lookup ends only when the
+/// resolver answers.
+///
+/// **What no console has confirmed** (#43's list): that command 9 with that
+/// handle cancels the command 6 in flight, which is what libnx documents
 /// (`resolverGetCancelHandle`, "the next resolver command on the current
-/// thread"), and that a cancel landing between the check and the IPC is not
-/// lost. A zero handle -- the request for one failed -- arms nothing, and the
-/// lookup is as cancellable as it was before #290: not at all.
+/// thread") -- on HOS 23, with c-ares behind `sfdnsres`, included (#310) -- and
+/// what a cancel that arrives before the request does. LIFE-03 and LIFE-11
+/// (docs/HARDWARE_TEST_PLAN.md) are where a console answers.
 bool ResolveCancellable(const std::string& host, std::uint32_t* address,
                         const http::CancelToken* cancel) {
   const u32 handle = resolverGetCancelHandle();

@@ -497,6 +497,39 @@ game played entirely between two ticks with no press.
 the borrowed title's -- and `title unknown` only for the game nothing looked at
 (#261). Record each module's title id.
 
+### LIFE-11: A lookup that never answers, cancelled at its deadline and at its first instant
+
+LIFE-03 meets the window #335 asks about only by chance: a cancel that lands
+after the token is read and before `sfdnsres` holds the request names a handle
+the service does not know yet. This scenario goes at both halves on purpose.
+
+**Steps.** NET-03's resolver that never answers, so every lookup of the
+server's name is one `sfdnsres` holds until it is cancelled.
+
+1. **The deadline, no sleep.** **Sync now**, and leave the console awake. Five
+   times.
+2. **The first instant.** Press **Sync now** and the power button in one
+   motion, so the sleep lands as the tick's first lookup is going out rather
+   than seconds into it. Wake after ~5 s. Fifty times. The tick's first request
+   is its lookup, so the quiesce's cancel lands before, at, or just after the
+   request reaches `sfdnsres` -- the window, every time, instead of once in a
+   while.
+
+**Expect.** Step 1: each attempt's `net.offline` line says `timed out` and,
+in its detail, `timed out resolving <host> after <n>ms`, at the request's
+connect timeout -- not `host could not be resolved`, and not minutes later.
+Step 2: nothing, most times.
+
+**Pass.** Step 1: every attempt ends at its connect timeout (10 s unless the
+request sets its own), so `sfdnsres` command 9 with the handle taken before
+command 6 does cancel it. Step 2: every sleep acknowledged within 3 s and **no**
+`power.sleep` line in fifty. A cancel that arrives before the request is sent
+again every 100 ms until the lookup returns (`sysmodule/source/http/lookup_watch.hpp`),
+so a `power.sleep` line here means the re-sent cancel did not land either:
+report it against #335 with the line, the HOS version and how many in fifty. A
+step 1 that runs to the resolver's own end instead is the cancel not working
+at all -- report it against #290; on HOS 23 that is #310's row.
+
 ---
 
 ## SAVE -- saves on the card and on the server
@@ -772,7 +805,7 @@ least one row.
 | `selftest` | PRE-02, CLK-04 |
 | `smoke` | PRE-01, PRE-02, PRE-03, INST-01, INST-02, INST-03, INST-04, INST-05, BOOT-01, BOOT-02, BOOT-03, NET-07, NET-08, LIFE-08, LIFE-09, LIFE-10, SAVE-01, SAVE-02, SAVE-03, SAVE-04, SAVE-05, SAVE-06, SAVE-07, SAVE-08, SAVE-09, SAVE-10, SAVE-11, DBG-01 |
 | `overlay` | OVL-01, OVL-02, INST-06, LIFE-05, LIFE-06, LIFE-07, MEM-03 |
-| `soak` | LIFE-01, LIFE-02, LIFE-03, LIFE-04, LIFE-05, LIFE-06, NET-01, NET-02, NET-03, NET-04, MEM-01, MEM-02, CLK-01, CLK-02, CLK-03, SAVE-05, DBG-01, DBG-02 |
+| `soak` | LIFE-01, LIFE-02, LIFE-03, LIFE-04, LIFE-05, LIFE-06, LIFE-11, NET-01, NET-02, NET-03, NET-04, MEM-01, MEM-02, CLK-01, CLK-02, CLK-03, SAVE-05, DBG-01, DBG-02 |
 | `matrix` | PRE-02, INST-01, INST-02, INST-03, BOOT-01, NET-06, NET-09, MEM-03, OVL-01 |
 | `servers` | NET-05, NET-06, CLK-03 |
 | `beta` | INST-01, INST-02, INST-03, SAVE-01, SAVE-03, SAVE-04, OVL-02, DBG-01 |

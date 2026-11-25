@@ -27,6 +27,7 @@
 // Header-only because `engine.cpp` reaches it too, from nine test targets.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -42,8 +43,9 @@ namespace rommsync::sysmodule {
 inline constexpr std::chrono::milliseconds kLookupResend{100};
 
 /// ...and how many times, so a resolver that ignores every cancel costs the
-/// keeper three seconds of waking -- `kQuiesceBudget` -- rather than a wake
-/// every slice for the rest of the boot, through a sleep.
+/// keeper three seconds of waking rather than a wake every slice for the rest
+/// of the boot, through a sleep. Three seconds is `kQuiesceBudget`, which
+/// `engine.cpp` holds this to: a sleep's quiesce re-sends for no longer.
 inline constexpr int kLookupResends = 30;
 
 class LookupWatch {
@@ -60,34 +62,92 @@ class LookupWatch {
   /// while it has been cancelled and has not been disarmed. -1 when every slot
   /// is taken. `token` must outlive the `Disarm`.
   int Arm(http::CancelToken* token, Clock::time_point deadline) {
-    (void)token;
-    (void)deadline;
+    std::lock_guard<std::mutex> held(mutex_);
+    for (std::size_t i = 0; i < kSlots; ++i) {
+      Slot& slot = slots_[i];
+      if (slot.token != nullptr) continue;
+      slot = Slot{};
+      slot.token = token;
+      slot.deadline = deadline;
+      // Under the lock, so a `Keep(nullptr)` that has returned is never woken.
+      if (wake_ != nullptr) wake_(wake_context_);
+      return static_cast<int>(i);
+    }
     return -1;
   }
 
   /// Stop watching. Once this returns, no `Fire` is still touching the token.
   /// True when it was the deadline that cancelled it.
   bool Disarm(int slot) {
-    (void)slot;
-    return false;
+    if (slot < 0 || static_cast<std::size_t>(slot) >= kSlots) return false;
+    std::lock_guard<std::mutex> held(mutex_);
+    const bool expired = slots_[static_cast<std::size_t>(slot)].expired;
+    slots_[static_cast<std::size_t>(slot)] = Slot{};
+    return expired;
   }
 
   /// Cancel every lookup past its deadline, and re-send the cancel of every
   /// cancelled one that is due. How long until this is next owed a call, or
   /// nothing when no lookup needs it -- the keeper then waits for `Arm`'s wake
   /// alone, and costs nothing.
+  ///
+  /// `Cancel` runs here under this lock, and the token's `Abort` under the
+  /// token's: so this is called holding no lock an `Abort` takes, as any
+  /// `Cancel` is.
   std::optional<Clock::duration> Fire(Clock::time_point now) {
-    (void)now;
-    return std::nullopt;
+    std::lock_guard<std::mutex> held(mutex_);
+    std::optional<Clock::time_point> next;
+    const auto owed = [&next](Clock::time_point at) {
+      next = next.has_value() ? std::min(*next, at) : at;
+    };
+    for (Slot& slot : slots_) {
+      if (slot.token == nullptr) continue;
+      if (!slot.token->canceled()) {
+        if (now < slot.deadline) {
+          owed(slot.deadline);
+          continue;
+        }
+        slot.expired = true;
+        slot.token->Cancel();
+        slot.resend_at = now + kLookupResend;
+      } else if (!slot.resend_at.has_value()) {
+        // Cancelled by somebody else -- a sleep -- a moment ago. That cancel
+        // went out with it; the first re-send is a slice behind it.
+        slot.resend_at = now + kLookupResend;
+      } else if (slot.resends < kLookupResends && now >= *slot.resend_at) {
+        ++slot.resends;
+        slot.token->Cancel();
+        slot.resend_at = now + kLookupResend;
+      }
+      if (slot.resends < kLookupResends) owed(*slot.resend_at);
+    }
+    if (!next.has_value()) return std::nullopt;
+    return *next > now ? *next - now : Clock::duration::zero();
   }
 
   /// `wake(context)` on every `Arm`, so a keeper waiting on `Fire`'s last
   /// answer looks again. One keeper; a null `wake` leaves none, and deadlines
   /// are then kept only while somebody quiesces.
   void Keep(void (*wake)(void*), void* context) {
-    (void)wake;
-    (void)context;
+    std::lock_guard<std::mutex> held(mutex_);
+    wake_ = wake;
+    wake_context_ = context;
   }
+
+ private:
+  struct Slot {
+    http::CancelToken* token = nullptr;
+    Clock::time_point deadline{};
+    /// When the cancel is next sent again; empty until it has been sent once.
+    std::optional<Clock::time_point> resend_at;
+    int resends = 0;
+    bool expired = false;
+  };
+
+  std::mutex mutex_;
+  std::array<Slot, kSlots> slots_{};
+  void (*wake_)(void*) = nullptr;
+  void* wake_context_ = nullptr;
 };
 
 /// The process's lookups. One, because the keeper is one thread.

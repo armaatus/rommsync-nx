@@ -14,8 +14,13 @@
 #include <cstring>
 #include <new>
 
+#include "lookup_watch.hpp"
+
 namespace rommsync::sysmodule {
 namespace {
+
+/// The request's cancel, passed on to the lookup's own token (`ConnectTo`).
+void CancelFollower(void* follower) { static_cast<http::CancelToken*>(follower)->Cancel(); }
 
 /// `connect()` with a deadline, and with the cancel token read every slice. A
 /// blocking connect can hang for the stack's own timeout, and never blocking
@@ -117,12 +122,33 @@ int ConnectTo(const Origin& origin, std::chrono::milliseconds connect_timeout,
   if (inet_pton(AF_INET, origin.host.c_str(), &address.sin_addr) != 1) {
     std::uint32_t resolved = 0;
     const Resolve lookup = resolve != nullptr ? resolve : ResolveBlocking;
-    if (!lookup(origin.host, &resolved, cancel)) {
+    // The lookup runs on a token of its own (#335), so its deadline can cancel
+    // it without cancelling the request: `cancel` is a tick's, and a slow
+    // resolver is a timed-out request, not a tick that was stopped. `cancel`
+    // still reaches it, through `follow`, and the watch cancels it at the
+    // connect timeout -- both through the `Abort` the resolver arms on it.
+    http::CancelToken looking;
+    const http::CancelToken::Abort follow(cancel, CancelFollower, &looking);
+    if (cancel != nullptr && cancel->canceled()) looking.Cancel();
+    const int watched = Lookups().Arm(&looking, LookupWatch::Clock::now() + connect_timeout);
+    const bool found = lookup(origin.host, &resolved, &looking);
+    const bool expired = Lookups().Disarm(watched);
+    if (!found) {
       // A lookup the cancel cut short is not a name that does not exist: the
       // tick ends cancelled, not with a `net.offline` about a working link.
-      const bool canceled = cancel != nullptr && cancel->canceled();
-      *error = canceled ? http::Error::kCanceled : http::Error::kUnresolvedHost;
-      *message = (canceled ? "canceled while resolving " : "could not resolve ") + origin.host;
+      // Nor is one the deadline cut short, which is a resolver that did not
+      // answer in time.
+      if (cancel != nullptr && cancel->canceled()) {
+        *error = http::Error::kCanceled;
+        *message = "canceled while resolving " + origin.host;
+      } else if (expired) {
+        *error = http::Error::kTimeout;
+        *message = "timed out resolving " + origin.host + " after " +
+                   std::to_string(connect_timeout.count()) + "ms";
+      } else {
+        *error = http::Error::kUnresolvedHost;
+        *message = "could not resolve " + origin.host;
+      }
       return -1;
     }
     address.sin_addr.s_addr = resolved;

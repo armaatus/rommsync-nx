@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "http/lookup_watch.hpp"
 #include "rommsync/atomic_file.hpp"
 #include "rommsync/auth.hpp"
 #include "rommsync/auth_gate.hpp"
@@ -1888,9 +1889,22 @@ void SdEngine::Quiesce() {
   // inside `download::Drain` and not inside `sync::RunTick`, so no save byte and
   // no rom byte is on its way to the card. A worker that was never started has
   // nothing to wait for.
-  const bool parked = quiesced_.wait_until(lock, deadline, [this] {
-    return (worker_parked_ || !worker_live_) && !pairing_busy_;
-  });
+  //
+  // In slices, re-sending the cancel of a name lookup that has not returned
+  // (#335): the one `CancelTickLocked` sent may have landed before `sfdnsres`
+  // held the request, and lost. On the console this is the thread that keeps
+  // the lookups' deadlines too, and it is not keeping them while it is here
+  // (`lookup_watch.hpp`).
+  static_assert(kLookupResend * kLookupResends == kQuiesceBudget,
+                "a lookup's cancel is re-sent for as long as a quiesce waits, and no longer");
+  const auto back = [this] { return (worker_parked_ || !worker_live_) && !pairing_busy_; };
+  bool parked = back();
+  while (!parked) {
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    if (now >= deadline) break;
+    Lookups().Fire(now);
+    parked = quiesced_.wait_until(lock, std::min(deadline, now + kLookupResend), back);
+  }
   // Read apart rather than derived from `parked`, because the two are
   // independent and the budget can run out with both of them false. Collapsing
   // them costs the half of the reason that is not reported, in the one line a
