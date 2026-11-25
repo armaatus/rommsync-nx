@@ -620,6 +620,15 @@ inline constexpr int kRewindRows = kMaxLoadedRows / 2;
 /// draw for it. The list ends with the reason on the `kMore` row instead.
 inline constexpr int kMaxEmptyPages = 4;
 
+/// How many runs of rows that are no place -- stepped past, or unreadable --
+/// one level remembers to map its places to the sysmodule's rows (#345).
+///
+/// Bounded for `kMaxLoadedRows`'s reason. Adjacent rows are one run, so a page
+/// this build cannot read at all costs one; a level with more than this many
+/// separate ones is a contract mismatch, and past the last it remembers, its
+/// cursors open at row 0 and read down, as they did before #339.
+inline constexpr std::size_t kMaxRowGaps = static_cast<std::size_t>(ipc::kMaxPageSize);
+
 /// What a row says when its `Enqueue` was answered to nobody (#344).
 ///
 /// Not *still applying*: nothing re-reads the queue behind a lost answer, so

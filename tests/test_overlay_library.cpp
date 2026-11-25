@@ -1635,6 +1635,9 @@ struct LongLibrary {
   /// the browser cannot read and drops.
   int unreadable = 0;
 
+  /// Non-zero: so is every rom whose 1-based number is a multiple of this.
+  int unreadable_every = 0;
+
   /// Non-zero: the rom at this 1-based row is stepped past, as `lists::Service`
   /// steps past a rom too large to send even alone (#248). It is on no page,
   /// and the page after it says it starts a row later (#341).
@@ -1680,7 +1683,8 @@ struct LongLibrary {
         while (open.offset < roms && open.offset + 1 != skipped) {
           ipc::ListItem rom =
               Rom(open.offset + 1, "Rom " + std::to_string(open.offset + 1), 1024);
-          if (open.offset + 1 == unreadable) {
+          if (open.offset + 1 == unreadable ||
+              (unreadable_every > 0 && (open.offset + 1) % unreadable_every == 0)) {
             rom.fields.erase(rom.fields.begin() + 1);
           }
           if (!ipc::AppendIfItFits(&page, std::move(rom))) {
@@ -1966,6 +1970,48 @@ void CheckARomSteppedPastAboveTheWindowKeepsItsPlaces(Checks& checks) {
   const Command press = model.Next();
   checks.Expect(press.kind == Command::Kind::kEnqueue && press.rom_id == drawn,
                 "and A enqueues that rom: " + std::to_string(press.rom_id));
+}
+
+/// Many unreadable roms above the window, each its own run of rows that are no
+/// place. Under `kMaxRowGaps` of them, the rewind still opens at the row its
+/// place maps to; past it, the level opens at row 0 and reads down rather than
+/// open at a row it cannot place (#345). Every row stood on is the rom at its
+/// place both ways.
+void CheckManyUnreadableItemsMapOrReadFromTheTop(Checks& checks) {
+  for (const int every : {40, 20}) {
+    overlay::LibraryBrowserModel model;
+    LongLibrary library;
+    library.roms = 3000;
+    library.unreadable_every = every;
+    // `every - 1` readable roms, then one dropped.
+    const auto rom_at = [every](int place) { return place + 1 + place / (every - 1); };
+    const std::int64_t first = ScrollToRow2000(checks, model, library);
+    const int from = static_cast<int>(first) - overlay::kRewindRows;
+    const bool mapped = static_cast<std::size_t>(from / (every - 1)) < overlay::kMaxRowGaps;
+    library.begins = 0;
+    library.nexts = 0;
+    bool consistent = true;
+    const int target = from + overlay::kPrefetchRows;
+    for (int frame = 0; frame < 4000 && model.selected_position() != target; ++frame) {
+      library.Answer(checks, model);
+      if (model.selected_position() > target) {
+        model.MoveSelection(-1);
+      }
+      const int at = model.selected_position();
+      const overlay::LibraryView view = model.Render(0, 0);
+      consistent = consistent && (at < 0 || (view.selected >= 0 &&
+                                             view.rows[static_cast<std::size_t>(view.selected)]
+                                                     .rom_id == rom_at(at)));
+    }
+    const std::string what = "every " + std::to_string(every) + "th rom unreadable";
+    checks.ExpectEq(model.selected_position(), target, what + ": the selection climbed");
+    checks.Expect(consistent, what + ": every row it stood on was the rom at its place");
+    checks.ExpectEq(library.begins, 1, what + ": one ListBegin");
+    checks.Expect(mapped == (every == 40), what + ": the case is the one meant");
+    checks.ExpectEq(library.last_offset,
+                    mapped ? std::int64_t{rom_at(from) - 1} : std::int64_t{0},
+                    what + (mapped ? ": at the row its place maps to" : ": from row 0"));
+  }
 }
 
 /// A rom stepped past above the window moves the row a lost page re-opens at
@@ -2287,6 +2333,7 @@ int main() {
   CheckAnUnreadableItemClimbsBackInOnePage(checks);
   CheckARomSteppedPastAboveTheWindowKeepsItsPlaces(checks);
   CheckALostPageReopensPastARomSteppedPast(checks);
+  CheckManyUnreadableItemsMapOrReadFromTheTop(checks);
   CheckAStepOnARewindKeepsItsPlaces(checks);
   CheckRenderIsASliceOnChange(checks);
   CheckQueueRowUsesEveryPinnedField(checks);
