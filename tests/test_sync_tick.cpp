@@ -333,7 +333,7 @@ void Aside(rig::Checks& checks) {
   const std::map<std::string, std::string> before = Snapshot(sandbox);
   const sync::RecoveryReport report =
       sync::RecoverStaging(*files, {harness::kSavesDir, harness::kBackupDir, "/never/created"},
-                           {"/config/rommsync", "/never/either"});
+                           "/config/rommsync");
 
   checks.ExpectEq(report.aside_left, std::size_t{4},
                   "two beside the save, one in .backup/ and one beside state.db are counted");
@@ -348,6 +348,10 @@ void Aside(rig::Checks& checks) {
   const sync::RecoveryReport plain = sync::RecoverStaging(*files, {harness::kSavesDir});
   checks.ExpectEq(plain.aside_left, std::size_t{2},
                   "a sweep given no count-only folder counts only what it swept");
+  const sync::RecoveryReport missing =
+      sync::RecoverStaging(*files, {harness::kSavesDir}, "/never/either");
+  checks.Expect(missing.warnings.empty() && missing.aside_left == 2,
+                "and a count-only folder that is not there is no warning and no count");
 }
 
 // --- durable ------------------------------------------------------------------

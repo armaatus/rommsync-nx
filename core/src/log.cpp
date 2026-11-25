@@ -375,6 +375,8 @@ const char* ToString(Event event) {
       return "ipc.error";
     case Event::kDiagnostics:
       return "diagnostics.bundle";
+    case Event::kFileAside:
+      return "file.aside";
   }
   return "unknown";
 }

@@ -48,6 +48,19 @@ bool EndsWith(std::string_view text, std::string_view suffix) {
          text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+/// `<file>.old.<n>`, the name `io::CommitStaged` sets a foreign `.old` aside
+/// under (#293): something ending `.old`, a dot, and only digits after it.
+bool IsAside(std::string_view name) {
+  std::size_t digits = name.size();
+  while (digits > 0 && name[digits - 1] >= '0' && name[digits - 1] <= '9') {
+    --digits;
+  }
+  const std::string& old = PreviousSuffix();
+  return digits < name.size() && digits > old.size() + 1 && name[digits - 1] == '.' &&
+         std::char_traits<char>::compare(name.data() + digits - 1 - old.size(), old.data(),
+                                         old.size()) == 0;
+}
+
 void Warn(RecoveryReport* report, std::string line) {
   if (report->warnings.size() < kMaxRecoveryWarnings) {
     report->warnings.push_back(std::move(line));
@@ -68,11 +81,21 @@ void Discard(const std::string& path, const std::string& sd_path, std::size_t* c
 
 RecoveryReport RecoverStaging(fs::FileSystem& files,
                               const std::vector<std::string>& directories,
-                              const std::vector<std::string>& /*count_only*/) {
+                              const std::string& count_only) {
   RecoveryReport report;
-  for (const std::string& directory : directories) {
+  // `count_only` after `directories`, in the one loop: the last pass lists it
+  // for its asides and nothing else (see the header). One loop rather than a
+  // second listing loop, because the sysmodule's text segment has no page to
+  // spare (scripts/image-budget.sh): a second loop measured a page over.
+  const std::size_t swept = directories.size();
+  for (std::size_t at = 0; at <= swept; ++at) {
+    const bool sweep = at < swept;
+    if (!sweep && count_only.empty()) {
+      break;
+    }
+    const std::string& directory = sweep ? directories[at] : count_only;
     const fs::Listing listing = files.List(directory);
-    if (!listing.ok() && listing.error != fs::ListError::kMissing) {
+    if (sweep && !listing.ok() && listing.error != fs::ListError::kMissing) {
       // A missing directory is not worth a line: a save folder a user mapped and
       // never created is a normal card (file_system.hpp), and there is by
       // definition nothing in it to recover. Anything else is, and the entries a
@@ -84,6 +107,13 @@ RecoveryReport RecoverStaging(fs::FileSystem& files,
     }
     for (const fs::Entry& entry : listing.entries) {
       if (entry.is_directory) {
+        continue;
+      }
+      if (IsAside(entry.name)) {
+        ++report.aside_left;
+        continue;
+      }
+      if (!sweep) {
         continue;
       }
       const std::string sd_path = directory + "/" + entry.name;
@@ -130,7 +160,7 @@ RecoveryReport RecoverStaging(fs::FileSystem& files,
         // write. `io::CommitStaged` removes its own on success, so reaching here
         // means even that failed -- one stale file, rarely, against the chance
         // of taking someone's manual backup. The next commit is as careful: it
-        // sets this one aside as `.old.<n>`, a name this sweep never matches.
+        // sets this one aside as `.old.<n>`, which this sweep only counts.
         ++report.previous_left;
         continue;
       }

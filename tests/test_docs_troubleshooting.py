@@ -62,6 +62,9 @@ SECTIONS = [
     "Saves are skipped: nothing matches",
     "The folder map switched saves off",
     "The SD card is full",
+    # #332. `file.aside` is a tag the code writes, and sixteen `.old.<n>` files
+    # stop one file's commits: a failure mode with a fix only a person can make.
+    "Files named .old.1, .old.2 and so on",
     "`config.ini` complaints",
     "The server refused the sync",
     # M10-2 (#228). `server.unsupported` is a tag the code writes, and the remedy

@@ -163,6 +163,9 @@ std::string Header(const Bundle& bundle) {
   // finding of its own -- no prune has finished since boot.
   const ipc::BackupUsage& b = e.backup;
   out += "\n[backup]\n";
+  // The sweep's count (#332), not the prune's: there whether or not a prune
+  // has measured anything.
+  Line(&out, "aside_files", b.aside_files);
   if (!b.measured) {
     Line(&out, "measured", "no (not measured yet: no prune has finished since boot)");
   } else {

@@ -5733,6 +5733,10 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
   // `state.db` at all names no server for its backups, and none of them would
   // be this server's to prove.
   console.sandbox.Write("/config/rommsync/state.db", "rommsync-state 3\n");
+  // #332: two records' `.old` files a commit set aside, which the tick's sweep
+  // counts -- the records' folder is listed for them alone -- and never touches.
+  console.sandbox.Write("/config/rommsync/queue.json.old.1", "an older queue\n");
+  console.sandbox.Write("/config/rommsync/play.db.old.2", "an older play.db\n");
 
   auth::StoredToken token;
   token.server_url = base;
@@ -5774,6 +5778,15 @@ int BackupPruned(http::HttpClient& client, const std::string& base) {
              "one of them kept only because it is the only copy");
   c.Expect(!status.backup.over_cap, "and with no cap, nothing is over it");
   c.Expect(!status.backup.truncated, "and one listing held the whole directory (#323)");
+
+  // #332: the sweep's count reaches the status and the log, and the files stay.
+  c.ExpectEq(status.backup.aside_files, std::int64_t{2},
+             "the two set-aside records are counted in the status");
+  c.Expect(Logged(log, "file.aside"), "and the log says so:" + Rendered(log));
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/queue.json.old.1"),
+             std::string("an older queue\n"), "and neither is touched");
+  c.ExpectEq(console.sandbox.Read("/config/rommsync/play.db.old.2"),
+             std::string("an older play.db\n"), "...either of them");
 
   harness::DeleteSave(client, base, fixture, uploaded.id);
   harness::DeleteDevice(client, base, fixture, device_id);

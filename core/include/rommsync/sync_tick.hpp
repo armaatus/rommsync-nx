@@ -108,8 +108,9 @@ struct RecoveryReport {
   /// `<file>.old.<n>`: a `.old` a later commit set aside rather than remove
   /// (#293), in a swept folder or a count-only one. **Counted and never
   /// touched** (#332), for `previous_left`'s reason -- one may be a player's own
-  /// file. Counted because once a file has all sixteen (`io::CommitStaged`)
-  /// every later commit to it fails, and nothing else says why.
+  /// file. Counted because once one file has all sixteen (`io::CommitStaged`)
+  /// every later commit to it fails: a total cannot say which file, but a
+  /// count that is not zero is what sends someone to look.
   std::size_t aside_left = 0;
 
   /// Leftovers the card would not let go of, and directories that would not
@@ -148,13 +149,13 @@ struct RecoveryReport {
 /// directories nothing else writes to is the whole reason this takes a list
 /// rather than deciding for itself.
 ///
-/// `count_only` are listed for `aside_left` and nothing else: no file in them is
-/// removed or renamed, and a listing that fails is not a warning. That is how
-/// `/config/rommsync` is counted (#332) without being swept -- its records'
-/// commits set `.old` files aside exactly as a save's do.
+/// `count_only`, when not empty, is listed for `aside_left` and nothing else:
+/// no file in it is removed or renamed, and a listing that fails is not a
+/// warning. That is how `/config/rommsync` is counted (#332) without being
+/// swept -- its records' commits set `.old` files aside exactly as a save's do.
 RecoveryReport RecoverStaging(fs::FileSystem& files,
                               const std::vector<std::string>& directories,
-                              const std::vector<std::string>& count_only = {});
+                              const std::string& count_only = {});
 
 /// How a tick ended, as the thing that schedules the next one needs it.
 ///
@@ -296,6 +297,11 @@ struct TickOptions {
   /// otherwise -- it stops with `TickOutcome::kRescanNeeded` -- but stopping
   /// costs a tick that scanning in the right order does not.
   std::vector<std::string> recover_dirs;
+
+  /// Listed for `RecoveryReport::aside_left` and nothing else
+  /// (`RecoverStaging`'s `count_only`, #332): the records' folder, which is
+  /// not swept. Empty is none.
+  std::string aside_dir;
 
   /// Create `execute.backup_dir` on entry if it is not there.
   ///

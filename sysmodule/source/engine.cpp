@@ -3175,6 +3175,8 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
     }
   }
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
+  // Counted for `.old.<n>` only, never swept, for the reason above (#332).
+  options.aside_dir = kConfigSdDir;
   // The scan's records go here, before the plan arrives: everything the rest of
   // the tick reads of them is in `reported`, `targets` and the options above,
   // and held to the end they were a third copy of every save beside the plan --
@@ -3234,6 +3236,25 @@ sync::TickResult SdEngine::RunSavesHalf(const TickInputs& inputs,
                                         found->reported, found->targets,
                                         std::move(found->loaded.value), *options);
   ObserveAnswer(tick.answer);
+  // The sweep's `.old.<n>` count, for `Snapshot` and the diagnostics bundle
+  // (#332). A cancel can come before the sweep, whose zero would be no count.
+  if (tick.outcome != sync::TickOutcome::kCanceled) {
+    const auto aside = static_cast<std::int64_t>(tick.recovered.aside_left);
+    std::int64_t was = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      was = backup_usage_.aside_files;
+      backup_usage_.aside_files = aside;
+    }
+    // Outside the lock, because a sink writes to the card; and when the count
+    // grows rather than every tick, because the log keeps only its tail.
+    if (aside > was) {
+      log::Warn(log::Event::kFileAside,
+                std::to_string(aside) +
+                    " files named <file>.old.<n> are set aside; at 16 for one file its commits "
+                    "fail (docs/TROUBLESHOOTING.md)");
+    }
+  }
   const std::vector<std::int64_t>& fresh = found->fresh;
   if (tick.totals.plans > 0 && tick.outcome != sync::TickOutcome::kCanceled && !fresh.empty()) {
     // Asked for, and done -- unless it was asked again for, or a plan never

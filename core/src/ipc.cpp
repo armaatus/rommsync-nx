@@ -854,6 +854,7 @@ std::string EncodeStatus(const Status& status) {
   AppendBool(&out, "truncated", status.backup.truncated);
   AppendInteger(&out, "state_budget_pruned", status.backup.state_budget_pruned);
   AppendInteger(&out, "state_orphans", status.backup.state_orphans);
+  AppendInteger(&out, "aside_files", status.backup.aside_files);
   out += '}';
   AppendKey(&out, "download");
   out += '{';
@@ -909,7 +910,8 @@ Decoded<Status> DecodeStatus(std::string_view text) {
         !ReadBool(*backup, "truncated", &out->backup.truncated, error) ||
         !ReadInteger(*backup, "state_budget_pruned", &out->backup.state_budget_pruned, 0,
                      kMaxCount, error) ||
-        !ReadInteger(*backup, "state_orphans", &out->backup.state_orphans, 0, kMaxCount, error)) {
+        !ReadInteger(*backup, "state_orphans", &out->backup.state_orphans, 0, kMaxCount, error) ||
+        !ReadInteger(*backup, "aside_files", &out->backup.aside_files, 0, kMaxCount, error)) {
       return;
     }
 

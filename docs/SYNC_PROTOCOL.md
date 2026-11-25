@@ -1501,6 +1501,7 @@ no cleanup got to run — `sync::RecoverStaging`, over the save folders and
 | `<save>.tmp.part` | a download the process died during | removed. `DownloadTarget::resume` is false for a save, so nothing in it is worth keeping and the next tick refetches |
 | `<save>.tmp` | a download whose body ended and whose commit did not | **removed, not committed.** See below |
 | `<save>.old` | an interrupted `io::CommitStaged` | renamed back when `<save>` is missing — it is then the only copy of the save. When `<save>` *is* there the commit finished, and the file is counted and **left alone**: a `Game.srm.old` a human made by hand has exactly that shape, and this sweep does not delete files it did not write. The next commit into `<save>` does not either: it renames it to `<save>.old.<n>`, which this sweep never matches (#293) |
+| `<file>.old.<n>` | a commit that found a `.old` it did not write (#293) | **counted and never touched** (#332): it may be a user's own file. Once one file has all sixteen names, every commit to it fails, so the count is logged as `file.aside` when it grows and carried as `Status.backup.aside_files` into the diagnostics bundle (and the refused commit itself is a `save.failed` line). Counted in `/config/rommsync` too, which is listed for this and nothing else (`RecoverStaging`'s `count_only`) |
 | `.backup/<rom_id>-<slot>-<ts>.<ext>` | any overwrite | never touched. A backup is never garbage: it is the copy M7-1 restores from, including one written for an overwrite that then failed |
 
 **A `<save>.tmp` is discarded rather than finished, and an earlier revision of
@@ -1525,7 +1526,8 @@ read, so a sweep adds nothing; and the overlay writes `config.ini` from another
 thread (M5-3), where removing a `.tmp` between that write and its rename would
 cost a setting the user had just changed. `RecoverStaging` takes the list of
 directories rather than deciding for itself precisely so a caller can keep to the
-ones nothing else writes.
+ones nothing else writes. It is listed only to count `<file>.old.<n>` (#332),
+which removes and renames nothing.
 
 The sweep runs *before* the network, and it is right to run it on a tick that
 turns out to be offline: it only removes litter and puts back a save an

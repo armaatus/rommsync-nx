@@ -210,7 +210,10 @@ inline constexpr const char* kServiceName = "rommsync";
 ///
 /// **23** since M11-27 (#346), which added `state_orphans` to `Status`'s
 /// `backup` -- required, for the same reason.
-inline constexpr std::uint32_t kVersion = 23;
+///
+/// **24** since #332, which added `aside_files` to `Status`'s `backup` --
+/// required, for the same reason.
+inline constexpr std::uint32_t kVersion = 24;
 
 /// The ceiling on one encoded request and on one encoded response.
 ///

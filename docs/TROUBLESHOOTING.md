@@ -117,6 +117,7 @@ and a log is not worth it. A save is never in that position; see
 | `net.tls_clock` | a TLS failure the console's clock is the likely cause of | [The console's clock is wrong](#the-consoles-clock-is-wrong) |
 | `ipc.error` | the service the overlay talks to met a kernel error, dropped the overlay's connections and carried on — or, after several in a row, stopped | [The overlay's connection failed](#the-overlays-connection-failed) |
 | `diagnostics.bundle` | the diagnostics file was written, and where — or why the card refused it | [What to attach to a bug report](#what-to-attach-to-a-bug-report) |
+| `file.aside` | files named `<file>.old.<n>` are on the card, and how many — written when the count grows | [Files named .old.1, .old.2 and so on](#files-named-old1-old2-and-so-on) |
 
 The overlay shows the end of the log under **Settings → Log**, read off the
 sysmodule over IPC — `GetLog`, command 16 in
@@ -658,6 +659,53 @@ counting only what was listed, and `backup.pruned` ends with "the directory
 holds more than one listing shows". The diagnostics bundle says the same:
 *at least* before each count, and `truncated = yes`.
 Clearing out old backups by hand, as above, brings it back under.
+
+---
+
+## Files named .old.1, .old.2 and so on
+
+**Symptom.** Files such as `Game.srm.old.1` or `state.db.old.2` appear beside
+your saves, in `.backup/` or in `sdmc:/config/rommsync/`, and stay there. Or one
+save, or the sync baseline, stops being written at all.
+
+**Log line.**
+
+```
+12 warn file.aside 3 files named <file>.old.<n> are set aside; at 16 for one file its commits fail (docs/TROUBLESHOOTING.md)
+13 error save.failed download rom 1234, slot autosave: the verified bytes could not be put in place: sdmc:/retroarch/saves/Game.srm.old: is not this commit's to remove, and every name to set it aside under is taken
+```
+
+**What is happening.** Every file this client writes — a save, `state.db`,
+`token.dat`, `queue.json` — is written beside itself first and then swapped in,
+with the previous version parked as `<file>.old` for an instant and deleted
+once the swap is done. If that delete fails, or you made a `<file>.old` of your
+own, the next write finds a `.old` it did not make. It never deletes one it did
+not make — it could be your own copy — so it renames it to the first free name
+from `<file>.old.1` to `<file>.old.16` and carries on.
+
+The client never deletes these files. Each sync of your saves counts them
+before it starts: `file.aside` gives the count when it grows, and the
+diagnostics bundle's `[backup]` section has the last count as `aside_files` —
+in the save folders, `.backup/` and `sdmc:/config/rommsync/` together (zero
+until the first sync since boot). Once **all sixteen** names are taken for one
+file, every later write to that file fails with the second line above — for a
+save the save keeps the bytes it had, and for `state.db` the baseline is not
+stored — until you make room.
+
+**The fix.** Look at the files by hand. Each `.old.<n>` is an earlier version
+of the file it is named after (or a copy you made yourself):
+
+- Beside a save, it is a previous version of that save. Copy any you want to
+  keep to a computer; the save's backups in `.backup/` are separate and the
+  **Conflicts** screen restores from those, not from these.
+- Beside `state.db`, `queue.json` or `play.db`, it is an older copy of the
+  client's own record and is safe to delete.
+- Beside `token.dat` or `device.dat`, it is an older credential: delete it, and
+  never attach it to a bug report.
+
+Deleting `.old.<n>` files is always safe for the client: nothing reads them.
+Do not delete the plain `<file>.old` while `<file>` itself is missing — that one
+is the only copy, and the next sync puts it back.
 
 ---
 
