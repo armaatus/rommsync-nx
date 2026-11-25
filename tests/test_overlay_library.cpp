@@ -1297,7 +1297,7 @@ void CheckALostPageReopensTheLevel(Checks& checks) {
 }
 
 /// An `Enqueue` out past the budget says so on its row, and the answer that
-/// follows replaces it. One that is lost is not sent again: it may have landed.
+/// follows replaces it.
 void CheckALateEnqueueSaysApplying(Checks& checks) {
   overlay::LibraryBrowserModel model;
   Begin(checks, model, 361);
@@ -1317,13 +1317,47 @@ void CheckALateEnqueueSaysApplying(Checks& checks) {
   checks.ExpectEq(overlay::ToString(ListRows(model.Render())[0].state),
                   overlay::ToString(overlay::RowState::kQueued), "and queued once it lands");
 
+}
+
+/// An `Enqueue` whose answer went to nobody (#344). Nothing re-reads the queue
+/// behind it, so "Still applying..." would stand on the row for as long as the
+/// screen is open; and sending it again could queue the rom twice. The row says
+/// it *may* have been queued, neutrally, and where to look -- whether the press
+/// had already been reported late or was lost inside the budget.
+void CheckALostEnqueueMayHaveBeenQueued(Checks& checks) {
+  const std::string may = "May have been queued -- check Downloads";
+  overlay::LibraryBrowserModel model;
+  Begin(checks, model, 371);
+  Deliver(checks, model, Page(checks, {Platform(1, "Game Boy", "gb", 4, true)}, false), 371,
+          "the platform page");
+  model.Activate();
+  Begin(checks, model, 372);
+  Deliver(checks, model, Page(checks, {Rom(1, "First", 1024), Rom(2, "Second", 2048)}, false),
+          372, "the rom page");
+
+  model.Activate();
+  checks.Expect(model.Next().kind == Command::Kind::kEnqueue, "A sends Enqueue");
+  model.OnApplying();
+  model.OnLost();
+  const overlay::LibraryRow late = ListRows(model.Render())[0];
+  checks.ExpectEq(late.note, may, "a late Enqueue that was lost says it may have been queued");
+  checks.ExpectEq(overlay::ToString(late.tone), overlay::ToString(overlay::Tone::kNeutral),
+                  "neutrally: nothing is known to have gone wrong");
+  for (int frame = 0; frame < 3; ++frame) {
+    checks.Expect(model.Next().kind == Command::Kind::kNone,
+                  "and the Enqueue is not sent a second time");
+  }
+
   model.MoveSelection(1);
   model.Activate();
   checks.Expect(model.Next().kind == Command::Kind::kEnqueue, "A sends Enqueue for the second");
   model.OnLost();
-  checks.ExpectEq(ListRows(model.Render())[1].note, std::string(overlay::kStillApplying),
-                  "a lost one says still applying too");
-  checks.Expect(model.Next().kind == Command::Kind::kNone, "and is not sent again by itself");
+  checks.ExpectEq(ListRows(model.Render())[1].note, may,
+                  "one lost inside the budget says the same");
+  checks.Expect(model.Next().kind == Command::Kind::kNone, "and is not sent again either");
+  model.OnEnqueued(1);
+  checks.ExpectEq(ListRows(model.Render())[1].note, may,
+                  "an answer arriving after it was given up on changes nothing");
 }
 
 /// A page that lands does not move the selection onto a row under it.
@@ -2088,6 +2122,7 @@ int main() {
   CheckACursorForALevelLeftIsClosed(checks);
   CheckALostPageReopensTheLevel(checks);
   CheckALateEnqueueSaysApplying(checks);
+  CheckALostEnqueueMayHaveBeenQueued(checks);
   CheckHeldKeyRepeats(checks);
   CheckHeldScrollKey(checks);
   CheckRow2000IsReachable(checks);
