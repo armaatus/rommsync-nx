@@ -1652,11 +1652,14 @@ class SdEngine : public ipc::Engine, public power::Sink {
   /// Guarded by `mutex_`.
   std::uint64_t server_switches_ = 0;
 
-  /// `binding::TagOf` the server `config.ini` names: what a conflict entry's
-  /// `server` is compared with before Keep local (#317). Set with the bump
-  /// above, in the same slice, so a Keep local reading both never pairs the
-  /// new count with the old server; and again whenever a configuration is
-  /// adopted. Guarded by `mutex_`.
+  /// `binding::TagOf` the server `config.ini` names, with the device the token
+  /// does (`binding::InstanceOf`, #352): what a conflict entry's `server` is
+  /// compared with before Keep local (#317). Set with the bump above, in the
+  /// same slice, so a Keep local reading both never pairs the new count with
+  /// the old server -- on a URL change, and on a pairing that hands back
+  /// another device; and again whenever a configuration is adopted. Not on
+  /// `Unpair`: the next pairing is weighed against the device it left.
+  /// Guarded by `mutex_`.
   std::uint64_t server_tag_ = 0;
 
   /// The held key `LandHeldKeepLocal` is writing now, taken out of

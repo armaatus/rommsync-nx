@@ -210,18 +210,22 @@ server's and sets it aside; a console between pairings decides nothing. One RomM
 URLs is still two servers: a URL change discards the token, so nothing knows
 the device until the re-pair, and the cost is a first sync. Pairing as another
 RomM user, or after the device was deleted in RomM, is a new device too, and
-costs the same. `conflicts.db`'s tags stay the URL's (`TagOf`). The backup prune
+costs the same. The backup prune
 (`backup::PruneOptions::server_since`) never removes a backup older than the
 binding on the new server's word.
 
 `conflicts.db` is not set aside: its entries point at backups on this card, and
 a plain restore of one is a local copy whichever server is configured. Instead
 each entry names the server its tick ran against (`Entry::server`, a digest of
-the identity, #317), and Keep local — which asks that server to take the
-bytes with `overwrite=true` — is refused on an entry from another. Rows written
-before #317 are claimed at boot for the server `server.id` named. A
-`server.url` change also drops every armed or held Keep local, which are
-in-memory keys of the old server's rom ids.
+the identity, URL and device since #352), and Keep local — which asks that
+server to take the bytes with `overwrite=true` — is refused on an entry from
+another, a RomM reinstalled behind the same URL included. Rows written before
+#317 are claimed at boot for the server `server.id` named, and so are rows
+tagged by that server's URL alone, before #352: they are the device the marker
+names, not one the console has paired as since — with #331's limit, that a
+reinstall made before the upgrade is not seen. A `server.url` change, and a
+pairing that hands back another device, also drop every armed or held Keep
+local, which are in-memory keys of the old server's rom ids.
 
 **The two halves on one card.** The IPC contract has its own version
 (`ipc::kVersion`): when it differs the overlay draws "sysmodule unreachable" and

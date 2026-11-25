@@ -82,9 +82,10 @@ std::string ArchiveSuffix(std::string_view identity);
 
 /// A number for `identity`, for a record that carries its server on every row
 /// (`conflicts::Entry::server`, #317): the first eight bytes of the identity's
-/// MD5, never zero. Zero for an empty identity -- no server. Of the URL alone,
-/// any device dropped: a row's tag is known before the token is, and rows
-/// tagged before #331 carry the URL's.
+/// MD5, never zero. Zero for an empty identity -- no server. Of the whole
+/// identity, device and all (#352): a row recorded before a reinstall is not
+/// the RomM paired after it. Rows tagged before #352 carry the URL's, and the
+/// engine gives them to the device `server.id` names (`History::Claim`).
 std::uint64_t TagOf(std::string_view identity);
 
 /// What `Archive` did.

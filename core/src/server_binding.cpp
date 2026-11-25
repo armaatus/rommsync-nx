@@ -157,9 +157,6 @@ Archived Archive(const std::string& path, std::string_view identity) {
 }
 
 std::uint64_t TagOf(std::string_view identity) {
-  // The URL's alone: `server_tag_` is known before the token is, and rows
-  // tagged before #331 carry the URL's.
-  identity = UrlOf(identity);
   if (identity.empty()) {
     return 0;
   }

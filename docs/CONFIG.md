@@ -876,7 +876,10 @@ the new install does not know this console's pairing, so you pair again, and
 the device RomM hands back is a new one. The set-aside name then carries the
 old device too, as far as 64 characters allow
 (`state.db.http-192.168.1.5-8080-<device id>`). Upgrading RomM in place keeps
-the pairing and the history.
+the pairing and the history. The Conflicts list stays, and a plain restore from
+it still works, but Keep local is refused on a conflict recorded before the
+reinstall, and a Keep local still waiting for its upload is dropped when the
+pairing lands: the new install's rom ids are not the old one's.
 
 If the write itself cannot happen — no card, a full one — the answer says so and
 your settings are unchanged: the file is committed with the same two-rename

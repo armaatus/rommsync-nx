@@ -652,7 +652,12 @@ void SdEngine::AdoptConfigLocked(config::LoadResult loaded) {
     previous_config_ = config_;
     config_ = std::make_shared<const config::Config>(std::move(loaded.value));
   }
-  server_tag_ = binding::TagOf(binding::IdentityOf(ConfigSnapshot()->server.url));
+  // With no token, only at boot: after `Unpair` the tag keeps the device it
+  // left, and a URL change has set the new URL's already (#352).
+  if (!token_.device_id.empty() || server_tag_ == 0) {
+    server_tag_ = binding::TagOf(
+        binding::InstanceOf(ConfigSnapshot()->server.url, token_.server_url, token_.device_id));
+  }
   // Before anything can send a request on this configuration (#288).
   if (ca_trust_) {
     ca_trust_(ConfigSnapshot()->server.ca_file);
@@ -703,8 +708,11 @@ void SdEngine::BindResidentRecords(const std::string& server) {
     if (rebound.rebound) {
       owner = rebound.previous.empty() ? std::string_view("unknown:") : rebound.previous;
     }
+    // Rows tagged by the URL alone, before #352, are the owner's device's too:
+    // the device `server.id` named, so a re-pair since gives them nothing.
     std::lock_guard<std::mutex> history(history_mutex_);
-    const conflicts::StoreResult claimed = history_.Claim(binding::TagOf(owner));
+    const conflicts::StoreResult claimed = history_.Claim(
+        binding::TagOf(owner), binding::TagOf(owner.substr(0, owner.find('#'))));
     if (!claimed.ok()) {
       log::Warn(log::Event::kServerVersion,
                 "the conflict history could not be marked with its server (" + claimed.message +
@@ -2684,8 +2692,10 @@ SdEngine::TickRun SdEngine::RunOneTick() {
     return rom == nullptr ? std::string() : rom->fs_name_no_ext;
   };
   // The server this tick runs against, which is the one its rom ids are of
-  // (#317), even if `server.url` moves before it ends.
-  record.server = binding::TagOf(binding::IdentityOf(inputs.config->server.url));
+  // (#317), even if `server.url` moves before it ends -- the device too, so a
+  // RomM reinstalled behind the URL never takes these rows' Keep local (#352).
+  record.server = binding::TagOf(binding::InstanceOf(
+      inputs.config->server.url, inputs.token.server_url, inputs.token.device_id));
 
   SavesTally tally;
   const sync::TickResult tick = RunSavesHalf(inputs, library, &options, &found, record, &tally);
@@ -3795,8 +3805,15 @@ void SdEngine::CommitGrant(const std::shared_ptr<PairingAttempt>& attempt,
     }
     // Once a pairing (#228): the first tick on these credentials asks the
     // server which RomM it is, rather than trusting what an earlier pairing's
-    // server said.
-    ForgetServerLocked(/*different_server=*/false);
+    // server said. Handed another device, it is another RomM (#331) -- one
+    // reinstalled behind the URL -- and the Keep local choices armed against
+    // the last go with it, as a URL change drops them (#352). `Unpair` leaves
+    // the tag alone, so a re-pair as the same device keeps them; a console's
+    // first pairing after an unpaired boot drops any, which sends nothing.
+    const std::uint64_t tag = binding::TagOf(
+        binding::InstanceOf(ConfigSnapshot()->server.url, record.server_url, record.device_id));
+    ForgetServerLocked(/*different_server=*/tag != server_tag_);
+    server_tag_ = tag;
   }
   // A paired console usually has a tick due: `[sync] on_boot` fired long before
   // there were credentials to fire it with -- and a queue too, if a drain gave

@@ -657,11 +657,11 @@ StoreResult History::Append(Entry entry) {
   return result;
 }
 
-StoreResult History::Claim(std::uint64_t server, std::uint64_t /*from*/) {
+StoreResult History::Claim(std::uint64_t server, std::uint64_t from) {
   bool stamped = false;
   if (server != 0) {
     for (Entry& entry : entries_) {
-      if (entry.server == 0) {
+      if (entry.server != server && (entry.server == 0 || entry.server == from)) {
         entry.server = server;
         stamped = true;
       }

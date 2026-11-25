@@ -253,7 +253,8 @@ struct Entry {
   /// zero otherwise.
   std::int64_t archive_save_id = 0;
 
-  /// Which RomM `rom_id` is one of (#317): `binding::TagOf` its identity, or
+  /// Which RomM `rom_id` is one of (#317): `binding::TagOf` its identity --
+  /// URL and, since #352, device (`binding::InstanceOf`) -- or
   /// zero for a row written before #317 that nothing has claimed yet
   /// (`History::Claim`). Keep local asks the server this tag names to take the
   /// bytes, so an entry from another server never arms it (`KeepLocal`); a
@@ -423,6 +424,10 @@ class History {
   /// engine claims them for the server its records were bound to when it first
   /// reads them. Nothing to stamp writes nothing; a zero `server` stamps
   /// nothing. As with `Append`, the stamps stand in memory if the write fails.
+  ///
+  /// Entries stamped `from` are taken too (#352): the engine passes a server's
+  /// URL alone, whose rows -- tagged before tags named the device -- are the
+  /// device's the records were bound to.
   StoreResult Claim(std::uint64_t server, std::uint64_t from = 0);
 
 
