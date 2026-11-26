@@ -45,7 +45,8 @@ no second copy, oldest first, beyond the newest `keep_states` of each state, and
 only those `backup::StateBackupsOf` names from `state.db`. The orphan bound
 (`[backup] orphan_days`, #346) does the same past an age for a previous server's,
 and only those `backup::SetAsideStateBackupsOf` names from the `state.db` a server
-move set aside. Never extend either to a save's backup, never let either take a
+move set aside, or `backup::DroppedStateBackupsOf` names from the states this
+server's `state.db` remembers dropping (#348). Never extend either to a save's backup, never let either take a
 state's newest, and never decide "this is a state's" from a file name alone.
 
 ## Proving it

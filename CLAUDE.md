@@ -18,8 +18,9 @@ idea to a merged PR — this file is the short form of it.
    There are two exceptions, both for save-**state** backups only: past
    `[backup] max_state_mib` (on by default, #340), the oldest beyond the newest
    `keep_states` of each state are deleted with no second copy; and past
-   `[backup] orphan_days` (#346), so is a previous server's, beyond the same
-   newest `keep_states`. Neither ever applies to a save's backup, nor to one of a
+   `[backup] orphan_days` (#346), so is a previous server's, or one of a state
+   this server's `state.db` remembers dropping (#348), beyond the same newest
+   `keep_states`. Neither ever applies to a save's backup, nor to one of a
    state's newest, and each only to backups a `state.db` names as a state's:
    this server's, or one a server move set aside.
    This is the one guarantee standing between a bug and a player's destroyed
