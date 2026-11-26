@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795611685717,
+  "lastUpdate": 1795696636183,
   "repoUrl": "https://github.com/armaatus/rommsync-nx",
   "entries": {
     "soak": [
@@ -1148,6 +1148,43 @@ window.BENCHMARK_DATA = {
           {
             "name": "soak: allocations a round",
             "value": 3594,
+            "unit": "allocations"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Joris de Jong",
+            "username": "armaatus",
+            "email": "jorisxdejong@gmail.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "23eed0c230c8a50c8cdf81860346c4727ac875a9",
+          "message": "Merge pull request #354 from armaatus/fleet/m11i\n\nM11 follow-ups: dropped-state backup bound, Library cursors on close, .old.<n> count (#348 #349 #350)",
+          "timestamp": "2026-11-26T11:27:18Z",
+          "url": "https://github.com/armaatus/rommsync-nx/commit/23eed0c230c8a50c8cdf81860346c4727ac875a9"
+        },
+        "date": 1795696635626,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "soak: held between rounds",
+            "value": 67795,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: a round's peak over that",
+            "value": 60052,
+            "unit": "bytes"
+          },
+          {
+            "name": "soak: allocations a round",
+            "value": 3920,
             "unit": "allocations"
           }
         ]
