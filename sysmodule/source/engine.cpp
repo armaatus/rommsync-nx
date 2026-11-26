@@ -2631,6 +2631,17 @@ void LogTickOutcome(const sync::TickResult& tick, const sync::StateSyncReport& s
              states.failed, tick.totals.stored);
 }
 
+/// Lists `folder` for `.old.<n>` alone, unless the sweep or this list has it
+/// already: a folder listed twice counts each of its asides twice (#350).
+void CountAsideIn(sync::TickOptions* options, const std::string& folder) {
+  for (const std::vector<std::string>* listed : {&options->recover_dirs, &options->aside_dirs}) {
+    if (std::find(listed->begin(), listed->end(), folder) != listed->end()) {
+      return;
+    }
+  }
+  options->aside_dirs.push_back(folder);
+}
+
 }  // namespace
 
 SdEngine::TickRun SdEngine::RunOneTick() {
@@ -2781,10 +2792,12 @@ void SdEngine::PruneBackups(const TickInputs& inputs, const sync::TickResult& ti
   // server's rom id, so this one's digests are not its proof (#294).
   options.server_since = bound_since;
   // A previous server's state backups, by the `state.db` set aside when the
-  // console left it (#346): the orphan bound's, never a name's.
+  // console left it (#346), and this one's of a state it dropped (#348): the
+  // orphan bound's, never a name's.
   if (options.retention.orphan_days > 0) {
     options.is_previous_state_backup =
         backup::SetAsideStateBackupsOf(*inputs.files, sync::kStateSdPath, bound_since, stored);
+    options.is_dropped_state_backup = backup::DroppedStateBackupsOf(stored);
   }
   const backup::PruneReport report = backup::Prune(*inputs.files, options);
   // A prune that could not read or remove something is asked again next tick,
@@ -3207,7 +3220,23 @@ sync::TickOptions SdEngine::SavesOptionsFor(const TickInputs& inputs,
   }
   options.recover_dirs.push_back(std::string(sync::kBackupDir));
   // Counted for `.old.<n>` only, never swept, for the reason above (#332).
-  options.aside_dir = kConfigSdDir;
+  // And where a download and a state commit (#350): the folder each platform's
+  // roms download to, whose `.tmp` and `.part` are a download in flight, and
+  // the folders the states half reads, which it places into.
+  CountAsideIn(&options, kConfigSdDir);
+  for (const auto& platform : config.platforms) {
+    const std::string target = config.RomTarget(platform.first);
+    if (!target.empty()) {
+      CountAsideIn(&options, target);
+    }
+  }
+  if (config.sync.states) {
+    const scan::FolderPlan states = scan::PlanFolders(config, found.retroarch.value,
+                                                      scan::Folders::kStates, *inputs.files, nullptr);
+    for (const scan::ScanFolder& folder : states.folders) {
+      CountAsideIn(&options, folder.directory);
+    }
+  }
   // The scan's records go here, before the plan arrives: everything the rest of
   // the tick reads of them is in `reported`, `targets` and the options above,
   // and held to the end they were a third copy of every save beside the plan --

@@ -1165,7 +1165,7 @@ void ABaselineCarriesItsServer(checks::Checks& c) {
   baseline.BindTo("http://romm.lan:8080", 1760000000);
   const std::string text = state::SerializeBaseline(baseline);
   c.ExpectEq(text.substr(0, text.find('\n')),
-             std::string("rommsync-state 4 1760000000 http://romm.lan:8080"),
+             std::string("rommsync-state 5 1760000000 http://romm.lan:8080"),
              "the header names the version, the second it was bound, and the server");
   const state::LoadedBaseline back = state::ParseBaseline(text);
   c.Expect(back.diagnostics.empty(), "it reads back cleanly -- " + back.DescribeDiagnostics());
@@ -1394,6 +1394,130 @@ void ALostBaselineCostsTimeNotCorrectness(checks::Checks& c) {
   c.ExpectEq(outcome.content_hash, crypto::Md5Hex("the save"), "into a real digest");
 }
 
+// --- #348: the states a baseline dropped -----------------------------------------
+
+/// A state row the baseline lets go is remembered, with when, so its backups
+/// stay attributable (`backup::DroppedStateBackupsOf`); a row of the same key
+/// takes it back; the newest `kMaxDroppedStates` are kept.
+void ADroppedStateIsRemembered(checks::Checks& c) {
+  state::Baseline baseline;
+  baseline.BindTo("http://romm.lan:8080", 1760000000);
+  baseline.Set(Full());
+  baseline.SetState(FullState());
+  const std::int64_t before = sync::UnixSeconds(std::chrono::system_clock::now());
+  c.Expect(baseline.EraseState(12, "Game (USA).state"), "the state's row is erased");
+  const std::int64_t after = sync::UnixSeconds(std::chrono::system_clock::now());
+  c.ExpectEq(baseline.dropped_states().size(), std::size_t{1}, "and remembered as dropped");
+  if (baseline.dropped_states().empty()) return;
+  const state::DroppedState dropped = baseline.dropped_states().front();
+  c.Expect(dropped.rom_id == 12 && dropped.file_name == "Game (USA).state" &&
+               dropped.dropped >= before && dropped.dropped <= after,
+           "by rom, name and the second it went");
+  c.Expect(!baseline.EraseState(12, "Game (USA).state") && baseline.dropped_states().size() == 1,
+           "erasing no row remembers nothing more");
+
+  const std::string text = state::SerializeBaseline(baseline);
+  c.ExpectEq(text.substr(0, text.find('\n')),
+             std::string("rommsync-state 5 1760000000 http://romm.lan:8080"),
+             "written as version 5");
+  const std::size_t first_dropped = text.find("{\"kind\":\"dropped\"");
+  c.Expect(first_dropped != std::string::npos, "as a line of its own kind");
+  const state::LoadedBaseline back = state::ParseBaseline(text);
+  c.Expect(back.diagnostics.empty(), "it reads back cleanly -- " + back.DescribeDiagnostics());
+  c.Expect(back.value.size() == 1 && back.value.dropped_states().size() == 1 &&
+               back.value.dropped_states().front().file_name == "Game (USA).state" &&
+               back.value.dropped_states().front().dropped == dropped.dropped,
+           "with its row, and the dropped state beside it -- not as a row");
+  c.ExpectEq(state::SerializeBaseline(back.value), text, "and writes back byte-identical");
+  c.ExpectEq(state::SerializedSize(back.value), first_dropped,
+             "SerializedSize counts the rows, never a dropped state");
+
+  baseline.SetState(FullState());
+  c.Expect(baseline.dropped_states().empty(), "a row of the same state takes it back");
+
+  for (int at = 0; at < 20; ++at) {
+    baseline.RememberDropped({at + 1, "Game.state", 1760000000 + at});
+  }
+  baseline.RememberDropped({5, "Game.state", 1770000000});
+  c.ExpectEq(baseline.dropped_states().size(), state::kMaxDroppedStates,
+             "only the newest kMaxDroppedStates are kept");
+  c.Expect(baseline.dropped_states().front().rom_id == 6 &&
+               baseline.dropped_states().back().rom_id == 5 &&
+               baseline.dropped_states().back().dropped == 1770000000,
+           "the oldest forgotten, and one dropped again is the newest, once");
+
+  // The version before is the same file with none, and is read.
+  const std::string v4 = "rommsync-state 4 1760000000 http://romm.lan:8080\n" +
+                         text.substr(text.find('\n') + 1, first_dropped - text.find('\n') - 1);
+  const state::LoadedBaseline four = state::ParseBaseline(v4);
+  c.Expect(four.diagnostics.empty() && four.version == state::kBoundVersion &&
+               four.value.size() == 1 && four.value.server() == "http://romm.lan:8080",
+           "a version 4 file is read -- " + four.DescribeDiagnostics());
+
+  const auto line = [](int rom_id) {
+    return "{\"kind\":\"dropped\",\"rom_id\":" + std::to_string(rom_id) +
+           ",\"file_name\":\"A.state\",\"dropped\":1760000000}\n";
+  };
+  std::string many = Header();
+  for (std::size_t at = 0; at <= state::kMaxDroppedStates; ++at) {
+    many += line(static_cast<int>(at) + 1);
+  }
+  c.Expect(!state::ParseBaseline(many).diagnostics.empty(),
+           "more dropped states than a build writes is not a file it wrote");
+  c.Expect(!state::ParseBaseline(Header() + line(12) + line(12)).diagnostics.empty(),
+           "nor is one dropped twice");
+  c.Expect(!state::ParseBaseline(Header() + line(0)).diagnostics.empty(),
+           "nor one that names no rom");
+  const state::LoadedBaseline one = state::ParseBaseline(Header() + line(12));
+  c.Expect(one.diagnostics.empty() && one.value.dropped_states().size() == 1,
+           "and one that does is read -- " + one.DescribeDiagnostics());
+}
+
+/// The dropped states never cost a row: a full baseline keeps every row, at
+/// the row bound and at the byte bound, and the oldest dropped states give way.
+void DroppedStatesGiveWayToRows(checks::Checks& c) {
+  const std::filesystem::path path = FreshPath("dropped.db");
+  state::Baseline full;
+  for (std::size_t at = 0; at < state::kMaxRecords; ++at) {
+    state::SaveRecord record = Full();
+    record.rom_id = static_cast<std::int64_t>(at) + 1;
+    full.Set(record);
+  }
+  for (std::size_t at = 0; at < state::kMaxDroppedStates; ++at) {
+    full.RememberDropped({static_cast<std::int64_t>(at) + 1, "Game.state", 1760000000});
+  }
+  const state::StoreResult stored = state::SaveBaseline(path.string(), full);
+  const state::LoadedBaseline back = state::LoadBaseline(path.string());
+  c.Expect(stored.ok() && back.value.size() == state::kMaxRecords &&
+               back.value.dropped_states().size() == state::kMaxDroppedStates,
+           "kMaxRecords rows and every dropped state: none is a row -- " + stored.message +
+               back.DescribeDiagnostics());
+
+  // Rows that all but fill the byte bound, and dropped states with long names.
+  state::Baseline fat;
+  std::size_t rows = 0;
+  while (state::SerializedSize(fat) < state::kMaxStateBytes - 600) {
+    state::SaveRecord record = Full();
+    record.rom_id = static_cast<std::int64_t>(++rows);
+    record.slot = std::string(100, 'x');
+    fat.Set(record);
+  }
+  for (std::size_t at = 0; at < state::kMaxDroppedStates; ++at) {
+    fat.RememberDropped({static_cast<std::int64_t>(at) + 1, std::string(150, 'y') + ".state",
+                         1760000000 + static_cast<std::int64_t>(at)});
+  }
+  const state::StoreResult tight = state::SaveBaseline(path.string(), fat);
+  const std::string written = ReadWhole(path.string());
+  const state::LoadedBaseline reread = state::ParseBaseline(written);
+  c.Expect(tight.ok() && written.size() <= state::kMaxStateBytes && reread.value.size() == rows,
+           "a file at the byte bound is written with every row -- " + tight.message);
+  c.Expect(!reread.value.dropped_states().empty() &&
+               reread.value.dropped_states().size() < state::kMaxDroppedStates &&
+               reread.value.dropped_states().back().dropped ==
+                   1760000000 + static_cast<std::int64_t>(state::kMaxDroppedStates) - 1,
+           "and the dropped states that fit, the oldest let go");
+}
+
 }  // namespace
 
 int main() {
@@ -1434,5 +1558,7 @@ int main() {
   AReinstalledServersBaselineIsSetAside(c);
   AnUpgradeKeepsTheBaseline(c);
   TheMarkerKnowsTheDeviceToo(c);
+  ADroppedStateIsRemembered(c);
+  DroppedStatesGiveWayToRows(c);
   return c.failures() == 0 ? 0 : 1;
 }

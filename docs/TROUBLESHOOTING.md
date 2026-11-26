@@ -109,7 +109,7 @@ and a log is not worth it. A save is never in that position; see
 | `server.unsupported` | the server is older than RomM 5.4.0, so nothing is synced with it | [RomM is too old](#romm-is-too-old) |
 | `sync.held` | a sync fell due while a game was open, and waits for it to close | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `save.deleted` | RomM said a save on this console was deleted on the server, and what became of the file | [A save disappeared from the card](#a-save-disappeared-from-the-card) |
-| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; and, naming `max_state_mib`, how many of them were save-state backups the state budget removed with no other copy; naming `orphan_days`, how many were a previous server's state backups removed by age; and how many state backups are left that the budget cannot count | [The SD card is full](#the-sd-card-is-full) |
+| `backup.pruned` | `.backup/` was pruned to its `[backup]` limits after a sync: how many went, the bytes freed and left, and how many were kept because no other copy of them exists; and, naming `max_state_mib`, how many of them were save-state backups the state budget removed with no other copy; naming `orphan_days`, how many were a previous server's, or a dropped state's, state backups removed by age; and how many state backups are left that the budget cannot count | [The SD card is full](#the-sd-card-is-full) |
 | `download.remote` | a rom queued for this console in RomM's web UI was taken into the queue or reported back, or the server would not answer about one | [A queued rom never arrives](#a-queued-rom-never-arrives) |
 | `play.recorded` | a play session this console recorded, and the title seen writing its save — or `unknown` | [Nothing syncs while a game is open](#nothing-syncs-while-a-game-is-open) |
 | `process.terminated` | the sysmodule stopped itself — usually out of memory — and this was the last thing it wrote | [The sysmodule stopped](#the-sysmodule-stopped) |
@@ -626,14 +626,15 @@ once it has happened since the console started. If you would rather keep every
 state backup and clear them yourself, set `max_state_mib = 0`.
 
 The budget cannot count state backups taken against **a server this console has
-since left**, nor those of a state its `state.db` no longer lists. The first
-kind go once older than `[backup] orphan_days` (180 days), beyond the newest
-three of each state, in a clause naming `orphan_days`; the second kind are
-never deleted, because nothing on the card proves they are not a save's. The
-log counts what is left of both:
+since left**, nor those of a state its `state.db` no longer lists. Both go once
+older than `[backup] orphan_days` (180 days), beyond the newest three of each
+state, in a clause naming `orphan_days` — a previous server's by the `state.db`
+set aside when the console left it, a dropped state's by the last 16 states
+`state.db` remembers dropping. Any other is never deleted, because nothing on
+the card proves it is not a save's. The log counts what is left:
 
 ```
-31 info backup.pruned 3 of 61 backups pruned, 6291456 bytes freed; 520093696 bytes in 58 left; 3 of them save-state backups of a previous server [backup] orphan_days removed with no other copy known; 21 save-state backups left that max_state_mib cannot count
+31 info backup.pruned 3 of 61 backups pruned, 6291456 bytes freed; 520093696 bytes in 58 left; 3 of them save-state backups of a previous server or a dropped state [backup] orphan_days removed with no other copy known; 21 save-state backups left that max_state_mib cannot count
 ```
 
 and the diagnostics bundle's `[backup]` section has the same count as
@@ -665,8 +666,10 @@ Clearing out old backups by hand, as above, brings it back under.
 ## Files named .old.1, .old.2 and so on
 
 **Symptom.** Files such as `Game.srm.old.1` or `state.db.old.2` appear beside
-your saves, in `.backup/` or in `sdmc:/config/rommsync/`, and stay there. Or one
-save, or the sync baseline, stops being written at all.
+your saves, your save states or your roms, in `.backup/` or in
+`sdmc:/config/rommsync/`, and stay there. The overlay's status screen shows a
+**Set aside** row — *3 .old.<n> files* — with this section as its hint. Or one
+save, state, rom or the sync baseline stops being written at all.
 
 **Log line.**
 
@@ -685,12 +688,14 @@ from `<file>.old.1` to `<file>.old.16` and carries on.
 
 The client never deletes these files. Each sync of your saves counts them
 before it starts: `file.aside` gives the count when it grows, and the
-diagnostics bundle's `[backup]` section has the last count as `aside_files` —
-in the save folders, `.backup/` and `sdmc:/config/rommsync/` together (zero
-until the first sync since boot). Once **all sixteen** names are taken for one
-file, every later write to that file fails with the second line above — for a
-save the save keeps the bytes it had, and for `state.db` the baseline is not
-stored — until you make room.
+diagnostics bundle's `[backup]` section has the last count as `aside_files`,
+and the status screen's **Set aside** row shows it whenever it is not zero. It
+covers the save folders, `.backup/`, `sdmc:/config/rommsync/`, the folder each
+platform's roms download to and, with `[sync] states` on, the folders save
+states are read from — together, and zero until the first sync since boot. Once
+**all sixteen** names are taken for one file, every later write to that file
+fails with the second line above — for a save the save keeps the bytes it had,
+and for `state.db` the baseline is not stored — until you make room.
 
 **The fix.** Look at the files by hand. Each `.old.<n>` is an earlier version
 of the file it is named after (or a copy you made yourself):
@@ -698,6 +703,8 @@ of the file it is named after (or a copy you made yourself):
 - Beside a save, it is a previous version of that save. Copy any you want to
   keep to a computer; the save's backups in `.backup/` are separate and the
   **Conflicts** screen restores from those, not from these.
+- Beside a save state or a rom, it is a previous version of that state or rom.
+  A state's backups are in `.backup/` too; a rom can be downloaded again.
 - Beside `state.db`, `queue.json` or `play.db`, it is an older copy of the
   client's own record and is safe to delete.
 - Beside `token.dat` or `device.dat`, it is an older credential: delete it, and

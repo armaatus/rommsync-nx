@@ -397,6 +397,23 @@ void AddBackups(StatusView* view, const ipc::BackupUsage& backup) {
   }
 }
 
+/// The Set aside row (#350): `<file>.old.<n>` files a commit found in its way
+/// and kept, counted by the tick's sweep rather than the prune -- so drawn
+/// whether or not the backups are measured. Only when there are some, and
+/// warned: sixteen for one file and its commits fail, and the files are a
+/// player's to look at, since nothing here removes them.
+void AddAside(StatusView* view, std::int64_t aside_files) {
+  if (aside_files <= 0) {
+    return;
+  }
+  Add(&view->lines, "Set aside",
+      std::to_string(aside_files) + (aside_files == 1 ? " .old.<n> file" : " .old.<n> files"),
+      Tone::kWarn);
+  if (view->hint.empty()) {
+    view->hint = "See TROUBLESHOOTING.md: Files named .old.1";
+  }
+}
+
 }  // namespace
 
 StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
@@ -465,6 +482,8 @@ StatusView Render(const ipc::Status& status, std::int64_t now_unix) {
   // After the clock, so a held upload keeps the hint over a filling card: one
   // costs a save now, the other a download later.
   AddBackups(&view, status.backup);
+  // After the backups: a filling card keeps the hint over set-aside files.
+  AddAside(&view, status.backup.aside_files);
   AddDownload(&view, status.download);
   // Last, because it is the line a user reads once and a support thread reads
   // first (`ipc::Status::build`).

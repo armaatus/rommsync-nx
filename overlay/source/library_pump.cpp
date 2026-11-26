@@ -130,9 +130,7 @@ bool LibraryPump::SendNext() {
     // `kNotResponding` was seen since it went, the session was never reopened
     // (`ScreenFrame::Diagnose`) and the cursors the model held are still open
     // on it, to be ended first (#343).
-    link_ = Link::kOk;
-    model_.OnLinkRestored(same_session_);
-    same_session_ = true;
+    Restored();
   }
   // One command out at a time. The model answers `kNone` as soon as the loaded
   // pages cover what is on screen, so a browser sitting still costs nothing.
@@ -206,6 +204,12 @@ void LibraryPump::Lost(Link link) {
   same_session_ = same_session_ && link == Link::kNotResponding;
 }
 
+void LibraryPump::Restored() {
+  link_ = Link::kOk;
+  model_.OnLinkRestored(same_session_);
+  same_session_ = true;
+}
+
 void LibraryPump::Close() {
   model_.Close();
   // Retired first: this runs from `~LibraryScreen`, which libtesla may run
@@ -216,8 +220,10 @@ void LibraryPump::Close() {
   // The call that is out, waited for within the budget: a `ListBegin` answered
   // now is a cursor the closed model queues for `ListEnd` (#329), and one left
   // out is a cursor only the sysmodule's TTL gets back.
+  const bool was_out = poller_.sending();
   const Poller::Event event = poller_.Drain();
-  if (event.kind == Poller::Event::Kind::kSent) {
+  const bool answered = event.kind == Poller::Event::Kind::kSent;
+  if (answered) {
     Answered(event.command, event.rc);
   }
   // The handshake, as before any other command (`overlay/AGENTS.md`). A
@@ -225,6 +231,15 @@ void LibraryPump::Close() {
   // about it, so this is where the teardown stops.
   if (frame_.Ready() != Link::kOk) {
     return;
+  }
+  // A model behind a down link hands out nothing, not even a `ListEnd`, so a
+  // screen closed while not responding would leave every cursor -- the late
+  // one just drained among them -- to the TTL (#349). The link is back once the
+  // call that held it has answered: `Ready()` alone proves nothing, since a
+  // checked session makes no call. A call still out is a sysmodule still stuck,
+  // and a `ListEnd` behind it would only wait out another budget to fail.
+  if (link_ != Link::kOk && (answered || !was_out)) {
+    Restored();
   }
   // This terminates, and it is worth saying why rather than capping it: after
   // `Close()` the only command the model will hand out is a `ListEnd` for a

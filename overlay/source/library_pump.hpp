@@ -70,6 +70,10 @@ class LibraryPump {
   /// Remember `link` was lost, and whether the session may have gone with it.
   void Lost(Link link);
 
+  /// The link is back: the model starts again, ending first the cursors still
+  /// open if the session is the one they were opened on (#343).
+  void Restored();
+
   IpcClient& client_;
   ScreenFrame frame_{client_};
   Poller poller_{frame_, client_, Poller::kSendsOnly};

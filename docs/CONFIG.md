@@ -40,7 +40,7 @@ keep_days = 30                     ; and every one younger than this; 0 = none b
 max_mib   = 512                    ; the size .backup/ is held to; 0 = no cap
 max_state_mib = 256                ; state backups past this go, other copy or not; 0 = off
 keep_states   = 3                  ; the newest backups of each state max_state_mib never takes
-orphan_days   = 180                ; a previous server's state backups past this go too; 0 = off
+orphan_days   = 180                ; a previous server's, or a dropped state's, backups past this go too; 0 = off
 
 ; Platform folder map: RomM platform_fs_slug -> SD folders.
 ; roms   = where downloads land (first entry is the write target)
@@ -529,7 +529,7 @@ At the end of every sync that completed, the sysmodule prunes it:
 | `max_mib` | `512` | while the directory is still larger than this, older backups go oldest first across every game — but never the newest of a save; `0` is no cap |
 | `max_state_mib` | `256` | the **state budget**: while state backups hold more than this, the oldest state backups go even when no other copy of their bytes exists — never a save's, and never one of the newest `keep_states` of a state; `0` is off |
 | `keep_states` | `3` | the newest this many backups of each state, which `max_state_mib` and `orphan_days` never remove |
-| `orphan_days` | `180` | the **orphan bound**: a previous server's state backups older than this many days go even when no other copy of their bytes exists — only those the `state.db` set aside when the console left that server names, never a save's, and never one of the newest `keep_states` of a state; `0` is off |
+| `orphan_days` | `180` | the **orphan bound**: a previous server's state backups, and a dropped state's, older than this many days go even when no other copy of their bytes exists — only those the `state.db` set aside when the console left that server names, or this server's `state.db` remembers dropping (#348), never a save's, and never one of the newest `keep_states` of a state; `0` is off |
 
 **A backup is only ever deleted when its bytes are somewhere else** — with one
 pair of exceptions, `max_state_mib` and `orphan_days`, below, which only ever apply to save states. RomM holds a save with the same MD5 for that game (every
@@ -578,10 +578,13 @@ rom id is that server's. When `[server] url` moves, the old `state.db` is set
 aside beside the new one as `state.db.<old server>`, and that file still names
 the old server's states. Once such a backup is older than `orphan_days` (180),
 it goes, oldest first, beyond the newest `keep_states` of its state — the
-second and last removal without a second copy, and again never a save's. A
-backup no `state.db` on the card names — one of a state this server's
-`state.db` has dropped, or from a server whose set-aside file is gone — is
-never removed: it cannot be told from a save's backup by its name alone. The
+second and last removal without a second copy, and again never a save's. So
+does one of **a state this server's `state.db` has dropped** — trimmed to its
+bounds, or erased when its file could not be read back: the file remembers the
+last 16 states it dropped and when, and names their backups up to then. A
+backup no `state.db` on the card names — of a state dropped longer ago than
+that memory, or from a server whose set-aside file is gone — is never removed:
+it cannot be told from a save's backup by its name alone. The
 `backup.pruned` line counts what is left of both kinds that the budget cannot
 reach (*save-state backups left that max_state_mib cannot count*), so a full
 card shows where its space went. Set `orphan_days = 0` to keep them all.

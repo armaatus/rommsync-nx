@@ -93,6 +93,20 @@
 // -- and is read as rc2's is. rc2 itself reads version 4 as a newer release's
 // file and rebuilds its baseline from the card, which is #255's rule.
 //
+// ## Version 5: the states it dropped (#348)
+//
+// A state row is let go -- trimmed to the bounds (`TrimStates`, `sync_finish`),
+// or erased when its bytes could not be described -- and from then on nothing
+// says its backups are a state's, so the orphan bound could not touch them and
+// they stayed forever. So the file remembers the last `kMaxDroppedStates` it
+// dropped, a `"kind":"dropped"` line each: the rom, the name and the second it
+// went (`DroppedState`). They are not rows: `kMaxRecords` and the trims never
+// count them, and `SaveBaseline` lets the oldest go before it would refuse a
+// file over `kMaxStateBytes`. One costs only what it named: its backups are
+// reported, as every backup no `state.db` names is. Version 4 is the same file
+// with none, and is read; an earlier build reads version 5 as a newer
+// release's.
+//
 // Timestamps are whole Unix seconds, not RFC 3339. The comparison the server
 // makes is at second granularity anyway, and a number cannot be spelled two
 // ways -- which the string can: this client writes `Z` and RomM writes `+00:00`
@@ -126,7 +140,11 @@ inline constexpr const char* kStateFileName = "state.db";
 /// The first line of a well-formed file, `<magic> <version>`, and since #294
 /// `<magic> <version> <bound since> <server>` -- see "Version 4" above.
 inline constexpr const char* kFormatMagic = "rommsync-state";
-inline constexpr int kFormatVersion = 4;
+inline constexpr int kFormatVersion = 5;
+
+/// The version before #348 remembered the states it dropped: the same header
+/// and rows, and none of them.
+inline constexpr int kBoundVersion = 4;
 
 /// The version before #294 bound the file to a server: rc2's, the same rows
 /// with no server in the header. Read, and adopted as the configured server's
@@ -205,6 +223,9 @@ inline constexpr std::size_t kMaxStateBytes = 32 * 1024;
 // save no tick can finish: the two bounds are one number (M9-20, #246).
 static_assert(sync::kMaxPlanOperations == kMaxRecords,
               "a negotiate plan may carry exactly as many operations as state.db records");
+
+/// How many dropped states a file remembers, the newest. See "Version 5".
+inline constexpr std::size_t kMaxDroppedStates = 16;
 
 /// How many diagnostics are kept before the rest are dropped. `config`'s
 /// reasoning: a corrupt file must not answer with fifty thousand strings.
@@ -323,6 +344,16 @@ struct StateRecord {
   std::int64_t server_file_size_bytes = 0;
 };
 
+/// A state row the baseline let go (#348): which state, and when. Not a row --
+/// it pairs nothing -- but what lets `backup::DroppedStateBackupsOf` still name
+/// that state's backups as a state's.
+struct DroppedState {
+  std::int64_t rom_id = 0;
+  std::string file_name;
+  /// The Unix second it went. Its backups from after it are not named.
+  std::int64_t dropped = 0;
+};
+
 /// The rows, keyed the way the server pairs each kind.
 ///
 /// Saves are keyed `(rom_id, slot)` and `std::optional`'s ordering puts the
@@ -345,12 +376,21 @@ class Baseline {
 
   /// Insert or replace the row for `record`'s key.
   void Set(SaveRecord record);
+  /// A state's row replaces any `DroppedState` of the same key.
   void SetState(StateRecord record);
 
   /// Drop the row for a save that is no longer on the card. Returns whether
   /// there was one.
   bool Erase(std::int64_t rom_id, const std::optional<std::string>& slot);
+  /// ...and for a state, remembered as dropped now (`RememberDropped`).
   bool EraseState(std::int64_t rom_id, std::string_view file_name);
+
+  /// Remember `dropped`, newest last, replacing one of the same key; past
+  /// `kMaxDroppedStates` the oldest is forgotten.
+  void RememberDropped(DroppedState dropped);
+  /// Forget the oldest `count`.
+  void ForgetDropped(std::size_t count);
+  const std::vector<DroppedState>& dropped_states() const { return dropped_; }
 
   const std::map<Key, SaveRecord>& rows() const { return rows_; }
   const std::map<StateKey, StateRecord>& state_rows() const { return states_; }
@@ -380,6 +420,7 @@ class Baseline {
  private:
   std::map<Key, SaveRecord> rows_;
   std::map<StateKey, StateRecord> states_;
+  std::vector<DroppedState> dropped_;  ///< oldest first
   std::string server_;
   std::int64_t bound_since_ = 0;
 };
@@ -422,10 +463,11 @@ struct LoadedBaseline {
 /// The whole file, version line included, ending in a newline.
 std::string SerializeBaseline(const Baseline& baseline);
 
-/// The bytes `SerializeBaseline` would produce, without holding the text: a
-/// trim that has to bring a baseline inside `kMaxStateBytes` asks this once
-/// and subtracts a row's own size as it drops it, rather than building 32 KiB
-/// per row it tries.
+/// The bytes `SerializeBaseline` would produce of the header and the rows,
+/// without holding the text: a trim that has to bring a baseline inside
+/// `kMaxStateBytes` asks this once and subtracts a row's own size as it drops
+/// it, rather than building 32 KiB per row it tries. The dropped states are not
+/// counted: they give way at the write, never a row.
 std::size_t SerializedSize(const Baseline& baseline);
 /// One row's line, newline included.
 std::size_t SerializedSize(const SaveRecord& record);
@@ -568,6 +610,9 @@ struct StoreResult {
 /// version and re-hash the entire library on every tick from then on, forever,
 /// with one log line to explain it. Leaving that one save out costs that one
 /// save a re-hash. The skipped rows are named in `skipped`.
+///
+/// The dropped states (#348) are written as far as `kMaxStateBytes` lets them,
+/// the oldest let go first: a row is never refused for one.
 ///
 /// The file-level bounds are refusals, because there is nothing partial to fall
 /// back to: more than `kMaxRecords` rows, or more than `kMaxStateBytes` of text,

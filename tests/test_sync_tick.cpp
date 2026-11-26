@@ -329,27 +329,36 @@ void Aside(rig::Checks& checks) {
   sandbox.Write("/config/rommsync/state.db.old.3", "an older state.db\n");
   sandbox.Write("/config/rommsync/config.ini.tmp", "a setting being written\n");
   sandbox.MakeDirs("/config/rommsync/state.db.old.4");
+  // #350: a rom folder, which a download commits into, is count-only too: its
+  // `.tmp` and `.tmp.part` are a download in flight, and its `.part` a resume.
+  sandbox.MakeDirs("/tico/roms/nes");
+  sandbox.Write("/tico/roms/nes/nova.nes.old.1", "a rom a re-download set aside\n");
+  sandbox.Write("/tico/roms/nes/nova.nes.tmp", "a rom being committed\n");
+  sandbox.Write("/tico/roms/nes/other.nes.tmp.part", "a rom being fetched\n");
+  sandbox.Write("/tico/roms/nes/other.nes.old", "a player's own copy\n");
 
   const std::map<std::string, std::string> before = Snapshot(sandbox);
   const sync::RecoveryReport report =
       sync::RecoverStaging(*files, {harness::kSavesDir, harness::kBackupDir, "/never/created"},
-                           "/config/rommsync");
+                           {"/config/rommsync", "/tico/roms/nes"});
 
-  checks.ExpectEq(report.aside_left, std::size_t{4},
-                  "two beside the save, one in .backup/ and one beside state.db are counted");
+  checks.ExpectEq(report.aside_left, std::size_t{5},
+                  "two beside the save, one in .backup/, one beside state.db and one beside a "
+                  "rom are counted");
   checks.ExpectEq(report.previous_left, std::size_t{1}, "the .old is still its own count");
   checks.ExpectEq(report.total(), std::size_t{0}, "and nothing was acted on");
   checks.Expect(report.warnings.empty(),
                 "with nothing to complain about: " +
                     (report.warnings.empty() ? std::string() : report.warnings[0]));
   checks.Expect(Snapshot(sandbox) == before,
-                "every file is byte-for-byte what it was -- the config folder's .tmp included");
+                "every file is byte-for-byte what it was -- the config folder's .tmp and the "
+                "rom folder's included");
 
   const sync::RecoveryReport plain = sync::RecoverStaging(*files, {harness::kSavesDir});
   checks.ExpectEq(plain.aside_left, std::size_t{2},
                   "a sweep given no count-only folder counts only what it swept");
   const sync::RecoveryReport missing =
-      sync::RecoverStaging(*files, {harness::kSavesDir}, "/never/either");
+      sync::RecoverStaging(*files, {harness::kSavesDir}, {"/never/either"});
   checks.Expect(missing.warnings.empty() && missing.aside_left == 2,
                 "and a count-only folder that is not there is no warning and no count");
 }

@@ -1373,6 +1373,44 @@ int RunFrames(Checks& checks) {
     console.engine().library_roms = 0;
   }
 
+  // #349: the same stuck `ListBegin`, but the screen is closed while the link
+  // still says not responding, and the call is released as it goes. The
+  // teardown waits for it, so the late cursor reaches the model -- and the
+  // session is the one both cursors are open on, so both are ended rather than
+  // left to the TTL because the model was last told the link was down.
+  {
+    console.engine().library_roms = 20;
+    console.engine().library_cursors.clear();
+    console.sysmodule().slow_command = -1;
+    console.sysmodule().delay_ms = 0;
+    overlay::IpcClient quick(kTestBudget);
+    {
+      overlay::LibraryPump pump(quick);
+      overlay::LibraryBrowserModel& model = pump.model();
+      std::chrono::milliseconds slowest{0};
+      checks.Expect(RunFramesUntil([&] { pump.Frame(); },
+                                   [&] { return model.selected_position() == 0; }, &slowest),
+                    "the library lists its platform" + Took(slowest));
+      console.sysmodule().hold.Arm();
+      model.Activate();
+      checks.Expect(
+          RunFramesUntil([&] { pump.Frame(); },
+                         [&] { return model.Render().link == overlay::Link::kNotResponding; },
+                         &slowest),
+          "a ListBegin stuck for twenty budgets is reported as not responding" + Took(slowest));
+      checks.ExpectEq(console.engine().library_cursors.size(), std::size_t{1},
+                      "while it is held, the platform list's cursor is the only one open");
+      console.sysmodule().hold.Release();
+      pump.Close();
+    }
+    checks.ExpectEq(console.engine().library_cursors.size(), std::size_t{0},
+                    "a screen closed while not responding still ends the late cursor and the one "
+                    "from before");
+    quick.Shutdown();
+    console.sysmodule().delay_ms = 300;
+    console.engine().library_roms = 0;
+  }
+
   // The conflicts screen's pages, the same way.
   {
     for (std::int64_t id = 1; id <= 12; ++id) {

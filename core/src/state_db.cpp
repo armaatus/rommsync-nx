@@ -352,12 +352,47 @@ bool ParseStateRecord(const json::Value& object, StateRecord* out, std::string* 
   return true;
 }
 
+void SerializeDropped(const DroppedState& dropped, std::string* out) {
+  *out += "{\"kind\":\"dropped\",\"rom_id\":";
+  *out += std::to_string(dropped.rom_id);
+  *out += ",\"file_name\":";
+  *out += json::Quote(dropped.file_name);
+  *out += ",\"dropped\":";
+  *out += std::to_string(dropped.dropped);
+  *out += "}\n";
+}
+
+/// A dropped state is held to a state row's key: `StateBackupsOf` builds the
+/// same group from it.
+bool UsableDropped(const DroppedState& dropped) {
+  return dropped.dropped >= 0 && dropped.rom_id > 0 && !dropped.file_name.empty() &&
+         dropped.file_name.find('\0') == std::string::npos &&
+         sync::IsSingleFileName(dropped.file_name);
+}
+
+bool ParseDropped(const json::Value& object, DroppedState* out, std::string* why) {
+  json::Reader reader(object, "dropped state");
+  reader.Required("rom_id", &out->rom_id);
+  reader.Required("file_name", &out->file_name);
+  reader.Required("dropped", &out->dropped);
+  if (!reader.ok()) {
+    *why = reader.error().Describe();
+    return false;
+  }
+  if (!UsableDropped(*out)) {
+    *why = "a dropped state must name a rom and a single file name";
+    return false;
+  }
+  return true;
+}
+
 /// Which kind of row a line holds, or a reason it holds neither.
 ///
-/// An absent `kind` is a save; `"state"` is a state. Anything else is a row this
-/// build cannot read, and -- like every other unreadable row here -- it discards
-/// the whole file rather than half-understanding it.
-enum class RowKind { kSave, kState, kUnknown };
+/// An absent `kind` is a save; `"state"` is a state; `"dropped"` a state let go
+/// (#348). Anything else is a row this build cannot read, and -- like every
+/// other unreadable row here -- it discards the whole file rather than
+/// half-understanding it.
+enum class RowKind { kSave, kState, kDropped, kUnknown };
 
 RowKind KindOf(const json::Value& object, std::string* why) {
   const json::Value* kind = object.Find("kind");
@@ -371,13 +406,16 @@ RowKind KindOf(const json::Value& object, std::string* why) {
   if (kind->string() == "state") {
     return RowKind::kState;
   }
+  if (kind->string() == "dropped") {
+    return RowKind::kDropped;
+  }
   *why = "field kind: \"" + kind->string() + "\" is not a kind of row this build knows";
   return RowKind::kUnknown;
 }
 
 /// The version line a well-formed file opens with.
-std::string FormatHeader() {
-  return std::string(kFormatMagic) + " " + std::to_string(kFormatVersion);
+std::string FormatHeader(int version = kFormatVersion) {
+  return std::string(kFormatMagic) + " " + std::to_string(version);
 }
 
 /// ...and `baseline`'s own: the server it is bound to, when it is bound to one
@@ -498,12 +536,17 @@ class Parser {
       // on slots that moved, and they are the migration's input
       // (`legacy_saves`).
       // And rc2's, which is this version's rows with no server named (#294).
-      const std::string current = FormatHeader();
-      if (line == current || line.starts_with(current + " ")) {
-        const std::string_view rest =
-            line.size() > current.size() ? line.substr(current.size() + 1) : std::string_view();
-        version_ = ParseBinding(rest, &since_, &server_) ? kFormatVersion : 0;
-      } else if (line == std::string(kFormatMagic) + " " + std::to_string(kUnboundVersion)) {
+      // And version 4's, which is this one's with no state it dropped (#348).
+      for (const int version : {kFormatVersion, kBoundVersion}) {
+        const std::string current = FormatHeader(version);
+        if (line == current || line.starts_with(current + " ")) {
+          const std::string_view rest =
+              line.size() > current.size() ? line.substr(current.size() + 1) : std::string_view();
+          version_ = ParseBinding(rest, &since_, &server_) ? version : 0;
+          return;
+        }
+      }
+      if (line == std::string(kFormatMagic) + " " + std::to_string(kUnboundVersion)) {
         version_ = kUnboundVersion;
       } else if (line == std::string(kFormatMagic) + " " + std::to_string(kSourceSlotVersion)) {
         version_ = kSourceSlotVersion;
@@ -524,7 +567,8 @@ class Parser {
       Add(&complaints_, "state.db line " + std::to_string(blank_) + " is blank");
       blank_ = 0;
     }
-    if (++rows_ > Bound()) {
+    // Every line is bounded before it is parsed; which kind it was, after.
+    if (++rows_ > Bound() + kMaxDroppedStates) {
       over_ = true;
       return;
     }
@@ -642,7 +686,31 @@ class Parser {
       return;
     }
     std::string why;
-    switch (KindOf(document.value, &why)) {
+    const RowKind kind = KindOf(document.value, &why);
+    if (kind == RowKind::kDropped) {
+      DroppedState dropped;
+      if (!ParseDropped(document.value, &dropped, &why)) {
+        Add(&complaints_, where + why);
+      } else if (++dropped_lines_ > kMaxDroppedStates) {
+        Add(&complaints_, where + "more dropped states than a state.db remembers");
+      } else {
+        // Within the bound nothing is forgotten, so a list that did not grow
+        // replaced one: the same state twice.
+        const std::size_t had = baseline_.dropped_states().size();
+        baseline_.RememberDropped(std::move(dropped));
+        if (baseline_.dropped_states().size() == had) {
+          Add(&complaints_, where + "a second dropped state for the same (rom_id, file_name)");
+        }
+      }
+      return;
+    }
+    if (rows_ - dropped_lines_ > Bound()) {
+      over_ = true;
+      return;
+    }
+    switch (kind) {
+      case RowKind::kDropped:
+        return;
       case RowKind::kSave: {
         SaveRecord record;
         if (!ParseSaveRecord(document.value, &record, &why)) {
@@ -701,6 +769,7 @@ class Parser {
   std::size_t blank_ = 0;
   std::size_t rows_ = 0;
   std::size_t dropped_ = 0;
+  std::size_t dropped_lines_ = 0;  ///< `"kind":"dropped"`, which are not rows
   int version_ = 0;
   int newer_ = 0;
   std::int64_t since_ = 0;
@@ -793,13 +862,48 @@ const StateRecord* Baseline::FindState(std::int64_t rom_id, std::string_view fil
   return found == states_.end() ? nullptr : &found->second;
 }
 
+namespace {
+
+/// Forget `rom_id`'s `file_name` from `dropped`, if it is there. One loop and
+/// one range erase for every caller: the image is budgeted by the page.
+void ForgetKey(std::vector<DroppedState>* dropped, std::int64_t rom_id,
+               std::string_view file_name) {
+  for (auto at = dropped->begin(); at != dropped->end(); ++at) {
+    if (at->rom_id == rom_id && at->file_name == file_name) {
+      dropped->erase(at, at + 1);
+      return;
+    }
+  }
+}
+
+}  // namespace
+
 void Baseline::SetState(StateRecord record) {
+  ForgetKey(&dropped_, record.rom_id, record.file_name);
   const StateKey key{record.rom_id, record.file_name};
   states_[key] = std::move(record);
 }
 
 bool Baseline::EraseState(std::int64_t rom_id, std::string_view file_name) {
-  return states_.erase(StateKey{rom_id, std::string(file_name)}) != 0;
+  std::string name(file_name);
+  if (states_.erase(StateKey{rom_id, name}) == 0) {
+    return false;
+  }
+  RememberDropped({rom_id, std::move(name), sync::UnixSeconds(std::chrono::system_clock::now())});
+  return true;
+}
+
+void Baseline::RememberDropped(DroppedState dropped) {
+  ForgetKey(&dropped_, dropped.rom_id, dropped.file_name);
+  dropped_.push_back(std::move(dropped));
+  if (dropped_.size() > kMaxDroppedStates) {
+    ForgetDropped(dropped_.size() - kMaxDroppedStates);
+  }
+}
+
+void Baseline::ForgetDropped(std::size_t count) {
+  dropped_.erase(dropped_.begin(),
+                 dropped_.begin() + static_cast<std::ptrdiff_t>(std::min(count, dropped_.size())));
 }
 
 std::string LoadedBaseline::DescribeDiagnostics() const {
@@ -854,6 +958,10 @@ std::string SerializeBaseline(const Baseline& baseline) {
     (void)key;
     out += SerializeRecord(record);
     out += "\n";
+  }
+  // Last, oldest first: not rows, and what `SaveBaseline` lets go first.
+  for (const DroppedState& dropped : baseline.dropped_states()) {
+    SerializeDropped(dropped, &out);
   }
   return out;
 }
@@ -936,7 +1044,7 @@ std::string BindToServer(LoadedBaseline* loaded, const std::string& path, std::s
     // No rows at all names no server for any backup, so that binds from now.
     const bool adopted = loaded->version == kUnboundVersion ||
                          loaded->version == kSourceSlotVersion ||
-                         (loaded->version == kFormatVersion &&
+                         (loaded->version >= kBoundVersion &&
                           !(loaded->value.empty() && loaded->legacy_saves.empty()));
     loaded->value.BindTo(std::string(server), adopted ? 0 : now_unix);
     return {};
@@ -1075,7 +1183,16 @@ StoreResult SaveBaseline(const std::string& path, const Baseline& baseline) {
     return result;
   }
 
-  const std::string text = SerializeBaseline(writable);
+  // The dropped states after, as many as fit: one the reader would refuse --
+  // its row was not usable either -- is never written.
+  for (const DroppedState& dropped : baseline.dropped_states()) {
+    if (UsableDropped(dropped)) writable.RememberDropped(dropped);
+  }
+  std::string text = SerializeBaseline(writable);
+  while (text.size() > kMaxStateBytes && !writable.dropped_states().empty()) {
+    writable.ForgetDropped(1);
+    text = SerializeBaseline(writable);
+  }
   if (text.size() > kMaxStateBytes) {
     result.error = StoreError::kTooLarge;
     result.message =

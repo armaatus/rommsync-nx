@@ -74,7 +74,7 @@ keep_days = 30                     ; and every one younger than this; 0 = none b
 max_mib   = 512                    ; the size .backup/ is held to; 0 = no cap
 max_state_mib = 256                ; state backups past this go, other copy or not; 0 = off
 keep_states   = 3                  ; the newest backups of each state max_state_mib never takes
-orphan_days   = 180                ; a previous server's state backups past this go too; 0 = off
+orphan_days   = 180                ; a previous server's, or a dropped state's, backups past this go too; 0 = off
 
 [tico]
 ; Tico 0.8 keeps saves per Switch account, under /tico/saves/users/<account>/.
