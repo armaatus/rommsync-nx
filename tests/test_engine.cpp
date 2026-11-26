@@ -5937,6 +5937,15 @@ int StateBackupPruned(http::HttpClient& client, const std::string& base) {
   console.sandbox.Write(backup(300), held);
   console.sandbox.Write(backup(200), unique);
   console.sandbox.Write(backup(100), newest);
+  // #350: a state's and a rom's `.old` a commit set aside -- in the folder the
+  // states scan reads and the one a download lands in, which are not swept.
+  const std::string state_aside = harness::StatePath("nova.state.old.1");
+  const std::string rom_aside = "/tico/roms/nes/nova.nes.old.1";
+  const std::string rom_staged = "/tico/roms/nes/nova.nes.tmp";
+  console.sandbox.Write(state_aside, "a state a placement set aside\n");
+  console.sandbox.MakeDirs("/tico/roms/nes");
+  console.sandbox.Write(rom_aside, "a rom a re-download set aside\n");
+  console.sandbox.Write(rom_staged, "a rom being committed\n");
 
   auth::StoredToken token;
   token.server_url = base;
@@ -5970,6 +5979,16 @@ int StateBackupPruned(http::HttpClient& client, const std::string& base) {
   c.ExpectEq(status.backup.backups, std::int64_t{2}, "two backups are left");
   c.ExpectEq(status.backup.kept_unique, std::int64_t{1},
              "one of them kept only because it is the only copy");
+
+  // #350: counted, both, and neither touched -- nor the rom folder's `.tmp`.
+  c.ExpectEq(status.backup.aside_files, std::int64_t{2},
+             "the state's and the rom's set-aside files are counted:" + Rendered(log));
+  c.ExpectEq(console.sandbox.Read(state_aside), std::string("a state a placement set aside\n"),
+             "and neither is touched");
+  c.ExpectEq(console.sandbox.Read(rom_aside), std::string("a rom a re-download set aside\n"),
+             "...either of them");
+  c.ExpectEq(console.sandbox.Read(rom_staged), std::string("a rom being committed\n"),
+             "and the rom folder is listed, not swept");
 
   harness::DeleteState(client, base, fixture, row.id);
   harness::DeleteDevice(client, base, fixture, device_id);

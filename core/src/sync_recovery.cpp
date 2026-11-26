@@ -81,19 +81,16 @@ void Discard(const std::string& path, const std::string& sd_path, std::size_t* c
 
 RecoveryReport RecoverStaging(fs::FileSystem& files,
                               const std::vector<std::string>& directories,
-                              const std::string& count_only) {
+                              const std::vector<std::string>& count_only) {
   RecoveryReport report;
-  // `count_only` after `directories`, in the one loop: the last pass lists it
+  // `count_only` after `directories`, in the one loop: those passes list it
   // for its asides and nothing else (see the header). One loop rather than a
   // second listing loop, because the sysmodule's text segment has no page to
   // spare (scripts/image-budget.sh): a second loop measured a page over.
   const std::size_t swept = directories.size();
-  for (std::size_t at = 0; at <= swept; ++at) {
+  for (std::size_t at = 0; at < swept + count_only.size(); ++at) {
     const bool sweep = at < swept;
-    if (!sweep && count_only.empty()) {
-      break;
-    }
-    const std::string& directory = sweep ? directories[at] : count_only;
+    const std::string& directory = sweep ? directories[at] : count_only[at - swept];
     const fs::Listing listing = files.List(directory);
     if (sweep && !listing.ok() && listing.error != fs::ListError::kMissing) {
       // A missing directory is not worth a line: a save folder a user mapped and

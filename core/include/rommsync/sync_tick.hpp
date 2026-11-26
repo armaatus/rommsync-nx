@@ -149,13 +149,16 @@ struct RecoveryReport {
 /// directories nothing else writes to is the whole reason this takes a list
 /// rather than deciding for itself.
 ///
-/// `count_only`, when not empty, is listed for `aside_left` and nothing else:
-/// no file in it is removed or renamed, and a listing that fails is not a
-/// warning. That is how `/config/rommsync` is counted (#332) without being
-/// swept -- its records' commits set `.old` files aside exactly as a save's do.
+/// `count_only` is listed for `aside_left` and nothing else: no file in it is
+/// removed or renamed, and a listing that fails is not a warning. That is how
+/// `/config/rommsync` is counted (#332) without being swept -- its records'
+/// commits set `.old` files aside exactly as a save's do -- and how a rom
+/// folder and a states folder are (#350): a rom folder's `.tmp` and `.part`
+/// are a download in flight, and a states folder is not the sweep's. A folder
+/// that is also in `directories` is counted twice; the caller passes each once.
 RecoveryReport RecoverStaging(fs::FileSystem& files,
                               const std::vector<std::string>& directories,
-                              const std::string& count_only = {});
+                              const std::vector<std::string>& count_only = {});
 
 /// How a tick ended, as the thing that schedules the next one needs it.
 ///
@@ -299,9 +302,10 @@ struct TickOptions {
   std::vector<std::string> recover_dirs;
 
   /// Listed for `RecoveryReport::aside_left` and nothing else
-  /// (`RecoverStaging`'s `count_only`, #332): the records' folder, which is
-  /// not swept. Empty is none.
-  std::string aside_dir;
+  /// (`RecoverStaging`'s `count_only`): the records' folder (#332), and the
+  /// rom and states folders a download or a state commits into (#350) -- none
+  /// of them swept. Not one of `recover_dirs`, which are counted already.
+  std::vector<std::string> aside_dirs;
 
   /// Create `execute.backup_dir` on entry if it is not there.
   ///

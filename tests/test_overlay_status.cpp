@@ -816,6 +816,35 @@ void CheckBackups(Checks& checks) {
   checks.ExpectEq(ValueOf(RenderOverWire(checks, budget_one), "State budget"),
                   std::string("1 only copy removed"), "one is singular");
 
+  // #350: files a commit set aside as `.old.<n>` get a row, and only when there
+  // are some: at sixteen for one file its commits fail, and the section that
+  // says what they are is the hint unless a worse problem already holds it.
+  checks.Expect(!HasLabel(under, "Set aside"), "with none set aside there is no row for it");
+  ipc::Status aside = measured;
+  aside.backup.aside_files = 3;
+  const overlay::StatusView set_aside = RenderOverWire(checks, aside);
+  checks.ExpectEq(ValueOf(set_aside, "Set aside"), std::string("3 .old.<n> files"),
+                  "the count of set-aside files is drawn");
+  checks.Expect(ToneOf(set_aside, "Set aside") == overlay::Tone::kWarn,
+                "in the warning tone: a player has files to look at");
+  checks.ExpectEq(set_aside.hint, std::string("See TROUBLESHOOTING.md: Files named .old.1"),
+                  "and the hint names the section");
+  ExpectNothingBlank(checks, set_aside, "a set-aside row");
+  ipc::Status aside_one = aside;
+  aside_one.backup.aside_files = 1;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, aside_one), "Set aside"),
+                  std::string("1 .old.<n> file"), "one is singular");
+  ipc::Status aside_full = over;
+  aside_full.backup.aside_files = 3;
+  checks.ExpectEq(RenderOverWire(checks, aside_full).hint,
+                  std::string("See TROUBLESHOOTING.md: The SD card is full"),
+                  "a filling card keeps the hint over set-aside files");
+  // Counted by the tick's sweep, not the prune, so drawn before a first prune.
+  ipc::Status aside_early = Healthy();
+  aside_early.backup.aside_files = 2;
+  checks.ExpectEq(ValueOf(RenderOverWire(checks, aside_early), "Set aside"),
+                  std::string("2 .old.<n> files"), "and before the backups are measured");
+
   // A worse problem keeps the hint: a held upload outranks a filling card.
   ipc::Status clock = over;
   clock.clock_trusted = false;

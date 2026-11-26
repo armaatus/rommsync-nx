@@ -666,8 +666,10 @@ Clearing out old backups by hand, as above, brings it back under.
 ## Files named .old.1, .old.2 and so on
 
 **Symptom.** Files such as `Game.srm.old.1` or `state.db.old.2` appear beside
-your saves, in `.backup/` or in `sdmc:/config/rommsync/`, and stay there. Or one
-save, or the sync baseline, stops being written at all.
+your saves, your save states or your roms, in `.backup/` or in
+`sdmc:/config/rommsync/`, and stay there. The overlay's status screen shows a
+**Set aside** row — *3 .old.<n> files* — with this section as its hint. Or one
+save, state, rom or the sync baseline stops being written at all.
 
 **Log line.**
 
@@ -686,12 +688,14 @@ from `<file>.old.1` to `<file>.old.16` and carries on.
 
 The client never deletes these files. Each sync of your saves counts them
 before it starts: `file.aside` gives the count when it grows, and the
-diagnostics bundle's `[backup]` section has the last count as `aside_files` —
-in the save folders, `.backup/` and `sdmc:/config/rommsync/` together (zero
-until the first sync since boot). Once **all sixteen** names are taken for one
-file, every later write to that file fails with the second line above — for a
-save the save keeps the bytes it had, and for `state.db` the baseline is not
-stored — until you make room.
+diagnostics bundle's `[backup]` section has the last count as `aside_files`,
+and the status screen's **Set aside** row shows it whenever it is not zero. It
+covers the save folders, `.backup/`, `sdmc:/config/rommsync/`, the folder each
+platform's roms download to and, with `[sync] states` on, the folders save
+states are read from — together, and zero until the first sync since boot. Once
+**all sixteen** names are taken for one file, every later write to that file
+fails with the second line above — for a save the save keeps the bytes it had,
+and for `state.db` the baseline is not stored — until you make room.
 
 **The fix.** Look at the files by hand. Each `.old.<n>` is an earlier version
 of the file it is named after (or a copy you made yourself):
@@ -699,6 +703,8 @@ of the file it is named after (or a copy you made yourself):
 - Beside a save, it is a previous version of that save. Copy any you want to
   keep to a computer; the save's backups in `.backup/` are separate and the
   **Conflicts** screen restores from those, not from these.
+- Beside a save state or a rom, it is a previous version of that state or rom.
+  A state's backups are in `.backup/` too; a rom can be downloaded again.
 - Beside `state.db`, `queue.json` or `play.db`, it is an older copy of the
   client's own record and is safe to delete.
 - Beside `token.dat` or `device.dat`, it is an older credential: delete it, and
